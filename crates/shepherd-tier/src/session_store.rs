@@ -48,6 +48,7 @@
 use std::sync::Mutex;
 
 use rusqlite::OptionalExtension;
+use shepherd_catalog::writer::{CatalogWriter, WriterError};
 use shepherd_catalog::{Catalog, CatalogError};
 use shepherd_core::{
     Blake3Hash, FileId, FsId, JobId, ObjectKey, ObjectVersion, TargetId, Timestamp,
@@ -61,7 +62,44 @@ use shepherd_storage::transfer_session::{
 /// SQLite-backed transfer sessions.
 #[derive(Debug)]
 pub struct CatalogSessionStore {
-    catalog: Mutex<Catalog>,
+    backend: Backend,
+}
+
+/// Where the store's catalog access goes.
+///
+/// Two forms on purpose, and neither is a fallback for the other:
+///
+/// * [`Backend::Owned`] holds its own connection. This is what the AC-2 test
+///   needs — a restart genuinely opens its own database, and a test sharing the
+///   daemon's actor would be exercising something weaker than a restart.
+/// * [`Backend::Actor`] routes through the single catalog writer. This is what
+///   the **daemon** needs: SQLite's WAL model is many-readers/one-writer, so a
+///   second writer on the same file is exactly what the actor exists to
+///   prevent.
+enum Backend {
+    Owned(Mutex<Catalog>),
+    Actor(CatalogWriter),
+}
+
+// Hand-written because `CatalogWriter` is not `Debug` — it wraps a channel
+// sender, and there is nothing useful to print from one. Naming which backend
+// is in use is the whole diagnostic value here: "owns its own connection"
+// versus "routes through the daemon's single writer" is the difference that
+// matters when a `SQLITE_BUSY` shows up in a log.
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backend::Owned(_) => f.write_str("Owned(<connection>)"),
+            Backend::Actor(_) => f.write_str("Actor(<catalog writer>)"),
+        }
+    }
+}
+
+fn writer_err(e: WriterError) -> StorageError {
+    StorageError::Transient {
+        op: "transfer_session".into(),
+        detail: e.to_string(),
+    }
 }
 
 fn to_storage(e: CatalogError) -> StorageError {
@@ -121,22 +159,37 @@ fn hash_from(bytes: Option<Vec<u8>>) -> Option<Blake3Hash> {
 }
 
 impl CatalogSessionStore {
+    /// Own a connection. For tests and for any caller that is the only writer.
     pub fn new(catalog: Catalog) -> Self {
         Self {
-            catalog: Mutex::new(catalog),
+            backend: Backend::Owned(Mutex::new(catalog)),
         }
     }
 
-    /// Open (or create) a catalog at `path` and wrap it.
+    /// Open (or create) a catalog at `path` and own it.
     pub fn open(path: &std::path::Path) -> StorageResult<Self> {
         Ok(Self::new(Catalog::open(path).map_err(to_storage)?))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Catalog> {
-        // A poisoned catalog mutex means a writer panicked mid-transaction.
-        // Recovering the guard is correct here: SQLite's own transaction
-        // semantics decide what survived, not this lock.
-        self.catalog.lock().unwrap_or_else(|e| e.into_inner())
+    /// Route through the daemon's single catalog writer.
+    ///
+    /// # The one way to deadlock this
+    ///
+    /// `CatalogWriter::with` blocks on a rendezvous channel until the actor
+    /// replies. **A store call made from inside another `with` closure wedges
+    /// the catalog permanently** — the actor is busy running the outer closure
+    /// and can never dequeue the inner one.
+    ///
+    /// This store is safe by construction rather than by convention, because
+    /// [`crate::upload::upload_item`] loads and saves the session at the **top
+    /// level** of the upload, before and around the driver run. There is no
+    /// arrangement in which its catalog access ends up nested inside another
+    /// one. Keep it that way: gather what a transaction needs in one closure,
+    /// or make the store call the outer one.
+    pub fn with_writer(writer: CatalogWriter) -> Self {
+        Self {
+            backend: Backend::Actor(writer),
+        }
     }
 }
 
@@ -150,7 +203,41 @@ impl TransferSessionStore for CatalogSessionStore {
     /// or skip one it had not — which is how a completed object becomes a
     /// chimera. The two must move together.
     async fn save(&self, session: &TransferSession) -> StorageResult<()> {
-        let mut cat = self.lock();
+        match &self.backend {
+            Backend::Owned(m) => {
+                let mut cat = m.lock().unwrap_or_else(|e| e.into_inner());
+                save_blocking(&mut cat, session)
+            }
+            Backend::Actor(w) => {
+                // Cloned into the closure: `with` needs `'static`, and a
+                // session is small next to the object it describes.
+                let s = session.clone();
+                w.with(move |cat| save_blocking(cat, &s))
+                    .map_err(writer_err)?
+            }
+        }
+    }
+
+    async fn load(&self, job_id: JobId) -> StorageResult<Option<TransferSession>> {
+        match &self.backend {
+            Backend::Owned(m) => {
+                let cat = m.lock().unwrap_or_else(|e| e.into_inner());
+                load_blocking(&cat, job_id)
+            }
+            Backend::Actor(w) => w
+                .with(move |cat| load_blocking(cat, job_id))
+                .map_err(writer_err)?,
+        }
+    }
+}
+
+/// The whole write, against a borrowed catalog.
+///
+/// Free functions rather than methods so both backends run **identical** SQL.
+/// Two copies of a transaction that must stay atomic is how the owned path and
+/// the daemon path drift into disagreeing about durability.
+fn save_blocking(cat: &mut Catalog, session: &TransferSession) -> StorageResult<()> {
+    {
         let tx = cat.conn_mut().transaction().map_err(sqlite)?;
 
         // Explicit UPDATE-then-INSERT rather than `ON CONFLICT(job_id)`.
@@ -261,11 +348,12 @@ impl TransferSessionStore for CatalogSessionStore {
         // Durable before return. `synchronous = FULL` is asserted at open by
         // `shepherd-catalog`, so this commit really is on disk.
         tx.commit().map_err(sqlite)?;
-        Ok(())
     }
+    Ok(())
+}
 
-    async fn load(&self, job_id: JobId) -> StorageResult<Option<TransferSession>> {
-        let cat = self.lock();
+fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferSession>> {
+    {
         let conn = cat.conn();
 
         let row = conn

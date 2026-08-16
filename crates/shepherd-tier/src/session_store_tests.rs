@@ -15,6 +15,7 @@ use crate::plan::{TierItem, derive_object_key};
 use crate::serialize::FileLocks;
 use crate::upload::{hash_file, upload_item};
 use shepherd_catalog::Catalog;
+use shepherd_catalog::writer::CatalogActor;
 use shepherd_storage::multipart::PartAction;
 use shepherd_storage::testing::MemAdapter;
 
@@ -269,6 +270,79 @@ async fn a_killed_upload_resumes_from_disk_without_resending_verified_parts() {
         recon.bytes_skipped > 0,
         "AC-2 measures bytes NOT re-sent; got {}",
         recon.bytes_skipped
+    );
+}
+
+/// Both backends must be interchangeable, and one of them is what the daemon
+/// will actually run.
+///
+/// If `with_writer` ever diverged from the owned path — a different
+/// transaction shape, a dropped column — the daemon would persist something
+/// subtly different from what every test in this file exercises, and nothing
+/// would say so. Both run the same `save_blocking` / `load_blocking`, and this
+/// asserts the round trip is identical through either.
+#[tokio::test]
+async fn the_actor_backend_round_trips_identically_to_the_owned_one() {
+    let dir = TempDir::new("actor");
+    let db = dir.join("catalog.db");
+    let src = dir.join("a.bin");
+    std::fs::write(&src, BODY).expect("write source");
+    let item = item_for(&src);
+    let job = JobId::new(11);
+    seed(&db, job, item.target, item.file);
+
+    let session = {
+        let adapter = MemAdapter::content_addressed();
+        let mut s = TransferSession::plan(
+            job,
+            item.target,
+            item.remote_key.clone(),
+            SourceIdentity {
+                file_id: item.file,
+                rel_path: item.path.clone(),
+                size: item.size,
+                mtime: Timestamp::from_nanos(7),
+                fs_id: FsId::new("vol-1:ino-9"),
+                blake3: item.blake3,
+            },
+            &adapter,
+            16,
+        )
+        .expect("plan");
+        s.state = TransferState::Uploading;
+        s.upload_id = Some(OpaqueToken::new("upload-actor"));
+        s.parts.push(PartCheckpoint {
+            part_no: 1,
+            offset: 0,
+            len: 16,
+            local_blake3: Blake3Hash::from_bytes([3u8; 32]),
+            etag: Some(OpaqueToken::new("etag-actor")),
+        });
+        s
+    };
+
+    // Write through the ACTOR, on its own thread.
+    {
+        let actor = CatalogActor::start(Catalog::open(&db).expect("open"), None);
+        let store = CatalogSessionStore::with_writer(actor.handle());
+        store.save(&session).await.expect("save via actor");
+    } // actor stopped, thread joined
+
+    // Read back through the OWNED path, from a fresh connection.
+    let owned = CatalogSessionStore::open(&db).expect("reopen");
+    let back = owned.load(job).await.expect("load").expect("row survived");
+    assert_eq!(back.state, session.state);
+    assert_eq!(back.upload_id, session.upload_id);
+    assert_eq!(back.parts.len(), 1);
+    assert_eq!(back.parts[0].etag, session.parts[0].etag);
+
+    // And through the actor again, to prove the read side matches too.
+    let actor = CatalogActor::start(Catalog::open(&db).expect("open"), None);
+    let via_actor = CatalogSessionStore::with_writer(actor.handle());
+    assert_eq!(
+        via_actor.load(job).await.expect("load via actor"),
+        Some(back),
+        "both backends must return the same session"
     );
 }
 
