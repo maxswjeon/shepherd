@@ -10,6 +10,21 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Exposes `shepherd_storage::testing` (MemAdapter / MemStore / MemSource) to
+# other crates' tests.
+#
+# It exists because §4.1 rule 4 makes a second `StorageAdapter` double
+# ILLEGAL rather than merely wasteful: `delete_object` may be implemented only
+# under `crates/shepherd-storage/src/`, so a test adapter written anywhere else
+# fails `cargo xtask check-deps`. The gate is right — two divergent doubles for
+# one safety-critical trait is exactly the drift it exists to prevent — so the
+# fix is to share this one, not to widen the policy.
+#
+# Off by default, so nothing reaches a shipping binary unless a dev-dependency
+# asks for it.
+testing = []
+
 [dependencies]
 shepherd-core.workspace = true
 

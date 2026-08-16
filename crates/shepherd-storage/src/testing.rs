@@ -63,6 +63,10 @@ struct Inner {
     /// Counts `list` calls, so OQ-1's "allocation never reads LIST" can be
     /// asserted directly instead of trusted.
     list_calls: usize,
+    /// Keys passed to `delete_object`, in order. The destroy-path tests assert
+    /// on what was actually deleted rather than inferring it from absence —
+    /// absence is also what a never-created object looks like.
+    deleted: Vec<String>,
 }
 
 /// An in-memory `StorageAdapter`.
@@ -135,6 +139,33 @@ impl MemAdapter {
         self.lock()
             .objects
             .insert(key.as_str().to_owned(), (body, v));
+    }
+
+    /// Same, with an explicit version id.
+    ///
+    /// The destroy path pins a version at verify and re-attests it with a
+    /// closing HEAD (§4.10.2 mechanism A), so its tests need to control that
+    /// value rather than accept a derived one.
+    pub fn put_versioned(&self, key: &ObjectKey, body: Bytes, version: &str) {
+        self.lock().objects.insert(
+            key.as_str().to_owned(),
+            (body, Some(ObjectVersion::new(version))),
+        );
+    }
+
+    /// Remove an object *without* going through the destructive verb — for
+    /// setting up "the remote copy vanished underneath us" states.
+    pub fn remove_raw(&self, key: &ObjectKey) {
+        self.lock().objects.remove(key.as_str());
+    }
+
+    /// Keys passed to `delete_object`, in call order.
+    ///
+    /// The destroy-path tests assert on what was actually deleted rather than
+    /// inferring it from absence — absence is also what a never-created object
+    /// looks like, so inferring would pass on a bug that deleted nothing.
+    pub fn deleted_keys(&self) -> Vec<String> {
+        self.lock().deleted.clone()
     }
 
     fn issue_token(inner: &mut Inner, what: &str) -> OpaqueToken {
@@ -401,7 +432,9 @@ impl StorageAdapter for MemAdapter {
     }
 
     async fn delete_object(&self, key: &ObjectKey, _guard: &VersionGuard) -> StorageResult<()> {
-        self.lock().objects.remove(key.as_str());
+        let mut inner = self.lock();
+        inner.deleted.push(key.as_str().to_owned());
+        inner.objects.remove(key.as_str());
         Ok(())
     }
 

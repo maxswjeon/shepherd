@@ -39,8 +39,13 @@ pub mod replica;
 pub mod s3;
 pub mod transfer_session;
 
-#[cfg(test)]
-mod testing;
+// `testing` is also reachable from other crates' tests via the `testing`
+// feature. §4.1 rule 4 permits `delete_object` to be implemented only under
+// `crates/shepherd-storage/src/`, so every `StorageAdapter` double in the
+// workspace has to live here — sharing this one is the only legal option, and
+// the right one anyway.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use adapter::{
     AdapterCapabilities, AttestationMode, ByteRange, ControlKey, CreatePrecondition, CreateReceipt,
