@@ -160,19 +160,63 @@ impl<'a> JobRepo<'a> {
     /// invisible here rather than being claimed and immediately re-failed,
     /// which would burn its `attempts` budget without ever waiting.
     pub fn claim_next(&mut self, now: Timestamp) -> Result<Option<JobId>> {
+        self.claim_next_of(now, None)
+    }
+
+    /// Claim the highest-priority ready job **of one of `classes`**.
+    ///
+    /// `None` means any class, which is what [`JobRepo::claim_next`] passes.
+    ///
+    /// # Why the filter is here and not in the caller
+    ///
+    /// The obvious shape is to claim whatever is next and put it back if the
+    /// caller cannot run it. That is what T6's worker pool did first, and it is
+    /// wrong for a measurable reason: `claim_next` increments `attempts`, so a
+    /// job of a class this build has no executor for accumulates attempts every
+    /// time a worker looks at it. Measured at **12 attempts in 3 seconds** from
+    /// a single polling thread; with a four-worker pool `MAX_ATTEMPTS` is
+    /// exhausted in under two seconds. The job would then fail terminally on
+    /// the *first* real failure once a later phase registered its executor.
+    ///
+    /// Filtering inside the claim means an unrunnable job is never claimed at
+    /// all: no attempts inflation, no `last_error` stomped with a message about
+    /// a missing executor, and no claim/requeue churn through the writer actor.
+    pub fn claim_next_of(
+        &mut self,
+        now: Timestamp,
+        classes: Option<&[JobClass]>,
+    ) -> Result<Option<JobId>> {
+        // An empty allowlist means "this build can run nothing", which must
+        // claim nothing rather than degrading to "anything".
+        if classes.is_some_and(<[JobClass]>::is_empty) {
+            return Ok(None);
+        }
+        let filter = match classes {
+            None => String::new(),
+            Some(cs) => {
+                let list = cs
+                    .iter()
+                    .map(|c| format!("'{}'", c.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // Interpolation is safe here and only here: `JobClass::as_str`
+                // returns one of a closed set of literals, never user input.
+                // The same CHECK constraint that guards `job.class` guards this.
+                format!(" AND class IN ({list})")
+            }
+        };
+        let sql = format!(
+            "UPDATE job SET state = 'running', attempts = attempts + 1, updated_at = ?1
+             WHERE id = (
+                 SELECT id FROM job
+                 WHERE state = 'queued' AND run_after <= ?1{filter}
+                 ORDER BY priority DESC, id ASC LIMIT 1
+             )
+             RETURNING id"
+        );
         let tx = self.0.conn_mut().transaction()?;
         let claimed: Option<i64> = tx
-            .query_row(
-                "UPDATE job SET state = 'running', attempts = attempts + 1, updated_at = ?1
-                 WHERE id = (
-                     SELECT id FROM job
-                     WHERE state = 'queued' AND run_after <= ?1
-                     ORDER BY priority DESC, id ASC LIMIT 1
-                 )
-                 RETURNING id",
-                params![now.as_nanos()],
-                |r| r.get(0),
-            )
+            .query_row(&sql, params![now.as_nanos()], |r| r.get(0))
             .optional()?;
         tx.commit()?;
         Ok(claimed.map(JobId::new))
@@ -515,6 +559,90 @@ mod tests {
                 .claim_next(Timestamp::from_nanos(1))
                 .unwrap(),
             Some(id)
+        );
+    }
+
+    /// The defect this exists to prevent, pinned: a class the caller cannot run
+    /// must not be claimed, because claiming counts an attempt.
+    #[test]
+    fn a_class_outside_the_allowlist_is_never_claimed() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(1);
+        let embed = JobRepo::new(&mut c)
+            .enqueue(JobClass::Embed, 10, "{}", t)
+            .unwrap();
+        let hash = JobRepo::new(&mut c)
+            .enqueue(JobClass::Hash, 0, "{}", t)
+            .unwrap();
+
+        // Repeatedly poll for only what we can run. The higher-priority Embed
+        // job must be skipped entirely, not claimed and returned.
+        for _ in 0..50 {
+            let got = JobRepo::new(&mut c)
+                .claim_next_of(t, Some(&[JobClass::Hash]))
+                .unwrap();
+            if let Some(id) = got {
+                assert_eq!(id, hash);
+                JobRepo::new(&mut c)
+                    .finish(id, JobState::Done, None, t)
+                    .unwrap();
+            }
+        }
+        let j = JobRepo::new(&mut c).get(embed).unwrap().unwrap();
+        assert_eq!(
+            j.attempts, 0,
+            "an unrunnable job must accumulate no attempts, saw {}",
+            j.attempts
+        );
+        assert_eq!(j.state, JobState::Queued);
+        assert!(
+            j.last_error.is_none(),
+            "and its last_error must be untouched"
+        );
+    }
+
+    #[test]
+    fn an_empty_allowlist_claims_nothing_rather_than_everything() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(1);
+        JobRepo::new(&mut c)
+            .enqueue(JobClass::Scan, 0, "{}", t)
+            .unwrap();
+        assert_eq!(
+            JobRepo::new(&mut c).claim_next_of(t, Some(&[])).unwrap(),
+            None
+        );
+        // And `None` still means "any", so the old behaviour is intact.
+        assert!(
+            JobRepo::new(&mut c)
+                .claim_next_of(t, None)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_allowlist_still_honours_priority_and_backoff() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(100);
+        let low = JobRepo::new(&mut c)
+            .enqueue(JobClass::Hash, 0, "{}", t)
+            .unwrap();
+        let high = JobRepo::new(&mut c)
+            .enqueue(JobClass::Hash, 10, "{}", t)
+            .unwrap();
+        let allow = [JobClass::Hash, JobClass::Scan];
+        assert_eq!(
+            JobRepo::new(&mut c).claim_next_of(t, Some(&allow)).unwrap(),
+            Some(high)
+        );
+        JobRepo::new(&mut c)
+            .requeue(high, Timestamp::from_nanos(9_999), Some("x"), t)
+            .unwrap();
+        assert_eq!(
+            JobRepo::new(&mut c).claim_next_of(t, Some(&allow)).unwrap(),
+            Some(low),
+            "backoff still applies inside the allowlist"
         );
     }
 

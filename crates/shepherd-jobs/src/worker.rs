@@ -324,6 +324,17 @@ impl Registry {
         v.sort_unstable();
         v
     }
+
+    /// The classes a worker may claim. Passed straight to the claim query.
+    pub fn runnable_classes(&self) -> Vec<JobClass> {
+        let mut v: Vec<JobClass> = self
+            .executors
+            .keys()
+            .filter_map(|name| JobClass::parse(name))
+            .collect();
+        v.sort_by_key(|c| c.as_str());
+        v
+    }
 }
 
 /// A fixed pool of worker threads.
@@ -393,20 +404,27 @@ fn worker_loop(writer: &CatalogWriter, registry: &Registry, stop: &AtomicBool) {
 /// Exposed so tests can drive the pool's logic deterministically, without
 /// threads or sleeps.
 pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, WorkerError> {
-    let claimed = writer.try_with(move |cat| Queue::claim(cat, now()))?;
+    // Ask only for classes this build can actually run. Claiming counts an
+    // attempt, so claiming-then-returning an unrunnable job burns its retry
+    // budget — measured at 12 attempts in 3 seconds from one thread before this
+    // was a filter rather than a check.
+    let runnable = registry.runnable_classes();
+    let claimed = writer.try_with(move |cat| Queue::claim_of(cat, now(), Some(&runnable)))?;
     let Some(job) = claimed else {
         return Ok(false);
     };
 
     let Some(executor) = registry.get(job.class) else {
-        // No executor for this class in this build. Put it back untouched
-        // rather than failing it — see `Registry`.
+        // Unreachable: the claim filtered on exactly this registry's classes.
+        // Kept as a typed outcome rather than an `unwrap` — a future caller
+        // passing a wider allowlist should get a job back in the queue, not a
+        // panic in a worker thread.
         let id = job.id;
         writer.try_with(move |cat| {
             shepherd_catalog::job_repo::JobRepo::new(cat).requeue(
                 id,
                 Timestamp::from_nanos(now().as_nanos() + IDLE_POLL.as_nanos() as i64),
-                Some("no executor registered for this class in this build"),
+                Some("claimed a class this worker has no executor for"),
                 now(),
             )
         })?;
@@ -531,9 +549,20 @@ mod tests {
         assert!(!run_one(&w, &registry).unwrap(), "queue is drained");
     }
 
-    /// A class nobody can execute must not have its attempts burned.
+    /// A class nobody can execute must cost it **nothing**.
+    ///
+    /// The first version of this test polled once and asserted `attempts <= 1`,
+    /// which passed while the real behaviour was one attempt per claim: a
+    /// requeue with a 250ms deadline, re-claimed forever. Measured at 12
+    /// attempts in 3 seconds from a single thread — `MAX_ATTEMPTS` is 5, so a
+    /// four-worker pool exhausted an untouched job's whole retry budget in
+    /// under two seconds, and the phase that later registered its executor
+    /// would have seen it fail terminally on the first transient error.
+    ///
+    /// So this polls hard and asserts **zero**, which only a claim-time filter
+    /// can satisfy.
     #[test]
-    fn a_job_with_no_executor_is_left_queued_not_failed() {
+    fn a_job_with_no_executor_costs_no_attempts_however_often_it_is_polled() {
         let actor = actor_in_memory();
         let w = actor.handle();
         let registry = Arc::new(Registry::new()); // empty
@@ -541,17 +570,43 @@ mod tests {
             .try_with(|cat| Queue::enqueue(cat, JobClass::Embed, 0, "{}", now()))
             .unwrap();
 
-        assert!(!run_one(&w, &registry).unwrap());
+        for _ in 0..200 {
+            assert!(!run_one(&w, &registry).unwrap(), "nothing is runnable");
+        }
         let job = w
             .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(id))
             .unwrap()
             .unwrap();
         assert_eq!(job.state, shepherd_catalog::job_repo::JobState::Queued);
-        assert!(
-            job.attempts <= 1,
-            "an unrunnable class must not burn its retry budget, saw {}",
-            job.attempts
+        assert_eq!(
+            job.attempts, 0,
+            "an unrunnable class must accumulate no attempts at all"
         );
+        assert!(
+            job.last_error.is_none(),
+            "and must not have its last_error stomped: {:?}",
+            job.last_error
+        );
+    }
+
+    /// A runnable job must not be starved by an unrunnable higher-priority one.
+    #[test]
+    fn an_unrunnable_job_does_not_block_a_runnable_one_behind_it() {
+        let actor = actor_in_memory();
+        let w = actor.handle();
+        let registry = Arc::new(Registry::new().with(JobClass::Hash, |_: &JobContext| Ok(())));
+        w.try_with(|cat| Queue::enqueue(cat, JobClass::Embed, 100, "{}", now()))
+            .unwrap();
+        let hash = w
+            .try_with(|cat| Queue::enqueue(cat, JobClass::Hash, 0, "{}", now()))
+            .unwrap();
+
+        assert!(run_one(&w, &registry).unwrap());
+        let job = w
+            .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(hash))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, shepherd_catalog::job_repo::JobState::Done);
     }
 
     #[test]

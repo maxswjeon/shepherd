@@ -125,7 +125,22 @@ impl Queue {
     /// atomic. Once a row is `running` nothing else will touch it, so reading
     /// it afterwards cannot race.
     pub fn claim(cat: &mut Catalog, now: Timestamp) -> Result<Option<Job>, CatalogError> {
-        let Some(id) = JobRepo::new(cat).claim_next(now)? else {
+        Self::claim_of(cat, now, None)
+    }
+
+    /// Claim the highest-priority ready job whose class is in `classes`.
+    ///
+    /// The pool passes what it has executors for. A job of any other class is
+    /// **never claimed**, rather than claimed and handed back: claiming counts
+    /// an attempt, so polling for a class this build cannot run would exhaust
+    /// that job's retry budget before the phase that implements it ever sees
+    /// it. See `JobRepo::claim_next_of`.
+    pub fn claim_of(
+        cat: &mut Catalog,
+        now: Timestamp,
+        classes: Option<&[JobClass]>,
+    ) -> Result<Option<Job>, CatalogError> {
+        let Some(id) = JobRepo::new(cat).claim_next_of(now, classes)? else {
             return Ok(None);
         };
         JobRepo::new(cat).get(id)
