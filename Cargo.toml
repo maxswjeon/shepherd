@@ -145,6 +145,20 @@ ignore = "0.4.33"
 # the plan's cited choice rather than `rustix`, which covers the same syscalls:
 # the citation is what was verified, and swapping it silently is the drift this
 # project keeps catching.
+# Path-glob matching for AC-13's rule predicates. Already in the tree
+# transitively — it is `ignore`'s own matcher — so it costs no build time, and
+# using the SAME glob semantics for inclusion as the walker uses for exclusion
+# avoids a class of bug all by itself.
+#
+# The failure direction is the mirror of `ignore`'s: there, a rule that fails to
+# match leaves a user-excluded file eligible for destruction. Here, a glob that
+# OVER-matches selects files the user never named — and `RuleAction::is_destructive`
+# is true for both `Tier` and `Archive`, so an over-broad `*` is a path to
+# destroying files nobody asked about. Subtle over-matching (`*` crossing
+# separators, `**` in the wrong position, trailing-slash cases) is exactly what
+# hand-rolled globs get wrong.
+globset = "0.4"
+
 libc = "0.2"
 
 # DEV-ONLY, `shepherd-tier`. §8.2 names an mmap hazard test for the destroy
