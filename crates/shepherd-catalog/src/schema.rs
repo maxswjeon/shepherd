@@ -19,7 +19,7 @@
 //! allocates an already-used name and silently overwrites a valid pointer.
 
 /// Schema version applied by [`crate::migrate::migrate`].
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 1;
 
 /// The full DDL for [`SCHEMA_VERSION`].
 ///
@@ -63,6 +63,19 @@ CREATE TABLE scan_root (
     -- OQ-A: claimed | symlink | delete, chosen per root at runtime. Both macOS
     -- mechanisms ship; this records which one this root uses.
     macos_placeholder_mode TEXT,
+
+    -- D-12 (§4.10.1): this root's filesystem supports neither identity-bound
+    -- staging (RENAME_NOREPLACE returns EINVAL on some FUSE/exFAT mounts) nor
+    -- enforceable writer exclusion. Such a root is scanned, indexed, searched
+    -- and may be COPIED to a target — its originals are simply never destroyed.
+    --
+    -- Set by a feasibility probe at ENROLLMENT, never discovered at destroy
+    -- time. §4.10.1 permits no detect-only fallback: iteration 2 fell back to
+    -- pathname deletion and logged the residual, "which directly contradicted
+    -- its own fail-closed gate — a plan cannot promise fail-closed and then
+    -- ship the failure mode behind a log line".
+    destruction_ineligible INTEGER NOT NULL DEFAULT 0,
+    destruction_ineligible_reason TEXT,
 
     journal_cursor         BLOB,                       -- watcher cursor (T6/Phase 4)
     created_at             INTEGER NOT NULL,
@@ -205,6 +218,17 @@ CREATE TABLE target (
     is_third_party         INTEGER NOT NULL DEFAULT 0,   -- WASM-plugin-backed
     custody_eligible       INTEGER NOT NULL DEFAULT 0,
 
+    -- §4.10.2, probed at target registration. A literal conjunct of the destroy
+    -- predicate — `L.attestation_mode != none` — so T8/T10 cannot express the
+    -- predicate without it.
+    --
+    -- DEFAULT 'none' is the fail-closed direction: a target that was never
+    -- probed cannot authorize a destruction. §4.10.2's S3 rider is why this is
+    -- a column rather than an assumption — bucket versioning is OFF by default,
+    -- so an ordinary S3/MinIO bucket is mechanism B, and "silently landing on B
+    -- while believing A is exactly how a safety claim decays into a slogan".
+    attestation_mode       TEXT    NOT NULL DEFAULT 'none',
+
     -- §4.4 INVARIANT: is_third_party = 1  =>  custody_eligible = 0.
     --
     -- There is no API, setting, acknowledgement or migration path that may set
@@ -215,6 +239,7 @@ CREATE TABLE target (
     -- CHECK below is necessary and not sufficient, and
     -- `migrate::assert_invariants` re-asserts it on every open.
     CHECK (is_third_party = 0 OR custody_eligible = 0),
+    CHECK (attestation_mode IN ('version','content','none')),
     CHECK (replica_state IS NULL OR replica_state IN ('ok','incomplete','forked'))
 );
 
@@ -318,6 +343,16 @@ CREATE TABLE job (
     checkpoint_json TEXT,
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
+
+    -- Retry backoff (T6). The job is not claimable until this instant.
+    --
+    -- A stored deadline rather than one derived from `updated_at + backoff
+    -- (attempts)` in the claim query: deriving it would weld backoff POLICY
+    -- into the claim statement, where it cannot be tested or changed without
+    -- touching the one query whose single-statement atomicity stops a `destroy`
+    -- job being handed out twice.
+    run_after       INTEGER NOT NULL DEFAULT 0,
+
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
     -- `scrub` (PM-2) is a first-class class so it inherits per-class power and
@@ -325,7 +360,7 @@ CREATE TABLE job (
     CHECK (class IN ('scan','hash','extract','tag','embed','upload','verify',
                      'destroy','restore','replicate','scrub'))
 );
-CREATE INDEX job_state_priority ON job(state, priority DESC, id ASC);
+CREATE INDEX job_state_priority ON job(state, run_after ASC, priority DESC, id ASC);
 
 -- Transfer sessions (§4.5).  Consumer is Phase 2 (T9, worker-4); the columns
 -- were agreed with that owner rather than invented here.
@@ -347,7 +382,11 @@ CREATE TABLE transfer_session (
     -- Source identity as believed at planning time, so a resumed run can prove
     -- the local file did not change underneath it.
     src_size             INTEGER NOT NULL,
-    src_blake3           BLOB,
+    -- NOT NULL: AC-1 makes the hash the precondition for destruction, so a
+    -- transfer cannot be planned without one. The consumer's `SourceIdentity`
+    -- cannot represent its absence either, and a column permitting a state the
+    -- consumer cannot express is a column that will eventually hold one.
+    src_blake3           BLOB    NOT NULL,
     src_fs_id            BLOB,
     src_mtime            INTEGER,
 
@@ -358,7 +397,8 @@ CREATE TABLE transfer_session (
     -- Fixed at `planned`. A resume recomputes identical part boundaries from
     -- these; they are never renegotiated mid-session.
     part_size            INTEGER NOT NULL,
-    part_count           INTEGER,
+    -- NOT NULL: always >= 1. A zero-byte object is still one empty part.
+    part_count           INTEGER NOT NULL,
 
     attempt_epoch        INTEGER NOT NULL DEFAULT 0,   -- bumped per resume
     last_reconciled_at   INTEGER,
@@ -385,6 +425,22 @@ CREATE TABLE transfer_part (
     part_no       INTEGER NOT NULL,
     etag          TEXT,
     bytes         INTEGER NOT NULL,
+
+    -- Per-part source hash. WRITE-ONLY TODAY, pending PM-1 hardening — the
+    -- transfer driver persists it and does not yet read it, and that is
+    -- recorded here rather than left for someone to discover.
+    --
+    -- Its purpose: an editor that preserves mtime defeats the cheap
+    -- `(size, mtime, fs_id)` resume fingerprint, and per-part source hashes are
+    -- the only record that could catch a changed part without re-reading the
+    -- whole file. Today the full remote BLAKE3 re-read at `verifying` is the
+    -- backstop that catches it.
+    --
+    -- `offset` is deliberately absent: it is derivable as
+    -- `(part_no - 1) * part_size`, and `part_size` is immutable for a session's
+    -- life (see the CHECK note on `transfer_session`).
+    local_blake3  BLOB,
+
     attempt_epoch INTEGER NOT NULL DEFAULT 0,
     verified_at   INTEGER,
     PRIMARY KEY (session_id, part_no)
@@ -518,58 +574,4 @@ CREATE TABLE setting (
     key        TEXT PRIMARY KEY,
     value_json TEXT NOT NULL
 );
-"#;
-
-/// Retry backoff for the job queue (T6, §6 Phase 1 "retry with backoff").
-///
-/// # Why a column rather than arithmetic on `updated_at`
-///
-/// A retryable failure has to become invisible to `claim_next` until its
-/// backoff expires, and the queue has nowhere to record "not before". The
-/// obvious alternative — deriving the deadline as `updated_at + f(attempts)`
-/// inside the claim query — was rejected: it welds the backoff *policy* into
-/// the SQL, where it cannot be unit-tested or changed without a migration, and
-/// it silently couples to `updated_at`, which `checkpoint()` also writes.
-///
-/// With this column the split is clean: `job_repo` owns the atomic transition
-/// (claim skips a job whose `run_after` is in the future), and
-/// `shepherd-jobs::queue` owns the curve that decides what `run_after` should
-/// be. §4.4's schema sketch predates the queue, which is why the column was not
-/// there to begin with.
-///
-/// `0` means "ready now" and is the default, so every row written before this
-/// migration is immediately claimable — a backlog does not stall on an upgrade.
-/// Timestamps are nanoseconds since the epoch and therefore always positive, so
-/// `0` cannot collide with a real deadline.
-///
-/// The `job_state_priority` index is deliberately left as it is. `run_after`
-/// applies as a residual filter after the index narrows to `state = 'queued'`,
-/// which is the right trade while the pool is small and fixed.
-/// ponytail: residual filter, index on (state, run_after, priority) if a large
-/// backed-off backlog ever shows up in a claim profile.
-pub const MIGRATION_0002: &str = r#"
-ALTER TABLE job ADD COLUMN run_after INTEGER NOT NULL DEFAULT 0;
-"#;
-
-/// Migration 0003 — D-12's `destruction_ineligible` flag (§4.10.1, T8).
-///
-/// §4.10.1 admits a filesystem that supports neither identity-bound staging
-/// (`RENAME_NOREPLACE` returns `EINVAL` on some FUSE and exFAT mounts) nor
-/// enforceable writer exclusion. **There is no detect-only fallback**:
-/// iteration 2 fell back to pathname deletion and logged the residual, "which
-/// directly contradicted its own fail-closed gate — a plan cannot promise
-/// fail-closed and then ship the failure mode behind a log line".
-///
-/// So such a root is scanned, indexed, searched and may be *copied* to a
-/// target, but its originals are never destroyed. Detected by a **feasibility
-/// probe at enrollment**, not discovered at destroy time, and disclosed to the
-/// user as a real capability reduction (D-12).
-///
-/// A separate migration rather than an amendment to 0001: another task had
-/// already added 0002 on top of 0001 in the working tree, so rewriting 0001
-/// would have invalidated a migration someone else was mid-way through
-/// building on.
-pub const MIGRATION_0003: &str = r#"
-ALTER TABLE scan_root ADD COLUMN destruction_ineligible INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE scan_root ADD COLUMN destruction_ineligible_reason TEXT;
 "#;

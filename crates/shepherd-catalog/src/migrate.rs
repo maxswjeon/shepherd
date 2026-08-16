@@ -6,20 +6,25 @@
 
 use rusqlite::{Connection, params};
 
-use crate::schema::{MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, SCHEMA_VERSION};
+use crate::schema::{MIGRATION_0001, SCHEMA_VERSION};
 use crate::{CatalogError, Result};
 
 /// Every migration, in order. Adding one is appending a row here; the runner
 /// applies whatever is not yet recorded.
-const MIGRATIONS: &[(i64, &str, &str)] = &[
-    (1, "initial schema (§4.4)", MIGRATION_0001),
-    (2, "job.run_after for retry backoff (T6)", MIGRATION_0002),
-    (
-        3,
-        "scan_root.destruction_ineligible (D-12, \u{a7}4.10.1)",
-        MIGRATION_0003,
-    ),
-];
+/// Every migration, in order. Adding one is appending a row here; the runner
+/// applies whatever is not yet recorded.
+///
+/// **There is one, and while the project is greenfield there will stay one.**
+/// Nothing is deployed and no catalog exists outside our own test runs, so a
+/// follow-on migration would encode history that never happened — and a
+/// migration chain that lies about the past is worse than one that is short.
+/// `job.run_after` and `scan_root.destruction_ineligible` briefly lived as 0002
+/// and 0003 and were folded back in; that consolidation is deliberate, not an
+/// edit to an applied migration.
+///
+/// This changes at M2. Once a real catalog exists on a real machine, 0001 is
+/// frozen and every change is additive.
+const MIGRATIONS: &[(i64, &str, &str)] = &[(1, "initial schema (§4.4)", MIGRATION_0001)];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(

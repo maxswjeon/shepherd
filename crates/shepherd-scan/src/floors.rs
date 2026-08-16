@@ -140,6 +140,19 @@ impl FloorRefusal {
     }
 }
 
+/// Record a refusal against the `destroy_skipped_total{reason}` counter.
+///
+/// The label is [`FloorRefusal::code`] — the *same string* as the preview text
+/// and the audit record, rather than three values that drift. §4.10.1 requires
+/// this metric by name because "a user whose files mysteriously never tier must
+/// be able to find out why", and the two refusals most likely to be invisible
+/// are `held-open` on a busy machine and `sparse` on a compressing filesystem.
+pub fn record_skip(registry: &shepherd_obs::Registry, refusal: &FloorRefusal) {
+    registry
+        .counter(&format!("destroy_skipped_total.{}", refusal.code()))
+        .incr();
+}
+
 /// How the open-handle question was answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenEvidence {
@@ -199,12 +212,20 @@ impl Verdict {
 /// *more* allocated than logical, and exact comparison would be noise. One page
 /// of slack absorbs that.
 ///
-/// **Known false positive, and deliberately left in:** a transparently
-/// compressing filesystem (btrfs with `compress`, ZFS) reports allocation below
-/// logical size for perfectly dense files, so those are refused as sparse. That
-/// is the fail-closed direction — the file stays local — and distinguishing
-/// compression from holes needs `FIEMAP`/`SEEK_HOLE` per platform, which is
-/// Phase 3 work, not a floor.
+/// **Known false positive — tracked as a risk, not only as a comment.** A
+/// transparently compressing filesystem (btrfs with `compress`, ZFS with
+/// `compression=on`) reports allocation below logical size for perfectly dense
+/// files, so every such file is refused as sparse. Fail-closed is the right
+/// direction — the file stays local — but the consequence is that **a user on a
+/// compressing filesystem may find that nothing tiers at all**, with no
+/// explanation unless one is surfaced.
+///
+/// Two things make it visible rather than mysterious: [`FloorRefusal::code`]
+/// returns the stable string `"sparse"`, which is the same value used for the
+/// `destroy_skipped_total{reason}` metric, the dry-run preview text and the
+/// audit record; and the risk is recorded in §7 with the resolution named —
+/// per-platform `FIEMAP` (Linux) / `SEEK_HOLE` to distinguish holes from
+/// compression, which is real work and not a floor tweak.
 const SPARSE_SLACK_BYTES: u64 = 4096;
 
 /// Evaluate every floor for `input` under `ctx`.
@@ -576,5 +597,59 @@ mod tests {
         ] {
             assert_eq!(r.code(), code);
         }
+    }
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+
+    /// The metric label and the refusal code are ONE string, not two that
+    /// drift. §4.10.1 requires `destroy_skipped_total{reason}` by name so a
+    /// user whose corpus never tiers can find out why.
+    #[test]
+    fn skips_are_counted_under_their_refusal_code() {
+        let r = shepherd_obs::Registry::new();
+        record_skip(
+            &r,
+            &FloorRefusal::Sparse {
+                allocated: 4096,
+                logical: 1 << 30,
+            },
+        );
+        record_skip(&r, &FloorRefusal::Symlink);
+        record_skip(&r, &FloorRefusal::Symlink);
+
+        let s = r.snapshot();
+        assert_eq!(s.counters.get("destroy_skipped_total.sparse"), Some(&1));
+        assert_eq!(s.counters.get("destroy_skipped_total.symlink"), Some(&2));
+    }
+
+    /// A compressing filesystem is the case most likely to be invisible: dense
+    /// files refused as sparse, and nothing tiers. The counter is what makes it
+    /// diagnosable rather than mysterious.
+    #[test]
+    fn a_compressing_filesystem_shows_up_as_sparse_skips() {
+        let r = shepherd_obs::Registry::new();
+        let mut i = FloorInput {
+            path: PathBuf::from("/data/dense-but-compressed.bin"),
+            size: 10 * 1024 * 1024,
+            age: Duration::from_secs(1 << 24),
+            nlink: 1,
+            is_symlink: false,
+            // btrfs with compress: dense content, half the allocation.
+            allocated_bytes: Some(5 * 1024 * 1024),
+            fs_id: None,
+            observed_at: Timestamp::from_nanos(1),
+        };
+        for _ in 0..3 {
+            let v = evaluate(&FloorPolicy::default(), &i, FloorContext::ScanTime);
+            record_skip(&r, v.refusal().expect("refused as sparse"));
+            i.size += 1;
+        }
+        assert_eq!(
+            r.snapshot().counters.get("destroy_skipped_total.sparse"),
+            Some(&3)
+        );
     }
 }

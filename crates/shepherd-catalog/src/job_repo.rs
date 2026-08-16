@@ -467,6 +467,57 @@ mod tests {
         assert_eq!(JobRepo::new(&mut c).claim_next(t).unwrap(), Some(id));
     }
 
+    /// A requeued job is invisible until its backoff elapses. Without the
+    /// `run_after <= now` clause, a failing job would be re-claimed instantly
+    /// and spin.
+    #[test]
+    fn a_requeued_job_is_not_claimable_before_its_deadline() {
+        let mut c = cat();
+        let t0 = Timestamp::from_nanos(1_000);
+        let id = JobRepo::new(&mut c)
+            .enqueue(JobClass::Upload, 0, "{}", t0)
+            .unwrap();
+        JobRepo::new(&mut c).claim_next(t0).unwrap();
+
+        JobRepo::new(&mut c)
+            .requeue(id, Timestamp::from_nanos(5_000), Some("transient"), t0)
+            .unwrap();
+
+        assert_eq!(
+            JobRepo::new(&mut c)
+                .claim_next(Timestamp::from_nanos(4_999))
+                .unwrap(),
+            None,
+            "still backing off"
+        );
+        assert_eq!(
+            JobRepo::new(&mut c)
+                .claim_next(Timestamp::from_nanos(5_000))
+                .unwrap(),
+            Some(id),
+            "claimable once the deadline is reached"
+        );
+        let j = JobRepo::new(&mut c).get(id).unwrap().unwrap();
+        assert_eq!(j.attempts, 2, "each claim counts an attempt");
+        assert_eq!(j.last_error.as_deref(), Some("transient"));
+    }
+
+    /// A job with no backoff is claimable immediately — `run_after` defaults to
+    /// 0, so the new clause must not gate ordinary work.
+    #[test]
+    fn a_fresh_job_is_claimable_at_any_time() {
+        let mut c = cat();
+        let id = JobRepo::new(&mut c)
+            .enqueue(JobClass::Scan, 0, "{}", Timestamp::from_nanos(1))
+            .unwrap();
+        assert_eq!(
+            JobRepo::new(&mut c)
+                .claim_next(Timestamp::from_nanos(1))
+                .unwrap(),
+            Some(id)
+        );
+    }
+
     #[test]
     fn an_unknown_class_is_refused_by_the_schema() {
         let mut c = cat();
