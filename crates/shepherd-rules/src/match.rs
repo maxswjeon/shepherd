@@ -26,6 +26,22 @@
 //! the test — that method exists so both sides agree, and re-deriving it is how
 //! `Relatime` (Linux's *default* mount option) nearly got rejected, which would
 //! have refused destructive age rules on very nearly every Linux root.
+//!
+//! # Write the assertion from the requirement, not from the library
+//!
+//! `a_single_star_does_not_cross_directory_separators` was written from what a
+//! path glob *should* do, before checking what `globset` actually does. It then
+//! failed: `*` crosses `/` by default, so `Photos/*.raw` also matched
+//! `Photos/2024/a.raw` — files the user never named, for an action that
+//! destroys on a delete-mode root. `literal_separator(true)` had to be asked
+//! for.
+//!
+//! Had the test been written *after* observing the library, it would have
+//! encoded the over-matching as expected and passed forever. **A test written
+//! from observed behaviour can only ever confirm it; only one written from the
+//! requirement can disagree with the code.** That generalises well past globs,
+//! and it is the reason this module's tests assert refusals — unknown keys,
+//! empty predicates, untrustworthy `atime` — rather than only successes.
 
 use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};

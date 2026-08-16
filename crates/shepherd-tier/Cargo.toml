@@ -36,11 +36,16 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+shepherd-rules = { workspace = true }
+shepherd-catalog = { workspace = true }
+shepherd-scan = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
 # §4.1 rule 4 makes a second `StorageAdapter` double ILLEGAL, not merely
 # wasteful: `delete_object` may be implemented only under
 # `crates/shepherd-storage/src/`. Sharing worker-4's `MemAdapter` was therefore
 # the only legal fix — widening the policy would have been the wrong one.
 shepherd-storage = { workspace = true, features = ["testing"] }
 memmap2 = { workspace = true }
-bytes = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
