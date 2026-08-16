@@ -1,0 +1,14 @@
+[package]
+name = "shepherd-jobs"
+description = "Durable job queue, workers, cron scheduling, catch-up and adaptive concurrency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+shepherd-core.workspace = true

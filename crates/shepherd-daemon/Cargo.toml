@@ -1,0 +1,20 @@
+[package]
+name = "shepherd-daemon"
+description = "The always-on daemon: IPC server and service lifecycle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "shepherdd"
+path = "src/main.rs"
+
+[dependencies]
+shepherd-core.workspace = true
+shepherd-proto.workspace = true
+shepherd-obs.workspace = true

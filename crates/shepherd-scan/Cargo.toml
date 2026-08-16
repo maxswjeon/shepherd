@@ -1,0 +1,14 @@
+[package]
+name = "shepherd-scan"
+description = "Filesystem walker: deny-list, user ignores, hard safety floors and BLAKE3 hashing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+shepherd-core.workspace = true

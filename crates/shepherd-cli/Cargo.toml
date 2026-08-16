@@ -1,0 +1,19 @@
+[package]
+name = "shepherd-cli"
+description = "Command-line client. Pure IPC client; its clap tree is generated from shepherd-proto."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "shepctl"
+path = "src/main.rs"
+
+[dependencies]
+shepherd-core.workspace = true
+shepherd-proto.workspace = true

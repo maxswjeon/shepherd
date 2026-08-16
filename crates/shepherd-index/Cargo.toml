@@ -1,0 +1,14 @@
+[package]
+name = "shepherd-index"
+description = "Metadata name index, sharded ANN index, hybrid search and reciprocal-rank fusion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+shepherd-core.workspace = true
