@@ -16,6 +16,12 @@ shepherd-core.workspace = true
 # §4.1 rule 2: THE permitted edge. No other crate may draw it.
 shepherd-placeholder.workspace = true
 shepherd-catalog.workspace = true
+# The discard predicate and AC-14's preview gate live here. The direction is
+# tier -> rules: rules DECIDES, tier EXECUTES. `shepherd-rules` deliberately
+# holds no edge to `shepherd-placeholder` (§4.1 rule 2), which works only
+# because this crate translates platform events into the values the predicate
+# consumes — see `discard.rs`.
+shepherd-rules.workspace = true
 shepherd-scan.workspace = true
 shepherd-storage.workspace = true
 blake3 = { workspace = true }

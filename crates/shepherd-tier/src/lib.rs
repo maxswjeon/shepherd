@@ -16,6 +16,7 @@
 pub mod audit;
 pub mod breaker;
 pub mod destroy;
+pub mod discard;
 pub mod fidelity;
 pub mod revalidate;
 pub mod serialize;
@@ -26,6 +27,10 @@ pub use breaker::{
     candidate_set_hash,
 };
 pub use destroy::{LocalDestroyRequest, execute_local_destruction, execute_remote_discard};
+pub use discard::{
+    DiscardRefusals, StubPlatform, confirmation_from_operator, confirmation_from_stub,
+    evaluate_discard, execute_discard, hold_blocks,
+};
 pub use fidelity::{
     AttrCapture, AttrClass, CoreAttrs, FidelityBreach, FidelityManifest, RestoreTarget,
     RestoredAttrs, choose_restore_path, verify_restore,
