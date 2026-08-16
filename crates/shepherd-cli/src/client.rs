@@ -27,7 +27,6 @@
 //! workspace builds on all three platforms from Phase 0a, and this keeps that
 //! true without pretending the transport exists.
 
-use std::io::{BufRead, BufReader, Write};
 use std::time::Duration;
 
 use shepherd_proto::{
@@ -48,6 +47,12 @@ pub const HELLO_METHOD: &str = "hello";
 pub enum ClientError {
     /// The daemon is not listening. `detail` is the whole actionable message,
     /// already naming every path tried and the start command.
+    ///
+    /// Only the Unix connector constructs it today; on Windows `connect`
+    /// returns [`ClientError::Unsupported`] before it can reach a socket. The
+    /// variant stays unconditional so the exit-code table is identical on all
+    /// three platforms rather than being cfg'd apart.
+    #[cfg_attr(not(unix), allow(dead_code))]
     NotRunning { detail: String },
     /// The socket exists but the exchange failed.
     Transport(String),
@@ -80,6 +85,7 @@ impl std::fmt::Display for ClientError {
 /// `~/.local/state/shepherd/daemon.sock`. Both are returned so an error can name
 /// every path that was tried — AC-61 forbids an error the user cannot act on,
 /// and "connection refused" without a path is precisely that.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn candidate_socket_paths() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR")
@@ -96,6 +102,7 @@ pub fn candidate_socket_paths() -> Vec<String> {
 }
 
 /// The platform command that starts the daemon, named in the not-running error.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn start_command() -> &'static str {
     if cfg!(target_os = "macos") {
         "launchctl kickstart -k gui/$UID/kr.swjeon.shepherd"
@@ -113,6 +120,7 @@ pub fn start_command() -> &'static str {
 /// The registration line says "not probed" rather than guessing, because
 /// querying systemd/launchd is `shepherd-daemon`'s job (T6) and a confident
 /// wrong answer here would be worse than an honest gap.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn not_running_message(tried: &[String], cause: &str) -> String {
     let paths = if tried.is_empty() {
         "  (none — neither XDG_RUNTIME_DIR nor HOME is set)".to_string()
@@ -142,6 +150,7 @@ pub use unix_impl::Connection;
 #[cfg(unix)]
 mod unix_impl {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
     /// One newline-delimited JSON-RPC connection.
