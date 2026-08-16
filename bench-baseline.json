@@ -1,4 +1,660 @@
 {
+  "ann_bench_f16_cold": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "cold",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 9164860516,
+    "on_disk_gib": 8.535441491752863,
+    "pass": true,
+    "peak_vm_hwm_bytes": 9747521536,
+    "precision": "f16",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "stats": {
+      "accepted_p95_ms": 42.483904,
+      "drift_flagged": true,
+      "median_p50_ms": 5.86766,
+      "median_p99_ms": 338.28976900000004,
+      "run_to_run_drift_pct": 13.487077364641449,
+      "runs": [
+        {
+          "max_ms": 1934.356723,
+          "mean_ms": 21.632854648999995,
+          "n": 1000,
+          "p50_ms": 6.506208,
+          "p95_ms": 42.483904,
+          "p99_ms": 332.976378
+        },
+        {
+          "max_ms": 1405.164212,
+          "mean_ms": 20.975318088,
+          "n": 1000,
+          "p50_ms": 5.86766,
+          "p95_ms": 37.540138,
+          "p99_ms": 382.54061700000005
+        },
+        {
+          "max_ms": 1398.193177,
+          "mean_ms": 20.816252755,
+          "n": 1000,
+          "p50_ms": 5.679197,
+          "p95_ms": 43.269975,
+          "p99_ms": 338.28976900000004
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 10000000,
+    "view_open_seconds_per_run": [
+      2.528307436,
+      2.546696204,
+      2.46744431
+    ],
+    "vm_rss_after_open_bytes": 2084614144,
+    "vm_rss_after_queries_bytes": 50204672
+  },
+  "ann_bench_f16_warm": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "warm",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 9164860516,
+    "on_disk_gib": 8.535441491752863,
+    "pass": true,
+    "peak_vm_hwm_bytes": 9770848256,
+    "precision": "f16",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "stats": {
+      "accepted_p95_ms": 10.685073999999998,
+      "drift_flagged": true,
+      "median_p50_ms": 5.344622,
+      "median_p99_ms": 16.213769,
+      "run_to_run_drift_pct": 12.813753091461976,
+      "runs": [
+        {
+          "max_ms": 43.865513,
+          "mean_ms": 5.972450756999997,
+          "n": 1000,
+          "p50_ms": 5.3482829999999995,
+          "p95_ms": 11.0774,
+          "p99_ms": 17.242883
+        },
+        {
+          "max_ms": 37.940692,
+          "mean_ms": 5.501969254000006,
+          "n": 1000,
+          "p50_ms": 4.989187,
+          "p95_ms": 9.708241,
+          "p99_ms": 15.172205
+        },
+        {
+          "max_ms": 48.054419,
+          "mean_ms": 5.904182745,
+          "n": 1000,
+          "p50_ms": 5.344622,
+          "p95_ms": 10.685073999999998,
+          "p99_ms": 16.213769
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 10000000,
+    "view_open_seconds_per_run": [
+      0.992664502,
+      1.053041696,
+      0.931274312
+    ],
+    "vm_rss_after_open_bytes": 2093588480,
+    "vm_rss_after_queries_bytes": 51138560
+  },
+  "ann_bench_f32_cold__scaled": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "cold",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 3368971872,
+    "on_disk_gib": 3.1375995576381683,
+    "pass": true,
+    "peak_vm_hwm_bytes": 3479134208,
+    "precision": "f32",
+    "scaled_run_reason": "f32 confirms exclusion, not selection. R-4 extrapolates f32 at ~17GB against AC-46's 16GB ceiling, so it is over the ceiling before measurement and cannot become the answer at any scale. Disk on this shared box could not hold 15.6GiB of f32 shards plus the 12GiB reserve, and the reserve was deliberately NOT lowered to make it fit. 2M vectors measures bytes-per-vector exactly: on-disk growth is dead linear across shards, verified in the corrected run at i8 (0.50/0.99/1.49/1.98/2.48 GiB over shards 0-4, 532 B/vector at 10M) and f16 (0.85/1.71/2.56/3.41/4.27/5.12 GiB, 114s/shard). Shard-0 recall is measured per 1M shard in EVERY precision, so this run's recall and ef-sweep are directly comparable to i8's and f16's rather than approximations. What this does NOT give is 10M-corpus query latency for f32, which is neither measured nor claimed - f32 is excluded on RAM, so its latency never enters the decision.",
+    "shards": 2,
+    "stats": {
+      "accepted_p95_ms": 23.702949,
+      "drift_flagged": false,
+      "median_p50_ms": 1.537172,
+      "median_p99_ms": 177.13534,
+      "run_to_run_drift_pct": 6.074471999243636,
+      "runs": [
+        {
+          "max_ms": 610.5713310000001,
+          "mean_ms": 7.941804358999997,
+          "n": 1000,
+          "p50_ms": 1.53287,
+          "p95_ms": 23.702949,
+          "p99_ms": 159.320048
+        },
+        {
+          "max_ms": 526.318071,
+          "mean_ms": 8.200469141000001,
+          "n": 1000,
+          "p50_ms": 1.638553,
+          "p95_ms": 24.958615,
+          "p99_ms": 177.13534
+        },
+        {
+          "max_ms": 560.860477,
+          "mean_ms": 8.376690404,
+          "n": 1000,
+          "p50_ms": 1.537172,
+          "p95_ms": 23.518786,
+          "p99_ms": 189.299751
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 2000000,
+    "view_open_seconds_per_run": [
+      0.444500952,
+      0.452455671,
+      0.459627616
+    ],
+    "vm_rss_after_open_bytes": 427053056,
+    "vm_rss_after_queries_bytes": 14061568
+  },
+  "ann_bench_f32_warm__scaled": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "warm",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 3368971872,
+    "on_disk_gib": 3.1375995576381683,
+    "pass": true,
+    "peak_vm_hwm_bytes": 3497308160,
+    "precision": "f32",
+    "scaled_run_reason": "f32 confirms exclusion, not selection. R-4 extrapolates f32 at ~17GB against AC-46's 16GB ceiling, so it is over the ceiling before measurement and cannot become the answer at any scale. Disk on this shared box could not hold 15.6GiB of f32 shards plus the 12GiB reserve, and the reserve was deliberately NOT lowered to make it fit. 2M vectors measures bytes-per-vector exactly: on-disk growth is dead linear across shards, verified in the corrected run at i8 (0.50/0.99/1.49/1.98/2.48 GiB over shards 0-4, 532 B/vector at 10M) and f16 (0.85/1.71/2.56/3.41/4.27/5.12 GiB, 114s/shard). Shard-0 recall is measured per 1M shard in EVERY precision, so this run's recall and ef-sweep are directly comparable to i8's and f16's rather than approximations. What this does NOT give is 10M-corpus query latency for f32, which is neither measured nor claimed - f32 is excluded on RAM, so its latency never enters the decision.",
+    "shards": 2,
+    "stats": {
+      "accepted_p95_ms": 2.7456970000000003,
+      "drift_flagged": false,
+      "median_p50_ms": 1.145025,
+      "median_p99_ms": 5.680246,
+      "run_to_run_drift_pct": 0.06482871198095312,
+      "runs": [
+        {
+          "max_ms": 12.198163999999998,
+          "mean_ms": 1.4371129819999986,
+          "n": 1000,
+          "p50_ms": 1.145025,
+          "p95_ms": 2.7456970000000003,
+          "p99_ms": 5.737057999999999
+        },
+        {
+          "max_ms": 19.762667,
+          "mean_ms": 1.4509625810000002,
+          "n": 1000,
+          "p50_ms": 1.155286,
+          "p95_ms": 2.746727,
+          "p99_ms": 5.239661
+        },
+        {
+          "max_ms": 13.665094,
+          "mean_ms": 1.4318076109999984,
+          "n": 1000,
+          "p50_ms": 1.140365,
+          "p95_ms": 2.744947,
+          "p99_ms": 5.680246
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 2000000,
+    "view_open_seconds_per_run": [
+      0.198589907,
+      0.17876093,
+      0.189320302
+    ],
+    "vm_rss_after_open_bytes": 427393024,
+    "vm_rss_after_queries_bytes": 14278656
+  },
+  "ann_bench_i8_cold": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "cold",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 5324860244,
+    "on_disk_gib": 4.959162551909685,
+    "pass": true,
+    "peak_vm_hwm_bytes": 5929529344,
+    "precision": "i8",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "stats": {
+      "accepted_p95_ms": 14.209567,
+      "drift_flagged": false,
+      "median_p50_ms": 4.765927,
+      "median_p99_ms": 163.014526,
+      "run_to_run_drift_pct": 9.75855914539831,
+      "runs": [
+        {
+          "max_ms": 970.473534,
+          "mean_ms": 12.469132129,
+          "n": 1000,
+          "p50_ms": 4.736715,
+          "p95_ms": 14.209567,
+          "p99_ms": 163.014526
+        },
+        {
+          "max_ms": 1197.901908,
+          "mean_ms": 12.477207300000003,
+          "n": 1000,
+          "p50_ms": 4.765927,
+          "p95_ms": 12.96685,
+          "p99_ms": 125.467244
+        },
+        {
+          "max_ms": 1353.916621,
+          "mean_ms": 13.711202063,
+          "n": 1000,
+          "p50_ms": 5.374705,
+          "p95_ms": 14.353499,
+          "p99_ms": 168.768874
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 10000000,
+    "view_open_seconds_per_run": [
+      2.446813736,
+      2.34805873,
+      2.404090135
+    ],
+    "vm_rss_after_open_bytes": 2092482560,
+    "vm_rss_after_queries_bytes": 50515968
+  },
+  "ann_bench_i8_warm": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "warm",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 5324860244,
+    "on_disk_gib": 4.959162551909685,
+    "pass": true,
+    "peak_vm_hwm_bytes": 5929713664,
+    "precision": "i8",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "stats": {
+      "accepted_p95_ms": 10.249112,
+      "drift_flagged": true,
+      "median_p50_ms": 4.827717,
+      "median_p99_ms": 13.781361,
+      "run_to_run_drift_pct": 15.061812184314128,
+      "runs": [
+        {
+          "max_ms": 23.798821,
+          "mean_ms": 5.77211781,
+          "n": 1000,
+          "p50_ms": 5.297073999999999,
+          "p95_ms": 11.099005,
+          "p99_ms": 18.158743
+        },
+        {
+          "max_ms": 26.867424,
+          "mean_ms": 5.297698675999994,
+          "n": 1000,
+          "p50_ms": 4.827717,
+          "p95_ms": 10.249112,
+          "p99_ms": 13.753211
+        },
+        {
+          "max_ms": 28.675999,
+          "mean_ms": 5.273318716999996,
+          "n": 1000,
+          "p50_ms": 4.8070070000000005,
+          "p95_ms": 9.555303,
+          "p99_ms": 13.781361
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 10000000,
+    "view_open_seconds_per_run": [
+      0.969986888,
+      0.949789045,
+      0.964725611
+    ],
+    "vm_rss_after_open_bytes": 2092392448,
+    "vm_rss_after_queries_bytes": 59338752
+  },
+  "ann_build_f16": {
+    "build_seconds": 1123.718555822,
+    "bytes_per_vector": 916.4860516,
+    "connectivity": 16,
+    "dimensions": 384,
+    "on_disk_bytes": 9164860516,
+    "on_disk_gib": 8.535441491752863,
+    "peak_vm_hwm_bytes": 1038663680,
+    "precision": "f16",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "vectors": 10000000,
+    "vectors_per_shard": 1000000
+  },
+  "ann_build_f32__scaled": {
+    "build_seconds": 293.376633627,
+    "bytes_per_vector": 1684.485936,
+    "connectivity": 16,
+    "dimensions": 384,
+    "on_disk_bytes": 3368971872,
+    "on_disk_gib": 3.1375995576381683,
+    "peak_vm_hwm_bytes": 1795227648,
+    "precision": "f32",
+    "scaled_run_reason": "f32 confirms exclusion, not selection. R-4 extrapolates f32 at ~17GB against AC-46's 16GB ceiling, so it is over the ceiling before measurement and cannot become the answer at any scale. Disk on this shared box could not hold 15.6GiB of f32 shards plus the 12GiB reserve, and the reserve was deliberately NOT lowered to make it fit. 2M vectors measures bytes-per-vector exactly: on-disk growth is dead linear across shards, verified in the corrected run at i8 (0.50/0.99/1.49/1.98/2.48 GiB over shards 0-4, 532 B/vector at 10M) and f16 (0.85/1.71/2.56/3.41/4.27/5.12 GiB, 114s/shard). Shard-0 recall is measured per 1M shard in EVERY precision, so this run's recall and ef-sweep are directly comparable to i8's and f16's rather than approximations. What this does NOT give is 10M-corpus query latency for f32, which is neither measured nor claimed - f32 is excluded on RAM, so its latency never enters the decision.",
+    "shards": 2,
+    "vectors": 2000000,
+    "vectors_per_shard": 1000000
+  },
+  "ann_build_i8": {
+    "build_seconds": 81.745267289,
+    "bytes_per_vector": 532.48614,
+    "connectivity": 16,
+    "dimensions": 384,
+    "on_disk_bytes": 532486140,
+    "on_disk_gib": 0.49591636285185814,
+    "peak_vm_hwm_bytes": 642777088,
+    "precision": "i8",
+    "scaled_run_reason": "i8 recall re-measured on shard 0 only, at 1M vectors. recall-ann reads shard 0 alone and shard 0 is seed-derived, so this is the identical shard the 10M run measured, not an approximation. Latency is NOT re-measured here and the 10M figures stand.",
+    "shards": 1,
+    "vectors": 1000000,
+    "vectors_per_shard": 1000000
+  },
+  "ann_recall_f16": {
+    "above_floor": true,
+    "bench_expansion_search": 200,
+    "expansion_search_sweep": [
+      {
+        "distance_ratio": 1.4063178478609342,
+        "expansion_search": 64,
+        "recall_at_10": 0.908,
+        "returned_mean_top10_cosine_distance": 0.2095298385620117
+      },
+      {
+        "distance_ratio": 1.0444157339842937,
+        "expansion_search": 200,
+        "recall_at_10": 0.988,
+        "returned_mean_top10_cosine_distance": 0.15560938835144042
+      },
+      {
+        "distance_ratio": 1.0000000390051835,
+        "expansion_search": 512,
+        "recall_at_10": 0.998,
+        "returned_mean_top10_cosine_distance": 0.14899181365966796
+      }
+    ],
+    "floor_provenance": "SELF-IMPOSED sanity floor, NOT a plan-committed threshold. §4.6's tiebreak rule governs latency and RSS and does not mention recall. A breach is escalated as a finding; it is not a contract violation and does not fail a candidate.",
+    "k": 10,
+    "oracle": "exact cosine brute force over f32 vectors regenerated from the seed — NOT read back from the quantised index, which would compare the index against itself",
+    "oracle_mean_top10_cosine_distance": 0.1489918078482151,
+    "precision": "f16",
+    "probes": 100,
+    "recall_at_10": 0.988,
+    "sanity_floor": 0.9,
+    "scaled_run_reason": null,
+    "shard": 0,
+    "shard_vectors": 1000000,
+    "vectors_per_shard_contract": 1000000
+  },
+  "ann_recall_f32__scaled": {
+    "above_floor": true,
+    "bench_expansion_search": 200,
+    "expansion_search_sweep": [
+      {
+        "distance_ratio": 1.3191856277274816,
+        "expansion_search": 64,
+        "recall_at_10": 0.93,
+        "returned_mean_top10_cosine_distance": 0.1965478515625
+      },
+      {
+        "distance_ratio": 1.0000000390051837,
+        "expansion_search": 200,
+        "recall_at_10": 1.0,
+        "returned_mean_top10_cosine_distance": 0.14899181365966796
+      },
+      {
+        "distance_ratio": 1.0000000390051837,
+        "expansion_search": 512,
+        "recall_at_10": 1.0,
+        "returned_mean_top10_cosine_distance": 0.14899181365966796
+      }
+    ],
+    "floor_provenance": "SELF-IMPOSED sanity floor, NOT a plan-committed threshold. §4.6's tiebreak rule governs latency and RSS and does not mention recall. A breach is escalated as a finding; it is not a contract violation and does not fail a candidate.",
+    "k": 10,
+    "oracle": "exact cosine brute force over f32 vectors regenerated from the seed — NOT read back from the quantised index, which would compare the index against itself",
+    "oracle_mean_top10_cosine_distance": 0.1489918078482151,
+    "precision": "f32",
+    "probes": 100,
+    "recall_at_10": 1.0,
+    "sanity_floor": 0.9,
+    "scaled_run_reason": "f32 confirms exclusion, not selection. R-4 extrapolates f32 at ~17GB against AC-46's 16GB ceiling, so it is over the ceiling before measurement and cannot become the answer at any scale. Disk on this shared box could not hold 15.6GiB of f32 shards plus the 12GiB reserve, and the reserve was deliberately NOT lowered to make it fit. 2M vectors measures bytes-per-vector exactly: on-disk growth is dead linear across shards, verified in the corrected run at i8 (0.50/0.99/1.49/1.98/2.48 GiB over shards 0-4, 532 B/vector at 10M) and f16 (0.85/1.71/2.56/3.41/4.27/5.12 GiB, 114s/shard). Shard-0 recall is measured per 1M shard in EVERY precision, so this run's recall and ef-sweep are directly comparable to i8's and f16's rather than approximations. What this does NOT give is 10M-corpus query latency for f32, which is neither measured nor claimed - f32 is excluded on RAM, so its latency never enters the decision.",
+    "shard": 0,
+    "shard_vectors": 1000000,
+    "vectors_per_shard_contract": 1000000
+  },
+  "ann_recall_i8": {
+    "above_floor": false,
+    "bench_expansion_search": 200,
+    "expansion_search_sweep": [
+      {
+        "distance_ratio": 1.4058505857603991,
+        "expansion_search": 64,
+        "recall_at_10": 0.716,
+        "returned_mean_top10_cosine_distance": 0.20946022033691403
+      },
+      {
+        "distance_ratio": 1.0444962566860023,
+        "expansion_search": 200,
+        "recall_at_10": 0.778,
+        "returned_mean_top10_cosine_distance": 0.15562138557434085
+      },
+      {
+        "distance_ratio": 1.0036439152872734,
+        "expansion_search": 512,
+        "recall_at_10": 0.785,
+        "returned_mean_top10_cosine_distance": 0.1495347213745117
+      }
+    ],
+    "floor_provenance": "SELF-IMPOSED sanity floor, NOT a plan-committed threshold. §4.6's tiebreak rule governs latency and RSS and does not mention recall. A breach is escalated as a finding; it is not a contract violation and does not fail a candidate.",
+    "k": 10,
+    "oracle": "exact cosine brute force over f32 vectors regenerated from the seed — NOT read back from the quantised index, which would compare the index against itself",
+    "oracle_mean_top10_cosine_distance": 0.1489918078482151,
+    "precision": "i8",
+    "probes": 100,
+    "recall_at_10": 0.778,
+    "sanity_floor": 0.9,
+    "scaled_run_reason": "i8 recall re-measured on shard 0 only, at 1M vectors. recall-ann reads shard 0 alone and shard 0 is seed-derived, so this is the identical shard the 10M run measured, not an approximation. Latency is NOT re-measured here and the 10M figures stand.",
+    "shard": 0,
+    "shard_vectors": 1000000,
+    "vectors_per_shard_contract": 1000000
+  },
   "capacity_primitives": {
     "bytes_per_row_base": 85.4011904,
     "bytes_per_row_marginal": 85.6064,
