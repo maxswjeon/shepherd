@@ -119,6 +119,12 @@ pub fn build(a: &Args) -> Result<(), String> {
         _ => 524.0,
     } * total as f64
         / 1073741824.0;
+    // Create the directory BEFORE the guard: `df` on a path that does not
+    // exist reports nothing, `free_bytes` reads that as zero, and the guard
+    // then refuses a leg that would have fit comfortably. A guard that fails
+    // closed on a missing directory is not a safety property, it is a bug that
+    // looks like one.
+    std::fs::create_dir_all(&a.fixtures).map_err(|e| e.to_string())?;
     crate::disk_guard_start(
         &a.fixtures,
         c.disk_guard.abort_below_free_gib,
@@ -544,7 +550,7 @@ pub fn recall(a: &Args) -> Result<(), String> {
     let queries = query_vectors(&c)?;
     let probes: Vec<&Vec<f32>> = queries.iter().take(PROBES).collect();
 
-    let hits: usize = probes
+    let (hits, oracle_dist_sum, ann_dist_sum) = probes
         .par_iter()
         .enumerate()
         .map(|(qi, q)| {
@@ -560,20 +566,60 @@ pub fn recall(a: &Args) -> Result<(), String> {
             all.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
             let truth: std::collections::HashSet<u64> =
                 all.iter().take(K).map(|(_, id)| *id).collect();
-            let got = index
+            let oracle_d: f32 = all.iter().take(K).map(|(d, _)| *d).sum::<f32>() / K as f32;
+            let keys = index
                 .search(probes[qi], K)
                 .map(|m| m.keys)
                 .unwrap_or_default();
-            got.iter().filter(|k| truth.contains(k)).count()
+            // Distance of what the ANN returned, recomputed against the SAME
+            // exact f32 oracle corpus rather than read out of the index — so it
+            // is comparable to `oracle_d` on identical terms.
+            let ann_d: f32 = keys
+                .iter()
+                .map(|&k| {
+                    let base = k as usize * dims;
+                    1.0 - (0..dims).map(|d| flat[base + d] * q[d]).sum::<f32>()
+                })
+                .sum::<f32>()
+                / keys.len().max(1) as f32;
+            (
+                keys.iter().filter(|k| truth.contains(k)).count(),
+                oracle_d,
+                ann_d,
+            )
         })
-        .sum();
+        .reduce(
+            || (0usize, 0f32, 0f32),
+            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+        );
 
     let recall = hits as f64 / (PROBES * K) as f64;
     let floor = c.bars.ann_recall_at_10_floor;
+    let oracle_mean = oracle_dist_sum as f64 / PROBES as f64;
+    let ann_mean = ann_dist_sum as f64 / PROBES as f64;
+    // THE DIAGNOSTIC THAT MAKES A LOW RECALL INTERPRETABLE.
+    //
+    // Recall-by-id answers "did it return the same rows". Distance ratio answers
+    // "did it return rows as good". They come apart precisely when the corpus
+    // has many near-ties: there, id-recall collapses toward zero while the
+    // returned neighbours are, in distance terms, indistinguishable from the
+    // true ones — and the index is doing its job perfectly.
+    //
+    // Reporting recall alone would attribute a fixture property to the index.
+    let ratio = if oracle_mean > 0.0 {
+        ann_mean / oracle_mean
+    } else {
+        1.0
+    };
     eprintln!(
         "[recall {prec}] recall@{K} = {recall:.4} over {PROBES} probes on shard 0 \
          ({n} vectors); sanity floor {floor:.2} -> {}",
         if recall >= floor { "ok" } else { "BELOW FLOOR" }
+    );
+    eprintln!(
+        "[recall {prec}] mean cosine distance: oracle top-{K} {oracle_mean:.6}, \
+         returned {ann_mean:.6}, ratio {ratio:.4} \
+         (1.0 = the returned neighbours are exactly as close as the true ones)"
     );
 
     crate::emit(
@@ -587,6 +633,9 @@ pub fn recall(a: &Args) -> Result<(), String> {
             "probes": PROBES,
             "k": K,
             "recall_at_10": recall,
+            "oracle_mean_top10_cosine_distance": oracle_mean,
+            "returned_mean_top10_cosine_distance": ann_mean,
+            "distance_ratio": ratio,
             "sanity_floor": floor,
             "above_floor": recall >= floor,
             "oracle": "exact cosine brute force over f32 vectors regenerated from the \

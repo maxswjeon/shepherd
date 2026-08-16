@@ -607,10 +607,7 @@ pub fn vector_for(seed: u64, i: u64, dims: usize, centroids: u64, noise: f32, ou
     let mut s = stream(seed ^ VECTOR_STREAM_KEY, i);
     let cid = splitmix64(&mut s) % centroids;
     centroid_into(seed, cid, out);
-    for x in out.iter_mut() {
-        *x += noise * gauss(&mut s);
-    }
-    normalize(out);
+    perturb(out, noise, &mut s);
 }
 
 /// Cluster centre `cid`. Derived rather than stored: 4096 x 384 f32 would be a
@@ -630,10 +627,43 @@ pub fn centroid_into(seed: u64, cid: u64, out: &mut [f32]) {
 pub fn query_vector(seed: u64, centroid_id: u64, k: u64, noise: f32, out: &mut [f32]) {
     centroid_into(seed, centroid_id, out);
     let mut s = stream(seed ^ QUERY_STREAM_KEY, k);
-    for x in out.iter_mut() {
-        *x += noise * gauss(&mut s);
+    perturb(out, noise, &mut s);
+}
+
+/// Add a perturbation of magnitude `noise` **relative to the unit centroid**,
+/// then renormalise.
+///
+/// # The bug this function exists to fix
+///
+/// The first implementation added `noise * gauss()` to each component
+/// independently. That is not a perturbation of size `noise` — a 384-dimensional
+/// vector of `N(0, noise)` components has length `noise * sqrt(384)`, so at
+/// `noise = 0.45` the perturbation was **8.8x longer than the unit centroid it
+/// was perturbing**. The centroid contributed about 11% of the final direction
+/// and the fixture was, for practical purposes, uniform random on the sphere —
+/// precisely the degenerate case the contract's `[fixture]` comment says
+/// clustering exists to avoid.
+///
+/// It was caught by the distance-ratio diagnostic in `recall`, not by recall
+/// itself: recall@10 came back at 0.04 for **f32**, which stores vectors
+/// exactly and therefore cannot lose accuracy to quantisation. The index was
+/// returning neighbours within 5.4% of optimal distance the whole time; the
+/// true top-10 simply sat at cosine distance 0.79 — similarity 0.21 — where
+/// tens of thousands of vectors are equally good answers and "did it return the
+/// same ids" stops meaning anything.
+///
+/// Normalising the perturbation direction first makes `noise` mean what the
+/// contract says it means: at `noise = 0.45` a vector lands at
+/// `cos = 1/sqrt(1 + 0.45^2) = 0.912` to its centroid, and two vectors sharing a
+/// centroid at roughly 0.83 — the range real sentence embeddings occupy.
+#[inline]
+fn perturb(v: &mut [f32], noise: f32, s: &mut u64) {
+    let mut d: Vec<f32> = (0..v.len()).map(|_| gauss(s)).collect();
+    normalize(&mut d);
+    for (x, dx) in v.iter_mut().zip(d) {
+        *x += noise * dx;
     }
-    normalize(out);
+    normalize(v);
 }
 
 /// Box-Muller, one of the two normals kept. Cheap enough at 384 dims and avoids

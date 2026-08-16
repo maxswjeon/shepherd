@@ -690,6 +690,12 @@ pub fn build(a: &Args) -> Result<(), String> {
         "tantivy" => 0.25 * rows as f64 / 1e6,
         _ => 0.0,
     };
+    // Create the directory BEFORE the guard: `df` on a path that does not
+    // exist reports nothing, `free_bytes` reads that as zero, and the guard
+    // then refuses a leg that would have fit comfortably. A guard that fails
+    // closed on a missing directory is not a safety property, it is a bug that
+    // looks like one.
+    std::fs::create_dir_all(&a.fixtures).map_err(|e| e.to_string())?;
     crate::disk_guard_start(
         &a.fixtures,
         c.disk_guard.abort_below_free_gib,
