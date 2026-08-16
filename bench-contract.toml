@@ -54,12 +54,32 @@ contract_version = 1
 #    own language. `bench-baseline.json` records the declared machine and the
 #    probed machine as separate objects so the substitution stays visible.
 # ---------------------------------------------------------------------------
+#
+# TOOLCHAIN AND LIBRARY PROVENANCE. Recorded here, and independently re-probed
+# into every result object in `bench-baseline.json`, so the two can be checked
+# against each other rather than trusted.
+#
+# Both entries below exist because of a near-miss. The bench crate initially
+# pinned `rusqlite` 0.37 directly while the workspace pinned 0.40.2, and those
+# two bundle different SQLite versions — the smoke test ran against SQLite
+# 3.50.2. Benchmarking FTS5-trigram on a SQLite the product does not ship would
+# make this decision describe something other than the product, which is the
+# same defect as measuring on a toolchain we do not ship. The pin was corrected
+# to inherit the workspace version before any measurement was taken, and the
+# probe in every result confirms it: every measured cell reports SQLite 3.53.2.
+# `libsqlite3-sys` carries `links = "sqlite3"` so cargo permits exactly one
+# version in the graph; a local pin here is a build break for the whole
+# workspace as well as a measurement error.
 [reference_machine]
 declared_cores = 8
 declared_ram_gib = 32
 declared_storage_class = "NVMe SSD"
 pin_to_cores = "0-7"
 substitution_is_a_rebaseline = true
+rustc = "1.96.0"
+sqlite_bundled = "3.53.2"
+usearch = "2.26.0"
+tantivy = "0.26.1"
 
 # ---------------------------------------------------------------------------
 # Fixture

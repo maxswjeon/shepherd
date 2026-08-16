@@ -66,6 +66,18 @@ pub struct ReferenceMachine {
     pub declared_storage_class: String,
     pub pin_to_cores: String,
     pub substitution_is_a_rebaseline: bool,
+    /// Toolchain and native-library provenance, declared here and independently
+    /// re-probed into every result object so the two can be cross-checked.
+    /// A benchmark whose toolchain is not recorded cannot be re-run for
+    /// comparison, which defeats the point of a precommitted contract.
+    pub rustc: String,
+    /// The SQLite the FTS5-trigram candidate was actually measured against.
+    /// `rusqlite` 0.37 and 0.40.2 bundle different SQLite versions, and FTS5
+    /// performance moves between SQLite releases — so measuring on a SQLite the
+    /// product does not ship would make this decision describe something else.
+    pub sqlite_bundled: String,
+    pub usearch: String,
+    pub tantivy: String,
 }
 
 #[derive(Debug, Deserialize)]
