@@ -1,0 +1,42 @@
+{
+  "$defs": {
+    "StubMode": {
+      "description": "Proto-local mirror of the per-root stub mode.\n\nA mirror rather than a re-export, because `shepherd_core::StubMode` is a\ndomain type this crate may not depend on. The serde representations must\nagree, and `shepherd-cli` is where the two are compared — it is the only\ncrate that legitimately depends on both.",
+      "enum": [
+        "dehydrate",
+        "delete"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`root.add` — register a scan root.",
+  "properties": {
+    "hosted_optin": {
+      "default": false,
+      "description": "Whether files under this root may be sent to a hosted inference provider.\nDefaults to `false`: consent is opt-in per root.",
+      "type": "boolean"
+    },
+    "path": {
+      "description": "Absolute path. Sent as the platform writes it; the daemon probes the\nroot's case and normalization policy (§4.9) rather than guessing here.",
+      "type": "string"
+    },
+    "stub_mode": {
+      "$ref": "#/$defs/StubMode",
+      "description": "What happens to a file's bytes locally once it is durably remote."
+    }
+  },
+  "required": [
+    "path",
+    "stub_mode"
+  ],
+  "title": "root.add request",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

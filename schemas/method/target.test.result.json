@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`target.test`.",
+  "properties": {
+    "detail": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "latency_ms": {
+      "default": null,
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "reachable": {
+      "type": "boolean"
+    },
+    "target_id": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "writable": {
+      "description": "Whether the probe could write and then remove a `_shepherd/` control\nobject. Reachable-but-read-only is a distinct and common misconfiguration.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "target_id",
+    "reachable",
+    "writable"
+  ],
+  "title": "target.test result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

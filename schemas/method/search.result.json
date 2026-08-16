@@ -1,0 +1,118 @@
+{
+  "$defs": {
+    "FileState": {
+      "description": "A file's local materialization state, as the catalog records it.",
+      "enum": [
+        "local",
+        "stub",
+        "remote",
+        "missing"
+      ],
+      "type": "string"
+    },
+    "SearchHit": {
+      "description": "One search hit.",
+      "properties": {
+        "blake3": {
+          "default": null,
+          "description": "Lowercase hex BLAKE3, or `None` while the file is still unhashed —\nhashing is its own job class and never gates cataloguing (§6 Phase 1).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "mtime": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "rel_path": {
+          "type": "string"
+        },
+        "root_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "score": {
+          "default": null,
+          "description": "Relevance, higher is better. Absent for a pure metadata query, where\nordering is by the requested sort and a score would be invented.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/FileState"
+        },
+        "tags": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "file_id",
+        "root_id",
+        "rel_path",
+        "size",
+        "mtime",
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`search`.",
+  "properties": {
+    "degraded": {
+      "default": null,
+      "description": "Set when the daemon could not serve the requested\n[`crate::request::SearchMode`] and answered with a weaker one — a Phase 1\ndaemon asked for `hybrid`, or a Phase 5 daemon whose ANN shard is\nrebuilding. A silent downgrade would make an incomplete result look\nauthoritative, so the reason travels with the result.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hits": {
+      "items": {
+        "$ref": "#/$defs/SearchHit"
+      },
+      "type": "array"
+    },
+    "took_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "total": {
+      "description": "Total matches, which may exceed `hits.len()` when `limit` truncated.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "hits",
+    "total",
+    "took_ms"
+  ],
+  "title": "search result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

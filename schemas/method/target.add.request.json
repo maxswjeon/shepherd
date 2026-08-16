@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`target.add`.",
+  "properties": {
+    "adapter": {
+      "description": "Adapter id, e.g. `\"s3\"`. Adapters are registered by `shepherd-storage`;\nthis crate deliberately does not enumerate them, so adding one in a later\nphase is not a proto change.",
+      "type": "string"
+    },
+    "config": {
+      "default": null,
+      "description": "Adapter-specific configuration. Opaque here and validated by the adapter."
+    },
+    "credentials_ref": {
+      "default": null,
+      "description": "A handle into the OS keychain, never a secret. §4.1 keeps credential\nmaterial out of the IPC surface entirely.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "description": "A unique name for this target.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "adapter"
+  ],
+  "title": "target.add request",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

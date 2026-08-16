@@ -1,0 +1,172 @@
+{
+  "$defs": {
+    "EventStream": {
+      "description": "The named event streams.\n\nA closed enum on purpose: a client subscribes by name, and an unknown stream\nname should be a clear error at subscribe time rather than a silent\nnever-delivers. Adding a stream is a minor bump.",
+      "oneOf": [
+        {
+          "const": "job",
+          "description": "Job queue transitions (§6 Phase 1's queue core).",
+          "type": "string"
+        },
+        {
+          "const": "scan",
+          "description": "Scan and walk progress.",
+          "type": "string"
+        },
+        {
+          "const": "index",
+          "description": "Index build progress.",
+          "type": "string"
+        },
+        {
+          "const": "tier",
+          "description": "Tiering, verification and restore progress.",
+          "type": "string"
+        },
+        {
+          "const": "power",
+          "description": "Power and network state changes (Phase 4 populates it; the stream is\ndeclared now so the Dashboard's contract does not change then).",
+          "type": "string"
+        },
+        {
+          "const": "target",
+          "description": "Target reachability and scrub results.",
+          "type": "string"
+        }
+      ]
+    },
+    "ResumeOutcome": {
+      "description": "What happened to the client's resume request.",
+      "oneOf": [
+        {
+          "description": "No cursor was supplied. Delivery starts with the next event produced.",
+          "properties": {
+            "outcome": {
+              "const": "fresh",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The cursor was in the buffer. Buffered frames after it are replayed\nbefore live delivery resumes.",
+          "properties": {
+            "from": {
+              "$ref": "#/$defs/Seq"
+            },
+            "outcome": {
+              "const": "resumed",
+              "type": "string"
+            },
+            "replayed": {
+              "description": "How many buffered frames are being replayed.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "outcome",
+            "from",
+            "replayed"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The cursor is unusable and the client **must** re-read state through the\nordinary methods before trusting the stream.\n\nThis is not an error frame; the subscription is live and starts at\n`next_seq`. Only the client's belief about the past is invalid.",
+          "properties": {
+            "oldest_available": {
+              "$ref": "#/$defs/Seq",
+              "description": "The oldest sequence the daemon still holds, so a client can report\nhow far behind it fell."
+            },
+            "outcome": {
+              "const": "snapshot_required",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/SnapshotReason"
+            }
+          },
+          "required": [
+            "outcome",
+            "reason",
+            "oldest_available"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Seq": {
+      "description": "A monotonic per-daemon-run event sequence number.\n\nNumbering is **global across streams**, not per stream. One counter means a\nclient holds one cursor no matter how many streams it subscribes to, and the\nrelative order of a `ScanProgress` and the `JobTransition` it caused is\npreserved. The cost is that a client subscribed to one stream sees gaps in\nthe numbers it receives; that is expected and is why the contract is \"no\ngaps in what the daemon *emitted*\", not \"no gaps in what you received\".\n\nSequence numbers restart at 1 on daemon restart. A resume cursor is\ntherefore only meaningful within one run, which is why\n[`SubscribeResult::epoch`] exists.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "SnapshotReason": {
+      "description": "Why a resume could not be honoured.",
+      "oneOf": [
+        {
+          "const": "cursor_evicted",
+          "description": "The cursor is older than the oldest buffered frame: the client was away\nlonger than the bound allows.",
+          "type": "string"
+        },
+        {
+          "const": "epoch_changed",
+          "description": "The cursor belongs to a previous daemon run.",
+          "type": "string"
+        },
+        {
+          "const": "cursor_ahead",
+          "description": "The cursor is ahead of anything the daemon has emitted — a client\ncarrying state from a daemon that was reinstalled or rolled back.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The answer to `events.subscribe`.",
+  "properties": {
+    "epoch": {
+      "description": "Identifies this daemon *run*. A cursor from a different epoch cannot be\nresumed — sequence numbers restart at 1 — and the daemon answers\n[`ResumeOutcome::SnapshotRequired`] rather than replaying the wrong\nevents with the right numbers.",
+      "type": "string"
+    },
+    "next_seq": {
+      "$ref": "#/$defs/Seq",
+      "description": "The sequence the next delivered frame will carry. A client that wants to\nreconnect later stores the highest `seq` it actually processed, not this."
+    },
+    "resume": {
+      "$ref": "#/$defs/ResumeOutcome"
+    },
+    "streams": {
+      "description": "The streams actually subscribed, expanded if the request named none.",
+      "items": {
+        "$ref": "#/$defs/EventStream"
+      },
+      "type": "array"
+    },
+    "subscription_id": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "subscription_id",
+    "epoch",
+    "resume",
+    "next_seq",
+    "streams"
+  ],
+  "title": "events.subscribe result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

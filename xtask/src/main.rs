@@ -8,14 +8,14 @@
 //! | `gate --audit` | implemented — §9 rule 6 AC-ownership audit |
 //! | `claim-ledger` | implemented — §9 rule 5 evidence-tag ledger |
 //! | `gate --phase` | NOT implemented; exits non-zero rather than pass vacuously |
-//! | `codegen`      | NOT implemented (Phase 1) |
+//! | `codegen`      | implemented — §4.3 IPC artifacts; `--check` is required in CI |
 //!
 //! Commands that are not implemented exit with a distinct non-zero status. A
 //! gate command that exited 0 without producing evidence is precisely the
 //! defect §9 rule 6 records ("a tool credited with running that did not
 //! exist"), so it is a deliberate design point that this binary never does so.
 
-use xtask::{check_deps, claim_ledger, gate_audit};
+use xtask::{check_deps, claim_ledger, codegen, gate_audit};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -46,13 +46,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         "check-deps" => cmd_check_deps(&root, rest),
         "gate" => cmd_gate(&root, rest),
         "claim-ledger" => cmd_claim_ledger(&root, rest),
-        "codegen" => {
-            eprintln!(
-                "xtask codegen: NOT IMPLEMENTED. It is a Phase 1 deliverable \
-                 (`xtask/src/codegen.rs`, §6 Phase 1). Exiting {EXIT_UNIMPLEMENTED}."
-            );
-            Ok(ExitCode::from(EXIT_UNIMPLEMENTED))
-        }
+        "codegen" => cmd_codegen(&root, rest),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(ExitCode::SUCCESS)
@@ -82,8 +76,10 @@ usage: cargo xtask <command>
         §9 rule 5: ledger of every [V]/[U] evidence tag in the plan, with
         untagged evidence cells treated as [U].
 
-  codegen
-        NOT IMPLEMENTED (Phase 1).
+  codegen [--check] [--json]
+        Emit the committed IPC artifacts under `schemas/` from
+        `shepherd_proto::MethodKind::ALL`. `--check` writes nothing and exits
+        non-zero when the tree disagrees with the method table.
 "
     );
 }
@@ -95,6 +91,26 @@ fn cmd_check_deps(root: &Path, args: &[String]) -> Result<ExitCode, String> {
     let policy_path = root.join("xtask/deps-policy.toml");
     let policy = check_deps::load_policy(&policy_path)?;
     let report = check_deps::run(root, &policy)?;
+    if json {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.render());
+    }
+    Ok(if report.failed() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn cmd_codegen(root: &Path, args: &[String]) -> Result<ExitCode, String> {
+    let json = args.iter().any(|a| a == "--json");
+    let checking = args.iter().any(|a| a == "--check");
+    let report = if checking {
+        codegen::check(root)?
+    } else {
+        codegen::write(root)?
+    };
     if json {
         println!("{}", report.to_json());
     } else {

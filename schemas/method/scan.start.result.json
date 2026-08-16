@@ -1,0 +1,59 @@
+{
+  "$defs": {
+    "SkippedRoot": {
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "root_id": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "root_id",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`scan.start`.",
+  "properties": {
+    "job_ids": {
+      "items": {
+        "format": "int64",
+        "type": "integer"
+      },
+      "type": "array"
+    },
+    "roots_started": {
+      "items": {
+        "format": "int64",
+        "type": "integer"
+      },
+      "type": "array"
+    },
+    "skipped": {
+      "default": [],
+      "description": "Roots skipped, with the reason — disabled, unmounted, already scanning.",
+      "items": {
+        "$ref": "#/$defs/SkippedRoot"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "job_ids",
+    "roots_started"
+  ],
+  "title": "scan.start result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

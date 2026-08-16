@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`tier.run`.",
+  "properties": {
+    "accepted": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "job_id": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "plan_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "plan_id",
+    "job_id",
+    "accepted"
+  ],
+  "title": "tier.run result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

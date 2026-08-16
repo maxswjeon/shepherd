@@ -1,0 +1,109 @@
+{
+  "codes": [
+    {
+      "code": -32700,
+      "name": "ParseError",
+      "stable_slug": "protocol_error",
+      "summary": "the frame was not valid JSON"
+    },
+    {
+      "code": -32600,
+      "name": "InvalidRequest",
+      "stable_slug": "protocol_error",
+      "summary": "valid JSON, but not a JSON-RPC 2.0 request"
+    },
+    {
+      "code": -32601,
+      "name": "MethodNotFound",
+      "stable_slug": "unknown_command",
+      "summary": "no such method at the negotiated protocol minor"
+    },
+    {
+      "code": -32602,
+      "name": "InvalidParams",
+      "stable_slug": "invalid_argument",
+      "summary": "params did not match the method's request schema"
+    },
+    {
+      "code": -32603,
+      "name": "InternalError",
+      "stable_slug": "internal_error",
+      "summary": "unhandled daemon fault; always a bug"
+    },
+    {
+      "code": 1001,
+      "name": "MethodNotImplemented",
+      "stable_slug": "not_implemented",
+      "summary": "registered method, not served by this build"
+    },
+    {
+      "code": 1002,
+      "name": "VersionMismatch",
+      "stable_slug": "version_mismatch",
+      "summary": "handshake rejected on protocol major version"
+    },
+    {
+      "code": 1003,
+      "name": "NotFound",
+      "stable_slug": "not_found",
+      "summary": "the named entity does not exist"
+    },
+    {
+      "code": 1004,
+      "name": "Invalid",
+      "stable_slug": "invalid_argument",
+      "summary": "the request violates an invariant of its own values"
+    },
+    {
+      "code": 1005,
+      "name": "Refused",
+      "stable_slug": "refused",
+      "summary": "legal but refused by policy or a safety floor"
+    },
+    {
+      "code": 1006,
+      "name": "Unprovable",
+      "stable_slug": "unprovable",
+      "summary": "identity could not be proven; failed closed (§4.10)"
+    },
+    {
+      "code": 1007,
+      "name": "Precondition",
+      "stable_slug": "precondition_failed",
+      "summary": "a precondition of a multi-step operation no longer holds"
+    },
+    {
+      "code": 1008,
+      "name": "Busy",
+      "stable_slug": "busy",
+      "summary": "at capacity or locked by another caller"
+    },
+    {
+      "code": 1009,
+      "name": "Io",
+      "stable_slug": "io_error",
+      "summary": "local I/O failure"
+    },
+    {
+      "code": 1010,
+      "name": "TargetUnreachable",
+      "stable_slug": "target_unreachable",
+      "summary": "a configured storage target could not be reached"
+    },
+    {
+      "code": 1011,
+      "name": "EventCursorLost",
+      "stable_slug": "event_cursor_lost",
+      "summary": "resume cursor evicted from the bounded event buffer"
+    }
+  ],
+  "note": "`code` is transport-level and may be added to or subdivided. `stable_slug` is the AC-56 contract: it is what `shepctl --json` puts in `error.code`, and it never changes meaning. Several codes may share one slug. A client that receives an unrecognised code reports the slug `unknown_error` rather than failing to parse.",
+  "unknown_code_slug": "unknown_error",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

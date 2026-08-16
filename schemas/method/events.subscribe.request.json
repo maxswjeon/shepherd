@@ -1,0 +1,78 @@
+{
+  "$defs": {
+    "EventStream": {
+      "description": "The named event streams.\n\nA closed enum on purpose: a client subscribes by name, and an unknown stream\nname should be a clear error at subscribe time rather than a silent\nnever-delivers. Adding a stream is a minor bump.",
+      "oneOf": [
+        {
+          "const": "job",
+          "description": "Job queue transitions (§6 Phase 1's queue core).",
+          "type": "string"
+        },
+        {
+          "const": "scan",
+          "description": "Scan and walk progress.",
+          "type": "string"
+        },
+        {
+          "const": "index",
+          "description": "Index build progress.",
+          "type": "string"
+        },
+        {
+          "const": "tier",
+          "description": "Tiering, verification and restore progress.",
+          "type": "string"
+        },
+        {
+          "const": "power",
+          "description": "Power and network state changes (Phase 4 populates it; the stream is\ndeclared now so the Dashboard's contract does not change then).",
+          "type": "string"
+        },
+        {
+          "const": "target",
+          "description": "Target reachability and scrub results.",
+          "type": "string"
+        }
+      ]
+    },
+    "Seq": {
+      "description": "A monotonic per-daemon-run event sequence number.\n\nNumbering is **global across streams**, not per stream. One counter means a\nclient holds one cursor no matter how many streams it subscribes to, and the\nrelative order of a `ScanProgress` and the `JobTransition` it caused is\npreserved. The cost is that a client subscribed to one stream sees gaps in\nthe numbers it receives; that is expected and is why the contract is \"no\ngaps in what the daemon *emitted*\", not \"no gaps in what you received\".\n\nSequence numbers restart at 1 on daemon restart. A resume cursor is\ntherefore only meaningful within one run, which is why\n[`SubscribeResult::epoch`] exists.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`events.subscribe` — see [`crate::event`] for the resume and overflow\ncontract.",
+  "properties": {
+    "resume_from": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Seq"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Resume after this sequence number. `None` starts from the next event\nproduced."
+    },
+    "streams": {
+      "default": [],
+      "description": "Empty subscribes to every stream. Naming streams explicitly is how a\nclient avoids paying for traffic it discards.",
+      "items": {
+        "$ref": "#/$defs/EventStream"
+      },
+      "type": "array"
+    }
+  },
+  "title": "events.subscribe request",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

@@ -19,6 +19,12 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+# `xtask codegen` derives every artifact under `schemas/` from the method table,
+# so it must link the crate that owns the table. This edge runs xtask ->
+# shepherd-proto; §4.1 rule 1 constrains what `shepherd-proto` may depend ON,
+# not who may depend on it, so `check-deps` is unaffected.
+shepherd-proto = { workspace = true }
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

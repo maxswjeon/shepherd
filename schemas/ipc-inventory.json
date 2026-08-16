@@ -1,0 +1,293 @@
+{
+  "cli_envelope_schema_version": 1,
+  "compatibility_policy": "Additive-only within a major version.\n  * A new method may be added at any minor. It carries since_minor and is not callable on a connection whose negotiated minor is lower.\n  * A new OPTIONAL field may be added to any request or result at any minor. Required fields may never be added, removed or retyped.\n  * A method's stable numeric id is permanent. Ids are never reused, including after the method is removed.\n  * A method is deprecated before it is removed: it keeps working, keeps its id, and advertises a replacement. Removal is a major bump.\n  * Unknown fields are ignored by both peers. No request or result type may deny unknown fields.\n  * Unknown capabilities are reported, never rejected.\nA major bump re-issues the whole table and is negotiated as incompatible.",
+  "method_count": 16,
+  "methods": [
+    {
+      "cli": [
+        "root",
+        "add"
+      ],
+      "cli_command": "shepctl root add",
+      "deprecated": null,
+      "id": 1001,
+      "mutates": true,
+      "name": "root.add",
+      "request_schema": "schemas/method/root.add.request.json",
+      "request_type": "RootAddRequest",
+      "result_schema": "schemas/method/root.add.result.json",
+      "result_type": "RootAddResult",
+      "since_minor": 0,
+      "summary": "Register a scan root"
+    },
+    {
+      "cli": [
+        "root",
+        "list"
+      ],
+      "cli_command": "shepctl root list",
+      "deprecated": null,
+      "id": 1002,
+      "mutates": false,
+      "name": "root.list",
+      "request_schema": "schemas/method/root.list.request.json",
+      "request_type": "RootListRequest",
+      "result_schema": "schemas/method/root.list.result.json",
+      "result_type": "RootListResult",
+      "since_minor": 0,
+      "summary": "List registered scan roots"
+    },
+    {
+      "cli": [
+        "root",
+        "remove"
+      ],
+      "cli_command": "shepctl root remove",
+      "deprecated": null,
+      "id": 1003,
+      "mutates": true,
+      "name": "root.remove",
+      "request_schema": "schemas/method/root.remove.request.json",
+      "request_type": "RootRemoveRequest",
+      "result_schema": "schemas/method/root.remove.result.json",
+      "result_type": "RootRemoveResult",
+      "since_minor": 0,
+      "summary": "Deregister a scan root (never deletes file bytes)"
+    },
+    {
+      "cli": [
+        "scan",
+        "start"
+      ],
+      "cli_command": "shepctl scan start",
+      "deprecated": null,
+      "id": 1101,
+      "mutates": true,
+      "name": "scan.start",
+      "request_schema": "schemas/method/scan.start.request.json",
+      "request_type": "ScanStartRequest",
+      "result_schema": "schemas/method/scan.start.result.json",
+      "result_type": "ScanStartResult",
+      "since_minor": 0,
+      "summary": "Walk one or every enabled root and update the catalog"
+    },
+    {
+      "cli": [
+        "scan",
+        "status"
+      ],
+      "cli_command": "shepctl scan status",
+      "deprecated": null,
+      "id": 1102,
+      "mutates": false,
+      "name": "scan.status",
+      "request_schema": "schemas/method/scan.status.request.json",
+      "request_type": "ScanStatusRequest",
+      "result_schema": "schemas/method/scan.status.result.json",
+      "result_type": "ScanStatusResult",
+      "since_minor": 0,
+      "summary": "Report scan progress per root"
+    },
+    {
+      "cli": [
+        "search"
+      ],
+      "cli_command": "shepctl search",
+      "deprecated": null,
+      "id": 1201,
+      "mutates": false,
+      "name": "search",
+      "request_schema": "schemas/method/search.request.json",
+      "request_type": "SearchRequest",
+      "result_schema": "schemas/method/search.result.json",
+      "result_type": "SearchResult",
+      "since_minor": 0,
+      "summary": "Search the catalog"
+    },
+    {
+      "cli": [
+        "status"
+      ],
+      "cli_command": "shepctl status",
+      "deprecated": null,
+      "id": 1301,
+      "mutates": false,
+      "name": "status",
+      "request_schema": "schemas/method/status.request.json",
+      "request_type": "StatusRequest",
+      "result_schema": "schemas/method/status.result.json",
+      "result_type": "StatusResult",
+      "since_minor": 0,
+      "summary": "Daemon health, catalog totals and queue depth"
+    },
+    {
+      "cli": [
+        "target",
+        "add"
+      ],
+      "cli_command": "shepctl target add",
+      "deprecated": null,
+      "id": 1401,
+      "mutates": true,
+      "name": "target.add",
+      "request_schema": "schemas/method/target.add.request.json",
+      "request_type": "TargetAddRequest",
+      "result_schema": "schemas/method/target.add.result.json",
+      "result_type": "TargetAddResult",
+      "since_minor": 0,
+      "summary": "Configure a storage target"
+    },
+    {
+      "cli": [
+        "target",
+        "list"
+      ],
+      "cli_command": "shepctl target list",
+      "deprecated": null,
+      "id": 1402,
+      "mutates": false,
+      "name": "target.list",
+      "request_schema": "schemas/method/target.list.request.json",
+      "request_type": "TargetListRequest",
+      "result_schema": "schemas/method/target.list.result.json",
+      "result_type": "TargetListResult",
+      "since_minor": 0,
+      "summary": "List configured storage targets"
+    },
+    {
+      "cli": [
+        "target",
+        "test"
+      ],
+      "cli_command": "shepctl target test",
+      "deprecated": null,
+      "id": 1403,
+      "mutates": false,
+      "name": "target.test",
+      "request_schema": "schemas/method/target.test.request.json",
+      "request_type": "TargetTestRequest",
+      "result_schema": "schemas/method/target.test.result.json",
+      "result_type": "TargetTestResult",
+      "since_minor": 0,
+      "summary": "Probe a target's reachability and write permission"
+    },
+    {
+      "cli": [
+        "rule",
+        "list"
+      ],
+      "cli_command": "shepctl rule list",
+      "deprecated": null,
+      "id": 1501,
+      "mutates": false,
+      "name": "rule.list",
+      "request_schema": "schemas/method/rule.list.request.json",
+      "request_type": "RuleListRequest",
+      "result_schema": "schemas/method/rule.list.result.json",
+      "result_type": "RuleListResult",
+      "since_minor": 0,
+      "summary": "List rules and their dry-run state"
+    },
+    {
+      "cli": [
+        "rule",
+        "preview"
+      ],
+      "cli_command": "shepctl rule preview",
+      "deprecated": null,
+      "id": 1502,
+      "mutates": false,
+      "name": "rule.preview",
+      "request_schema": "schemas/method/rule.preview.request.json",
+      "request_type": "RulePreviewRequest",
+      "result_schema": "schemas/method/rule.preview.result.json",
+      "result_type": "RulePreviewResult",
+      "since_minor": 0,
+      "summary": "Dry-run a rule (mandatory before it may be enabled)"
+    },
+    {
+      "cli": [
+        "tier",
+        "plan"
+      ],
+      "cli_command": "shepctl tier plan",
+      "deprecated": null,
+      "id": 1601,
+      "mutates": false,
+      "name": "tier.plan",
+      "request_schema": "schemas/method/tier.plan.request.json",
+      "request_type": "TierPlanRequest",
+      "result_schema": "schemas/method/tier.plan.result.json",
+      "result_type": "TierPlanResult",
+      "since_minor": 0,
+      "summary": "Compute a tiering candidate set (read-only; moves nothing)"
+    },
+    {
+      "cli": [
+        "tier",
+        "run"
+      ],
+      "cli_command": "shepctl tier run",
+      "deprecated": null,
+      "id": 1602,
+      "mutates": true,
+      "name": "tier.run",
+      "request_schema": "schemas/method/tier.run.request.json",
+      "request_type": "TierRunRequest",
+      "result_schema": "schemas/method/tier.run.result.json",
+      "result_type": "TierRunResult",
+      "since_minor": 0,
+      "summary": "Execute a tiering plan against its confirmed candidate set"
+    },
+    {
+      "cli": [
+        "restore"
+      ],
+      "cli_command": "shepctl restore",
+      "deprecated": null,
+      "id": 1701,
+      "mutates": true,
+      "name": "restore",
+      "request_schema": "schemas/method/restore.request.json",
+      "request_type": "RestoreRequest",
+      "result_schema": "schemas/method/restore.result.json",
+      "result_type": "RestoreResult",
+      "since_minor": 0,
+      "summary": "Restore a file's bytes from its target"
+    },
+    {
+      "cli": [
+        "events",
+        "subscribe"
+      ],
+      "cli_command": "shepctl events subscribe",
+      "deprecated": null,
+      "id": 1801,
+      "mutates": false,
+      "name": "events.subscribe",
+      "request_schema": "schemas/method/events.subscribe.request.json",
+      "request_type": "SubscribeRequest",
+      "result_schema": "schemas/method/events.subscribe.result.json",
+      "result_type": "SubscribeResult",
+      "since_minor": 0,
+      "summary": "Stream daemon events, optionally resuming from a cursor"
+    }
+  ],
+  "not_generated": {
+    "typescript_client": "Phase 8 (§6). No TS toolchain exists in this workspace, so an emitted client could not be compiled or checked here.",
+    "ui_subset_of_cli": "Phase 8. `CLI == registered_methods` is structural from Phase 1 — shepctl builds its command tree from the registry — but `UI ⊆ CLI` needs static extraction of TypeScript invoke() sites, which a Rust trait cannot type-check."
+  },
+  "proto_version": {
+    "major": 1,
+    "minor": 0
+  },
+  "registry_canonical_form": "1001\troot.add\troot add\t0\t-\ttrue\tRootAddRequest\tRootAddResult\n1002\troot.list\troot list\t0\t-\tfalse\tRootListRequest\tRootListResult\n1003\troot.remove\troot remove\t0\t-\ttrue\tRootRemoveRequest\tRootRemoveResult\n1101\tscan.start\tscan start\t0\t-\ttrue\tScanStartRequest\tScanStartResult\n1102\tscan.status\tscan status\t0\t-\tfalse\tScanStatusRequest\tScanStatusResult\n1201\tsearch\tsearch\t0\t-\tfalse\tSearchRequest\tSearchResult\n1301\tstatus\tstatus\t0\t-\tfalse\tStatusRequest\tStatusResult\n1401\ttarget.add\ttarget add\t0\t-\ttrue\tTargetAddRequest\tTargetAddResult\n1402\ttarget.list\ttarget list\t0\t-\tfalse\tTargetListRequest\tTargetListResult\n1403\ttarget.test\ttarget test\t0\t-\tfalse\tTargetTestRequest\tTargetTestResult\n1501\trule.list\trule list\t0\t-\tfalse\tRuleListRequest\tRuleListResult\n1502\trule.preview\trule preview\t0\t-\tfalse\tRulePreviewRequest\tRulePreviewResult\n1601\ttier.plan\ttier plan\t0\t-\tfalse\tTierPlanRequest\tTierPlanResult\n1602\ttier.run\ttier run\t0\t-\ttrue\tTierRunRequest\tTierRunResult\n1701\trestore\trestore\t0\t-\ttrue\tRestoreRequest\tRestoreResult\n1801\tevents.subscribe\tevents subscribe\t0\t-\tfalse\tSubscribeRequest\tSubscribeResult\n",
+  "registry_fingerprint": "0a9109ca86bf2c18",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

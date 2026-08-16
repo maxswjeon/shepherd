@@ -1,0 +1,170 @@
+{
+  "$defs": {
+    "FileState": {
+      "description": "A file's local materialization state, as the catalog records it.",
+      "enum": [
+        "local",
+        "stub",
+        "remote",
+        "missing"
+      ],
+      "type": "string"
+    },
+    "SearchFilters": {
+      "description": "Narrowing predicates for [`SearchRequest`].\n\nA nested object rather than fifteen flattened fields: it is passed unchanged\nto `shepherd-rules`' matcher shape, and flattening would make every future\npredicate a top-level CLI flag. `shepctl` renders it as a single\n`--filters <JSON>` argument, which is the documented handling for any\nnon-scalar request field.",
+      "properties": {
+        "ext": {
+          "default": [],
+          "description": "Extensions without the dot, e.g. `[\"pdf\", \"docx\"]`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_size": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_size": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "modified_after": {
+          "default": null,
+          "description": "Nanoseconds since the Unix epoch.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "modified_before": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path_glob": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "root_id": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tags": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SearchMode": {
+      "description": "How a search should be executed.\n\n`Hybrid` and `Semantic` are declared at Phase 1 and served at Phase 5. A\nPhase 1 daemon answers them with [`crate::ErrorCode::MethodNotImplemented`]\nor degrades to `Metadata` and says so in\n[`crate::response::SearchResult::degraded`]. Declaring them now is the\nadditive-evolution design point: the *enum* grows without a major bump only\nif the values that already exist keep their meaning.",
+      "oneOf": [
+        {
+          "const": "metadata",
+          "description": "Catalog metadata only. The only mode a Phase 1 daemon serves.",
+          "type": "string"
+        },
+        {
+          "const": "semantic",
+          "description": "Vector similarity over embeddings (Phase 5).",
+          "type": "string"
+        },
+        {
+          "const": "hybrid",
+          "description": "Reciprocal-rank fusion of both (Phase 5).",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`search`.",
+  "properties": {
+    "filters": {
+      "$ref": "#/$defs/SearchFilters",
+      "default": {
+        "ext": [],
+        "max_size": null,
+        "min_size": null,
+        "modified_after": null,
+        "modified_before": null,
+        "path_glob": null,
+        "root_id": null,
+        "state": null,
+        "tags": []
+      },
+      "description": "Narrowing predicates, as a JSON object."
+    },
+    "limit": {
+      "default": 50,
+      "description": "Maximum hits to return.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "mode": {
+      "$ref": "#/$defs/SearchMode",
+      "default": "metadata",
+      "description": "How to execute the search. Only `metadata` is served before Phase 5."
+    },
+    "offset": {
+      "default": 0,
+      "description": "Hits to skip, for paging.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "query": {
+      "description": "The query text. Matched against name and path in `metadata` mode.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "query"
+  ],
+  "title": "search request",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "$defs": {
+    "Capability": {
+      "description": "A named, optional feature of one peer.\n\nCapabilities are compared by string equality and are never parsed. A peer\nthat does not recognise one must ignore it.",
+      "type": "string"
+    },
+    "JobClassDepth": {
+      "properties": {
+        "class": {
+          "type": "string"
+        },
+        "failed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pending": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "running": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "class",
+        "pending",
+        "running",
+        "failed"
+      ],
+      "type": "object"
+    },
+    "ProtoVersion": {
+      "description": "A `major.minor` protocol version.\n\nSerialized as an object rather than a `\"1.0\"` string so a future `patch` or\nbuild-metadata field is an additive change instead of a parse change.",
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`status`.",
+  "properties": {
+    "build": {
+      "description": "The daemon's build version, e.g. `\"0.1.0\"`.",
+      "type": "string"
+    },
+    "bytes_catalogued": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "bytes_pending_discard": {
+      "description": "Bytes that are tiered and awaiting the end of their deferral window.\n\nAC-49 surfaces this on the Dashboard for a specific reason recorded in\n§9: with OQ-H's 14-day default, a user who deleted files to free space\nsees no reduction for two weeks, and without this number the overhang is\nmysterious.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "capabilities": {
+      "items": {
+        "$ref": "#/$defs/Capability"
+      },
+      "type": "array"
+    },
+    "files_catalogued": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "jobs_pending": {
+      "description": "Queue depth per job class.",
+      "items": {
+        "$ref": "#/$defs/JobClassDepth"
+      },
+      "type": "array"
+    },
+    "negotiated_minor": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "proto_version": {
+      "$ref": "#/$defs/ProtoVersion",
+      "description": "The daemon's protocol version, and the minor this connection negotiated."
+    },
+    "roots": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "uptime_secs": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "build",
+    "proto_version",
+    "negotiated_minor",
+    "capabilities",
+    "uptime_secs",
+    "roots",
+    "files_catalogued",
+    "bytes_catalogued",
+    "jobs_pending",
+    "bytes_pending_discard"
+  ],
+  "title": "status result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`tier.run` — execute a plan.\n\n`candidate_set_hash` is not a convenience. §4.10's bulk breaker confirms\nagainst the hash of the candidate set the *user saw*: if the set changed\nbetween plan and run, the daemon must refuse rather than act on a set nobody\napproved. Making the field required puts that confirmation in the type.",
+  "properties": {
+    "candidate_set_hash": {
+      "description": "Lowercase hex BLAKE3 of the candidate set, as returned by `tier.plan`.",
+      "type": "string"
+    },
+    "plan_id": {
+      "description": "The plan returned by `tier.plan`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "plan_id",
+    "candidate_set_hash"
+  ],
+  "title": "tier.run request",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.0",
+    "registry_fingerprint": "0a9109ca86bf2c18",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}
