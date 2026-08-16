@@ -534,17 +534,17 @@
     "vectors_per_shard": 1000000
   },
   "ann_build_i8": {
-    "build_seconds": 81.745267289,
-    "bytes_per_vector": 532.48614,
+    "build_seconds": 821.543875344,
+    "bytes_per_vector": 532.4859564,
     "connectivity": 16,
     "dimensions": 384,
-    "on_disk_bytes": 532486140,
-    "on_disk_gib": 0.49591636285185814,
-    "peak_vm_hwm_bytes": 642777088,
+    "on_disk_bytes": 5324859564,
+    "on_disk_gib": 4.959161918610334,
+    "peak_vm_hwm_bytes": 654909440,
     "precision": "i8",
-    "scaled_run_reason": "i8 recall re-measured on shard 0 only, at 1M vectors. recall-ann reads shard 0 alone and shard 0 is seed-derived, so this is the identical shard the 10M run measured, not an approximation. Latency is NOT re-measured here and the 10M figures stand.",
-    "shards": 1,
-    "vectors": 1000000,
+    "scaled_run_reason": null,
+    "shards": 10,
+    "vectors": 10000000,
     "vectors_per_shard": 1000000
   },
   "ann_recall_f16": {
@@ -594,13 +594,13 @@
         "returned_mean_top10_cosine_distance": 0.1965478515625
       },
       {
-        "distance_ratio": 1.0000000390051837,
+        "distance_ratio": 1.0000000390051835,
         "expansion_search": 200,
         "recall_at_10": 1.0,
         "returned_mean_top10_cosine_distance": 0.14899181365966796
       },
       {
-        "distance_ratio": 1.0000000390051837,
+        "distance_ratio": 1.0000000390051835,
         "expansion_search": 512,
         "recall_at_10": 1.0,
         "returned_mean_top10_cosine_distance": 0.14899181365966796
@@ -672,8 +672,8 @@
   },
   "fixture_catalog": {
     "dir_space": 200000,
-    "generate_seconds": 16.350792317,
-    "on_disk_bytes": 854011904,
+    "generate_seconds": 16.673074152,
+    "on_disk_bytes": 854093824,
     "rows": 10000000,
     "scaled_run_reason": null,
     "seed": 20260816
@@ -1285,10 +1285,10 @@
     "scaled_run_reason": null
   },
   "meta_build_tantivy": {
-    "build_seconds": 116.117974541,
-    "bytes": 2150263151,
+    "build_seconds": 113.860015016,
+    "bytes": 2116526084,
     "candidate": "tantivy",
-    "peak_vm_hwm_bytes": 1929162752,
+    "peak_vm_hwm_bytes": 1887293440,
     "persistence_note": "independent on-disk index with its own commit semantics",
     "rows": 10000000,
     "scaled_run_reason": null

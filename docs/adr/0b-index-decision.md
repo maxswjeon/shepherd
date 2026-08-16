@@ -255,6 +255,42 @@ Reported rather than left implicit: a benchmark run on a contended box is a
 weaker measurement than one run on a quiet box, and saying so is cheaper than
 having a reader discover it.
 
+## 5b. Confirmation re-run — tantivy's FAIL holds
+
+§5a flagged one verdict as close enough to the bar to deserve re-checking:
+tantivy fails at 68.08 ms against 50 ms, only 36% over, which is not obviously
+outside the ambient noise of a shared machine. The arena's PASS (22.20 ms) and
+FTS5's FAIL (378.59 ms) are far enough away that no plausible load reorders them.
+
+Re-run end to end — catalog regenerated from the seed, tantivy index rebuilt,
+both candidates re-benched — and emitted under separate keys so it could not
+overwrite the contract run:
+
+| candidate | contract run | confirmation | verdict |
+|---|---|---|---|
+| arena | 22.20 ms | **24.00 ms** | PASS both times |
+| tantivy | 68.08 ms | **62.09 ms** | **FAIL both times** |
+
+**It was not a quieter box — it was a busier one.** Load average was 15.0 during
+the confirmation against roughly 10 during the contract run, recorded from
+`/proc/loadavg` at both ends of the run. That makes the result stronger, not
+weaker: under *heavier* contention tantivy came in **6 ms faster** and still
+missed the bar by 24%. Whatever ambient noise is present is not what put tantivy
+over.
+
+Two incidental reproducibility checks fell out of it, and both are worth more
+than they cost:
+
+- the tantivy index rebuilt from the same seed in **113.9 s** against 116.1 s,
+  and the arena rebuilt in 3.6 s against 3.53 s;
+- separately, the 10M i8 vector index was built twice from the same seed and
+  produced **4.96 GiB / 532 B per vector both times**, in 822 s against 825 s.
+
+Two independent builds agreeing to within 0.4% on time and exactly on size is
+the evidence that the counter-based generator delivers what §0 claims: the
+fixture is reproducible, so a future re-run is comparing indexes rather than
+comparing corpora.
+
 ## 6. What survives into Phase 1
 
 **Survives (harness):** `generate.rs` in full, the contract loader, the machine
