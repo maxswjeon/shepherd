@@ -179,7 +179,25 @@ pub async fn execute_local_destruction(
     }
 
     // --- step 6: the irreversible one ---------------------------------------
-    provider.destroy_local(&staged, req.expected_hash)?;
+    //
+    // If the unlink itself fails, the destruction has NOT happened — the staged
+    // entry is still there and still holds the bytes. §4.10.4 is
+    // abort-forward-never, so this restores rather than leaving the file
+    // orphaned in staging for a later recovery pass to find. Startup recovery
+    // remains the backstop (the entry is discoverable via `list_staged`), but
+    // recovering in-process while we still hold the context is strictly better
+    // than deferring to a pass that has to reconstruct it.
+    if let Err(e) = provider.destroy_local(&staged, req.expected_hash) {
+        match provider.restore_staged(staged) {
+            Ok(o) => tracing::warn!(?o, error = %e, "unlink failed; file restored"),
+            Err(re) => tracing::error!(
+                error = %e,
+                restore_error = %re,
+                "unlink failed AND restore failed — the file is in staging and needs recovery"
+            ),
+        }
+        return Err(e.into());
+    }
 
     // The audit write happens AFTER the syscall by construction, so it cannot
     // refuse. A failure here halts subsequent destruction (§4.10.4).

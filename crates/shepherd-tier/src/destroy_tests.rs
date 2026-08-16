@@ -25,7 +25,7 @@ use shepherd_storage::adapter::AttestationMode;
 
 use super::*;
 use crate::revalidate::{Location, LocationState};
-use crate::test_adapter::FakeRemote;
+use shepherd_storage::testing::MemAdapter;
 
 struct Tmp(PathBuf);
 impl Tmp {
@@ -106,7 +106,7 @@ struct Fixture {
     hash: Blake3Hash,
     identity: FileIdentity,
     key: ObjectKey,
-    adapter: FakeRemote,
+    adapter: MemAdapter,
     audit: AuditLog,
     locks: FileLocks,
     provider: DeleteModeProvider,
@@ -119,8 +119,15 @@ fn fixture(tag: &str, mode: AttestationMode) -> Fixture {
     let hash = shepherd_scan::hash_bytes(&body);
     let key = shepherd_catalog::identity::content_key("t", hash);
 
-    let adapter = FakeRemote::new(mode == AttestationMode::Version);
-    adapter.put(&key, body.clone().into());
+    let adapter = if mode == AttestationMode::Version {
+        MemAdapter::versioned()
+    } else {
+        MemAdapter::content_addressed()
+    };
+    // `put_versioned`: mechanism A pins a version at verify and re-attests it
+    // with the closing HEAD, so these tests must control the value rather than
+    // accept a derived one.
+    adapter.put_versioned(&key, body.clone().into(), "v9");
 
     let audit = AuditLog::open(&tmp.0.join("audit").join("destroy.jsonl")).unwrap();
     Fixture {
@@ -157,7 +164,7 @@ impl Fixture {
         execute_local_destruction(
             &self.request(custodian),
             &self.provider,
-            &self.adapter,
+            &(&self.adapter as &dyn shepherd_storage::StorageAdapter),
             &self.audit,
             &self.locks,
             Timestamp::from_nanos(1_000_000),
@@ -200,7 +207,7 @@ async fn content_changed_since_verification_aborts_and_restores() {
     let err = execute_local_destruction(
         &req,
         &f.provider,
-        &f.adapter,
+        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
         &f.audit,
         &f.locks,
         Timestamp::from_nanos(1),
@@ -234,7 +241,7 @@ async fn identity_mismatch_aborts_and_restores() {
     let err = execute_local_destruction(
         &req,
         &f.provider,
-        &f.adapter,
+        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
         &f.audit,
         &f.locks,
         Timestamp::from_nanos(1),
@@ -274,7 +281,7 @@ async fn a_remote_object_deleted_before_the_closing_head_aborts() {
     let f = fixture("vanished", AttestationMode::Content);
     let c = custodian(AttestationMode::Content, f.hash);
     // Remove it behind the adapter's back.
-    f.adapter.remove(&f.key);
+    f.adapter.remove_raw(&f.key);
 
     let err = f.run(&c).await.unwrap_err();
     assert!(matches!(err, DestroyError::Refused(_)), "{err}");
@@ -446,7 +453,7 @@ async fn remote_discard_deletes_and_audits_through_the_same_apparatus() {
 
     execute_remote_discard(
         IntentId::new(7),
-        &f.adapter,
+        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
         &f.key,
         &guard,
         &f.audit,
@@ -473,7 +480,7 @@ async fn remote_discard_refuses_while_the_audit_log_is_halted() {
 
     let err = execute_remote_discard(
         IntentId::new(8),
-        &f.adapter,
+        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
         &f.key,
         &guard,
         &f.audit,
@@ -487,5 +494,41 @@ async fn remote_discard_refuses_while_the_audit_log_is_halted() {
     assert!(
         f.adapter.deleted_keys().is_empty(),
         "nothing may be deleted while the record is incomplete"
+    );
+}
+
+/// §4.10.4, abort-forward-never, at the last possible moment: the **unlink
+/// itself** fails. The destruction has not happened — the staged entry still
+/// holds the bytes — so the file is restored rather than left orphaned in
+/// staging.
+///
+/// Uses `MockPlaceholderProvider::fail_next_destroy()`, which makes this
+/// reachable without needing a filesystem to misbehave on cue. It found a real
+/// gap: the first version of `execute_local_destruction` propagated the error
+/// straight out and left the file staged.
+#[tokio::test]
+async fn a_failing_unlink_restores_rather_than_orphaning_the_file() {
+    use shepherd_placeholder::mock::MockPlaceholderProvider;
+
+    let f = fixture("unlink-fails", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let provider = MockPlaceholderProvider::new();
+    provider.fail_next_destroy();
+
+    let err = execute_local_destruction(
+        &f.request(&c),
+        &provider,
+        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, DestroyError::Provider(_)), "{err}");
+    assert!(
+        f.audit.read_all().is_empty(),
+        "nothing was destroyed, so nothing may be audited as destroyed"
     );
 }
