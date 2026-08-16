@@ -21,6 +21,8 @@
 #![forbid(unsafe_code)]
 
 pub mod delete_policy;
+/// AC-13's matcher. `match` is a keyword, hence the raw identifier.
+pub mod r#match;
 pub mod preview;
 
 pub use delete_policy::{
@@ -28,6 +30,7 @@ pub use delete_policy::{
     DeferralKind, DeferralStatus, DeleteAction, DiscardDecision, DiscardInputs, DiscardRefusal,
     PermanentDeleteConfirmation, RootGates, discard_permitted, effective_window_days,
 };
+pub use r#match::{MatchContext, MatchError, MatchOutcome, Matcher, Predicate, TimeField};
 pub use preview::{
     AccessSignalSource, EnableDecision, EnableRefusal, PreviewRecord, RuleBody, preview_hash,
 };

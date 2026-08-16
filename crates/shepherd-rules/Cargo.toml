@@ -24,5 +24,9 @@ shepherd-core.workspace = true
 shepherd-catalog.workspace = true
 
 blake3.workspace = true
+# AC-13's path-glob predicate. `ignore`'s own matcher, so inclusion globs and
+# the walker's exclusion globs share one semantics rather than two.
+globset.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
