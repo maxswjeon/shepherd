@@ -12,3 +12,7 @@ workspace = true
 
 [dependencies]
 shepherd-core.workspace = true
+blake3 = { workspace = true }
+ignore = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
