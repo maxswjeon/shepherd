@@ -550,12 +550,11 @@ pub fn recall(a: &Args) -> Result<(), String> {
     let queries = query_vectors(&c)?;
     let probes: Vec<&Vec<f32>> = queries.iter().take(PROBES).collect();
 
-    let (hits, oracle_dist_sum, ann_dist_sum) = probes
+    // Exact top-K, computed ONCE. It is the expensive half (a full linear scan
+    // of the shard per probe), and it does not depend on `expansion_search`.
+    let truth: Vec<(std::collections::HashSet<u64>, f32)> = probes
         .par_iter()
-        .enumerate()
-        .map(|(qi, q)| {
-            // Exact top-K by cosine distance. Vectors are unit-normalised, so
-            // 1 - dot is the cosine distance and no norms are needed.
+        .map(|q| {
             let mut all: Vec<(f32, u64)> = (0..n as usize)
                 .map(|i| {
                     let base = i * dims;
@@ -564,62 +563,85 @@ pub fn recall(a: &Args) -> Result<(), String> {
                 })
                 .collect();
             all.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-            let truth: std::collections::HashSet<u64> =
-                all.iter().take(K).map(|(_, id)| *id).collect();
-            let oracle_d: f32 = all.iter().take(K).map(|(d, _)| *d).sum::<f32>() / K as f32;
-            let keys = index
-                .search(probes[qi], K)
-                .map(|m| m.keys)
-                .unwrap_or_default();
-            // Distance of what the ANN returned, recomputed against the SAME
-            // exact f32 oracle corpus rather than read out of the index — so it
-            // is comparable to `oracle_d` on identical terms.
-            let ann_d: f32 = keys
-                .iter()
-                .map(|&k| {
-                    let base = k as usize * dims;
-                    1.0 - (0..dims).map(|d| flat[base + d] * q[d]).sum::<f32>()
-                })
-                .sum::<f32>()
-                / keys.len().max(1) as f32;
             (
-                keys.iter().filter(|k| truth.contains(k)).count(),
-                oracle_d,
-                ann_d,
+                all.iter().take(K).map(|(_, id)| *id).collect(),
+                all.iter().take(K).map(|(d, _)| *d).sum::<f32>() / K as f32,
             )
         })
-        .reduce(
-            || (0usize, 0f32, 0f32),
-            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
-        );
+        .collect();
+    let oracle_mean = truth.iter().map(|(_, d)| *d as f64).sum::<f64>() / PROBES as f64;
 
-    let recall = hits as f64 / (PROBES * K) as f64;
+    // SWEEP `expansion_search` RATHER THAN MEASURE AT ONE VALUE.
+    //
+    // Two reasons, and the first is a defect in the earlier version of this
+    // function. It measured recall at ef = 64 while `bench-ann` measures latency
+    // at ef = top_k = 200 — so "recall 0.729" and "p95 10.25 ms" described two
+    // different search configurations and were being reported as though they
+    // described one system. Sweeping fixes that by construction: the row at the
+    // bench's own ef is the one that pairs with its latency.
+    //
+    // Second, a recall figure without a lever is a dead end for whoever has to
+    // act on it. "Below the floor" invites a shrug; "below the floor at ef=64,
+    // recovers to X at ef=512" is a tuning decision someone can actually take.
+    // The sweep is nearly free — the oracle above is already computed, so each
+    // extra ef costs 100 approximate searches.
+    let sweep: Vec<usize> = vec![64, c.execution.top_k, 512];
+    let mut rows = Vec::new();
+    for ef in sweep {
+        index.change_expansion_search(ef);
+        let effective = index.expansion_search();
+        let (hits, ann_dist_sum) = probes
+            .par_iter()
+            .enumerate()
+            .map(|(qi, q)| {
+                let keys = index.search(q, K).map(|m| m.keys).unwrap_or_default();
+                let ann_d: f32 = keys
+                    .iter()
+                    .map(|&k| {
+                        let base = k as usize * dims;
+                        1.0 - (0..dims).map(|d| flat[base + d] * q[d]).sum::<f32>()
+                    })
+                    .sum::<f32>()
+                    / keys.len().max(1) as f32;
+                (
+                    keys.iter().filter(|k| truth[qi].0.contains(k)).count(),
+                    ann_d,
+                )
+            })
+            .reduce(|| (0usize, 0f32), |a, b| (a.0 + b.0, a.1 + b.1));
+        let recall = hits as f64 / (PROBES * K) as f64;
+        let ann_mean = ann_dist_sum as f64 / PROBES as f64;
+        let ratio = if oracle_mean > 0.0 {
+            ann_mean / oracle_mean
+        } else {
+            1.0
+        };
+        eprintln!(
+            "[recall {prec}] ef={effective:<4} recall@{K}={recall:.4}  \
+             oracle_dist={oracle_mean:.6}  returned={ann_mean:.6}  ratio={ratio:.4}"
+        );
+        rows.push(serde_json::json!({
+            "expansion_search": effective,
+            "recall_at_10": recall,
+            "returned_mean_top10_cosine_distance": ann_mean,
+            "distance_ratio": ratio,
+        }));
+    }
+
+    // The headline pair is the row measured at the SAME ef the latency bench
+    // used, so the two numbers describe one system.
+    let at_bench_ef = rows
+        .iter()
+        .find(|r| r["expansion_search"] == c.execution.top_k)
+        .cloned()
+        .unwrap_or_else(|| rows[0].clone());
+    let recall = at_bench_ef["recall_at_10"].as_f64().unwrap_or(0.0);
     let floor = c.bars.ann_recall_at_10_floor;
-    let oracle_mean = oracle_dist_sum as f64 / PROBES as f64;
-    let ann_mean = ann_dist_sum as f64 / PROBES as f64;
-    // THE DIAGNOSTIC THAT MAKES A LOW RECALL INTERPRETABLE.
-    //
-    // Recall-by-id answers "did it return the same rows". Distance ratio answers
-    // "did it return rows as good". They come apart precisely when the corpus
-    // has many near-ties: there, id-recall collapses toward zero while the
-    // returned neighbours are, in distance terms, indistinguishable from the
-    // true ones — and the index is doing its job perfectly.
-    //
-    // Reporting recall alone would attribute a fixture property to the index.
-    let ratio = if oracle_mean > 0.0 {
-        ann_mean / oracle_mean
-    } else {
-        1.0
-    };
     eprintln!(
-        "[recall {prec}] recall@{K} = {recall:.4} over {PROBES} probes on shard 0 \
-         ({n} vectors); sanity floor {floor:.2} -> {}",
+        "[recall {prec}] AT THE BENCH'S ef={}: recall@{K}={recall:.4} vs sanity floor \
+         {floor:.2} -> {}",
+        c.execution.top_k,
         if recall >= floor { "ok" } else { "BELOW FLOOR" }
-    );
-    eprintln!(
-        "[recall {prec}] mean cosine distance: oracle top-{K} {oracle_mean:.6}, \
-         returned {ann_mean:.6}, ratio {ratio:.4} \
-         (1.0 = the returned neighbours are exactly as close as the true ones)"
     );
 
     crate::emit(
@@ -632,12 +654,16 @@ pub fn recall(a: &Args) -> Result<(), String> {
             "vectors_per_shard_contract": per_shard,
             "probes": PROBES,
             "k": K,
-            "recall_at_10": recall,
             "oracle_mean_top10_cosine_distance": oracle_mean,
-            "returned_mean_top10_cosine_distance": ann_mean,
-            "distance_ratio": ratio,
+            "expansion_search_sweep": rows,
+            "bench_expansion_search": c.execution.top_k,
+            "recall_at_10": recall,
             "sanity_floor": floor,
             "above_floor": recall >= floor,
+            "floor_provenance": "SELF-IMPOSED sanity floor, NOT a plan-committed \
+                threshold. §4.6's tiebreak rule governs latency and RSS and does \
+                not mention recall. A breach is escalated as a finding; it is not \
+                a contract violation and does not fail a candidate.",
             "oracle": "exact cosine brute force over f32 vectors regenerated from the \
                        seed — NOT read back from the quantised index, which would \
                        compare the index against itself",
