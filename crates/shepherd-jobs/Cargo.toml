@@ -11,4 +11,13 @@ publish = false
 workspace = true
 
 [dependencies]
+shepherd-catalog.workspace = true
 shepherd-core.workspace = true
+
+# `rusqlite` appears here for exactly one reason: the dedicated PASSIVE
+# WAL-checkpoint connection in `worker.rs`, which is a second connection to the
+# same file and therefore cannot go through `Catalog` (whose whole contract is
+# that it is the single writer). No query in this crate uses it.
+rusqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
