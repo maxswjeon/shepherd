@@ -1,7 +1,7 @@
 # Phase 0b — the index decision
 
-**Status:** metadata index **decided**. Vector leg (§7) **measurement in
-progress** — this document is incomplete until that section carries numbers.
+**Status:** metadata index **decided** (§3). Vector precision **measured and
+recorded** (§7), with one escalation.
 **Date:** 2026-08-16
 **Gate:** §9 Phase 0a/0b. Evidence: `bench-baseline.json`, `bench-contract.toml`,
 `crates/shepherd-bench/traces/query-trace-v1.tsv`.
@@ -276,3 +276,179 @@ disappearing.
 **Carried to T7 as a requirement, not a suggestion:** the writer-starvation
 finding in §3.6.1. The bake-off measured a design whose write path does not work
 under sustained read load.
+
+---
+
+## 7. Vector index — `usearch` precision
+
+§4.6 selects `usearch` on evidence, so this leg is not a bake-off between
+crates. It measures **precision** against the 300 ms bar and the AC-46 RAM
+ceiling, and re-measures the plan's own RAM extrapolation, which R-4 flags
+`[U — third-party, single source; Phase 0b re-measures]`.
+
+### 7.0 The first vector run was void, and why
+
+**Every ANN number from the first run was discarded before it was reported.**
+The fixture generator added `noise * gauss()` per component; a 384-dimensional
+vector of `N(0, 0.45)` components has length `0.45 * sqrt(384) ≈ 8.8`, so the
+perturbation was **8.8× longer than the unit centroid it perturbed**. The
+centroid contributed ~11% of direction and the corpus was, in effect, uniform
+random on the sphere — the exact degenerate case `bench-contract.toml` says
+clustering exists to avoid.
+
+It surfaced as `recall@10 = 0.0070` for i8. What identified it as a fixture
+fault rather than quantisation loss was **running the same check on f32**, which
+stores vectors exactly and therefore cannot lose accuracy to quantisation. f32
+scored 0.0500. When the control fails too, the fault is not in the thing under
+test.
+
+The contract stated the intent correctly and the code did not implement it, so
+this was a bug fix; `cluster_noise = 0.45` kept its committed value and no
+contract edit was made. Corroboration from an independent direction: the
+corrected fixture builds **2.8× faster** (83 s/shard against 230 s) and queries
+**3.6× faster**, because HNSW converges and traverses faster when the data has
+neighbourhood structure to exploit.
+
+### 7.1 Latency against the 300 ms bar
+
+Accepted p95 = median-of-runs, 3 runs × 1000 semantic queries, 4 concurrent
+clients, `expansion_search = top_k = 200`, per-run drop-and-reopen for cold.
+
+| precision | scale | warm p95 | cold p95 | bar | verdict |
+|---|---|---|---|---|---|
+| **i8** | 10M `[M]` | **10.25 ms** | **14.21 ms** | 300 ms | **PASS** (21×) |
+| **f16** | 10M `[M]` | **10.69 ms** | **42.48 ms** | 300 ms | **PASS** (7×) |
+| f32 | 2M `[M, scaled]` | 2.75 ms | 23.70 ms | 300 ms | PASS — *not comparable*, see 7.3 |
+
+Cold p95 exceeds warm for every precision and by the largest factor for f16
+(4.0×), which is what a larger mmap'd index paying more first-touch page faults
+should look like. **No cold cell is over budget**, so there is no cold-vs-warm
+escalation.
+
+**These exclude query embedding.** No model exists at Phase 0b, so §4.6's
+15–25 ms embed budget is not in these figures; that note travels in the JSON,
+not only here.
+
+### 7.2 RAM — AC-46, and R-4 re-measured
+
+| precision | measured | B/vector | 10M projection | plan's `[U]` estimate | AC-46 4–16 GB |
+|---|---|---|---|---|---|
+| **i8** | 4.96 GiB @ 10M `[M]` | 532 | **5.33 GB** | ~6.3 GB | **inside** |
+| **f16** | 8.54 GiB @ 10M `[M]` | 916 | **9.17 GB** | ~10 GB | **inside** |
+| f32 | 3.14 GiB @ 2M `[M]` | 1684 | **16.84 GB** `[X]` | ~17 GB | **at/over the ceiling** |
+
+**R-4's extrapolation is confirmed and was conservative** — high by ~1% (f32),
+~9% (f16), ~18% (i8). The table §4.6 flagged as single-source is now measured,
+and it erred in the safe direction.
+
+**§4.6's `view()` mmap claim is confirmed with a number.** "Resident RAM is then
+only navigation structures plus a bounded hot-page budget; the OS page cache
+does the rest" was an architectural assertion. Measured:
+
+| precision | on disk | RSS after open | resident fraction |
+|---|---|---|---|
+| i8 | 4.96 GiB | **1.97 GiB** | 40% |
+| f16 | 8.54 GiB | **1.95 GiB** | 23% |
+
+Resident set stays flat at ~1.95 GiB while the index nearly doubles — which is
+what "navigation structures plus a bounded hot-page budget" predicts, and it is
+the property the whole AC-46 ceiling argument depends on.
+
+### 7.3 f32 was measured at 2M, deliberately
+
+The start guard refused f32 at 10M with the real output:
+
+```
+disk guard: 25.0 GiB free at fixtures, but this leg needs 15.6 GiB and the
+reserve floor is 12.0 GiB (27.6 GiB required). Refusing to start.
+```
+
+**The reserve was not lowered to make it fit.** Adjusting a threshold until the
+thing passes is the instinct this spike exists to resist, and the machine is
+shared with three other agents.
+
+Scaling f32 costs nothing the decision needs, because **f32's job here is to
+confirm exclusion, not to be chosen**: R-4 put it above the AC-46 ceiling before
+measurement, and the measurement agrees at 16.84 GB. What 2M gives exactly is
+bytes-per-vector — verified dead linear across shards in both full runs — and
+shard-0 recall, which every precision measures on the identical seed-derived 1M
+shard. What it does **not** give is 10M-corpus latency for f32, which is neither
+measured nor claimed.
+
+### 7.4 Recall — and the number that needed a diagnosis
+
+**The floor here is self-imposed.** §4.6's tiebreak rule governs latency and RSS
+and does not mention recall; `ann_recall_at_10_floor = 0.90` is a sanity check
+this spike added to catch a fast, small index that returns garbage. A breach is
+a finding, never a failure of a candidate the plan did not authorise failing.
+
+Measured on the identical 1M shard 0, 100 probes, against an exact brute-force
+oracle over f32 vectors **regenerated from the seed** — never read back out of
+the index under test, which would compare a quantised index against its own
+quantised contents and report near-perfect recall for everything:
+
+| ef | i8 recall | i8 ratio | f16 recall | f16 ratio | f32 recall | f32 ratio |
+|---|---|---|---|---|---|---|
+| 64 | 0.7160 | **1.4059** | 0.9080 | **1.4063** | 0.9300 | **1.3192** |
+| **200** (bench's ef) | **0.7780** | **1.0445** | **0.9880** | **1.0444** | **1.0000** | **1.0000** |
+| 512 | 0.7850 | 1.0036 | 0.9980 | 1.0000 | 1.0000 | 1.0000 |
+
+**Two findings, and the first one corrects a methodological error of mine.**
+
+**(a) Recall had been measured at a different `ef` than latency.** `recall-ann`
+used `ef = 64` while `bench-ann` uses `ef = top_k = 200`, so an earlier
+"i8 recall 0.729, ratio 1.3255" and "i8 p95 10.25 ms" described two different
+search configurations and were about to be reported as one system. The ef=64 row
+above shows why it mattered: **at ef=64 even f16 — near-lossless for unit
+vectors — posts ratio 1.4063, worse than i8's.** The distance degradation was
+beam width, not precision. Sweeping ef fixes it by construction: the headline row
+is the one measured at the bench's own ef.
+
+**(b) i8 substitutes ids among neighbours of equal quality.** At ef=200, i8 and
+f16 return neighbours at mean cosine distance **0.155621 and 0.155609** — a
+difference of 0.008% — yet their id-recall differs by 21 points (0.778 vs 0.988).
+Their distance ratios are identical to four decimals. i8's quantisation
+reshuffles *which* near-neighbours come back without meaningfully changing *how
+close* they are. Raising ef does not fix i8's id-recall (0.778 → 0.785 from 200
+to 512, saturated) but does drive its ratio to 1.0036, so the residual is a
+quantisation ceiling on identity, not on quality.
+
+**Read the ratio as a mean, and outlier-sensitive.** f32 reaches exactly 1.0000
+at ef=200 while f16 and i8 sit at 1.0445 on 0.988 and 0.778 recall respectively —
+consistent with roughly one probe in a hundred landing in a poor graph region
+rather than a broad quality gap.
+
+### 7.5 Decision, and the escalation
+
+> **i8 is confirmed as the default**, on the plan's own criteria. It passes the
+> 300 ms bar by 21× warm and 14× cold, and at **5.33 GB** it is the only
+> precision comfortably inside AC-46's 4–16 GB band. **f16 is a viable fallback**
+> at 9.17 GB, also inside the band. **f32 is excluded**, at 16.84 GB against a
+> 16 GB ceiling — as R-4 predicted, now measured.
+
+**Escalated, not decided here:** i8's id-recall at the benched configuration is
+**0.778**, below the 0.90 sanity floor, while its retrieval *quality* is
+indistinguishable from f16's. Whether that matters is a product judgement about
+what "correct results" means, and it is not this spike's to settle:
+
+- if relevance is the criterion — a user searching their own files wants good
+  results, not identity with a brute-force oracle's id list — **i8 is fine**, and
+  §4.6's RRF fusion consumes ranks rather than exact ids, which points this way;
+- if exact-id agreement matters anywhere downstream, **f16 buys 21 points of
+  recall for +3.84 GB**, still inside the ceiling, at +4.0× cold p95.
+
+The lever exists and is cheap either way, which is what the sweep is for.
+
+### 7.6 Disclosures
+
+1. **No background ingest on this leg.** The contract's `[execution]` block reads
+   as global and the writer was implemented for the metadata leg only. Defensible
+   — §4.6's sealed shards are immutable by design and the hot-shard write path is
+   Phase 5 — but it is a deviation from the contract as written, and stated here
+   rather than left for a reviewer to notice.
+2. **Query embedding is excluded** (§7.1).
+3. **`ann_build_i8` was briefly overwritten** by the 1M shard-0 re-measurement,
+   because both emitted under one key. The 10M figures survived in
+   `ann_bench_i8_*` and the run log, and `emit` now suffixes any scaled record so
+   a scaled run can never displace a contract-scale one again.
+4. **Shared machine** — see §5a. Applies here too.

@@ -682,6 +682,20 @@ fn run() -> Result<(), String> {
 /// means something), sequentially over hours, and a crash in leg 4 must not
 /// erase legs 1-3.
 pub fn emit(out: &Path, key: &str, value: serde_json::Value) -> Result<(), String> {
+    // A scaled run NEVER overwrites a contract-scale result.
+    //
+    // This is not hypothetical: re-measuring i8 recall on a single 1M shard
+    // silently replaced the 10M `ann_build_i8` record with the 1M one, because
+    // both emitted under the same key. The scaled record was correctly stamped
+    // with its own `scaled_run_reason`, so nothing was mislabelled — but the
+    // contract-scale figure it displaced was simply gone, and the artifact
+    // looked complete either way. Suffixing makes the two coexist, so a reader
+    // sees both rather than whichever ran last.
+    let key = &if value.get("scaled_run_reason").is_some_and(|r| !r.is_null()) {
+        format!("{key}__scaled")
+    } else {
+        key.to_string()
+    };
     let mut doc: serde_json::Value = match std::fs::read_to_string(out) {
         Ok(s) => serde_json::from_str(&s).map_err(|e| format!("{}: {e}", out.display()))?,
         Err(_) => serde_json::json!({}),
