@@ -21,6 +21,10 @@ path = "src/main.rs"
 [dependencies]
 shepherd-catalog.workspace = true
 shepherd-core.workspace = true
+# The §4.6 metadata index. The daemon owns the catalog read that fills it and
+# the `Arc` swap that refreshes it, because `shepherd-index` is deliberately
+# catalog-agnostic — see its `meta` module docs.
+shepherd-index.workspace = true
 shepherd-jobs.workspace = true
 shepherd-obs.workspace = true
 shepherd-proto.workspace = true

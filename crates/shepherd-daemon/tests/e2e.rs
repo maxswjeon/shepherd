@@ -427,7 +427,10 @@ fn unserved_methods_answer_with_a_distinct_code() {
     let d = Daemon::start("notimpl");
     let mut c = d.connect();
     for (method, params) in [
-        ("search", serde_json::json!({"query": "x"})),
+        // `search` is NOT in this list any more: T7's metadata index landed and
+        // the daemon serves it. `search_finds_scanned_files_and_misses_absent_ones`
+        // is what replaced this row — if that test is ever deleted, put the row
+        // back rather than leaving the method unowned by any test.
         ("target.list", serde_json::json!({})),
         ("rule.list", serde_json::json!({})),
         (
@@ -449,6 +452,307 @@ fn unserved_methods_answer_with_a_distinct_code() {
             err.message
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The M1 demo: root add -> scan -> search
+// ---------------------------------------------------------------------------
+
+/// Wait for the root's scan to finish, then assert it catalogued `expect` files.
+///
+/// Waiting matters more than it looks: a search racing an unfinished scan
+/// returns *fewer* hits, and a smaller number is exactly the shape of a passing
+/// test. Asserting the catalogued count here means every search assertion below
+/// runs against a corpus of known size. `wait_for_scan` is the scan executor's
+/// own helper, reused so there is one definition of "the scan is done".
+fn scan_and_expect(c: &mut Client, root_id: i64, expect: u64) {
+    let scan = wait_for_scan(c, root_id);
+    assert!(scan["last_error"].is_null(), "the scan failed: {scan}");
+    assert_eq!(
+        scan["files_seen"],
+        serde_json::json!(expect),
+        "the scan walked a different number of files than were written: {scan}"
+    );
+    let status = c.call("status", serde_json::json!({}));
+    assert_eq!(
+        status["files_catalogued"],
+        serde_json::json!(expect),
+        "the walk saw {expect} files but the catalog holds a different number: {status}"
+    );
+}
+
+fn write_file(dir: &Path, rel: &str, body: &str) {
+    let p = dir.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, body).unwrap();
+}
+
+/// §6 Phase 1's M1 demo, over a real socket, with the counts asserted.
+///
+/// **The point of this test is the pair of numbers, not the exit code.** The
+/// recurring defect it is written against is instance #3 — an index that
+/// benchmarked beautifully while matching zero documents. A `search` that always
+/// returned `[]` would pass any assertion that only checks the call succeeded,
+/// so every needle here asserts an exact hit count, and each is paired with a
+/// needle in the same corpus that must return exactly zero.
+#[test]
+fn search_finds_scanned_files_and_misses_absent_ones() {
+    let d = Daemon::start("search");
+    let mut c = d.connect();
+    let corpus = d.dir.join("corpus");
+
+    // Nine files. `report` is in two filenames, in one directory name, and in
+    // no others — so the right answer is 2, an answer of 0 is a broken index and
+    // an answer of 9 is a broken scope check.
+    write_file(&corpus, "notes/quarterly-report.pdf", "a");
+    write_file(&corpus, "notes/alpha.md", "b");
+    write_file(&corpus, "notes/beta.txt", "c");
+    write_file(&corpus, "docs/Annual_REPORTING_2025.docx", "d");
+    write_file(&corpus, "reports/summary.csv", "e");
+    write_file(&corpus, "docs/gamma.txt", "f");
+    write_file(&corpus, "docs/delta.txt", "g");
+    write_file(&corpus, "archive/epsilon.log", "h");
+    write_file(&corpus, "archive/zeta.log", "i");
+
+    // The empty-catalog control, BEFORE the root exists. If this returned hits
+    // the index would be matching something other than this daemon's catalog.
+    let before = c.call("search", serde_json::json!({"query": "report"}));
+    assert_eq!(
+        before["total"],
+        serde_json::json!(0),
+        "an empty catalog cannot contain `report`: {before}"
+    );
+    assert_eq!(before["hits"].as_array().unwrap().len(), 0);
+
+    // The plan writes this leg as `shepctl root add ./corpus`. Two corrections,
+    // both reported to the lead: the path must be absolute (the daemon rejects
+    // relative paths, and its cwd is not the caller's), and the scan command is
+    // `scan start` — a bare `scan` leaf cannot exist, because proto's own
+    // `no_cli_path_is_a_prefix_of_another` test forbids it.
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": corpus.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+    c.call("scan.start", serde_json::json!({}));
+    scan_and_expect(&mut c, root_id, 9);
+
+    // --- the demo query -------------------------------------------------
+    let hit = c.call("search", serde_json::json!({"query": "report"}));
+    assert_eq!(
+        hit["total"],
+        serde_json::json!(2),
+        "expected quarterly-report.pdf and Annual_REPORTING_2025.docx: {hit}"
+    );
+    let paths: Vec<&str> = hit["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["rel_path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"notes/quarterly-report.pdf"), "{paths:?}");
+    assert!(
+        paths.contains(&"docs/Annual_REPORTING_2025.docx"),
+        "case-insensitive matching is part of AC-40: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"reports/summary.csv"),
+        "`reports/` is a directory; a name query must not return everything under it: {paths:?}"
+    );
+    assert_eq!(hit["degraded"], serde_json::Value::Null);
+
+    // A hydrated hit carries the catalog's view of the file, not just its name.
+    let first = &hit["hits"][0];
+    assert_eq!(first["root_id"], serde_json::json!(root_id));
+    assert_eq!(first["state"], serde_json::json!("local"));
+    assert_eq!(first["size"], serde_json::json!(1));
+    assert!(first["file_id"].as_i64().unwrap() > 0);
+    // Hashing is its own job class and never gates cataloguing (§6 Phase 1), so
+    // an unhashed file is `null` here rather than an invented value.
+    assert!(first["blake3"].is_null() || first["blake3"].is_string());
+
+    // --- the negative controls, same daemon, same index -----------------
+    for absent in ["zzzz-no-such-file", "report.pdf.bak", "quarterly-reports"] {
+        let miss = c.call("search", serde_json::json!({"query": absent}));
+        assert_eq!(
+            miss["total"],
+            serde_json::json!(0),
+            "`{absent}` is in no filename in the corpus: {miss}"
+        );
+    }
+
+    // A path-scoped query reaches directory components; the same text without
+    // the separator is a name query and finds nothing.
+    let scoped = c.call("search", serde_json::json!({"query": "archive/"}));
+    assert_eq!(scoped["total"], serde_json::json!(2), "{scoped}");
+    let unscoped = c.call("search", serde_json::json!({"query": "archive"}));
+    assert_eq!(unscoped["total"], serde_json::json!(0), "{unscoped}");
+
+    // --- limit, offset and their honesty --------------------------------
+    let page = c.call("search", serde_json::json!({"query": ".txt", "limit": 2}));
+    assert_eq!(page["hits"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        page["total"],
+        serde_json::json!(2),
+        "`limit` caps the page; three .txt files exist but only two were requested"
+    );
+    assert!(
+        page["degraded"].as_str().unwrap().contains("lower bound"),
+        "a capped scan must say its total is a floor: {page}"
+    );
+    let all_txt = c.call("search", serde_json::json!({"query": ".txt", "limit": 50}));
+    assert_eq!(all_txt["total"], serde_json::json!(3), "{all_txt}");
+    assert_eq!(all_txt["degraded"], serde_json::Value::Null);
+
+    // Paging does not repeat or skip.
+    let p0 = c.call(
+        "search",
+        serde_json::json!({"query": ".txt", "limit": 2, "offset": 0}),
+    );
+    let p1 = c.call(
+        "search",
+        serde_json::json!({"query": ".txt", "limit": 2, "offset": 2}),
+    );
+    let ids0: Vec<i64> = p0["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["file_id"].as_i64().unwrap())
+        .collect();
+    let ids1: Vec<i64> = p1["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["file_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids0.len(), 2);
+    assert_eq!(ids1.len(), 1);
+    assert!(
+        ids1.iter().all(|id| !ids0.contains(id)),
+        "page 2 repeated a row from page 1: {ids0:?} then {ids1:?}"
+    );
+
+    // --- filters narrow, and are applied to the catalog ------------------
+    let filtered = c.call(
+        "search",
+        serde_json::json!({"query": ".txt", "filters": {"ext": ["txt"]}}),
+    );
+    assert_eq!(filtered["total"], serde_json::json!(3), "{filtered}");
+    let none = c.call(
+        "search",
+        serde_json::json!({"query": ".txt", "filters": {"ext": ["pdf"]}}),
+    );
+    assert_eq!(
+        none["total"],
+        serde_json::json!(0),
+        "no .txt file has extension pdf: {none}"
+    );
+    let by_state = c.call(
+        "search",
+        serde_json::json!({"query": ".txt", "filters": {"state": "remote"}}),
+    );
+    assert_eq!(
+        by_state["total"],
+        serde_json::json!(0),
+        "nothing is tiered at Phase 1, so no file is `remote`: {by_state}"
+    );
+
+    // --- the modes that are declared but not served ----------------------
+    let semantic = c.call(
+        "search",
+        serde_json::json!({"query": "report", "mode": "semantic"}),
+    );
+    assert_eq!(
+        semantic["total"],
+        serde_json::json!(2),
+        "a degraded search still answers: {semantic}"
+    );
+    assert!(
+        semantic["degraded"].as_str().unwrap().contains("Phase 5"),
+        "a downgrade must travel with the result: {semantic}"
+    );
+
+    // --- refusals ---------------------------------------------------------
+    let empty = c.call_err("search", serde_json::json!({"query": ""}));
+    assert_eq!(empty.kind(), Some(shepherd_proto::ErrorCode::Invalid));
+    let glob = c.call_err(
+        "search",
+        serde_json::json!({"query": "a", "filters": {"path_glob": "**/*.txt"}}),
+    );
+    assert_eq!(
+        glob.kind(),
+        Some(shepherd_proto::ErrorCode::MethodNotImplemented)
+    );
+
+    // --- doctor sees the index -------------------------------------------
+    let doc = c.call("doctor", serde_json::json!({}));
+    let index_check = doc["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == serde_json::json!("metadata index"))
+        .expect("doctor must report on the metadata index");
+    assert_eq!(index_check["status"], serde_json::json!("ok"));
+    assert!(
+        index_check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("9 entries"),
+        "doctor must report the real entry count, not a health colour: {index_check}"
+    );
+}
+
+/// The CLI leg of the demo, through the real `shepctl` binary.
+///
+/// The typed client above proves the daemon; this proves the path a user
+/// actually types, including `--json`'s stable envelope.
+#[test]
+fn shepctl_search_returns_json_a_script_can_read() {
+    let d = Daemon::start("cli-search");
+    let mut c = d.connect();
+    let corpus = d.dir.join("corpus");
+    write_file(&corpus, "q1-report.pdf", "x");
+    write_file(&corpus, "q2-report.pdf", "y");
+    write_file(&corpus, "unrelated.bin", "z");
+
+    let run = |args: &[&str]| -> serde_json::Value {
+        let out = Command::new(shepctl())
+            .arg("--socket")
+            .arg(&d.socket)
+            .args(args)
+            .output()
+            .expect("run shepctl");
+        assert!(
+            out.status.success(),
+            "shepctl {args:?} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("shepctl --json emits one JSON document")
+    };
+
+    run(&[
+        "root",
+        "add",
+        corpus.to_str().unwrap(),
+        "--stub-mode",
+        "delete",
+        "--json",
+    ]);
+    let started = run(&["scan", "start", "--json"]);
+    let root_id = started["data"]["roots_started"][0].as_i64().unwrap();
+    scan_and_expect(&mut c, root_id, 3);
+
+    let env = run(&["search", "report", "--json"]);
+    assert_eq!(env["ok"], serde_json::json!(true), "{env}");
+    assert_eq!(
+        env["data"]["total"],
+        serde_json::json!(2),
+        "two of the three files are reports: {env}"
+    );
+    // The control, through the same binary and the same envelope.
+    let miss = run(&["search", "nothing-matches-this", "--json"]);
+    assert_eq!(miss["data"]["total"], serde_json::json!(0), "{miss}");
 }
 
 #[test]
@@ -614,10 +918,26 @@ fn shepctl_drives_a_real_daemon_end_to_end() {
     assert_eq!(env["data"]["source"], serde_json::json!("daemon"));
 
     // An unserved method: stable slug, and the documented exit code 4.
-    let (code, env, raw) = run(&["search", "report", "--json"]);
+    //
+    // This used to be `search`, which is now served (T7's metadata index).
+    // `target list` inherits the role rather than the assertion being deleted —
+    // exit code 4 is a documented part of the CLI contract and something has to
+    // keep proving it reaches a script.
+    let (code, env, raw) = run(&["target", "list", "--json"]);
     assert_eq!(code, 4, "{raw}");
     assert_eq!(env["ok"], serde_json::json!(false));
     assert_eq!(env["error"]["code"], serde_json::json!("not_implemented"));
+
+    // `search` now succeeds through the same path. The *counts* are asserted by
+    // `shepctl_search_returns_json_a_script_can_read`, which waits for the scan
+    // first; this call deliberately does not wait, so it asserts only what is
+    // true regardless of scan progress — that the method is served and the
+    // envelope is well-formed.
+    let (code, env, raw) = run(&["search", "report", "--json"]);
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(env["ok"], serde_json::json!(true), "{raw}");
+    assert!(env["data"]["total"].is_u64(), "{raw}");
+    assert!(env["data"]["hits"].is_array(), "{raw}");
 
     // Human output is not JSON and does not crash.
     let (code, _, raw) = run(&["root", "list"]);

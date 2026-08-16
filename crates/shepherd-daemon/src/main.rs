@@ -102,6 +102,19 @@ fn cmd_run() -> Result<(), String> {
 
     warn_about_lingering();
 
+    // §4.6's winning candidate has no persisted form, so the arena is rebuilt at
+    // every start. A failure here is logged and NOT fatal: an unsearchable
+    // daemon still scans, still tiers and still restores, and refusing to boot
+    // would take the safety-critical paths down with the convenience one.
+    // `search` answers `Precondition` in the meantime rather than answering
+    // "no hits", and `doctor` reports it — an index that is absent must never be
+    // indistinguishable from an index that found nothing.
+    match daemon.rebuild_index() {
+        Ok(entries) => tracing::info!(entries, "metadata index ready"),
+        Err(e) => tracing::error!(error = %e, "the metadata index could not be built; \
+                                               `search` will be refused until a restart"),
+    }
+
     let listener = server::bind(&paths.socket).map_err(|e| e.to_string())?;
     tracing::info!(
         socket = %paths.socket.display(),

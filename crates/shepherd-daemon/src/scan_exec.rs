@@ -1,9 +1,10 @@
 //! The `scan` job executor: walk a root, upsert what it finds.
 //!
 //! This is the piece `main.rs` left a `ponytail:` note for — the empty
-//! `Registry` now has one entry. With it, `shepctl root add && shepctl scan`
-//! reaches the catalog, which is two of the three legs of §6 Phase 1's M1
-//! demo. The third, `shepctl search`, is T7's index.
+//! `Registry` now has one entry. With it, `shepctl root add && shepctl scan
+//! start` reaches the catalog. T7's metadata index closed the third leg, so all
+//! of §6 Phase 1's M1 demo now runs; this executor refreshes that index before
+//! it reports the scan done (see the end of `run`).
 //!
 //! # What resumes, and what does not — stated plainly
 //!
@@ -182,8 +183,27 @@ impl Executor for ScanExecutor {
             }
         }
 
+        // The metadata index is an in-RAM projection of `file`, so a scan that
+        // updated `file` and did not refresh it leaves `search` answering from
+        // the pre-scan catalog — which looks exactly like a correct search that
+        // found nothing. Refreshing here, before the job is marked done, is what
+        // makes `shepctl scan start && shepctl search ...` deterministic.
+        //
+        // A failure fails the JOB rather than being logged and swallowed: a
+        // "successful" scan whose results are unsearchable is the completion
+        // this project keeps having to walk back.
+        let entries = self.daemon.rebuild_index().map_err(|e| {
+            format!("refreshing the metadata index after scanning root {root_id}: {e}")
+        })?;
+
         self.publish(root_id, files_seen, bytes_seen, None, true);
-        tracing::info!(root = root_id, files_seen, bytes_seen, "scan complete");
+        tracing::info!(
+            root = root_id,
+            files_seen,
+            bytes_seen,
+            indexed = entries,
+            "scan complete"
+        );
         Ok(())
     }
 }

@@ -12,16 +12,29 @@
 //!
 //! | served here | answered `MethodNotImplemented` |
 //! |---|---|
-//! | `root.add`, `root.list`, `root.remove` | `search` (the index is T7) |
-//! | `scan.start`, `scan.status` | `target.*` (storage is T9, Phase 2) |
-//! | `status`, `doctor` | `rule.*` (the engine is Phase 2) |
-//! | `events.subscribe` | `tier.*`, `restore` (Phase 2) |
+//! | `root.add`, `root.list`, `root.remove` | `target.*` (storage is T9, Phase 2) |
+//! | `scan.start`, `scan.status` | `rule.*` (the engine is Phase 2) |
+//! | `search` (T7's metadata index) | `tier.*`, `restore` (Phase 2) |
+//! | `status`, `doctor`, `events.subscribe` | |
 //!
 //! The unimplemented ones return [`ErrorCode::MethodNotImplemented`] rather
-//! than a stopgap. A catalog `LIKE` query dressed up as `search` would be a
-//! second implementation to keep in step with T7's index and would make the
-//! Phase 1 gate look passed when it is not. The distinct error code, and
-//! `shepctl`'s exit status 4, are what make "not built yet" legible to a script.
+//! than a stopgap. The distinct error code, and `shepctl`'s exit status 4, are
+//! what make "not built yet" legible to a script.
+//!
+//! # `search` is served by the index, and by nothing else
+//!
+//! This file previously carried a standing warning that "a catalog `LIKE` query
+//! dressed up as `search` would be a second implementation to keep in step with
+//! T7's index". T7 has landed and the warning still stands, pointed the other
+//! way: [`Session::search`] must keep going through `shepherd_index::MetaIndex`
+//! even when a `LIKE` would be easier — for a filter, for a fallback while the
+//! index rebuilds, for anything. `LIKE '%x%'` is the FTS5-shaped answer §4.6
+//! measured at 378 ms p95, and a fallback that silently substitutes it would put
+//! the 50 ms bar's failure mode back in the product behind a passing gate.
+//!
+//! What the catalog *does* own here is everything the index has no opinion
+//! about: hydrating a row's size, mtime, state, hash and tags, and applying the
+//! property filters. See `hydrate`.
 
 use std::sync::Arc;
 
@@ -326,14 +339,104 @@ impl ShepherdApi for Session {
         Ok(result)
     }
 
-    // --- registered, not served at Phase 1 --------------------------------
+    // --- search -----------------------------------------------------------
 
-    fn search(&mut self, _: SearchRequest) -> Result<SearchResult, RpcError> {
-        Err(not_implemented(
-            "search",
-            "the metadata index lands with shepherd-index in Phase 1 task T7",
-        ))
+    fn search(&mut self, req: SearchRequest) -> Result<SearchResult, RpcError> {
+        let started = std::time::Instant::now();
+
+        if req.query.is_empty() {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                "`query` is empty. An empty as-you-type box matches every file in the \
+                 catalog, which is not a search result — send no request instead.",
+            ));
+        }
+        // A glob is `shepherd-rules`' predicate (AC-13), and implementing a
+        // second globber here would be a second semantics to keep in step with
+        // the one the rule engine destroys files by. Refused, and named.
+        if req.filters.path_glob.is_some() {
+            return Err(not_implemented(
+                "search.filters.path_glob",
+                "the glob predicate belongs to shepherd-rules' matcher and the search path \
+                 adopts it with the rule engine in Phase 2",
+            ));
+        }
+
+        // §4.6's vector side is Phase 5. Degrading and *saying so* is what the
+        // proto's `degraded` field exists for; a silent downgrade would make a
+        // metadata-only answer look like a semantic one.
+        let degraded = match req.mode {
+            SearchMode::Metadata => None,
+            SearchMode::Semantic | SearchMode::Hybrid => Some(format!(
+                "asked for `{}`, served `metadata`: the ANN index and embeddings land in \
+                 Phase 5, so no semantic ranking exists to fuse",
+                match req.mode {
+                    SearchMode::Semantic => "semantic",
+                    _ => "hybrid",
+                }
+            )),
+        };
+
+        let index = self.daemon.index()?;
+        let offset = req.offset as usize;
+        let limit = req.limit as usize;
+        let want = offset.saturating_add(limit);
+
+        // Filters are applied to catalog rows, so the index has to hand over
+        // more candidates than the caller asked for or a filtered page comes
+        // back short. The multiplier is a bounded guess, and `degraded` reports
+        // when it was not enough rather than pretending it was.
+        let cap = if req.filters == SearchFilters::default() {
+            want
+        } else {
+            want.saturating_mul(FILTERED_CANDIDATE_FACTOR)
+                .min(MAX_CANDIDATES)
+        };
+
+        let matched = index.search(&req.query, cap.max(1));
+        let candidates = matched.ids.clone();
+        let filters = req.filters.clone();
+        let mut hits = self.cat(move |cat| hydrate(cat, &candidates, &filters))?;
+
+        // The index already ordered by `file_id`; hydration reorders by
+        // whatever SQLite felt like. Restoring index order is what keeps paging
+        // stable across two calls that differ only in `offset`.
+        let rank: std::collections::HashMap<i64, usize> = matched
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
+        hits.sort_by_key(|h| rank.get(&h.file_id).copied().unwrap_or(usize::MAX));
+
+        let total = hits.len() as u64;
+        let page: Vec<SearchHit> = hits.into_iter().skip(offset).take(limit).collect();
+
+        // `total` is a count of what survived filtering, which is exact only
+        // when the scan was not capped. Saying so beats reporting a truncated
+        // count as authoritative — AC-40's UI shows this number to a human.
+        let degraded = match (degraded, matched.truncated) {
+            (Some(mode), true) => Some(format!(
+                "{mode}; and the index scan stopped at {cap} candidates, so `total` is a \
+                 lower bound"
+            )),
+            (Some(mode), false) => Some(mode),
+            (None, true) => Some(format!(
+                "the index scan stopped at {cap} candidates, so `total` is a lower bound, \
+                 not a total"
+            )),
+            (None, false) => None,
+        };
+
+        Ok(SearchResult {
+            hits: page,
+            total,
+            took_ms: started.elapsed().as_millis() as u64,
+            degraded,
+        })
     }
+
+    // --- registered, not served at Phase 1 --------------------------------
 
     fn target_add(&mut self, _: TargetAddRequest) -> Result<TargetAddResult, RpcError> {
         Err(not_implemented("target.add", "storage lands in Phase 2"))
@@ -441,6 +544,181 @@ fn root_summary(cat: &mut Catalog, id: RootId) -> Result<Option<RootSummary>, Ca
     Ok(list_roots(cat, true)?
         .into_iter()
         .find(|r| r.root_id == id.get()))
+}
+
+/// Candidates fetched per requested hit when filters are present.
+///
+/// Filters are catalog predicates, so the index cannot apply them; it hands over
+/// a wider candidate set and SQL narrows it. Too small and a filtered page comes
+/// back short; too large and a cheap query pays for a full scan. 16 is a guess,
+/// and the `degraded` field is what makes it an honest one — a page that hit the
+/// cap says so rather than reporting a short result as complete.
+const FILTERED_CANDIDATE_FACTOR: usize = 16;
+
+/// Absolute ceiling on candidates, whatever the factor computes.
+///
+/// Bounds both the arena scan and the `IN (...)` list handed to SQLite.
+const MAX_CANDIDATES: usize = 10_000;
+
+/// Turn index candidate ids into wire hits, applying the catalog-side filters.
+///
+/// The index's job ends at "these file ids match the text". Everything AC-40's
+/// result row shows — size, mtime, state, hash, tags — and every predicate that
+/// is about a file's *properties* rather than its name lives here, in the
+/// catalog, which is the only place that knows them.
+fn hydrate(
+    cat: &mut Catalog,
+    candidates: &[i64],
+    filters: &SearchFilters,
+) -> Result<Vec<SearchHit>, CatalogError> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A bound parameter per id rather than string interpolation: these ids come
+    // from the index, but "it came from inside the process" is exactly the
+    // reasoning that makes the one interpolated query in a codebase the
+    // injection. SQLite's default parameter ceiling is well above
+    // `MAX_CANDIDATES`.
+    let placeholders = std::iter::repeat_n("?", candidates.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut sql = format!(
+        "SELECT id, root_id, rel_path, size, mtime, state, blake3
+         FROM file
+         WHERE id IN ({placeholders})"
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = candidates
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+
+    if !filters.ext.is_empty() {
+        let marks = std::iter::repeat_n("?", filters.ext.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND ext IN ({marks})"));
+        for e in &filters.ext {
+            // `file.ext` is stored lowercase and without the dot by the
+            // catalog's own `split_name`; matching its convention here is what
+            // keeps `--filters '{"ext":["PDF"]}'` from silently finding nothing.
+            params.push(Box::new(e.trim_start_matches('.').to_lowercase()));
+        }
+    }
+    if let Some(min) = filters.min_size {
+        sql.push_str(" AND size >= ?");
+        params.push(Box::new(min as i64));
+    }
+    if let Some(max) = filters.max_size {
+        sql.push_str(" AND size <= ?");
+        params.push(Box::new(max as i64));
+    }
+    if let Some(after) = filters.modified_after {
+        sql.push_str(" AND mtime > ?");
+        params.push(Box::new(after));
+    }
+    if let Some(before) = filters.modified_before {
+        sql.push_str(" AND mtime < ?");
+        params.push(Box::new(before));
+    }
+    if let Some(state) = filters.state {
+        sql.push_str(" AND state = ?");
+        params.push(Box::new(file_state_str(state).to_string()));
+    }
+    if let Some(root) = filters.root_id {
+        sql.push_str(" AND root_id = ?");
+        params.push(Box::new(root));
+    }
+
+    let mut hits: Vec<SearchHit> = {
+        let mut stmt = cat.conn().prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        stmt.query_map(refs.as_slice(), |r| {
+            Ok(SearchHit {
+                file_id: r.get(0)?,
+                root_id: r.get(1)?,
+                rel_path: r.get(2)?,
+                size: r.get::<_, i64>(3)? as u64,
+                mtime: r.get(4)?,
+                state: match r.get::<_, String>(5)?.as_str() {
+                    "stub" => FileState::Stub,
+                    "remote" => FileState::Remote,
+                    "missing" => FileState::Missing,
+                    _ => FileState::Local,
+                },
+                blake3: r
+                    .get::<_, Option<Vec<u8>>>(6)?
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                    .map(|b| shepherd_core::Blake3Hash::from_bytes(b).to_hex()),
+                tags: Vec::new(),
+                // Absent by protocol contract for a metadata query: there is no
+                // relevance model here, and inventing one would make a future
+                // real score indistinguishable from this placeholder.
+                score: None,
+            })
+        })?
+        .collect::<Result<_, _>>()?
+    };
+
+    attach_tags(cat, &mut hits)?;
+    if !filters.tags.is_empty() {
+        let want: Vec<String> = filters.tags.iter().map(|t| t.to_lowercase()).collect();
+        // ALL, not ANY: two tag filters narrow a search. ANY would widen it,
+        // which is the opposite of what a user adding a second filter means.
+        hits.retain(|h| {
+            want.iter()
+                .all(|w| h.tags.iter().any(|t| t.to_lowercase() == *w))
+        });
+    }
+    Ok(hits)
+}
+
+/// Fill in each hit's tags with one query rather than one per hit.
+fn attach_tags(cat: &mut Catalog, hits: &mut [SearchHit]) -> Result<(), CatalogError> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", hits.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = cat.conn().prepare(&format!(
+        "SELECT ft.file_id, t.name
+         FROM file_tag ft JOIN tag t ON t.id = ft.tag_id
+         WHERE ft.file_id IN ({placeholders})
+         ORDER BY t.name"
+    ))?;
+    let ids: Vec<&dyn rusqlite::ToSql> = hits
+        .iter()
+        .map(|h| &h.file_id as &dyn rusqlite::ToSql)
+        .collect();
+    let mut by_file: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    let rows = stmt.query_map(ids.as_slice(), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (file_id, tag) = row?;
+        by_file.entry(file_id).or_default().push(tag);
+    }
+    for hit in hits.iter_mut() {
+        if let Some(tags) = by_file.remove(&hit.file_id) {
+            hit.tags = tags;
+        }
+    }
+    Ok(())
+}
+
+/// The `file.state` column's spelling for a wire `FileState`.
+///
+/// The reverse mapping is inline in `hydrate`; this direction is separate
+/// because a filter comparing against the wrong spelling matches zero rows and
+/// looks exactly like a filter that legitimately matched nothing.
+fn file_state_str(state: FileState) -> &'static str {
+    match state {
+        FileState::Local => "local",
+        FileState::Stub => "stub",
+        FileState::Remote => "remote",
+        FileState::Missing => "missing",
+    }
 }
 
 fn list_roots(cat: &mut Catalog, include_disabled: bool) -> Result<Vec<RootSummary>, CatalogError> {
