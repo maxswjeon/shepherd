@@ -10,11 +10,30 @@ publish = false
 [lints]
 workspace = true
 
+[lib]
+name = "shepherd_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "shepherdd"
 path = "src/main.rs"
 
 [dependencies]
+shepherd-catalog.workspace = true
 shepherd-core.workspace = true
-shepherd-proto.workspace = true
+shepherd-jobs.workspace = true
 shepherd-obs.workspace = true
+shepherd-proto.workspace = true
+shepherd-secrets.workspace = true
+
+rusqlite.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The E2E drives the daemon with a typed client rather than only through the
+# CLI, so it needs the wire types it would otherwise have to hand-roll.
+shepherd-proto.workspace = true
+serde_json = { workspace = true }
