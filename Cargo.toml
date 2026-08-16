@@ -139,6 +139,18 @@ bytes = "1"
 # implementation is the wrong call. Same reasoning that kept
 # `unicode-normalization` rather than hand-folding NFC.
 ignore = "0.4.33"
+
+# §4.10.1's identity-bound acquisition primitive. `renameat2(RENAME_NOREPLACE)`
+# on Linux and `renameatx_np(RENAME_EXCL)` on macOS are not in std. Following
+# the plan's cited choice rather than `rustix`, which covers the same syscalls:
+# the citation is what was verified, and swapping it silently is the drift this
+# project keeps catching.
+libc = "0.2"
+
+# DEV-ONLY, `shepherd-tier`. §8.2 names an mmap hazard test for the destroy
+# path: OQ-J's residual must be EXERCISED, not assumed away, and a held mmap is
+# the case `rename()` cannot invalidate. Never ships.
+memmap2 = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
