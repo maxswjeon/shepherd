@@ -14,6 +14,7 @@
 //! | `plan` / `upload` / `verify` / `discard` / `breaker` / `restore` / `fidelity` | | 2 (T10) |
 
 pub mod audit;
+pub mod breaker;
 pub mod destroy;
 pub mod revalidate;
 pub mod serialize;
@@ -21,6 +22,10 @@ pub mod serialize;
 mod test_adapter;
 
 pub use audit::{AuditLog, AuditRecord};
+pub use breaker::{
+    BreakerLimits, BreakerRefusal, Candidate, Episode, EpisodeState, HoldScope, RateWindow,
+    candidate_set_hash,
+};
 pub use destroy::{LocalDestroyRequest, execute_local_destruction, execute_remote_discard};
 pub use revalidate::{ClosingCheck, DestroyRefusal, Location, LocationState, destroy_permitted};
 pub use serialize::FileLocks;

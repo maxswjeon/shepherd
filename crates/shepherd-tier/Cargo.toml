@@ -19,6 +19,11 @@ shepherd-catalog.workspace = true
 shepherd-scan.workspace = true
 shepherd-storage.workspace = true
 blake3 = { workspace = true }
+# The breaker's rolling rate window and candidate set are PERSISTED (§4.4's
+# `discard_rate_window` / `discard_candidate`). An in-memory counter would make
+# the breaker evadable by restarting the daemon, which is the failure a rate
+# limit most needs to survive.
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
