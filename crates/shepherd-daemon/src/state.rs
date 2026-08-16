@@ -92,10 +92,24 @@ impl Daemon {
         )
         .map_err(|e| format!("opening {} read-only: {e}", db.display()))?;
 
+        // One read transaction across BOTH statements, so the count and the rows
+        // come from the same WAL snapshot.
+        //
+        // Without it these are two auto-commit reads with two snapshots, and any
+        // write landing between them — the worker pool runs several scans, and
+        // each one's completion rebuilds while another may still be upserting —
+        // makes the count disagree with the rows for no reason. The consistency
+        // check below would then fail the scan job with a confident message
+        // about a partial index that was never partial. Pinning the snapshot is
+        // what turns that check from a race detector into a real guard.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("opening a read snapshot of the catalog: {e}"))?;
+
         // Reserving up front avoids doubling a several-hundred-megabyte arena,
         // which costs both rebuild time and — because the old and new
         // allocations coexist during a copy — transient RSS charged to AC-46.
-        let expected: i64 = conn
+        let expected: i64 = tx
             .query_row("SELECT COUNT(*) FROM file", [], |r| r.get(0))
             .map_err(|e| format!("counting catalog rows: {e}"))?;
         let mut builder = MetaIndexBuilder::with_capacity(expected.max(0) as usize);
@@ -103,19 +117,24 @@ impl Daemon {
         // `ORDER BY id` is load-bearing, not tidiness: `MetaIndex` returns hits
         // in push order, so pushing in id order is what makes a paged search
         // return a stable, non-overlapping sequence of pages.
-        let mut stmt = conn
-            .prepare("SELECT id, rel_path FROM file ORDER BY id")
-            .map_err(|e| format!("preparing the index rebuild query: {e}"))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| format!("reading catalog rows: {e}"))?;
-        while let Some(row) = rows.next().map_err(|e| format!("reading a row: {e}"))? {
-            let id: i64 = row.get(0).map_err(|e| format!("file.id: {e}"))?;
-            let rel_path: String = row.get(1).map_err(|e| format!("file.rel_path: {e}"))?;
-            builder
-                .push(id, &rel_path)
-                .map_err(|e| format!("building the metadata index: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare("SELECT id, rel_path FROM file ORDER BY id")
+                .map_err(|e| format!("preparing the index rebuild query: {e}"))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| format!("reading catalog rows: {e}"))?;
+            while let Some(row) = rows.next().map_err(|e| format!("reading a row: {e}"))? {
+                let id: i64 = row.get(0).map_err(|e| format!("file.id: {e}"))?;
+                let rel_path: String = row.get(1).map_err(|e| format!("file.rel_path: {e}"))?;
+                builder
+                    .push(id, &rel_path)
+                    .map_err(|e| format!("building the metadata index: {e}"))?;
+            }
         }
+        // Read-only and read-only throughout, so there is nothing to commit;
+        // dropping the transaction rolls back an empty one.
+        drop(tx);
 
         let built = builder
             .build()
