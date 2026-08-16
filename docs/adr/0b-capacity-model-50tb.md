@@ -209,6 +209,23 @@ falls by roughly three orders of magnitude. That is a large enough swing that it
 must be measured rather than assumed, and the model is not revised down on the
 strength of an emulator that reported the opposite.
 
+**A near-miss inside the mitigation, worth recording next to the price.** The
+checksum was being requested at upload and then **dropped at verify** — the
+`VerifiedLocation` did not carry it through to `remote_object.checksum_kind`
+(fixed in `9f241ef`). Had it shipped, every step would have succeeded: the
+upload works, the provider computes the checksum, `verify_upload` returns `Ok`.
+Nothing would have failed anywhere. The only value scrub compares against on
+every later pass would simply have been discarded, and **the entire upload-time
+decision priced above would have bought nothing.**
+
+That is a defect whose symptom is a **cost** — it shows up in a bill, not in a
+log line. Worse than the money: scrub would have gone on reading multipart
+objects in full forever, and someone would eventually have concluded that
+whole-object checksums "don't work on this provider" and retired a working
+mechanism on false evidence. It is the same shape as every other defect this
+spike caught, in its most expensive form yet: **every observable signal was
+green and the work behind it was absent.**
+
 **This does not become a cheap path to gating destruction.** A provider-computed
 CRC detects bit rot; it is worthless against a provider that is wrong about its
 own bytes, and it is not BLAKE3. It addresses scrub *cost* only. §4.10's
