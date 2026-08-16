@@ -342,18 +342,58 @@ fn run_evidence(root: &Path, ev: &Evidence) -> CheckOutcome {
         }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     let (passed, failed) = parse_counts(&stdout);
+    classify(passed, failed, out.status.success(), &stderr)
+}
 
-    // The count IS the assertion. A filter matching nothing exits 0.
+/// The outcome decision, split out from the process so it is testable without
+/// spawning cargo.
+///
+/// Zero counts have TWO causes and they mean opposite things:
+///
+/// - the filter matched nothing — the named test does not exist, and cargo
+///   exits **0**, which is the defect this module is shaped around;
+/// - the harness never ran at all — a compile error, a link error, or a panic
+///   before the first `test result:` line — and cargo exits **non-zero**.
+///
+/// Only the exit code separates them, which is why the exit code is consulted
+/// here and nowhere else. Collapsing the two sends a reader to go rename a test
+/// that was fine all along, while the actual build failure goes unmentioned.
+/// That is not a hypothetical: it is how a green workspace produced a gate
+/// reporting ten missing tests, every one of which existed and passed.
+pub fn classify(passed: u32, failed: u32, success: bool, stderr: &str) -> CheckOutcome {
     if passed == 0 && failed == 0 {
-        return CheckOutcome::MatchedNothing;
+        if success {
+            return CheckOutcome::MatchedNothing;
+        }
+        return CheckOutcome::Failed {
+            detail: format!(
+                "the test harness never ran — cargo exited non-zero and printed no \
+                 `test result:` line at all, so this is a BUILD failure, not a missing \
+                 test. Last lines of stderr:\n{}",
+                stderr_tail(stderr)
+            ),
+        };
     }
-    if failed > 0 || !out.status.success() {
+    if failed > 0 || !success {
         return CheckOutcome::Failed {
             detail: format!("{failed} test(s) failed, {passed} passed"),
         };
     }
     CheckOutcome::Passed { count: passed }
+}
+
+/// The last few non-blank stderr lines, indented. Enough to name the crate and
+/// the error; not so much that one broken build buries the other eleven rows.
+fn stderr_tail(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(8);
+    lines[start..]
+        .iter()
+        .map(|l| format!("             | {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Sum `test result:` lines. Summing rather than taking the first, because a
@@ -392,6 +432,31 @@ mod tests {
     fn a_filter_that_matched_nothing_is_all_zeroes() {
         let out = "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s\n";
         assert_eq!(parse_counts(out), (0, 0));
+    }
+
+    /// The mirror defect, and the one that actually bit: zero counts with a
+    /// NON-zero exit is a build failure. Reporting it as an empty filter says
+    /// the test is missing when the test is fine, which is the most expensive
+    /// possible wrong answer — it points the reader at the wrong file.
+    #[test]
+    fn a_build_failure_is_not_an_empty_filter() {
+        let outcome = classify(0, 0, false, "error[E0432]: unresolved import `foo::Bar`");
+        match outcome {
+            CheckOutcome::Failed { detail } => {
+                assert!(detail.contains("BUILD failure"), "got: {detail}");
+                assert!(detail.contains("E0432"), "stderr must be surfaced: {detail}");
+            }
+            other => panic!("a non-zero exit with no test results must FAIL as a build error, got {other:?}"),
+        }
+    }
+
+    /// The two zero-count cases must not be collapsed in either direction
+    /// either: a filter that matched nothing still exits 0 and must stay
+    /// `MatchedNothing`, or the fix above would relabel every missing test as a
+    /// build failure and lose the original signal.
+    #[test]
+    fn an_empty_filter_still_reports_as_an_empty_filter() {
+        assert_eq!(classify(0, 0, true, ""), CheckOutcome::MatchedNothing);
     }
 
     #[test]
