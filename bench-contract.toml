@@ -161,7 +161,18 @@ query_clients = 4
 background_ingest = true
 background_ingest_rows_per_sec = 2_000
 cache_states = ["warm", "cold"]
-top_k = 10
+
+# `top_k` is the ANN retrieval depth. §4.6's latency budget line is "ANN top-200
+# across shards, parallel, per-shard deadline", so 200 is the depth the 300 ms
+# bar was costed against. An earlier draft of this contract said 10, which would
+# have measured a materially cheaper query than the plan budgets for and reported
+# it against the plan's bar. Corrected to 200 before any measurement was taken —
+# the correction makes the test harder, not easier, and the git history shows it
+# landing ahead of the first result commit.
+top_k = 200
+
+# `result_limit` is the metadata leg's early-exit depth: one screenful of
+# as-you-type results.
 result_limit = 50
 
 # ---------------------------------------------------------------------------

@@ -38,22 +38,130 @@ use crate::{Args, Contract, splitmix64, stream};
 /// a substring query match many rows rather than one. A large vocabulary would
 /// make every query near-unique and would flatter every candidate equally.
 const WORDS: &[&str] = &[
-    "annual", "archive", "assets", "audit", "backup", "budget", "build", "cache", "campaign",
-    "client", "config", "contract", "customer", "dashboard", "data", "delivery", "design",
-    "device", "diagram", "draft", "engine", "estimate", "export", "final", "finance", "forecast",
-    "handoff", "handover", "header", "hotfix", "image", "import", "index", "internal", "invoice",
-    "kickoff", "layout", "ledger", "legacy", "license", "logistics", "manifest", "meeting",
-    "metrics", "migration", "minutes", "mockup", "monthly", "network", "notes", "onboarding",
-    "output", "overview", "package", "patch", "payroll", "pipeline", "planning", "policy",
-    "portrait", "presentation", "pricing", "product", "profile", "project", "proposal",
-    "prototype", "quarterly", "receipt", "recording", "refactor", "release", "render", "report",
-    "request", "research", "resource", "response", "restore", "review", "roadmap", "rollout",
-    "sample", "sandbox", "schedule", "schema", "scratch", "screenshot", "script", "security",
-    "server", "service", "session", "settings", "sheet", "sketch", "snapshot", "source",
-    "specification", "sprint", "staging", "statement", "storage", "strategy", "summary",
-    "support", "survey", "sync", "system", "template", "testing", "timeline", "tracking",
-    "transcript", "transfer", "update", "upload", "usage", "vendor", "version", "video",
-    "wireframe", "workflow", "workshop",
+    "annual",
+    "archive",
+    "assets",
+    "audit",
+    "backup",
+    "budget",
+    "build",
+    "cache",
+    "campaign",
+    "client",
+    "config",
+    "contract",
+    "customer",
+    "dashboard",
+    "data",
+    "delivery",
+    "design",
+    "device",
+    "diagram",
+    "draft",
+    "engine",
+    "estimate",
+    "export",
+    "final",
+    "finance",
+    "forecast",
+    "handoff",
+    "handover",
+    "header",
+    "hotfix",
+    "image",
+    "import",
+    "index",
+    "internal",
+    "invoice",
+    "kickoff",
+    "layout",
+    "ledger",
+    "legacy",
+    "license",
+    "logistics",
+    "manifest",
+    "meeting",
+    "metrics",
+    "migration",
+    "minutes",
+    "mockup",
+    "monthly",
+    "network",
+    "notes",
+    "onboarding",
+    "output",
+    "overview",
+    "package",
+    "patch",
+    "payroll",
+    "pipeline",
+    "planning",
+    "policy",
+    "portrait",
+    "presentation",
+    "pricing",
+    "product",
+    "profile",
+    "project",
+    "proposal",
+    "prototype",
+    "quarterly",
+    "receipt",
+    "recording",
+    "refactor",
+    "release",
+    "render",
+    "report",
+    "request",
+    "research",
+    "resource",
+    "response",
+    "restore",
+    "review",
+    "roadmap",
+    "rollout",
+    "sample",
+    "sandbox",
+    "schedule",
+    "schema",
+    "scratch",
+    "screenshot",
+    "script",
+    "security",
+    "server",
+    "service",
+    "session",
+    "settings",
+    "sheet",
+    "sketch",
+    "snapshot",
+    "source",
+    "specification",
+    "sprint",
+    "staging",
+    "statement",
+    "storage",
+    "strategy",
+    "summary",
+    "support",
+    "survey",
+    "sync",
+    "system",
+    "template",
+    "testing",
+    "timeline",
+    "tracking",
+    "transcript",
+    "transfer",
+    "update",
+    "upload",
+    "usage",
+    "vendor",
+    "version",
+    "video",
+    "wireframe",
+    "workflow",
+    "workshop",
 ];
 
 /// Extensions with realistic frequency skew. The first entries dominate because
@@ -111,14 +219,75 @@ const ROOTS: &[&str] = &[
 /// Directory-name components, distinct from file words so path-fragment queries
 /// are recognisably path-shaped.
 const DIRWORDS: &[&str] = &[
-    "2019", "2020", "2021", "2022", "2023", "2024", "2025", "2026", "accounting", "admin",
-    "android", "api", "archive", "backend", "benchmarks", "clients", "common", "components",
-    "core", "customers", "デザイン", "docs", "engineering", "examples", "exports", "fixtures",
-    "frontend", "hr", "images", "imports", "infra", "inbox", "legal", "lib", "marketing", "media",
-    "migrations", "misc", "mobile", "models", "modules", "operations", "outbox", "packages",
-    "personal", "photos", "platform", "products", "public", "quarterly", "reports", "research",
-    "resources", "sales", "scripts", "服务", "shared", "src", "staging", "static", "styles",
-    "support", "targets", "tests", "tools", "utils", "vendors", "웹", "workspace",
+    "2019",
+    "2020",
+    "2021",
+    "2022",
+    "2023",
+    "2024",
+    "2025",
+    "2026",
+    "accounting",
+    "admin",
+    "android",
+    "api",
+    "archive",
+    "backend",
+    "benchmarks",
+    "clients",
+    "common",
+    "components",
+    "core",
+    "customers",
+    "デザイン",
+    "docs",
+    "engineering",
+    "examples",
+    "exports",
+    "fixtures",
+    "frontend",
+    "hr",
+    "images",
+    "imports",
+    "infra",
+    "inbox",
+    "legal",
+    "lib",
+    "marketing",
+    "media",
+    "migrations",
+    "misc",
+    "mobile",
+    "models",
+    "modules",
+    "operations",
+    "outbox",
+    "packages",
+    "personal",
+    "photos",
+    "platform",
+    "products",
+    "public",
+    "quarterly",
+    "reports",
+    "research",
+    "resources",
+    "sales",
+    "scripts",
+    "服务",
+    "shared",
+    "src",
+    "staging",
+    "static",
+    "styles",
+    "support",
+    "targets",
+    "tests",
+    "tools",
+    "utils",
+    "vendors",
+    "웹",
+    "workspace",
 ];
 
 // ---------------------------------------------------------------------------
@@ -164,12 +333,16 @@ fn pick_ext(s: &mut u64) -> &'static str {
     EXTS[0].0
 }
 
+/// Keys the directory stream away from the row stream, so the directory tree is
+/// stable even if the row generator changes shape.
+const DIR_STREAM_KEY: u64 = 0xD15E_A5ED_0000_0004;
+
 /// The directory a row lives in. Directories are drawn from a bounded space —
 /// `dir_space` distinct directories — so that many files share a parent, which
 /// is what real trees look like and what makes path-fragment queries return
 /// many rows rather than one.
 pub fn dir_for(seed: u64, dir_id: u64) -> String {
-    let mut s = stream(seed ^ 0xD1_5EA5_ED, dir_id);
+    let mut s = stream(seed ^ DIR_STREAM_KEY, dir_id);
     let root = pick(&mut s, ROOTS);
     let depth = 1 + (splitmix64(&mut s) % 4); // 1..=4 components below the root
     let mut p = String::with_capacity(64);
@@ -260,7 +433,7 @@ pub fn row(seed: u64, i: u64, dir_space: u64) -> Row {
                 pick(&mut s, WORDS),
                 1 + splitmix64(&mut s) % 9
             );
-            if splitmix64(&mut s) % 4 == 0 {
+            if splitmix64(&mut s).is_multiple_of(4) {
                 let _ = write!(stem, " (copy {})", 1 + splitmix64(&mut s) % 3);
             }
         }
@@ -348,12 +521,14 @@ pub fn gen_catalog(a: &Args) -> Result<(), String> {
                 )
                 .map_err(|e| e.to_string())?;
             for r in &batch {
+                // `u64` has no `ToSql`: SQLite integers are signed 64-bit, so
+                // the cast is the storage reality rather than a convenience.
                 st.execute(rusqlite::params![
-                    r.id,
+                    r.id as i64,
                     &r.parent,
                     &r.name,
                     r.ext,
-                    r.size,
+                    r.size as i64,
                     r.mtime
                 ])
                 .map_err(|e| e.to_string())?;
@@ -361,7 +536,7 @@ pub fn gen_catalog(a: &Args) -> Result<(), String> {
         }
         tx.commit().map_err(|e| e.to_string())?;
         done += n;
-        if done % 1_000_000 == 0 {
+        if done.is_multiple_of(1_000_000) {
             eprintln!(
                 "[gen-catalog] {done}/{rows} rows, {:.1}s",
                 t0.elapsed().as_secs_f64()
@@ -426,7 +601,7 @@ pub fn vector_for(seed: u64, i: u64, dims: usize, centroids: u64, noise: f32, ou
     debug_assert_eq!(out.len(), dims);
     let mut s = stream(seed ^ VECTOR_STREAM_KEY, i);
     let cid = splitmix64(&mut s) % centroids;
-    centroid_into(seed, cid, dims, out);
+    centroid_into(seed, cid, out);
     for x in out.iter_mut() {
         *x += noise * gauss(&mut s);
     }
@@ -436,7 +611,7 @@ pub fn vector_for(seed: u64, i: u64, dims: usize, centroids: u64, noise: f32, ou
 /// Cluster centre `cid`. Derived rather than stored: 4096 x 384 f32 would be a
 /// 6 MiB table to thread through every call site, and deriving it costs the same
 /// arithmetic the noise term already pays.
-pub fn centroid_into(seed: u64, cid: u64, dims: usize, out: &mut [f32]) {
+pub fn centroid_into(seed: u64, cid: u64, out: &mut [f32]) {
     let mut s = stream(seed ^ CENTROID_STREAM_KEY, cid);
     for x in out.iter_mut() {
         *x = gauss(&mut s);
@@ -447,8 +622,8 @@ pub fn centroid_into(seed: u64, cid: u64, dims: usize, out: &mut [f32]) {
 /// A query vector for the semantic trace class: the same construction as a
 /// corpus vector, so a query lands inside the cluster structure the index was
 /// built from rather than in empty space.
-pub fn query_vector(seed: u64, centroid_id: u64, k: u64, dims: usize, noise: f32, out: &mut [f32]) {
-    centroid_into(seed, centroid_id, dims, out);
+pub fn query_vector(seed: u64, centroid_id: u64, k: u64, noise: f32, out: &mut [f32]) {
+    centroid_into(seed, centroid_id, out);
     let mut s = stream(seed ^ QUERY_STREAM_KEY, k);
     for x in out.iter_mut() {
         *x += noise * gauss(&mut s);
@@ -543,7 +718,7 @@ pub fn build_trace(c: &Contract) -> Vec<TraceLine> {
                     let comps: Vec<&str> = r.parent.split('/').filter(|s| !s.is_empty()).collect();
                     let tail = comps.len().min(2);
                     let mut t = comps[comps.len() - tail..].join("/");
-                    if splitmix64(&mut s) % 2 == 0 {
+                    if splitmix64(&mut s).is_multiple_of(2) {
                         t.push('/');
                         t.push_str(&take_chars(&r.name, 0, 3));
                     }
@@ -582,7 +757,65 @@ pub fn build_trace(c: &Contract) -> Vec<TraceLine> {
     push("infix", n_infix, &mut out, 2);
     push("path_fragment", n_path, &mut out, 3);
     push("semantic", n_sem, &mut out, 4);
-    out
+
+    // INTERLEAVE, and this is load-bearing rather than cosmetic.
+    //
+    // Generated class-by-class, the trace is 4000 prefix queries followed by
+    // 3000 infix, then 2000 path-fragment, then 1000 semantic. Each run draws a
+    // contiguous 1000-query slice — so run 0, run 1 and run 2 would every one of
+    // them be *pure prefix*, and the infix class, which is the whole reason this
+    // bake-off is hard, would never be measured at all. The pilot run caught
+    // exactly that.
+    //
+    // Fixed by emitting in blocks of ten holding exactly the mandated mix
+    // (4 prefix : 3 infix : 2 path : 1 semantic), with the order inside each
+    // block permuted deterministically from the seed. Every 1000-query window
+    // then carries the contract's composition, and no window is a single class.
+    let mut buckets: std::collections::BTreeMap<&str, std::collections::VecDeque<TraceLine>> =
+        std::collections::BTreeMap::new();
+    for l in out {
+        buckets.entry(l.class).or_default().push_back(l);
+    }
+    let mut mixed = Vec::with_capacity(total);
+    let mut block: Vec<&str> = Vec::new();
+    let mut s = stream(seed ^ TRACE_STREAM_KEY, 0xFFFF_FFFF);
+    let mut i = 0usize;
+    while mixed.len() < total {
+        if block.is_empty() {
+            for (class, n) in [
+                ("prefix", c.query_trace.pct_prefix / 10),
+                ("infix", c.query_trace.pct_infix / 10),
+                ("path_fragment", c.query_trace.pct_path_fragment / 10),
+                ("semantic", c.query_trace.pct_semantic / 10),
+            ] {
+                for _ in 0..n {
+                    block.push(class);
+                }
+            }
+            // Fisher-Yates over the ten slots.
+            for k in (1..block.len()).rev() {
+                block.swap(k, (splitmix64(&mut s) % (k as u64 + 1)) as usize);
+            }
+        }
+        let class = block.pop().unwrap();
+        // A bucket can run dry only if the percentages do not divide evenly into
+        // tens; fall through to any non-empty bucket rather than emitting fewer
+        // queries than the contract fixes.
+        let take = if buckets.get(class).is_some_and(|b| !b.is_empty()) {
+            class
+        } else {
+            match buckets.iter().find(|(_, b)| !b.is_empty()) {
+                Some((k, _)) => k,
+                None => break,
+            }
+        };
+        if let Some(mut l) = buckets.get_mut(take).and_then(|b| b.pop_front()) {
+            l.idx = i;
+            i += 1;
+            mixed.push(l);
+        }
+    }
+    mixed
 }
 
 fn pick_word(s: &mut u64) -> &'static str {
