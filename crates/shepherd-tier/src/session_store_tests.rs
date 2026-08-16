@@ -716,6 +716,113 @@ async fn the_writer_actor_queues_a_session_save_behind_a_scan_batch_instead_of_f
     assert_eq!(back.upload_id, session.upload_id);
 }
 
+/// **The deadlock, proven rather than argued.**
+///
+/// [`CatalogWriter::with`] blocks on a rendezvous channel until the actor
+/// replies, so a store call made from *inside* another `with` closure wedges
+/// the catalog permanently: the actor is busy running the outer closure and can
+/// never dequeue the inner one. A hang, not a slow path — it does not recover
+/// and it does not time out.
+///
+/// # The audit this guards
+///
+/// `with_writer`'s docs argue the shape cannot arise. Reading every `with` /
+/// `try_with` call site in the workspace agrees, and for a stronger reason than
+/// the one recorded there:
+///
+/// * no production closure body can reach a store — they are
+///   `save_blocking` / `load_blocking` (session_store.rs:215,228), `Queue::*`
+///   and `JobRepo::*` (worker.rs), `load_scan_input` / `upsert_batch`
+///   (scan_exec.rs:107,161) and one `COUNT(*)` (state.rs:163), all pure SQL;
+/// * `run_one` calls `executor.run(&ctx)` **outside** the closure (worker.rs),
+///   so no executor — present or future — inherits an open actor frame;
+/// * `upload_item` is the only constructor of a `TransferDriver`
+///   (upload.rs:189) and is reached only from test bodies today.
+///
+/// So the hazard is unreachable. But a structural safety argument with no test
+/// is a comment, and comments scroll out of view. This fails the moment someone
+/// makes the nesting reachable and then reasons that it is fine.
+#[test]
+fn a_store_call_nested_inside_a_writer_closure_deadlocks() {
+    let dir = TempDir::new("nested");
+    let db = dir.join("catalog.db");
+    let src = dir.join("a.bin");
+    std::fs::write(&src, BODY).expect("write source");
+    let item = item_for(&src);
+    let job = JobId::new(29);
+    seed(&db, job, item.target, item.file);
+
+    /// Long enough that a working call is not merely slow: a top-level save
+    /// through the actor is sub-millisecond, and the control below asserts it.
+    const NEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+    // LEAKED DELIBERATELY. `CatalogActor::drop` joins the writer thread, and
+    // wedging that thread is the whole point of this test — so letting the
+    // actor drop would hang the suite instead of proving anything. The wedged
+    // thread and its connection live until the test process exits.
+    let actor: &'static CatalogActor = Box::leak(Box::new(CatalogActor::start(
+        Catalog::open(&db).expect("open"),
+        None,
+    )));
+
+    // --- positive control, FIRST -------------------------------------------
+    // The identical call at the top level must succeed, and fast. Without this
+    // the test could pass because the save was broken rather than because it
+    // was nested — the timeout cannot tell those apart on its own.
+    {
+        let store = CatalogSessionStore::with_writer(actor.handle());
+        let session = session_for(job, &item, "control");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = Instant::now();
+        rt.block_on(store.save(&session))
+            .expect("a top-level save through the actor must succeed");
+        let took = started.elapsed();
+        assert!(
+            took < NEST_TIMEOUT,
+            "the control save took {took:?}, so the {NEST_TIMEOUT:?} timeout below could not \
+             distinguish a deadlock from ordinary slowness"
+        );
+    }
+
+    // --- the forbidden shape ------------------------------------------------
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let writer = actor.handle();
+    let session = session_for(job, &item, "nested");
+    std::thread::Builder::new()
+        .name("nested-store-call".into())
+        .spawn(move || {
+            let store = CatalogSessionStore::with_writer(writer.clone());
+            // A store call from INSIDE a `with` closure. The actor is running
+            // this closure, so it can never dequeue the save the closure makes.
+            let _ = writer.with(move |_cat| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(store.save(&session))
+            });
+            // Unreachable while the invariant holds.
+            let _ = done_tx.send(());
+        })
+        .expect("spawn the nesting thread");
+
+    let outcome = done_rx.recv_timeout(NEST_TIMEOUT);
+    // `Timeout` specifically, NOT merely `is_err()`. A panicking thread drops
+    // its sender and yields `Disconnected` immediately, which would satisfy a
+    // bare `is_err()` and pass this test for entirely the wrong reason.
+    assert!(
+        matches!(outcome, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "expected the nested call to HANG (Timeout); got {outcome:?}. `Disconnected` means the \
+         thread panicked or unwound, which is not a deadlock. `Ok` means the nesting completed — \
+         either `with` stopped being a blocking rendezvous or the store stopped routing through \
+         the actor, and in both cases `with_writer`'s safety argument no longer describes this \
+         code"
+    );
+}
+
 /// A store wrapper that stops persisting after `n` saves, modelling a process
 /// death: the provider keeps what it received, the database keeps only what was
 /// committed before the kill.
