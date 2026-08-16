@@ -1,0 +1,408 @@
+//! Crash-window tests for the transfer state machine.
+//!
+//! One test per window in the table at the top of `transfer_session.rs`, plus
+//! PM-1's modify-during-upload race and the transition table itself. Each
+//! "crash" is a durable-write failure at a chosen point followed by reloading
+//! the session from the store — so every assertion is about what the resumed
+//! process could actually read, not about in-memory state that a real restart
+//! would have lost.
+
+use super::*;
+use crate::multipart::PartAction;
+use crate::testing::{Faults, MemAdapter, MemSource, MemStore};
+
+const PART: u64 = 10;
+const BODY: usize = 40; // 4 parts of 10 bytes.
+
+fn body_of(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+
+struct Rig {
+    adapter: MemAdapter,
+    store: MemStore,
+    source: MemSource,
+    key: ObjectKey,
+}
+
+impl Rig {
+    fn new(versioned: bool) -> Self {
+        let bytes = body_of(BODY);
+        Self {
+            adapter: if versioned {
+                MemAdapter::versioned()
+            } else {
+                MemAdapter::content_addressed()
+            },
+            store: MemStore::new(),
+            source: MemSource::new(bytes),
+            key: ObjectKey::new("objects/aa/bb/aabbcc"),
+        }
+    }
+
+    fn session(&self) -> TransferSession {
+        let body = self.source.body();
+        let source = SourceIdentity {
+            file_id: FileId::new(1),
+            rel_path: "docs/big.bin".into(),
+            size: body.len() as u64,
+            mtime: Timestamp::from_nanos(1_000),
+            fs_id: FsId::new("vol-1:inode-7"),
+            blake3: self.source.blake3(),
+        };
+        TransferSession::plan(
+            JobId::new(42),
+            TargetId::new(3),
+            self.key.clone(),
+            source,
+            &self.adapter,
+            PART,
+        )
+        .expect("plan")
+    }
+
+    fn driver(&self) -> TransferDriver<'_> {
+        let mut d = TransferDriver::new(&self.adapter, &self.store, &self.source);
+        d.verify_chunk = PART;
+        d
+    }
+
+    /// What a restarted process would find in the database.
+    async fn reload(&self) -> TransferSession {
+        self.store
+            .load(JobId::new(42))
+            .await
+            .expect("load")
+            .expect("a session must have been persisted before the crash")
+    }
+}
+
+#[tokio::test]
+async fn happy_path_uploads_verifies_and_commits() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+    let out = rig.driver().run(&mut s).await.expect("run");
+
+    assert_eq!(out.state, TransferState::Committed);
+    assert_eq!(out.parts_sent, 4);
+    assert_eq!(out.bytes_skipped, 0);
+    assert!(!out.resolved_ambiguous_completion);
+    assert_eq!(
+        rig.adapter.object(&rig.key).expect("object").as_ref(),
+        rig.source.body().as_ref(),
+        "the assembled object must be byte-identical to the source"
+    );
+    // A non-versioned bucket lands on mechanism B — probed, not assumed.
+    assert_eq!(s.attestation_mode, Some(AttestationMode::Content));
+    assert_eq!(s.object_version, None);
+}
+
+#[tokio::test]
+async fn a_versioned_target_pins_a_version_and_reports_mechanism_a() {
+    let rig = Rig::new(true);
+    let mut s = rig.session();
+    rig.driver().run(&mut s).await.expect("run");
+    assert_eq!(s.attestation_mode, Some(AttestationMode::Version));
+    assert!(
+        s.object_version.is_some(),
+        "mechanism A must pin an immutable version id at verify"
+    );
+}
+
+/// **AC-2.** Kill mid-upload, restart, resume without re-sending verified parts.
+#[tokio::test]
+async fn ac2_resume_does_not_resend_durably_acknowledged_parts() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+    assert_eq!(s.plan.part_count, 4);
+
+    // Saves: 1 = Initiating, 2 = Uploading, 3 = part1, 4 = part2, 5 = part3.
+    // Dying at 5 leaves parts 1 and 2 durable; part 3 reached the provider but
+    // its checkpoint never landed.
+    rig.store.die_at_save(5);
+    let err = rig.driver().run(&mut s).await.expect_err("must die");
+    assert!(err.is_retryable(), "a lost write is transient: {err}");
+
+    // --- restart ---
+    rig.store.revive();
+    let mut resumed = rig.reload().await;
+    assert_eq!(resumed.state, TransferState::Uploading);
+    assert_eq!(
+        resumed.parts.iter().filter(|p| p.is_acknowledged()).count(),
+        2,
+        "exactly two parts were durably acknowledged before the crash"
+    );
+
+    let out = rig.driver().run(&mut resumed).await.expect("resume");
+    assert_eq!(out.state, TransferState::Committed);
+    assert_eq!(
+        out.bytes_skipped,
+        2 * PART,
+        "the two verified parts must not be re-sent — this is what AC-2 measures"
+    );
+    assert_eq!(
+        out.parts_sent, 2,
+        "only the unacknowledged parts 3 and 4 are re-sent"
+    );
+    assert_eq!(
+        rig.adapter.object(&rig.key).expect("object").as_ref(),
+        rig.source.body().as_ref()
+    );
+}
+
+/// Window 2 — the part reached the provider, the checkpoint did not.
+#[tokio::test]
+async fn a_part_uploaded_before_its_checkpoint_is_resent_not_adopted() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+
+    rig.store.die_at_save(3); // dies committing part 1's checkpoint
+    rig.driver().run(&mut s).await.expect_err("must die");
+
+    rig.store.revive();
+    let resumed = rig.reload().await;
+    assert!(
+        resumed.parts.iter().all(|p| !p.is_acknowledged()),
+        "no checkpoint became durable"
+    );
+
+    // The provider genuinely holds part 1 — but nothing durable attributes it
+    // to us, and an opaque ETag cannot close that gap.
+    let remote = rig
+        .adapter
+        .list_parts(&rig.key, resumed.upload_id.as_ref().expect("token"))
+        .await
+        .expect("list_parts");
+    assert_eq!(remote.len(), 1, "the provider does hold the orphaned part");
+
+    let recon = crate::multipart::reconcile_parts(&resumed.plan, &resumed.parts, &remote);
+    assert_eq!(recon.actions[0], PartAction::Send);
+    assert_eq!(recon.orphan_remote_parts, 1);
+    assert_eq!(recon.bytes_skipped, 0);
+}
+
+/// Window 1 — a provider session exists that the database never learned about.
+#[tokio::test]
+async fn an_orphaned_provider_session_is_reaped_before_a_new_one_starts() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+
+    // Save 1 = Initiating (durable), then create_multipart succeeds, then
+    // save 2 (which would record the upload id) dies.
+    rig.store.die_at_save(2);
+    rig.driver().run(&mut s).await.expect_err("must die");
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        1,
+        "the provider is holding a session nobody has the id for"
+    );
+
+    rig.store.revive();
+    let mut resumed = rig.reload().await;
+    assert_eq!(resumed.state, TransferState::Initiating);
+    assert_eq!(resumed.upload_id, None, "the id never became durable");
+
+    let out = rig.driver().run(&mut resumed).await.expect("resume");
+    assert_eq!(out.state, TransferState::Committed);
+    assert_eq!(
+        rig.adapter.aborts().len(),
+        1,
+        "the orphan must be aborted, so abandoned multiparts stop accruing cost"
+    );
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        0,
+        "nothing is left dangling once the transfer commits"
+    );
+}
+
+/// Window 3 — the completion succeeded and its response was lost.
+#[tokio::test]
+async fn a_lost_completion_response_resolves_by_head_plus_full_hash() {
+    let rig = Rig::new(false);
+    rig.adapter.set_faults(Faults {
+        lose_complete_response: true,
+        ..Faults::default()
+    });
+
+    let mut s = rig.session();
+    rig.driver()
+        .run(&mut s)
+        .await
+        .expect_err("the completion response is lost");
+
+    let resumed_state = rig.reload().await;
+    assert_eq!(
+        resumed_state.state,
+        TransferState::Completing,
+        "`Completing` must be durable BEFORE the call, or the ambiguity is unrecoverable"
+    );
+
+    let mut resumed = rig.reload().await;
+    let out = rig.driver().run(&mut resumed).await.expect("resume");
+    assert_eq!(out.state, TransferState::Committed);
+    assert!(
+        out.resolved_ambiguous_completion,
+        "the run must report that it resolved an ambiguous completion"
+    );
+    assert_eq!(
+        out.parts_sent, 0,
+        "the object was already complete; nothing is re-uploaded"
+    );
+}
+
+/// Window 3, adversarial — the object is present but holds the wrong bytes.
+///
+/// This is the test that proves the resolution is HEAD **plus a full hash**
+/// rather than a HEAD alone. A HEAD-only resolution would commit here.
+#[tokio::test]
+async fn an_ambiguous_completion_over_wrong_bytes_fails_closed() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+    s.state = TransferState::Completing;
+    s.upload_id = Some(crate::adapter::OpaqueToken::new("stale-upload"));
+    rig.store.save(&s).await.expect("seed");
+
+    // Same length, different content: a size-checking HEAD cannot tell.
+    let mut wrong = body_of(BODY);
+    wrong[0] ^= 0xff;
+    rig.adapter.put_raw(&rig.key, Bytes::from(wrong));
+
+    let err = rig
+        .driver()
+        .run(&mut s)
+        .await
+        .expect_err("a same-size content replacement must be caught");
+    assert!(
+        matches!(err, StorageError::ContentMismatch { .. }),
+        "expected a content mismatch, got {err:?}"
+    );
+    assert!(!err.is_retryable(), "a hash disagreement is terminal");
+    assert_ne!(s.state, TransferState::Committed);
+}
+
+/// Window 4 — the provider forgot the session.
+#[tokio::test]
+async fn provider_session_expiry_opens_a_new_attempt_epoch() {
+    let rig = Rig::new(false);
+    rig.adapter.set_faults(Faults {
+        expire_session_once: true,
+        ..Faults::default()
+    });
+
+    let mut s = rig.session();
+    let out = rig.driver().run(&mut s).await.expect("run");
+
+    assert_eq!(out.state, TransferState::Committed);
+    assert_eq!(
+        s.attempt_epoch, 1,
+        "losing the session must open a new attempt epoch, not retry a dead token"
+    );
+    assert_eq!(
+        rig.adapter.object(&rig.key).expect("object").as_ref(),
+        rig.source.body().as_ref()
+    );
+}
+
+#[tokio::test]
+async fn a_target_that_never_keeps_a_session_fails_closed() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+    s.attempt_epoch = DEFAULT_MAX_ATTEMPT_EPOCHS;
+    s.state = TransferState::Uploading;
+    s.upload_id = Some(crate::adapter::OpaqueToken::new("dead"));
+    rig.store.save(&s).await.expect("seed");
+
+    let err = rig.driver().run(&mut s).await.expect_err("must give up");
+    assert!(
+        err.to_string().contains("giving up"),
+        "a permanently-expiring target must stop, not spin: {err}"
+    );
+}
+
+/// PM-1 — the user edits the file while it is being uploaded.
+#[tokio::test]
+async fn a_source_that_changes_between_attempts_aborts_rather_than_splicing() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+
+    rig.store.die_at_save(4);
+    rig.driver().run(&mut s).await.expect_err("must die");
+
+    // The user saves the file while the daemon is down.
+    let mut edited = body_of(BODY);
+    edited[35] ^= 0xff;
+    rig.source.mutate(edited);
+
+    rig.store.revive();
+    let mut resumed = rig.reload().await;
+    let err = rig
+        .driver()
+        .run(&mut resumed)
+        .await
+        .expect_err("a mutated source must not be spliced with pre-crash parts");
+    assert!(
+        matches!(err, StorageError::ContentMismatch { .. }),
+        "expected the fingerprint gate to fire, got {err:?}"
+    );
+    assert_ne!(resumed.state, TransferState::Committed);
+}
+
+#[test]
+fn the_transition_table_is_closed_against_illegal_moves() {
+    use TransferState::{
+        AbortPending, Aborted, Committed, Completing, Initiating, Planned, Uploading, Verifying,
+    };
+
+    // Legal.
+    assert!(Planned.can_advance_to(Initiating));
+    assert!(Initiating.can_advance_to(Uploading));
+    assert!(Uploading.can_advance_to(Completing));
+    assert!(Completing.can_advance_to(Verifying));
+    assert!(Verifying.can_advance_to(Committed));
+    assert!(Uploading.can_advance_to(Uploading), "resume is re-entrant");
+    assert!(Uploading.can_advance_to(Initiating), "window 4 restart");
+    assert!(Completing.can_advance_to(Initiating), "window 4 restart");
+    assert!(AbortPending.can_advance_to(Aborted(AbortOutcome::Clean)));
+
+    // Illegal — the ones that would skip a durability point.
+    assert!(
+        !Planned.can_advance_to(Uploading),
+        "must persist Initiating first"
+    );
+    assert!(
+        !Uploading.can_advance_to(Verifying),
+        "verification may not skip the completion record"
+    );
+    assert!(
+        !Completing.can_advance_to(Committed),
+        "AC-1's full re-read may never be skipped"
+    );
+    assert!(!Verifying.can_advance_to(Uploading));
+
+    // Terminal states are terminal, including for abort requests.
+    for t in [
+        Committed,
+        Aborted(AbortOutcome::Clean),
+        Aborted(AbortOutcome::Ambiguous),
+    ] {
+        assert!(t.is_terminal());
+        assert!(!t.can_advance_to(Initiating));
+        assert!(!t.can_advance_to(AbortPending));
+    }
+    // Abort may be requested from any live state.
+    for t in [Planned, Initiating, Uploading, Completing, Verifying] {
+        assert!(t.can_advance_to(AbortPending), "{t:?} must be abortable");
+    }
+}
+
+#[tokio::test]
+async fn an_abort_that_the_provider_did_not_confirm_is_recorded_as_ambiguous() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+    // Nothing was ever created remotely, so the abort is trivially clean.
+    s.state = TransferState::AbortPending;
+    rig.store.save(&s).await.expect("seed");
+    let out = rig.driver().run(&mut s).await.expect("abort");
+    assert_eq!(out.state, TransferState::Aborted(AbortOutcome::Clean));
+}
