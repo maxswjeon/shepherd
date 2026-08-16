@@ -16,3 +16,34 @@ path = "src/main.rs"
 
 [dependencies]
 shepherd-core.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# --- Phase 0b bake-off dependencies ------------------------------------------
+#
+# These are SPIKE dependencies, not production selections. Only the winner of
+# the §4.6 tiebreak survives into `shepherd-index` at Phase 1 (task T7); the
+# losers are dropped from this manifest at that point. `shepherd-bench` is
+# `publish = false` and is not depended on by any other workspace crate, so
+# nothing here reaches a shipping binary.
+
+# Candidate (a): in-RAM name arena + SIMD substring scan.
+memchr = "2"
+
+# Candidate (b): tantivy inverted index with an n-gram tokenizer.
+tantivy = "0.26.1"
+
+# Candidate (c): SQLite FTS5-trigram. `bundled` pins the SQLite build so the
+# measurement does not silently depend on whatever libsqlite3 the host ships.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Vector ANN under test (§4.6 primary; not a bake-off candidate — the bake-off
+# there is over f32/f16/i8 precision, not over crates).
+usearch = "2.26"
+
+# Fixture generation and the brute-force recall oracle are embarrassingly
+# parallel; the query clients are threads, not tasks (no async runtime in the
+# harness on purpose).
+rayon = "1"
