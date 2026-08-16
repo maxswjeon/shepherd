@@ -367,34 +367,74 @@ fn run_evidence(root: &Path, ev: &Evidence) -> CheckOutcome {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let (passed, failed) = parse_counts(&stdout);
-    classify(passed, failed, out.status.success(), &stderr)
+    classify(
+        passed,
+        failed,
+        saw_result_line(&stdout),
+        out.status.success(),
+        &stderr,
+    )
+}
+
+/// Did the harness print a `test result:` line *at all*?
+///
+/// Deliberately separate from [`parse_counts`], because "no line" and "a line
+/// summing to zero" are different facts and only one of them survives a
+/// `(u32, u32)` return. Collapsing them is what made a build failure and a
+/// misnamed test indistinguishable.
+fn saw_result_line(stdout: &str) -> bool {
+    stdout.lines().any(|l| l.trim().starts_with("test result:"))
 }
 
 /// The outcome decision, split out from the process so it is testable without
 /// spawning cargo.
 ///
-/// Zero counts have TWO causes and they mean opposite things:
+/// Zero counts have two causes that mean opposite things — the filter matched
+/// nothing (go rename a test) and the harness never ran (go fix a crate) — and
+/// **the discriminator is the presence of a `test result:` line, not the exit
+/// code.** A filter matching nothing still prints one, with zeroes. A compile
+/// error, a link error, or a blocked build-directory lock prints none.
 ///
-/// - the filter matched nothing — the named test does not exist, and cargo
-///   exits **0**, which is the defect this module is shaped around;
-/// - the harness never ran at all — a compile error, a link error, or a panic
-///   before the first `test result:` line — and cargo exits **non-zero**.
+/// The exit code is the wrong discriminator in both directions. Cargo exits
+/// **0** for an empty filter, which is the original defect; and an
+/// infrastructure failure can also exit 0, which an exit-code test reports as
+/// `MatchedNothing` — sending a reader to rename a test that exists. That
+/// second case is the one an earlier version of this function got wrong, and it
+/// is the reason the signal moved off the exit code.
 ///
-/// Only the exit code separates them, which is why the exit code is consulted
-/// here and nowhere else. Collapsing the two sends a reader to go rename a test
-/// that was fine all along, while the actual build failure goes unmentioned.
-/// That is not a hypothetical: it is how a green workspace produced a gate
-/// reporting ten missing tests, every one of which existed and passed.
-pub fn classify(passed: u32, failed: u32, success: bool, stderr: &str) -> CheckOutcome {
+/// The exit code survives only as corroboration: zeroes on a line we did see,
+/// with a non-zero exit, means one binary matched nothing while something else
+/// broke — indeterminate, not empty.
+///
+/// This is not hypothetical in either direction. A green workspace produced a
+/// gate reporting ten missing tests that all existed and passed; separately, a
+/// concurrent `cargo test --workspace` contending for the build directory
+/// produced a one-off "AC-1 failed" between two clean runs.
+pub fn classify(
+    passed: u32,
+    failed: u32,
+    saw_result_line: bool,
+    success: bool,
+    stderr: &str,
+) -> CheckOutcome {
+    if !saw_result_line {
+        return CheckOutcome::CouldNotRun {
+            detail: format!(
+                "no `test result:` line at all, so the harness never reached the tests. \
+                 Last lines of stderr:\n{}",
+                stderr_tail(stderr)
+            ),
+        };
+    }
     if passed == 0 && failed == 0 {
         if success {
             return CheckOutcome::MatchedNothing;
         }
-        return CheckOutcome::Failed {
+        return CheckOutcome::CouldNotRun {
             detail: format!(
-                "the test harness never ran — cargo exited non-zero and printed no \
-                 `test result:` line at all, so this is a BUILD failure, not a missing \
-                 test. Last lines of stderr:\n{}",
+                "a `test result:` line summing to zero, but cargo exited non-zero — one \
+                 binary matched nothing while another failed to run. Indeterminate, not \
+                 empty. Last lines of stderr:\n{}",
                 stderr_tail(stderr)
             ),
         };
@@ -457,34 +497,39 @@ mod tests {
         assert_eq!(parse_counts(out), (0, 0));
     }
 
-    /// The mirror defect, and the one that actually bit: zero counts with a
-    /// NON-zero exit is a build failure. Reporting it as an empty filter says
-    /// the test is missing when the test is fine, which is the most expensive
-    /// possible wrong answer — it points the reader at the wrong file.
+    /// The mirror defect, and the one that actually bit: a build failure
+    /// reported as an empty filter says the test is missing when the test is
+    /// fine — the most expensive possible wrong answer, because it points the
+    /// reader at the wrong file.
+    ///
+    /// Kept, but rewritten: this originally asserted `Failed { "BUILD failure" }`
+    /// because the first fix keyed on the exit code. The outcome is now
+    /// `CouldNotRun`, which is a better answer to the same question — the
+    /// distinction it draws is the one the reader needs, and it no longer
+    /// depends on the failure having exited non-zero. Deleted the old
+    /// expectation deliberately rather than leaving it asserting something
+    /// weaker than it reads.
     #[test]
     fn a_build_failure_is_not_an_empty_filter() {
-        let outcome = classify(0, 0, false, "error[E0432]: unresolved import `foo::Bar`");
-        match outcome {
-            CheckOutcome::Failed { detail } => {
-                assert!(detail.contains("BUILD failure"), "got: {detail}");
+        let stderr = "error[E0432]: unresolved import `foo::Bar`";
+        match classify(0, 0, false, false, stderr) {
+            CheckOutcome::CouldNotRun { detail } => {
                 assert!(
                     detail.contains("E0432"),
                     "stderr must be surfaced: {detail}"
                 );
             }
-            other => panic!(
-                "a non-zero exit with no test results must FAIL as a build error, got {other:?}"
-            ),
+            other => panic!("a build failure must not read as a missing test, got {other:?}"),
         }
     }
 
-    /// The two zero-count cases must not be collapsed in either direction
-    /// either: a filter that matched nothing still exits 0 and must stay
-    /// `MatchedNothing`, or the fix above would relabel every missing test as a
-    /// build failure and lose the original signal.
+    /// The two zero-count cases must not be collapsed in either direction: a
+    /// filter that matched nothing still prints its result line and exits 0,
+    /// and must stay `MatchedNothing`, or the fix above would relabel every
+    /// missing test as infrastructure and lose the original signal.
     #[test]
     fn an_empty_filter_still_reports_as_an_empty_filter() {
-        assert_eq!(classify(0, 0, true, ""), CheckOutcome::MatchedNothing);
+        assert_eq!(classify(0, 0, true, true, ""), CheckOutcome::MatchedNothing);
     }
 
     #[test]
@@ -560,17 +605,30 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 mod harness_tests {
     use super::*;
 
-    /// A filter that matched nothing DOES print a result line. An infrastructure
-    /// failure does not. That difference is the whole discriminator, and it is
-    /// worth a test because the two look identical at the exit-code level —
-    /// both non-zero, or in the filter case zero.
+    /// Drive the real decision, not a property of the fixture.
+    ///
+    /// An earlier version of these tests asserted `out.contains("test result:")`
+    /// on a string literal written two lines above, which cannot fail whatever
+    /// the gate does. `CouldNotRun` was declared, labelled, cloned and
+    /// "tested" while **no production path could emit it** — the module's own
+    /// defect, inside the fix for that defect. Every case below therefore goes
+    /// through [`classify`] and asserts the outcome.
+    fn classify_out(stdout: &str, success: bool, stderr: &str) -> CheckOutcome {
+        let (p, f) = parse_counts(stdout);
+        classify(p, f, saw_result_line(stdout), success, stderr)
+    }
+
+    /// A filter that matched nothing DOES print a result line, and must stay
+    /// `MatchedNothing` — otherwise the fix relabels every missing test as
+    /// infrastructure and the original signal is lost.
     #[test]
     fn a_zero_result_line_is_matched_nothing_not_a_harness_failure() {
         let out = "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 41 filtered out;\n";
-        assert!(out.contains("test result:"));
-        assert_eq!(parse_counts(out), (0, 0));
+        assert_eq!(classify_out(out, true, ""), CheckOutcome::MatchedNothing);
     }
 
+    /// Real harness output for the two infrastructure failures actually
+    /// observed on this branch.
     #[test]
     fn output_with_no_result_line_at_all_is_a_harness_failure() {
         for out in [
@@ -578,10 +636,41 @@ mod harness_tests {
             "Blocking waiting for file lock on build directory\n",
             "",
         ] {
-            assert!(
-                !out.contains("test result:"),
-                "no result line means the harness never ran tests: {out:?}"
-            );
+            match classify_out(out, false, out) {
+                CheckOutcome::CouldNotRun { .. } => {}
+                other => panic!("no result line must be CouldNotRun, got {other:?} for {out:?}"),
+            }
+        }
+    }
+
+    /// **The case an exit-code discriminator gets wrong, and the reason the
+    /// signal moved off the exit code.** An infrastructure failure that exits
+    /// 0 has no result line; reading the exit code alone calls that
+    /// `MatchedNothing` and sends someone to rename a test that exists.
+    #[test]
+    fn a_harness_failure_that_exits_zero_is_still_not_an_empty_filter() {
+        match classify_out(
+            "Blocking waiting for file lock on build directory\n",
+            true,
+            "",
+        ) {
+            CheckOutcome::CouldNotRun { .. } => {}
+            other => {
+                panic!("exit 0 with no result line must NOT read as an empty filter: {other:?}")
+            }
+        }
+    }
+
+    /// Zeroes on a line we did see, with a non-zero exit: one binary matched
+    /// nothing while another failed to run. Indeterminate, not empty.
+    #[test]
+    fn a_zero_line_with_a_failing_exit_is_indeterminate_not_empty() {
+        let out = "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 41 filtered out;\n";
+        match classify_out(out, false, "error: could not compile `shepherd-scan`") {
+            CheckOutcome::CouldNotRun { detail } => {
+                assert!(detail.contains("Indeterminate"), "got: {detail}");
+            }
+            other => panic!("expected CouldNotRun, got {other:?}"),
         }
     }
 
@@ -590,9 +679,11 @@ mod harness_tests {
     /// check as held-open.
     #[test]
     fn could_not_run_fails_and_says_it_is_not_a_verdict_on_the_evidence() {
-        let o = CheckOutcome::CouldNotRun {
-            detail: "error: could not compile".into(),
-        };
+        let o = classify_out(
+            "error: could not compile\n",
+            false,
+            "error: could not compile",
+        );
         assert!(!o.ok());
         assert!(o.label().contains("NOT a verdict"));
         assert!(o.label().contains("could not determine"));
