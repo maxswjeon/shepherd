@@ -243,6 +243,7 @@ impl TransferSession {
                     part_no: p.part_no,
                     size: p.len,
                     etag: e.clone(),
+                    checksum: None,
                 })
             })
             .collect();

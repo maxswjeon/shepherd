@@ -186,6 +186,65 @@ pub enum CreatePrecondition {
     Unconditional,
 }
 
+/// A provider-computed checksum algorithm that supports **whole-object** values
+/// on multipart uploads.
+///
+/// Only these three do. `SHA1`/`SHA256` are COMPOSITE-only for multipart — a
+/// digest-of-digests, which is why an ordinary multipart ETag cannot be
+/// compared against a checksum of the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChecksumAlgorithm {
+    Crc32,
+    Crc32c,
+    Crc64Nvme,
+}
+
+impl ChecksumAlgorithm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChecksumAlgorithm::Crc32 => "CRC32",
+            ChecksumAlgorithm::Crc32c => "CRC32C",
+            ChecksumAlgorithm::Crc64Nvme => "CRC64NVME",
+        }
+    }
+}
+
+/// A provider-attested checksum covering the **whole object**.
+///
+/// # What this is for, and what it is emphatically NOT for
+///
+/// It is for **scrub** (PM-2): re-verifying, on a rolling window, that a stored
+/// object has not silently rotted. Without it the only way to check a multipart
+/// object's integrity is to read all of it back, and per the Phase-0b capacity
+/// model the 2% of files large enough to be multipart hold **60.3% of the
+/// bytes** — so full-read scrub is what puts that gate 18x over budget on S3
+/// Standard. A whole-object checksum returned by HEAD moves those objects onto
+/// the cheap path.
+///
+/// It is **not** a substitute for AC-1's full BLAKE3 re-read before
+/// destruction, for two independent reasons:
+///
+/// 1. It is a different function over different bytes-of-record — a CRC is not
+///    BLAKE3, and Shepherd's identity is BLAKE3.
+/// 2. It is **provider-computed**. Asking a provider to attest its own storage
+///    is fine for detecting bit rot, which is an accident, and worthless
+///    against a provider that is wrong about its own bytes. AC-1's re-read is
+///    Shepherd hashing bytes it received; this is the provider reporting a
+///    number it stored. Those are different claims and only one of them may
+///    gate an irreversible delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectChecksum {
+    pub algorithm: ChecksumAlgorithm,
+    /// Base64 as the provider returned it. Compared, never parsed.
+    pub value: String,
+    /// True when the provider says this covers the whole object rather than
+    /// being a composite digest-of-digests. **A composite value must never be
+    /// compared against a checksum of the bytes** — it would never match, and
+    /// treating a mismatch as corruption would alarm on every multipart object.
+    pub whole_object: bool,
+}
+
 /// What Shepherd knows about a remote object after a HEAD or a create.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -195,6 +254,10 @@ pub struct ObjectMeta {
     pub version: Option<ObjectVersion>,
     /// Opaque. Not a content hash — see the module docs.
     pub etag: Option<OpaqueToken>,
+    /// Present only where the provider supports whole-object checksums and the
+    /// object was uploaded with one requested. `None` means the scrub path must
+    /// fall back to a full read for this object.
+    pub whole_object_checksum: Option<ObjectChecksum>,
 }
 
 /// The receipt for a completed create, single-shot or multipart.
@@ -211,6 +274,13 @@ pub struct PartReceipt {
     pub part_no: u32,
     pub size: u64,
     pub etag: OpaqueToken,
+    /// The per-part checksum, when the session requested one.
+    ///
+    /// Carried because `CompleteMultipartUpload` must echo each part's checksum
+    /// back alongside its ETag — verified against MinIO, which otherwise
+    /// rejects the completion with `InvalidPart`. Opaque like the ETag: sent
+    /// back, never interpreted.
+    pub checksum: Option<String>,
 }
 
 /// A multipart upload the provider still considers live.

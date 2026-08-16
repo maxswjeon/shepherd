@@ -265,6 +265,7 @@ impl StorageAdapter for MemAdapter {
             part_no,
             size,
             etag,
+            checksum: None,
         })
     }
 
@@ -294,6 +295,7 @@ impl StorageAdapter for MemAdapter {
                 part_no: *no,
                 size: b.len() as u64,
                 etag: e.clone(),
+                checksum: None,
             })
             .collect();
         v.sort_by_key(|p| p.part_no);
@@ -398,6 +400,9 @@ impl StorageAdapter for MemAdapter {
             size: b.len() as u64,
             version: v.clone(),
             etag: Some(OpaqueToken::new("head-etag")),
+            // The in-memory adapter models no provider checksum: the scrub
+            // fallback path is what it exercises.
+            whole_object_checksum: None,
         }))
     }
 

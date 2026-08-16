@@ -327,6 +327,7 @@ mod tests {
                 part_no: 1,
                 size: len,
                 etag: OpaqueToken::new("e1"),
+                checksum: None,
             },
             // The provider really does hold part 2 — but no durable record
             // proves it is ours, so it must not be adopted.
@@ -334,6 +335,7 @@ mod tests {
                 part_no: 2,
                 size: len,
                 etag: OpaqueToken::new("e2"),
+                checksum: None,
             },
         ];
 
@@ -367,6 +369,7 @@ mod tests {
             part_no: 1,
             size: len,
             etag: OpaqueToken::new("other"),
+            checksum: None,
         }];
         assert_eq!(
             reconcile_parts(&plan, &cp("mine"), &remote_wrong_tag).actions[0],
@@ -378,6 +381,7 @@ mod tests {
             part_no: 1,
             size: len - 1,
             etag: OpaqueToken::new("mine"),
+            checksum: None,
         }];
         assert_eq!(
             reconcile_parts(&plan, &cp("mine"), &remote_short).actions[0],
@@ -431,6 +435,7 @@ mod tests {
             part_no: 1,
             size: len,
             etag: OpaqueToken::new("e1"),
+            checksum: None,
         }];
         assert!(reconcile_parts(&plan, &local, &remote).is_complete());
     }

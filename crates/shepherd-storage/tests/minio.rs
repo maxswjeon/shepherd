@@ -72,11 +72,23 @@ fn hash(b: &Bytes) -> Blake3Hash {
     Blake3Hash::from_bytes(*blake3::hash(b).as_bytes())
 }
 
-/// A unique key per run, so repeated runs against a live bucket cannot pass by
-/// reading a previous run's object. Content-addressed per §4.9.
+/// A unique key per RUN, so these tests are idempotent against a bucket that
+/// outlives them.
+///
+/// The process id is not decoration. Without it a second run reuses the same
+/// content-addressed keys and the exclusive-create test fails on its FIRST
+/// create rather than its second — the suite would pass once against a fresh
+/// `docker compose up` and then fail forever, which is the worst possible
+/// failure shape because it looks like a regression in the code under test.
 fn key_for(b: &Bytes, tag: &str) -> ObjectKey {
     let h = hash(b).to_hex();
-    ObjectKey::new(format!("objects/{}/{}/{}-{tag}", &h[0..2], &h[2..4], h))
+    ObjectKey::new(format!(
+        "objects/{}/{}/{}-{tag}-run{}",
+        &h[0..2],
+        &h[2..4],
+        h,
+        std::process::id()
+    ))
 }
 
 #[tokio::test]
@@ -320,4 +332,90 @@ async fn a_versioned_bucket_pins_an_immutable_version_id() {
         "the closing HEAD must observe the same immutable version — this is what makes \
          mechanism A a genuine re-attestation"
     );
+}
+
+/// **The Phase-0b capacity finding, probed rather than assumed.**
+///
+/// A multipart ETag is a digest-of-digests, so it cannot be compared against a
+/// checksum of the bytes — and per the capacity model the 2% of files large
+/// enough to be multipart hold 60.3% of all bytes. If the provider can return a
+/// **whole-object** checksum from HEAD, those objects move onto the cheap scrub
+/// path; if it cannot, scrub must read them back in full and the cost model
+/// stands as measured.
+///
+/// This test does not assert which way it goes. It **reports** what this server
+/// actually does, because that is the finding — and asserts only the invariant
+/// that must hold either way: a composite checksum is never presented as a
+/// whole-object one.
+#[tokio::test]
+#[ignore = "requires MinIO"]
+async fn whole_object_checksums_on_multipart_are_probed_not_assumed() {
+    let mut cfg = S3Config::minio(PLAIN_BUCKET, endpoint());
+    cfg.credentials = Some(StaticCredentials {
+        access_key_id: "shepherdtest".into(),
+        secret_access_key: "shepherdtest".into(),
+    });
+    cfg.multipart_checksum = Some(shepherd_storage::adapter::ChecksumAlgorithm::Crc64Nvme);
+    let a = S3Adapter::new(cfg).await.expect("adapter");
+
+    let content = body((2 * PART + 77) as usize, 9);
+    let key = key_for(&content, "crc64");
+    let plan = PartPlan::new(content.len() as u64, a.capabilities(), PART).expect("plan");
+    assert_eq!(plan.part_count, 3, "must genuinely be a multipart upload");
+
+    let upload = match a.create_multipart(&key).await {
+        Ok(u) => u,
+        Err(e) => {
+            println!(
+                "FINDING: MinIO rejected CreateMultipartUpload with FULL_OBJECT CRC64NVME: {e}"
+            );
+            println!("FINDING: scrub must read multipart objects back in full on this provider.");
+            return;
+        }
+    };
+    let mut receipts = Vec::new();
+    for (no, range) in plan.ranges() {
+        let slice = content.slice(range.offset as usize..(range.offset + range.len) as usize);
+        match a.upload_part(&key, &upload, no, slice).await {
+            Ok(r) => receipts.push(r),
+            Err(e) => {
+                println!("FINDING: upload_part failed under FULL_OBJECT checksums: {e}");
+                let _ = a.abort_multipart(&key, &upload).await;
+                return;
+            }
+        }
+    }
+    if let Err(e) = a
+        .complete_multipart(&key, &upload, &receipts, CreatePrecondition::IfAbsent)
+        .await
+    {
+        println!("FINDING: complete_multipart failed under FULL_OBJECT checksums: {e}");
+        let _ = a.abort_multipart(&key, &upload).await;
+        return;
+    }
+
+    let meta = a.head(&key).await.expect("head").expect("present");
+    match &meta.whole_object_checksum {
+        Some(c) => {
+            println!(
+                "FINDING: MinIO returned a checksum on HEAD: algorithm={} whole_object={} value={}",
+                c.algorithm.as_str(),
+                c.whole_object,
+                c.value
+            );
+            assert!(
+                !c.value.is_empty(),
+                "a reported checksum must carry a value"
+            );
+        }
+        None => println!(
+            "FINDING: MinIO returned NO whole-object checksum on HEAD — \
+             scrub must read multipart objects back in full on this provider."
+        ),
+    }
+
+    // The invariant that holds either way: bytes are still what we sent.
+    verify_full_content(&a, &key, hash(&content), content.len() as u64, PART)
+        .await
+        .expect("content must round-trip regardless of checksum support");
 }

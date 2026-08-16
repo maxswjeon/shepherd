@@ -40,9 +40,10 @@ use bytes::Bytes;
 use shepherd_core::{ObjectKey, ObjectVersion};
 
 use crate::adapter::{
-    AdapterCapabilities, AttestationMode, ByteRange, ControlKey, CreatePrecondition, CreateReceipt,
-    IncompleteUpload, ListPage, ListVisibility, ObjectMeta, OpaqueToken, PartReceipt,
-    StorageAdapter, StorageError, StorageResult, VersionGuard,
+    AdapterCapabilities, AttestationMode, ByteRange, ChecksumAlgorithm, ControlKey,
+    CreatePrecondition, CreateReceipt, IncompleteUpload, ListPage, ListVisibility, ObjectChecksum,
+    ObjectMeta, OpaqueToken, PartReceipt, StorageAdapter, StorageError, StorageResult,
+    VersionGuard,
 };
 
 /// S3 minimum non-final part size.
@@ -79,8 +80,19 @@ pub struct S3Config {
     pub region: Option<String>,
     /// MinIO and most compatibles need path style.
     pub force_path_style: bool,
-    /// `None` falls back to the ambient credential chain.
+    /// `None` uses the ambient credential chain.
     pub credentials: Option<StaticCredentials>,
+    /// Request a **whole-object** checksum on every multipart upload.
+    ///
+    /// This is a Phase-2 upload-time decision that cannot be retrofitted
+    /// without re-uploading every object, which is why it is a config rather
+    /// than something the scrub path turns on later. Per the Phase-0b capacity
+    /// model, the 2% of files large enough to be multipart hold 60.3% of the
+    /// bytes, and their ETags are digest-of-digests, so without this the only
+    /// integrity check available for them is a full read.
+    ///
+    /// `None` means the scrub path must read those objects back in full.
+    pub multipart_checksum: Option<ChecksumAlgorithm>,
 }
 
 impl S3Config {
@@ -92,6 +104,7 @@ impl S3Config {
             region: Some("us-east-1".into()),
             force_path_style: true,
             credentials: None,
+            multipart_checksum: None,
         }
     }
 }
@@ -102,6 +115,15 @@ pub struct S3Adapter {
     client: aws_sdk_s3::Client,
     bucket: String,
     caps: AdapterCapabilities,
+    multipart_checksum: Option<ChecksumAlgorithm>,
+}
+
+fn to_sdk_algorithm(a: ChecksumAlgorithm) -> aws_sdk_s3::types::ChecksumAlgorithm {
+    match a {
+        ChecksumAlgorithm::Crc32 => aws_sdk_s3::types::ChecksumAlgorithm::Crc32,
+        ChecksumAlgorithm::Crc32c => aws_sdk_s3::types::ChecksumAlgorithm::Crc32C,
+        ChecksumAlgorithm::Crc64Nvme => aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme,
+    }
 }
 
 impl S3Adapter {
@@ -129,6 +151,7 @@ impl S3Adapter {
         Ok(Self {
             client: aws_sdk_s3::Client::from_conf(b.build()),
             bucket: cfg.bucket,
+            multipart_checksum: cfg.multipart_checksum,
             caps: AdapterCapabilities {
                 provider: "s3",
                 // S3 has offered `If-None-Match: *` on PUT and
@@ -265,11 +288,22 @@ impl StorageAdapter for S3Adapter {
     }
 
     async fn create_multipart(&self, key: &ObjectKey) -> StorageResult<OpaqueToken> {
-        let out = self
+        let mut req = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
-            .key(key.as_str())
+            .key(key.as_str());
+        // FULL_OBJECT, not COMPOSITE. A composite value is a digest-of-digests
+        // over the part checksums and can never be compared against a checksum
+        // of the bytes — which is precisely why a multipart ETag is useless for
+        // scrub. Only CRC32/CRC32C/CRC64NVME support FULL_OBJECT; the SHA
+        // algorithms are composite-only for multipart.
+        if let Some(alg) = self.multipart_checksum {
+            req = req
+                .checksum_algorithm(to_sdk_algorithm(alg))
+                .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject);
+        }
+        let out = req
             .send()
             .await
             .map_err(|e| Self::map_err("create_multipart_upload", key.as_str(), e))?;
@@ -290,14 +324,26 @@ impl StorageAdapter for S3Adapter {
         body: Bytes,
     ) -> StorageResult<PartReceipt> {
         let size = body.len() as u64;
-        let out = self
+        let mut req = self
             .client
             .upload_part()
             .bucket(&self.bucket)
             .key(key.as_str())
             .upload_id(upload_id.as_opaque())
             .part_number(i32::try_from(part_no).unwrap_or(i32::MAX))
-            .body(ByteStream::from(body.to_vec()))
+            .body(ByteStream::from(body.to_vec()));
+        // The part checksum algorithm MUST match the one the session was
+        // created with. Verified against MinIO, which accepts the session and
+        // then rejects the first part:
+        //
+        //   InvalidArgument: (checksum missing, want "CRC64NVME", got "CRC32")
+        //
+        // The SDK otherwise defaults the part to CRC32, so omitting this makes
+        // every whole-object upload fail at part 1 rather than at setup.
+        if let Some(alg) = self.multipart_checksum {
+            req = req.checksum_algorithm(to_sdk_algorithm(alg));
+        }
+        let out = req
             .send()
             .await
             .map_err(|e| Self::map_err("upload_part", key.as_str(), e))?;
@@ -306,6 +352,11 @@ impl StorageAdapter for S3Adapter {
             size,
             // Opaque. Compared against a durable checkpoint, never parsed.
             etag: OpaqueToken::new(out.e_tag().unwrap_or_default()),
+            checksum: out
+                .checksum_crc64_nvme()
+                .or_else(|| out.checksum_crc32_c())
+                .or_else(|| out.checksum_crc32())
+                .map(str::to_owned),
         })
     }
 
@@ -340,6 +391,11 @@ impl StorageAdapter for S3Adapter {
                     part_no: u32::try_from(p.part_number().unwrap_or_default()).unwrap_or_default(),
                     size: u64::try_from(p.size().unwrap_or_default()).unwrap_or_default(),
                     etag: OpaqueToken::new(p.e_tag().unwrap_or_default()),
+                    checksum: p
+                        .checksum_crc64_nvme()
+                        .or_else(|| p.checksum_crc32_c())
+                        .or_else(|| p.checksum_crc32())
+                        .map(str::to_owned),
                 });
             }
 
@@ -373,10 +429,20 @@ impl StorageAdapter for S3Adapter {
         let completed: Vec<CompletedPart> = parts
             .iter()
             .map(|p| {
-                CompletedPart::builder()
+                let mut b = CompletedPart::builder()
                     .part_number(i32::try_from(p.part_no).unwrap_or(i32::MAX))
-                    .e_tag(p.etag.as_opaque())
-                    .build()
+                    .e_tag(p.etag.as_opaque());
+                // Echo the part checksum back. Without it MinIO rejects the
+                // completion with `InvalidPart` — the ETag alone is not enough
+                // once the session was created with a checksum algorithm.
+                if let (Some(c), Some(alg)) = (p.checksum.as_deref(), self.multipart_checksum) {
+                    b = match alg {
+                        ChecksumAlgorithm::Crc64Nvme => b.checksum_crc64_nvme(c),
+                        ChecksumAlgorithm::Crc32c => b.checksum_crc32_c(c),
+                        ChecksumAlgorithm::Crc32 => b.checksum_crc32(c),
+                    };
+                }
+                b.build()
             })
             .collect();
 
@@ -475,12 +541,34 @@ impl StorageAdapter for S3Adapter {
             .send()
             .await
         {
-            Ok(o) => Ok(Some(ObjectMeta {
-                key: key.clone(),
-                size: u64::try_from(o.content_length().unwrap_or_default()).unwrap_or_default(),
-                version: o.version_id().map(ObjectVersion::new),
-                etag: o.e_tag().map(OpaqueToken::new),
-            })),
+            Ok(o) => {
+                // Only report a checksum the provider says covers the WHOLE
+                // object. A composite value would never match a checksum of the
+                // bytes, so surfacing it would make every multipart object look
+                // corrupt on the first scrub.
+                let whole_object =
+                    o.checksum_type() == Some(&aws_sdk_s3::types::ChecksumType::FullObject);
+                let checksum = [
+                    (ChecksumAlgorithm::Crc64Nvme, o.checksum_crc64_nvme()),
+                    (ChecksumAlgorithm::Crc32c, o.checksum_crc32_c()),
+                    (ChecksumAlgorithm::Crc32, o.checksum_crc32()),
+                ]
+                .into_iter()
+                .find_map(|(algorithm, v)| {
+                    v.map(|value| ObjectChecksum {
+                        algorithm,
+                        value: value.to_owned(),
+                        whole_object,
+                    })
+                });
+                Ok(Some(ObjectMeta {
+                    key: key.clone(),
+                    size: u64::try_from(o.content_length().unwrap_or_default()).unwrap_or_default(),
+                    version: o.version_id().map(ObjectVersion::new),
+                    etag: o.e_tag().map(OpaqueToken::new),
+                    whole_object_checksum: checksum,
+                }))
+            }
             // Absence is a legitimate answer to a HEAD, not an error — the
             // ambiguous-completion path asks exactly this question.
             Err(e) => match Self::map_err("head_object", key.as_str(), e) {
