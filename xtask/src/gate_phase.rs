@@ -118,6 +118,21 @@ pub enum CheckOutcome {
     MissingEnv {
         var: String,
     },
+    /// The test harness itself could not run — a build failure, a lock on the
+    /// target directory, a toolchain problem. **Not** a statement about the
+    /// evidence.
+    ///
+    /// Distinguished because it fails for a different reason and wants a
+    /// different response. A gate that reports "AC-1 failed" when the truth is
+    /// "cargo could not build" sends someone to debug the wrong thing — and if
+    /// it happens intermittently it teaches people to re-run until green, which
+    /// corrodes the gate faster than a wrong answer would.
+    ///
+    /// It still fails the gate. "Could not determine" is not a pass here for
+    /// the same reason it is not one in the acquisition floors.
+    CouldNotRun {
+        detail: String,
+    },
 }
 
 impl CheckOutcome {
@@ -133,6 +148,11 @@ impl CheckOutcome {
                  why the count is asserted rather than the exit code"
                     .into()
             }
+            CheckOutcome::CouldNotRun { detail } => format!(
+                "FAIL — the test harness could not run ({detail}). This is NOT a verdict on \
+                 the evidence: re-run once the build is clean. It still fails the gate, \
+                 because \"could not determine\" is not a pass"
+            ),
             CheckOutcome::MissingEnv { var } => format!(
                 "FAIL — ${var} is not set, so this evidence could not be produced. Absent \
                  evidence fails; skipping is how \"not run\" becomes \"passed\""
@@ -315,6 +335,9 @@ fn clone_outcome(o: &CheckOutcome) -> CheckOutcome {
         },
         CheckOutcome::MatchedNothing => CheckOutcome::MatchedNothing,
         CheckOutcome::MissingEnv { var } => CheckOutcome::MissingEnv { var: var.clone() },
+        CheckOutcome::CouldNotRun { detail } => CheckOutcome::CouldNotRun {
+            detail: detail.clone(),
+        },
     }
 }
 
@@ -530,5 +553,48 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             missing_reason: None,
         };
         assert!(!one_bad.ok());
+    }
+}
+
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+
+    /// A filter that matched nothing DOES print a result line. An infrastructure
+    /// failure does not. That difference is the whole discriminator, and it is
+    /// worth a test because the two look identical at the exit-code level —
+    /// both non-zero, or in the filter case zero.
+    #[test]
+    fn a_zero_result_line_is_matched_nothing_not_a_harness_failure() {
+        let out = "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 41 filtered out;\n";
+        assert!(out.contains("test result:"));
+        assert_eq!(parse_counts(out), (0, 0));
+    }
+
+    #[test]
+    fn output_with_no_result_line_at_all_is_a_harness_failure() {
+        for out in [
+            "error: could not compile `shepherd-tier`\n",
+            "Blocking waiting for file lock on build directory\n",
+            "",
+        ] {
+            assert!(
+                !out.contains("test result:"),
+                "no result line means the harness never ran tests: {out:?}"
+            );
+        }
+    }
+
+    /// It still fails the gate. "Could not determine" is not a pass — the same
+    /// posture as the acquisition floors treating an indeterminate open-handle
+    /// check as held-open.
+    #[test]
+    fn could_not_run_fails_and_says_it_is_not_a_verdict_on_the_evidence() {
+        let o = CheckOutcome::CouldNotRun {
+            detail: "error: could not compile".into(),
+        };
+        assert!(!o.ok());
+        assert!(o.label().contains("NOT a verdict"));
+        assert!(o.label().contains("could not determine"));
     }
 }
