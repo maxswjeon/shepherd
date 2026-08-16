@@ -18,6 +18,7 @@ pub mod breaker;
 pub mod destroy;
 pub mod discard;
 pub mod fidelity;
+pub mod restore;
 pub mod revalidate;
 pub mod serialize;
 
@@ -35,5 +36,6 @@ pub use fidelity::{
     AttrCapture, AttrClass, CoreAttrs, FidelityBreach, FidelityManifest, RestoreTarget,
     RestoredAttrs, choose_restore_path, verify_restore,
 };
+pub use restore::{RestoreError, RestoreOutcome, read_back, restore_file};
 pub use revalidate::{ClosingCheck, DestroyRefusal, Location, LocationState, destroy_permitted};
 pub use serialize::FileLocks;
