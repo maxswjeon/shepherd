@@ -1,0 +1,107 @@
+//! Post-upload verification (AC-1).
+//!
+//! # Thin, and the thinness is the point
+//!
+//! `shepherd-storage::verify_full_content` is the full re-read. This module
+//! adds only what the *tiering decision* needs on top of it: pin the
+//! attestation, and refuse to record a location as verified on a target that
+//! could never authorize a destruction anyway.
+//!
+//! # A HEAD is not a verification, and the type says so
+//!
+//! PM-2's distinction is that `last_presence_check_at` and
+//! `last_full_hash_verified_at` are different columns because they are
+//! different claims. [`VerifiedLocation`] carries both timestamps separately
+//! for the same reason: a caller cannot accidentally satisfy AC-1 by writing
+//! the cheap one.
+
+use shepherd_core::{Blake3Hash, ObjectKey, ObjectVersion, TargetId, Timestamp};
+use shepherd_storage::adapter::{
+    AttestationMode, StorageAdapter, StorageError, StorageResult, verify_full_content,
+};
+
+/// The chunk size for the streaming full-content read.
+pub const VERIFY_CHUNK: u64 = 16 * 1024 * 1024;
+
+/// What a successful verification established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedLocation {
+    pub target: TargetId,
+    pub key: ObjectKey,
+    pub size: u64,
+    /// Pinned under mechanism A; `None` under B.
+    pub object_version: Option<ObjectVersion>,
+    pub attestation_mode: AttestationMode,
+    /// A HEAD proved the object exists. **Presence only.**
+    pub presence_checked_at: Timestamp,
+    /// A full read proved the bytes hash correctly. This is AC-1's claim, and
+    /// it is never set by a HEAD.
+    pub full_hash_verified_at: Timestamp,
+}
+
+/// Verify an uploaded object end to end.
+///
+/// HEAD for existence and size, then the mandatory full re-read, then the
+/// attestation probe. The order matters: probing attestation first would let a
+/// target that cannot attest at all still pay for a full read.
+pub async fn verify_upload(
+    adapter: &dyn StorageAdapter,
+    key: &ObjectKey,
+    expected: Blake3Hash,
+    expected_size: u64,
+    target: TargetId,
+    now: Timestamp,
+) -> StorageResult<VerifiedLocation> {
+    let meta = adapter
+        .head(key)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            key: key.as_str().to_owned(),
+        })?;
+    if meta.size != expected_size {
+        return Err(StorageError::ContentMismatch {
+            key: key.as_str().to_owned(),
+            expected: format!("{expected_size} bytes"),
+            actual: format!("{} bytes", meta.size),
+        });
+    }
+
+    // AC-1. Streamed by range: a 50 GB object read into one buffer would need
+    // 50 GB of RAM, and these are exactly the objects the tier path exists for.
+    verify_full_content(adapter, key, expected, expected_size, VERIFY_CHUNK).await?;
+
+    let mode = adapter.probe_attestation_mode().await?;
+    if mode == AttestationMode::None {
+        // The bytes are correct and the upload succeeded — but this target can
+        // never authorize destroying the original, so recording the location as
+        // custody-bearing would overstate what was established. Fail closed
+        // here rather than let §4.10.2's predicate discover it later.
+        return Err(StorageError::Unsupported {
+            provider: adapter.capabilities().provider,
+            what: format!(
+                "target has no attestation mechanism, so {} can hold a replica but never \
+                 authorize a destruction",
+                key.as_str()
+            ),
+        });
+    }
+
+    Ok(VerifiedLocation {
+        target,
+        key: key.clone(),
+        size: meta.size,
+        // Pinned only where the provider actually attests it. Recording a
+        // version under mechanism B would invite a later closing HEAD to
+        // "re-attest" against a value the provider never guaranteed.
+        object_version: (mode == AttestationMode::Version)
+            .then_some(meta.version)
+            .flatten(),
+        attestation_mode: mode,
+        presence_checked_at: now,
+        full_hash_verified_at: now,
+    })
+}
+
+#[cfg(test)]
+#[path = "verify_tests.rs"]
+mod tests;

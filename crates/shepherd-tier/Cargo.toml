@@ -25,6 +25,9 @@ shepherd-rules.workspace = true
 shepherd-scan.workspace = true
 shepherd-storage.workspace = true
 blake3 = { workspace = true }
+# `upload.rs`'s `SourceReader` hands ranges to the transfer driver as `Bytes`.
+# Was dev-only until the real upload path landed.
+bytes = { workspace = true }
 # The breaker's rolling rate window and candidate set are PERSISTED (§4.4's
 # `discard_rate_window` / `discard_candidate`). An in-memory counter would make
 # the breaker evadable by restarting the daemon, which is the failure a rate
@@ -40,7 +43,6 @@ shepherd-rules = { workspace = true }
 shepherd-catalog = { workspace = true }
 shepherd-scan = { workspace = true }
 blake3 = { workspace = true }
-bytes = { workspace = true }
 serde_json = { workspace = true }
 # §4.1 rule 4 makes a second `StorageAdapter` double ILLEGAL, not merely
 # wasteful: `delete_object` may be implemented only under
