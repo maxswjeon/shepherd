@@ -2652,6 +2652,7 @@ dependencies = [
  "clap",
  "serde_json",
  "shepherd-core",
+ "shepherd-obs",
  "shepherd-proto",
 ]
 
@@ -2668,9 +2669,18 @@ dependencies = [
 name = "shepherd-daemon"
 version = "0.1.0"
 dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "shepherd-catalog",
  "shepherd-core",
+ "shepherd-jobs",
  "shepherd-obs",
  "shepherd-proto",
+ "shepherd-scan",
+ "shepherd-secrets",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -2698,7 +2708,11 @@ dependencies = [
 name = "shepherd-jobs"
 version = "0.1.0"
 dependencies = [
+ "rusqlite",
+ "shepherd-catalog",
  "shepherd-core",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -2721,7 +2735,10 @@ dependencies = [
 name = "shepherd-placeholder"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "shepherd-core",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -2745,7 +2762,13 @@ dependencies = [
 name = "shepherd-rules"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "globset",
+ "serde",
+ "serde_json",
+ "shepherd-catalog",
  "shepherd-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -2755,6 +2778,7 @@ dependencies = [
  "blake3",
  "ignore",
  "shepherd-core",
+ "shepherd-obs",
  "thiserror",
  "tracing",
 ]
@@ -2763,7 +2787,10 @@ dependencies = [
 name = "shepherd-secrets"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "shepherd-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -2788,8 +2815,22 @@ dependencies = [
 name = "shepherd-tier"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
+ "memmap2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "shepherd-catalog",
  "shepherd-core",
  "shepherd-placeholder",
+ "shepherd-rules",
+ "shepherd-scan",
+ "shepherd-storage",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
