@@ -15,5 +15,12 @@ name = "shepctl"
 path = "src/main.rs"
 
 [dependencies]
+# `shepherd-core` is here for one reason: it is the only crate that may depend
+# on BOTH the domain enums and the wire enums, so the test asserting that
+# `StubMode` serializes identically on each side can only live here (§4.1 rule 1
+# forbids `shepherd-proto` from depending on `shepherd-core`).
 shepherd-core.workspace = true
 shepherd-proto.workspace = true
+
+clap = { workspace = true }
+serde_json = { workspace = true }
