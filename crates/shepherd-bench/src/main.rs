@@ -10,11 +10,19 @@
 //! number produced then have to be comparable, which they only are if the
 //! measuring apparatus is the same code.
 //!
-//! **The candidates do not survive.** The three metadata candidate
-//! implementations in `meta_bench.rs` are spike code written to be measured, not
-//! to be shipped. Exactly one of them is re-implemented properly in
-//! `shepherd-index/src/meta.rs` at Phase 1 (task T7), and at that point the
-//! other two, plus their entries in this crate's manifest, are deleted.
+//! **The candidates did not survive, and this is that deletion.** `meta_bench.rs`
+//! held all three metadata candidates as spike code written to be measured, not
+//! shipped; the bake-off is decided (`docs/adr/0b-index-decision.md`) and the
+//! winner — the in-RAM SIMD arena — is re-implemented properly in
+//! `shepherd-index/src/meta.rs`. The file and the `tantivy` dependency that
+//! served the losing candidate are gone.
+//!
+//! **What this costs, stated rather than discovered later:** `shepherd-bench` can
+//! no longer benchmark the metadata index at all. §9's Phase 5 gate requires the
+//! bench re-run against the real `fixtures/corpus-10m` warm and cold, so that leg
+//! has to come back — but pointed at `shepherd-index` rather than at a private
+//! copy of a candidate. Re-adding it as a `shepherd-index` dependency is the
+//! correct shape and is a Phase 5 task; re-adding the spike would not be.
 //!
 //! # Why the contract is a file and not flags
 //!
@@ -27,7 +35,6 @@
 
 mod ann_bench;
 mod generate;
-mod meta_bench;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -71,13 +78,13 @@ pub struct ReferenceMachine {
     /// A benchmark whose toolchain is not recorded cannot be re-run for
     /// comparison, which defeats the point of a precommitted contract.
     pub rustc: String,
-    /// The SQLite the FTS5-trigram candidate was actually measured against.
-    /// `rusqlite` 0.37 and 0.40.2 bundle different SQLite versions, and FTS5
-    /// performance moves between SQLite releases — so measuring on a SQLite the
-    /// product does not ship would make this decision describe something else.
+    /// The bundled SQLite the fixture and capacity primitives were measured
+    /// against. It mattered acutely while FTS5-trigram was a live candidate —
+    /// `rusqlite` 0.37 and 0.40.2 bundle different SQLite versions and FTS5
+    /// performance moves between releases — and it still matters for the catalog
+    /// fixture and the WAL/checkpoint figures behind the 50 TB model.
     pub sqlite_bundled: String,
     pub usearch: String,
-    pub tantivy: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -551,8 +558,6 @@ COMMANDS:
   gen-trace                Write the committed query trace from the contract seed.
   gen-catalog              Generate the SQLite catalog fixture (contract rows).
   capacity                 Measure the 50 TB model's DB/WAL/checkpoint primitives.
-  build-meta   <candidate> Build one metadata index: arena | tantivy | fts5
-  bench-meta   <candidate> Benchmark one metadata candidate.
   build-ann    <precision> Build usearch shards: f32 | f16 | i8
   bench-ann    <precision> Benchmark one usearch precision.
   recall-ann   <precision> Recall@10 vs an exact brute-force oracle.
@@ -663,8 +668,6 @@ fn run() -> Result<(), String> {
         "gen-trace" => generate::gen_trace(&args),
         "gen-catalog" => generate::gen_catalog(&args),
         "capacity" => generate::capacity(&args),
-        "build-meta" => meta_bench::build(&args),
-        "bench-meta" => meta_bench::bench(&args),
         "build-ann" => ann_bench::build(&args),
         "bench-ann" => ann_bench::bench(&args),
         "recall-ann" => ann_bench::recall(&args),
@@ -734,15 +737,19 @@ fn smoke() -> Result<(), String> {
         return Err("memchr smoke: expected exactly 1 hit".into());
     }
 
-    // -- SQLite FTS5 trigram ----------------------------------------------
-    // FTS5 and the trigram tokenizer are both compile-time SQLite options. If
-    // `bundled` ever stops enabling them this line is where we find out.
+    // -- SQLite ------------------------------------------------------------
+    // Narrowed from an FTS5-trigram check when that candidate was eliminated.
+    // What the surviving harness actually needs from SQLite is what
+    // `gen-catalog` and `capacity` do: create a table, insert, query, and run a
+    // WAL checkpoint. Testing FTS5 here would assert a capability nothing left
+    // in this crate uses — a check that passes and proves nothing about the
+    // code that ships.
     let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
     conn.execute_batch(
-        "CREATE VIRTUAL TABLE t USING fts5(name, tokenize='trigram');
-         INSERT INTO t(name) VALUES ('quarterly-report.pdf'), ('notes.md');",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+         INSERT INTO t (id, name) VALUES (1, 'quarterly-report.pdf'), (2, 'notes.md');",
     )
-    .map_err(|e| format!("FTS5 trigram unavailable in this SQLite build: {e}"))?;
+    .map_err(|e| e.to_string())?;
     let n: i64 = conn
         .query_row(
             "SELECT count(*) FROM t WHERE name LIKE '%report%'",
@@ -750,60 +757,9 @@ fn smoke() -> Result<(), String> {
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
-    writeln!(
-        report,
-        "sqlite {:<7}: FTS5 trigram ok, {n} row(s)",
-        rusqlite::version()
-    )
-    .unwrap();
+    writeln!(report, "sqlite {:<7}: ok, {n} row(s)", rusqlite::version()).unwrap();
     if n != 1 {
-        return Err("FTS5 smoke: expected exactly 1 row".into());
-    }
-
-    // -- tantivy with an n-gram tokenizer ---------------------------------
-    {
-        use tantivy::schema::{STORED, Schema, TEXT, TextFieldIndexing, TextOptions};
-        use tantivy::tokenizer::NgramTokenizer;
-        let mut sb = Schema::builder();
-        let opts = TextOptions::default().set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer("ng")
-                .set_index_option(tantivy::schema::IndexRecordOption::WithFreqs),
-        );
-        let name = sb.add_text_field("name", opts);
-        let _id = sb.add_u64_field("id", STORED);
-        let _p = sb.add_text_field("path", TEXT);
-        let schema = sb.build();
-        let idx = tantivy::Index::create_in_ram(schema);
-        idx.tokenizers().register(
-            "ng",
-            NgramTokenizer::all_ngrams(3, 3).map_err(|e| e.to_string())?,
-        );
-        let mut w: tantivy::IndexWriter = idx.writer(50_000_000).map_err(|e| e.to_string())?;
-        w.add_document(tantivy::doc!(name => "quarterly-report.pdf"))
-            .map_err(|e| e.to_string())?;
-        w.add_document(tantivy::doc!(name => "notes.md"))
-            .map_err(|e| e.to_string())?;
-        w.commit().map_err(|e| e.to_string())?;
-        let reader = idx.reader().map_err(|e| e.to_string())?;
-        let searcher = reader.searcher();
-        let qp = tantivy::query::QueryParser::for_index(&idx, vec![name]);
-        let q = qp.parse_query("\"rep\"").map_err(|e| e.to_string())?;
-        let top = searcher
-            .search(
-                &q,
-                &tantivy::collector::TopDocs::with_limit(10).order_by_score(),
-            )
-            .map_err(|e| e.to_string())?;
-        writeln!(
-            report,
-            "tantivy       : ngram(3,3) ok, {} hit(s)",
-            top.len()
-        )
-        .unwrap();
-        if top.is_empty() {
-            return Err("tantivy smoke: ngram query returned nothing".into());
-        }
+        return Err("sqlite smoke: expected exactly 1 row".into());
     }
 
     // -- usearch: build, save, view(), search ------------------------------

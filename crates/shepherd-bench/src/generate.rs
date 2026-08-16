@@ -306,12 +306,6 @@ pub struct Row {
     pub mtime: i64,
 }
 
-impl Row {
-    pub fn path(&self) -> String {
-        format!("{}/{}", self.parent, self.name)
-    }
-}
-
 #[inline]
 fn pick<'a, T>(s: &mut u64, xs: &'a [T]) -> &'a T {
     &xs[(splitmix64(s) % xs.len() as u64) as usize]
@@ -467,9 +461,9 @@ pub fn catalog_path(fixtures: &Path) -> std::path::PathBuf {
 /// Build the SQLite catalog fixture.
 ///
 /// This is the shared source of truth for all three metadata candidates: FTS5
-/// indexes it in place, tantivy indexes from it, and the arena is **rebuilt from
-/// it** — which is the cold-start measurement the tiebreak rule's third
-/// durability axis needs.
+/// it was the shared source of truth for all three bake-off candidates, and it
+/// remains the input the 50 TB model's DB-growth and WAL figures are measured
+/// against.
 pub fn gen_catalog(a: &Args) -> Result<(), String> {
     let c = Contract::load(&a.contract)?;
     let rows = a.rows_override.unwrap_or(c.fixture.rows);
