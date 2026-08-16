@@ -16,7 +16,7 @@
 //! docker compose -f tests/docker-compose.yml down -v
 //! ```
 //!
-//! # WHAT IS REAL HERE AND WHAT IS STUBBED
+//! # WHAT IS REAL HERE, AND WHAT IS COVERED ELSEWHERE
 //!
 //! Stated up front, because a harness that *appears* complete is worse than an
 //! obviously partial one — and because §9 rule 1 forbids satisfying a gate with
@@ -26,17 +26,25 @@
 //! |---|---|
 //! | scan + floors | **real** — `shepherd-scan` |
 //! | rule match + dry-run preview | **real** — `shepherd-rules` |
-//! | plan | **STUBBED** — `shepherd-tier::plan` is not landed (worker-4). [`stub_plan`] selects candidates directly from the walk, which is what `plan.rs` will do. |
-//! | upload | **STUBBED** — `shepherd-tier::upload` is not landed. [`stub_upload`] performs a single-shot `create` through the real adapter against real MinIO. The **transfer/resume state machine is therefore not exercised here**; `shepherd-storage`'s own MinIO suite covers multipart and `ListParts` resume. |
+//! | plan | **real** — `shepherd-tier::plan_tier`. [`tier_plan_for`] feeds it the walk's selections; the §4.9 content-addressed key comes from `derive_object_key` and nowhere else, so the object this test uploads to is named by the production code path. |
+//! | upload | **real** — `shepherd-tier::upload_item` driving `shepherd-storage`'s `TransferDriver`: a genuine **multipart** upload against real MinIO, with the part size taken from the transfer config ([`PART_SIZE`]) and the resulting part count asserted ([`EXPECTED_PARTS`]). |
 //! | hash-verify | **real** — `verify_full_content`, AC-1's mandatory full re-read |
-//! | attestation probe | **real** — `probe_attestation_mode` against both buckets |
+//! | attestation probe | **real** — recorded on the session by the driver, against both buckets |
 //! | destroy | **real** — `execute_local_destruction`, the whole §4.10 ordering |
 //! | restore | **real** — `restore_file`, exclusive-create |
 //! | fidelity | **real** — `verify_restore` against a manifest |
 //!
-//! When `plan.rs` and `upload.rs` land, the two `stub_*` functions are the only
-//! things that change; every assertion below is written against the real
-//! outcome and stays.
+//! Two things are deliberately **not** this file's subject, named so nobody
+//! reads their absence as coverage:
+//!
+//! * **Crash windows and resume.** `TransferDriver`'s four windows and its
+//!   `ListParts` reconciliation are `shepherd-storage`'s own suite; AC-2's
+//!   cross-process leg is `session_store_tests.rs`. This test runs one
+//!   uninterrupted transfer and asserts it as such (`bytes_skipped == 0`).
+//! * **Durable session persistence.** The store here is `shepherd-storage`'s
+//!   `MemStore`. The production `CatalogSessionStore` is exactly what
+//!   `session_store_tests.rs` exists to exercise, and duplicating it here would
+//!   add a catalog-seeding apparatus without adding evidence.
 //!
 //! # Both attestation modes, not just the convenient one
 //!
@@ -59,28 +67,56 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bytes::Bytes;
 use shepherd_catalog::AtimeMode;
 use shepherd_catalog::file_repo::{Availability, ScanRoot};
-use shepherd_catalog::identity::{PathCasePolicy, PathNormPolicy, content_key};
-use shepherd_core::{Blake3Hash, FileStat, IntentId, ObjectKey, RootId, StubMode, Timestamp};
+use shepherd_catalog::identity::{PathCasePolicy, PathNormPolicy};
+use shepherd_core::{
+    Blake3Hash, FileId, FileStat, FsId, IntentId, JobId, RootId, StubMode, TargetId, Timestamp,
+};
 use shepherd_placeholder::DeleteModeProvider;
 use shepherd_placeholder::provider::FileIdentity;
 use shepherd_rules::{MatchContext, Matcher};
 use shepherd_scan::{DenyList, FloorContext, FloorInput, FloorPolicy, IgnoreSet, floors, walk};
-use shepherd_storage::adapter::{
-    AttestationMode, CreatePrecondition, StorageAdapter, verify_full_content,
-};
+use shepherd_storage::adapter::{AttestationMode, StorageAdapter, verify_full_content};
+use shepherd_storage::multipart::DEFAULT_PART_SIZE;
 use shepherd_storage::s3::{S3Adapter, S3Config, StaticCredentials};
+use shepherd_storage::testing::MemStore;
+use shepherd_storage::transfer_session::{TransferSessionStore, TransferState};
 use shepherd_tier::fidelity::{CoreAttrs, FidelityManifest};
 use shepherd_tier::revalidate::{Location, LocationState};
 use shepherd_tier::{
-    AuditLog, FileLocks, LocalDestroyRequest, execute_local_destruction, read_back, restore_file,
-    verify_restore,
+    AuditLog, FileLocks, LocalDestroyRequest, SelectedFile, TierPlan, execute_local_destruction,
+    hash_file, plan_tier, read_back, restore_file, upload_item, verify_restore,
 };
 
 const VERSIONED_BUCKET: &str = "shepherd-versioned";
 const PLAIN_BUCKET: &str = "shepherd-plain";
+
+/// The part size handed to the transfer, and the count it must produce.
+///
+/// **Deliberately not [`DEFAULT_PART_SIZE`].** Passing a constant where the
+/// transfer config belongs is this project's instance-#6 defect: the plan
+/// collapses to a single part, the multipart path is never entered, and the
+/// round trip goes green having proven nothing about it. Because 5 MiB is S3's
+/// own floor — `PartPlan::new` clamps anything smaller *up* to it — it is also
+/// the smallest value that can cut an object into more than one part at all.
+const PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// 12 MiB in 5 MiB parts is 5 + 5 + 2: three parts, the last one short.
+///
+/// A literal rather than a `div_ceil` recomputation of the planner's own
+/// arithmetic, so a change in `PartPlan::new` cannot quietly agree with itself
+/// here.
+const EXPECTED_PARTS: u32 = 3;
+
+/// Large enough that [`PART_SIZE`] genuinely splits it.
+const PAYLOAD_LEN: usize = 12 * 1024 * 1024;
+
+// Both properties the two constants above exist to hold, checked at compile
+// time so an edit to either cannot silently turn this suite back into a
+// single-shot upload that measures nothing.
+const _: () = assert!(PART_SIZE != DEFAULT_PART_SIZE);
+const _: () = assert!(PAYLOAD_LEN as u64 > PART_SIZE);
 
 fn endpoint() -> String {
     std::env::var("SHEPHERD_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string())
@@ -130,7 +166,7 @@ impl Corpus {
         std::fs::create_dir_all(dir.join("Docs")).unwrap();
         std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
 
-        let payload = body(3 * 1024 * 1024, 7);
+        let payload = body(PAYLOAD_LEN, 7);
         let target = dir.join("Photos/2024/shoot.raw");
         std::fs::write(&target, &payload).unwrap();
 
@@ -178,11 +214,14 @@ impl Drop for Corpus {
     }
 }
 
-/// **STUB for `shepherd-tier::plan`.** Selects tiering candidates by running
-/// the real matcher and the real floors over the real walk. When `plan.rs`
-/// lands it does this against the catalog instead; the selection *criteria* are
-/// already what the plan specifies.
-fn stub_plan(corpus: &Corpus, now: Timestamp) -> Vec<FileStat> {
+/// Tiering candidates, by the real matcher and the real floors over the real
+/// walk.
+///
+/// This is the **input** to `shepherd-tier::plan_tier`, not a substitute for
+/// it: `plan.rs` is deliberately thin and takes selections as values, knowing
+/// nothing about walking or matching. See [`tier_plan_for`] for the planning
+/// step itself.
+fn select_candidates(corpus: &Corpus, now: Timestamp) -> Vec<FileStat> {
     let ignores = IgnoreSet::new(&corpus.dir, &["*.tmp".to_string()]).unwrap();
     let out = walk(
         RootId::new(1),
@@ -247,18 +286,32 @@ fn stub_plan(corpus: &Corpus, now: Timestamp) -> Vec<FileStat> {
         .collect()
 }
 
-/// **STUB for `shepherd-tier::upload`.** Single-shot `create` through the real
-/// adapter against real MinIO.
+/// The real `shepherd-tier::plan`, over the real selection.
 ///
-/// The transfer/resume state machine is **not** exercised by this — no
-/// multipart, no checkpointing, no `ListParts` reconciliation. AC-2's resume is
-/// covered by `shepherd-storage`'s own MinIO suite, and this stub deliberately
-/// does not pretend otherwise.
-async fn stub_upload(a: &S3Adapter, key: &ObjectKey, bytes: Vec<u8>) -> AttestationMode {
-    a.create(key, Bytes::from(bytes), CreatePrecondition::Unconditional)
-        .await
-        .expect("upload");
-    a.probe_attestation_mode().await.expect("probe attestation")
+/// The remote key is `plan_tier`'s and nowhere else's. A key the test built for
+/// itself would pass happily while the production key differed — which is the
+/// §4.9 mistake (path-derived keys) reproduced inside the test that exists to
+/// catch it.
+fn tier_plan_for(corpus: &Corpus, now: Timestamp, prefix: &str) -> TierPlan {
+    let selected: Vec<SelectedFile> = select_candidates(corpus, now)
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let abs = corpus.dir.join(&f.rel_path);
+            SelectedFile {
+                file: FileId::new(i as i64 + 1),
+                // ABSOLUTE. `upload_item` opens this path directly, so a
+                // relative one would fail at read time rather than at plan time.
+                path: abs.display().to_string(),
+                size: f.size,
+                // The real streamed planning hasher, not a convenience re-hash
+                // of the buffer the test already holds in memory. Cross-checked
+                // against that buffer in `round_trip`.
+                blake3: Some(hash_file(&abs).expect("hash the source")),
+            }
+        })
+        .collect();
+    plan_tier(&selected, &[TargetId::new(1)], prefix)
 }
 
 fn hash_of(b: &[u8]) -> Blake3Hash {
@@ -281,24 +334,100 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
     let corpus = Corpus::new(tag);
     let a = adapter(bucket).await;
 
-    // --- scan + dry-run selection ------------------------------------------
-    let candidates = stub_plan(&corpus, now);
+    // --- scan + dry-run selection + plan -------------------------------------
+    let plan = tier_plan_for(&corpus, now, &format!("m2-{}-{tag}", std::process::id()));
 
-    // ASSERT THE QUANTITY. Exactly one file, and exactly the right one — not
+    // ASSERT THE QUANTITY. Exactly one item, and exactly the right one — not
     // "at least one", which would pass if the rule matched the whole corpus.
-    assert_eq!(
-        candidates.len(),
-        1,
-        "expected exactly one candidate, got {:?}",
-        candidates.iter().map(|f| &f.rel_path).collect::<Vec<_>>()
+    assert!(
+        plan.refused.is_empty(),
+        "nothing may be silently unplannable here: {:?}",
+        plan.refused
     );
-    assert_eq!(candidates[0].rel_path, "Photos/2024/shoot.raw");
+    assert_eq!(
+        plan.items.len(),
+        1,
+        "expected exactly one planned item, got {:?}",
+        plan.items.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+    assert_eq!(plan.distinct_objects(), 1);
+    let item = &plan.items[0];
+    assert_eq!(Path::new(&item.path), corpus.target.as_path());
+    assert_eq!(item.size, corpus.payload.len() as u64);
 
     let hash = hash_of(&corpus.payload);
-    let key = content_key(&format!("m2-{}-{tag}", std::process::id()), hash);
+    assert_eq!(
+        item.blake3, hash,
+        "the streamed planning hash must equal the in-memory one — the key is \
+         derived from it, so a divergence names the object after bytes it does \
+         not hold"
+    );
+    let key = item.remote_key.clone();
 
-    // --- tier ---------------------------------------------------------------
-    let mode = stub_upload(&a, &key, corpus.payload.clone()).await;
+    // --- tier: the real multipart uploader -----------------------------------
+    let store = MemStore::new();
+    let locks = FileLocks::new();
+    let job = JobId::new(1);
+    let outcome = upload_item(
+        job,
+        item,
+        &a,
+        &store,
+        &locks,
+        FsId::new("uuid:m2-test"),
+        PART_SIZE,
+    )
+    .await
+    .expect("upload");
+
+    // ASSERT THE QUANTITY, again — and specifically the part count. An upload
+    // that quietly collapsed to a single part would still commit, still verify
+    // and still restore, so every downstream assertion here would pass while
+    // the multipart path this leg exists to cover went unexercised.
+    assert_eq!(outcome.state, TransferState::Committed);
+    assert_eq!(
+        outcome.parts_sent,
+        EXPECTED_PARTS,
+        "{} B at a {PART_SIZE} B part size is {EXPECTED_PARTS} parts; {} were sent",
+        corpus.payload.len(),
+        outcome.parts_sent
+    );
+    assert_eq!(
+        outcome.bytes_uploaded,
+        corpus.payload.len() as u64,
+        "every byte goes over the wire exactly once on a fresh session"
+    );
+    assert_eq!(
+        outcome.bytes_skipped, 0,
+        "a fresh session has no acknowledged parts to skip"
+    );
+    assert!(
+        !outcome.resolved_ambiguous_completion,
+        "the driver found an object already at `{}` and skipped \
+         CompleteMultipartUpload entirely — verify would still pass on identical \
+         content, so this run would prove nothing about multipart completion",
+        key.as_str()
+    );
+
+    // The persisted plan, not just the outcome: this is what proves `PART_SIZE`
+    // reached `PartPlan::new` instead of a hardcoded default being used behind
+    // the parameter's back.
+    let session = store
+        .load(job)
+        .await
+        .expect("load session")
+        .expect("a committed transfer leaves its session behind");
+    assert_eq!(
+        session.plan.part_size, PART_SIZE,
+        "the part size must come from the transfer config, not a constant"
+    );
+    assert_eq!(session.plan.part_count, EXPECTED_PARTS);
+    assert_eq!(session.parts.len(), EXPECTED_PARTS as usize);
+    assert_eq!(session.remote_key, key);
+
+    let mode = session
+        .attestation_mode
+        .expect("the driver records the mechanism that will authorize destruction");
     assert_eq!(
         mode, expect_mode,
         "bucket `{bucket}` reported {mode:?}; the compose file says it should be \
@@ -306,7 +435,25 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
          into a slogan (§4.10.2)."
     );
 
+    // Printed because `--nocapture` is the documented way to run this suite and
+    // because whoever reads a gate report should be able to SEE the quantities
+    // rather than take a green "ok" for them.
+    eprintln!(
+        "[{tag}] {bucket}: uploaded {} B as {} part(s) of {} B ({} skipped), \
+         attestation {mode:?}, key {}",
+        outcome.bytes_uploaded,
+        outcome.parts_sent,
+        session.plan.part_size,
+        outcome.bytes_skipped,
+        key.as_str()
+    );
+
     // --- hash-verify: AC-1's mandatory full re-read --------------------------
+    //
+    // Kept even though `TransferDriver::verify` already did one internally. This
+    // is AC-1's *cited* evidence, and delegating it to the code under test would
+    // make the citation circular: the driver deciding it verified itself is not
+    // the same fact as the object hashing correctly.
     verify_full_content(&a, &key, hash, corpus.payload.len() as u64, 1024 * 1024)
         .await
         .expect("remote copy must hash to the expected value before anything is destroyed");
@@ -314,7 +461,7 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
     // --- destroy ------------------------------------------------------------
     let meta = a.head(&key).await.unwrap().expect("object present");
     let custodian = Location {
-        target: shepherd_core::TargetId::new(1),
+        target: item.target,
         state: LocationState::Verified,
         attestation: mode,
         custody_eligible: true,
@@ -377,12 +524,13 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
     // The negatives are still there. A rule that matched everything would have
     // destroyed these too, and a round trip asserting only the happy path would
     // not notice.
-    for survivor in [
+    let survivors = [
         "Docs/notes.txt",
         "Photos/2024/raw-backups/old.raw",
         ".git/objects/pack.raw",
         "Photos/2024/thumb.raw",
-    ] {
+    ];
+    for survivor in survivors {
         assert!(
             corpus.dir.join(survivor).exists(),
             "`{survivor}` must not have been touched"
@@ -445,6 +593,14 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
 
     let attrs = read_back(&corpus.target).expect("read back");
     verify_restore(&manifest, &attrs).expect("fidelity contract holds");
+
+    eprintln!(
+        "[{tag}] {bucket}: restored {} B to {} — hash {} matches, {} negative(s) untouched",
+        restored.len(),
+        corpus.target.display(),
+        hash.to_hex(),
+        survivors.len()
+    );
 }
 
 /// Mechanism A — versioning on. The closing HEAD genuinely re-attests.
@@ -472,7 +628,8 @@ async fn m2_round_trip_mechanism_b_content_addressed() {
 #[test]
 fn the_dry_run_selects_exactly_one_candidate_out_of_five() {
     let corpus = Corpus::new("select");
-    let picked = stub_plan(&corpus, Timestamp::from_nanos(1_000_000_000_000));
+    let now = Timestamp::from_nanos(1_000_000_000_000);
+    let picked = select_candidates(&corpus, now);
     assert_eq!(
         picked.len(),
         1,
@@ -480,6 +637,36 @@ fn the_dry_run_selects_exactly_one_candidate_out_of_five() {
         picked.iter().map(|f| &f.rel_path).collect::<Vec<_>>()
     );
     assert_eq!(picked[0].rel_path, "Photos/2024/shoot.raw");
+
+    // …and the real planner turns that one selection into one work item at one
+    // content-addressed key. Network-free, so `plan.rs`'s integration with the
+    // selection above is checked by a plain `cargo test`, not only by the
+    // `#[ignore]`d round trip nobody runs by accident.
+    let plan = tier_plan_for(&corpus, now, "m2-dry-run");
+    assert!(plan.refused.is_empty(), "{:?}", plan.refused);
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.distinct_objects(), 1);
+    let hash = hash_of(&corpus.payload);
+    assert_eq!(plan.items[0].blake3, hash);
+
+    // §4.9: content-addressed, never path-derived. Asserted on the key's own
+    // text rather than by re-calling `derive_object_key` — comparing the
+    // producer against itself would hold just as well if it were named after
+    // the path.
+    let k = plan.items[0].remote_key.as_str();
+    assert_eq!(
+        k,
+        format!(
+            "m2-dry-run/objects/{}/{}/{}",
+            &hash.to_hex()[0..2],
+            &hash.to_hex()[2..4],
+            hash.to_hex()
+        )
+    );
+    assert!(
+        !k.contains("shoot") && !k.contains("Photos"),
+        "no part of the local path may appear in the key: {k}"
+    );
 }
 
 /// Each negative is excluded for its OWN reason, asserted separately.
