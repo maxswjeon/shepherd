@@ -27,10 +27,10 @@ use std::sync::Arc;
 
 use shepherd_catalog::file_repo::FileRepo;
 use shepherd_catalog::job_repo::JobClass;
+use shepherd_catalog::writer::CatalogWriter;
 use shepherd_catalog::{Catalog, CatalogError};
 use shepherd_core::{RootId, Timestamp};
 use shepherd_jobs::Queue;
-use shepherd_jobs::worker::CatalogWriter;
 use shepherd_proto::request::*;
 use shepherd_proto::response::*;
 use shepherd_proto::{ErrorCode, Negotiated, RpcError, ShepherdApi};
@@ -70,14 +70,14 @@ impl Session {
     }
 }
 
-fn map_worker_error(e: shepherd_jobs::WorkerError) -> RpcError {
-    use shepherd_jobs::WorkerError;
+fn map_worker_error(e: shepherd_catalog::writer::WriterError) -> RpcError {
+    use shepherd_catalog::writer::WriterError;
     match e {
-        WorkerError::WriterGone => RpcError::new(
+        WriterError::Gone => RpcError::new(
             ErrorCode::InternalError,
             "the catalog writer has stopped; the daemon is shutting down or has faulted",
         ),
-        WorkerError::Catalog(c) => map_catalog_error(c),
+        WriterError::Catalog(c) => map_catalog_error(c),
     }
 }
 

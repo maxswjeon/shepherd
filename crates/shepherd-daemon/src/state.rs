@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use shepherd_jobs::worker::{CatalogActor, CatalogWriter};
+use shepherd_catalog::writer::{CatalogActor, CatalogWriter};
 use shepherd_proto::response::{CheckStatus, DoctorCheck};
 use shepherd_proto::{Capability, RpcError, capability};
 

@@ -1,10 +1,18 @@
-//! The catalog writer actor and the fixed worker pool.
+//! The worker pool and the class-to-executor registry.
 //!
-//! # The writer actor
+//! # The writer actor is next door
 //!
 //! §9's Phase 1 gate names it directly: *"Catalog write discipline:
-//! single-writer actor, dedicated PASSIVE-checkpoint connection."*
-//! [`CatalogWriter`] is that actor.
+//! single-writer actor, dedicated PASSIVE-checkpoint connection."* That is
+//! `shepherd_catalog::writer::CatalogActor`, and it lives in the catalog crate
+//! because it is the same single-writer invariant `&mut self` already enforces
+//! within a thread, extended across them. It started here, when the pool was
+//! its only consumer; it moved when `shepherd-tier` needed it too and taking it
+//! from the queue crate would have meant a `tier -> jobs` edge for a type with
+//! nothing to do with queues.
+//!
+//! What is left here is the part that really is about jobs: the pool, the
+//! registry, and the claim-run-complete loop.
 //!
 //! `shepherd-catalog` carries the single-writer rule in its types — every
 //! mutating method takes `&mut Catalog`, so the borrow checker refuses two
@@ -43,12 +51,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use shepherd_catalog::job_repo::{Job, JobClass};
-use shepherd_catalog::{Catalog, CatalogError};
+use shepherd_catalog::writer::{CatalogWriter, WriterError};
 use shepherd_core::{JobId, Timestamp};
 
 use crate::queue::{Disposition, Queue, Recovery};
@@ -76,173 +83,6 @@ pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 /// ponytail: 250ms poll; notify on enqueue if job latency ever shows up.
 pub const IDLE_POLL: Duration = Duration::from_millis(250);
 
-#[derive(Debug, thiserror::Error)]
-pub enum WorkerError {
-    #[error("the catalog writer actor has stopped")]
-    WriterGone,
-    #[error(transparent)]
-    Catalog(#[from] CatalogError),
-}
-
-type Task = Box<dyn FnOnce(&mut Catalog) + Send>;
-
-/// What the writer thread receives.
-///
-/// `Stop` exists because "the channel closed" is not a usable shutdown signal
-/// here: [`CatalogWriter`] is cloneable by design, so any live clone — one held
-/// by a worker, or one a caller kept — keeps the channel open and the writer
-/// thread alive. An earlier version relied on dropping the actor's own sender
-/// and deadlocked in `Drop`, joining a thread that was still waiting on a
-/// channel somebody else held open.
-enum Msg {
-    Run(Task),
-    Stop,
-}
-
-/// A handle to the one thread permitted to touch the catalog.
-///
-/// Cloneable and `Send`: hand it to workers, the IPC server, anything. Cloning
-/// the handle does not clone the connection — there is still exactly one.
-#[derive(Clone)]
-pub struct CatalogWriter {
-    tx: Sender<Msg>,
-}
-
-impl CatalogWriter {
-    /// Run `f` on the catalog thread and wait for its result.
-    ///
-    /// The closure returns through a rendezvous channel, so a caller cannot
-    /// proceed on the assumption that a write landed when it has not.
-    pub fn with<T, F>(&self, f: F) -> Result<T, WorkerError>
-    where
-        F: FnOnce(&mut Catalog) -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        let (reply_tx, reply_rx) = sync_channel::<T>(0);
-        self.tx
-            .send(Msg::Run(Box::new(move |cat| {
-                let out = f(cat);
-                // A receiver that hung up means the caller gave up waiting. The
-                // write still happened; dropping the reply is correct.
-                let _ = reply_tx.send(out);
-            })))
-            .map_err(|_| WorkerError::WriterGone)?;
-        reply_rx.recv().map_err(|_| WorkerError::WriterGone)
-    }
-
-    /// Convenience for the common fallible case.
-    pub fn try_with<T, F>(&self, f: F) -> Result<T, WorkerError>
-    where
-        F: FnOnce(&mut Catalog) -> Result<T, CatalogError> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.with(f)?.map_err(WorkerError::from)
-    }
-}
-
-/// Owns the catalog thread and the WAL checkpoint thread.
-pub struct CatalogActor {
-    handle: CatalogWriter,
-    writer_thread: Option<JoinHandle<()>>,
-    checkpoint_thread: Option<JoinHandle<()>>,
-    stop: Arc<AtomicBool>,
-}
-
-impl CatalogActor {
-    /// Take ownership of `catalog` and start the actor.
-    ///
-    /// `checkpoint_path` is the database file for the dedicated PASSIVE
-    /// checkpoint connection. `None` skips that thread, which is what an
-    /// in-memory catalog needs — a second connection to `:memory:` would open a
-    /// *different, empty* database, so checkpointing it would be theatre.
-    pub fn start(catalog: Catalog, checkpoint_path: Option<std::path::PathBuf>) -> Self {
-        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
-        let stop = Arc::new(AtomicBool::new(false));
-
-        let writer_thread = std::thread::Builder::new()
-            .name("shepherd-catalog-writer".into())
-            .spawn(move || {
-                let mut catalog = catalog;
-                // Ends on `Stop`, or if every sender is gone. Tasks already
-                // queued ahead of `Stop` still run, so a write submitted before
-                // shutdown is not silently discarded.
-                for msg in rx {
-                    match msg {
-                        Msg::Run(task) => task(&mut catalog),
-                        Msg::Stop => break,
-                    }
-                }
-            })
-            .expect("spawning the catalog writer thread");
-
-        let checkpoint_thread = checkpoint_path.map(|path| {
-            let stop = Arc::clone(&stop);
-            std::thread::Builder::new()
-                .name("shepherd-wal-checkpoint".into())
-                .spawn(move || checkpoint_loop(&path, &stop))
-                .expect("spawning the WAL checkpoint thread")
-        });
-
-        Self {
-            handle: CatalogWriter { tx },
-            writer_thread: Some(writer_thread),
-            checkpoint_thread,
-            stop,
-        }
-    }
-
-    pub fn handle(&self) -> CatalogWriter {
-        self.handle.clone()
-    }
-}
-
-impl Drop for CatalogActor {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        // Queued tasks run first; `Stop` is behind them. Outstanding
-        // `CatalogWriter` clones stay valid to *call* and will get
-        // `WriterGone`, because once the thread returns the receiver drops and
-        // the send fails.
-        let _ = self.handle.tx.send(Msg::Stop);
-        if let Some(t) = self.writer_thread.take() {
-            let _ = t.join();
-        }
-        if let Some(t) = self.checkpoint_thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-/// The dedicated PASSIVE-checkpoint connection.
-///
-/// Failures are logged, never propagated: a checkpoint that could not run is a
-/// WAL that stays large for another interval, which is a performance condition,
-/// not a correctness one. Turning it into an error would take the daemon down
-/// over housekeeping.
-fn checkpoint_loop(path: &std::path::Path, stop: &AtomicBool) {
-    let conn = match rusqlite::Connection::open(path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "WAL checkpoint connection unavailable; \
-                                        the WAL will be checkpointed by SQLite's own policy");
-            return;
-        }
-    };
-    // Sleep in short slices so shutdown is prompt without a condvar.
-    let slice = Duration::from_millis(100);
-    let mut waited = Duration::ZERO;
-    while !stop.load(Ordering::SeqCst) {
-        if waited >= CHECKPOINT_INTERVAL {
-            waited = Duration::ZERO;
-            if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "PASSIVE") {
-                tracing::warn!(error = %e, "PASSIVE WAL checkpoint failed");
-            }
-        }
-        std::thread::sleep(slice);
-        waited += slice;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Executors and the pool
 // ---------------------------------------------------------------------------
@@ -268,7 +108,7 @@ impl JobContext {
     /// AC-2 is only satisfiable if an executor can do this *while working*, so
     /// it is on the context rather than being something the pool does at the
     /// end.
-    pub fn save_checkpoint(&self, checkpoint_json: &str) -> Result<(), WorkerError> {
+    pub fn save_checkpoint(&self, checkpoint_json: &str) -> Result<(), WriterError> {
         let id = self.job.id;
         let json = checkpoint_json.to_string();
         let now = now();
@@ -390,7 +230,7 @@ fn worker_loop(writer: &CatalogWriter, registry: &Registry, stop: &AtomicBool) {
         match run_one(writer, registry) {
             Ok(true) => {}
             Ok(false) => std::thread::sleep(IDLE_POLL),
-            Err(WorkerError::WriterGone) => return,
+            Err(WriterError::Gone) => return,
             Err(e) => {
                 tracing::warn!(error = %e, "worker could not reach the catalog");
                 std::thread::sleep(IDLE_POLL);
@@ -403,7 +243,7 @@ fn worker_loop(writer: &CatalogWriter, registry: &Registry, stop: &AtomicBool) {
 ///
 /// Exposed so tests can drive the pool's logic deterministically, without
 /// threads or sleeps.
-pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, WorkerError> {
+pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, WriterError> {
     // Ask only for classes this build can actually run. Claiming counts an
     // attempt, so claiming-then-returning an unrunnable job burns its retry
     // budget — measured at 12 attempts in 3 seconds from one thread before this
@@ -458,7 +298,7 @@ pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, Work
 }
 
 /// Resolve crash-interrupted jobs. Call before starting the pool.
-pub fn recover(writer: &CatalogWriter) -> Result<Vec<Recovery>, WorkerError> {
+pub fn recover(writer: &CatalogWriter) -> Result<Vec<Recovery>, WriterError> {
     writer.try_with(move |cat| Queue::recover_interrupted(cat, now()))
 }
 
@@ -475,12 +315,17 @@ pub fn now() -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shepherd_catalog::Catalog;
+    use shepherd_catalog::writer::CatalogActor;
     use std::sync::Mutex;
 
     fn actor_in_memory() -> CatalogActor {
         CatalogActor::start(Catalog::open_in_memory().unwrap(), None)
     }
 
+    /// The pool's own use of the actor. The actor's *invariant* is tested where
+    /// it now lives — `shepherd_catalog::writer::tests` — on a file-backed
+    /// catalog; this is the in-memory version that the queue depends on.
     #[test]
     fn the_writer_actor_serialises_writes_from_many_threads() {
         // The property the gate names. Without a single owner this races on the
@@ -764,15 +609,5 @@ mod tests {
         assert_eq!(r.classes(), vec!["hash", "scan"]);
         assert!(r.get(JobClass::Scan).is_some());
         assert!(r.get(JobClass::Upload).is_none());
-    }
-
-    #[test]
-    fn a_dropped_actor_reports_writer_gone_rather_than_hanging() {
-        let w = {
-            let actor = actor_in_memory();
-            actor.handle()
-        };
-        let err = w.try_with(|cat| Queue::depth(cat)).unwrap_err();
-        assert!(matches!(err, WorkerError::WriterGone), "{err:?}");
     }
 }

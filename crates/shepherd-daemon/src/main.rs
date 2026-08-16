@@ -25,12 +25,13 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use shepherd_catalog::writer::CatalogActor;
 use shepherd_daemon::events::EventHub;
 use shepherd_daemon::paths::Paths;
 use shepherd_daemon::scan_exec::ScanExecutor;
 use shepherd_daemon::state::Daemon;
 use shepherd_daemon::{EVENT_BUFFER, server, service};
-use shepherd_jobs::worker::{CatalogActor, Pool, Registry};
+use shepherd_jobs::worker::{Pool, Registry};
 use shepherd_jobs::{POOL_SIZE, Recovery, recover};
 
 fn main() -> std::process::ExitCode {

@@ -21,12 +21,15 @@
 //!            ▲
 //!   queue.rs                     policy: backoff curve, attempt ceiling,
 //!            ▲                   which classes may retry, crash recovery
-//!   worker.rs                    the single-writer actor, the fixed pool,
-//!                                the class → executor registry
+//!   worker.rs                    the fixed pool and the class → executor
+//!                                registry (the writer actor moved to
+//!                                shepherd-catalog::writer)
 //! ```
 //!
-//! [`worker::CatalogWriter`] is the §9 Phase 1 gate's "single-writer actor":
-//! exactly one thread owns the `Catalog`, everyone else sends it a closure.
+//! The §9 Phase 1 gate's "single-writer actor" is
+//! [`shepherd_catalog::writer::CatalogActor`] — it lives in the catalog crate
+//! because it is the same invariant `&mut self` enforces, extended across
+//! threads. Re-exported here for the pool's callers.
 //!
 //! # The one safety rule in this crate
 //!
@@ -46,7 +49,7 @@ pub use queue::{
     BASE_BACKOFF, Disposition, MAX_ATTEMPTS, MAX_BACKOFF, Queue, Recovery, backoff_for,
     is_retryable,
 };
-pub use worker::{
-    CatalogActor, CatalogWriter, Executor, JobContext, POOL_SIZE, Pool, Registry, WorkerError,
-    recover, run_one,
-};
+pub use worker::{Executor, JobContext, POOL_SIZE, Pool, Registry, recover, run_one};
+
+/// Re-exported for convenience; the actor's home is `shepherd-catalog`.
+pub use shepherd_catalog::writer::{CatalogActor, CatalogWriter, WriterError};

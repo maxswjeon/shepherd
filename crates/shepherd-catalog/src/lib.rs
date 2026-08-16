@@ -10,10 +10,16 @@
 //!
 //! # Single writer, carried by the type system
 //!
-//! SQLite's WAL model is many-readers/one-writer. This crate does **not** run a
-//! writer actor — that is the daemon's job (T6) — but every mutating method
+//! SQLite's WAL model is many-readers/one-writer, and every mutating method
 //! takes `&mut self`, so a caller cannot hold two writers without the borrow
-//! checker objecting. `rusqlite` over `sqlx` is an ADR-001 decision for the same
+//! checker objecting.
+//!
+//! **The crate does not spawn anything on your behalf.** `Catalog::open` gives
+//! you a connection and nothing runs unless you run it.
+//! [`writer::CatalogActor::start`] is opt-in, and it is the *same* single-writer
+//! invariant `&mut self` enforces within a thread, extended across them — which
+//! is why it lives here rather than in whichever crate happened to need it
+//! first. `rusqlite` over `sqlx` is an ADR-001 decision for the same
 //! reason: `sqlx` silently upgrades a `SELECT` that later writes in the same
 //! transaction into an exclusive write transaction, starving the pool.
 
@@ -26,6 +32,7 @@ pub mod migrate;
 pub mod schema;
 pub mod target_repo;
 pub mod volume;
+pub mod writer;
 
 use std::path::Path;
 

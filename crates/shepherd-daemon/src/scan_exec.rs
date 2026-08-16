@@ -39,9 +39,10 @@
 use std::sync::Arc;
 
 use shepherd_catalog::file_repo::{Availability, FileRepo, ScanRoot};
+use shepherd_catalog::writer::CatalogWriter;
 use shepherd_catalog::{Catalog, CatalogError};
 use shepherd_core::RootId;
-use shepherd_jobs::worker::{CatalogWriter, Executor, JobContext, now};
+use shepherd_jobs::worker::{Executor, JobContext, now};
 use shepherd_proto::event::{EventPayload, EventStream};
 use shepherd_scan::{DenyList, IgnoreSet, Skip, walk};
 
