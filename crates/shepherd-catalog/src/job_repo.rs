@@ -104,6 +104,10 @@ pub struct Job {
     pub checkpoint_json: Option<String>,
     pub attempts: i64,
     pub last_error: Option<String>,
+    /// Nanoseconds since the epoch before which this job is not claimable.
+    /// `0` means "ready now". Written by the retry backoff in
+    /// `shepherd-jobs::queue`; enforced here by [`JobRepo::claim_next`].
+    pub run_after: i64,
 }
 
 pub struct JobRepo<'a>(pub &'a mut Catalog);
@@ -133,7 +137,7 @@ impl<'a> JobRepo<'a> {
             .conn()
             .query_row(
                 "SELECT id, class, state, priority, payload_json, checkpoint_json,
-                        attempts, last_error
+                        attempts, last_error, run_after
                  FROM job WHERE id = ?1",
                 params![id.get()],
                 row_to_job,
@@ -143,7 +147,7 @@ impl<'a> JobRepo<'a> {
             .transpose()
     }
 
-    /// Claim the highest-priority queued job atomically.
+    /// Claim the highest-priority *ready* queued job atomically.
     ///
     /// The `UPDATE … WHERE state = 'queued'` with a subquery is one statement on
     /// purpose: a select-then-update would let two workers read the same row
@@ -151,13 +155,18 @@ impl<'a> JobRepo<'a> {
     /// impossible — the catalog is also opened by tests and by `shepctl
     /// doctor` — and a job claimed twice is a duplicated upload or, for the
     /// `destroy` class, a duplicated destruction attempt.
+    ///
+    /// "Ready" means `run_after <= now`. A job serving out a retry backoff is
+    /// invisible here rather than being claimed and immediately re-failed,
+    /// which would burn its `attempts` budget without ever waiting.
     pub fn claim_next(&mut self, now: Timestamp) -> Result<Option<JobId>> {
         let tx = self.0.conn_mut().transaction()?;
         let claimed: Option<i64> = tx
             .query_row(
                 "UPDATE job SET state = 'running', attempts = attempts + 1, updated_at = ?1
                  WHERE id = (
-                     SELECT id FROM job WHERE state = 'queued'
+                     SELECT id FROM job
+                     WHERE state = 'queued' AND run_after <= ?1
                      ORDER BY priority DESC, id ASC LIMIT 1
                  )
                  RETURNING id",
@@ -167,6 +176,35 @@ impl<'a> JobRepo<'a> {
             .optional()?;
         tx.commit()?;
         Ok(claimed.map(JobId::new))
+    }
+
+    /// Return a job to the queue, not claimable again until `run_after`.
+    ///
+    /// One statement, for the same reason `claim_next` is: the transition out of
+    /// `running` and the deadline that governs the next claim must not be
+    /// separately observable.
+    ///
+    /// `attempts` is deliberately **not** touched — `claim_next` already counted
+    /// this attempt when it handed the job out. Incrementing here too would
+    /// double-count and halve the effective retry budget.
+    ///
+    /// The backoff curve, the attempt ceiling, and the decision that a class is
+    /// retryable at all belong to `shepherd-jobs::queue`. This is only the
+    /// transition.
+    pub fn requeue(
+        &mut self,
+        id: JobId,
+        run_after: Timestamp,
+        last_error: Option<&str>,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.0.conn_mut().execute(
+            "UPDATE job
+             SET state = 'queued', run_after = ?2, last_error = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![id.get(), run_after.as_nanos(), last_error, now.as_nanos()],
+        )?;
+        Ok(())
     }
 
     /// Persist a resume point. T6's worker calls this; the row shape is what
@@ -202,7 +240,7 @@ impl<'a> JobRepo<'a> {
     pub fn interrupted(&self) -> Result<Vec<Job>> {
         let mut stmt = self.0.conn().prepare(
             "SELECT id, class, state, priority, payload_json, checkpoint_json,
-                    attempts, last_error
+                    attempts, last_error, run_after
              FROM job WHERE state = 'running' ORDER BY id",
         )?;
         let rows = stmt
@@ -227,6 +265,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Job>> {
             checkpoint_json: row.get(5)?,
             attempts: row.get(6)?,
             last_error: row.get(7)?,
+            run_after: row.get(8)?,
         })
     })())
 }
@@ -312,6 +351,120 @@ mod tests {
         assert_eq!(stranded[0].state, JobState::Running);
         // Still running: nothing put it back in the queue behind our back.
         assert!(JobRepo::new(&mut c).claim_next(t).unwrap().is_none());
+    }
+
+    /// The point of the column: a job inside its backoff window is invisible to
+    /// `claim_next`, and becomes claimable the instant the deadline passes.
+    #[test]
+    fn a_job_in_backoff_is_not_claimable_until_its_deadline() {
+        let mut c = cat();
+        let t0 = Timestamp::from_nanos(1_000);
+        let id = JobRepo::new(&mut c)
+            .enqueue(JobClass::Upload, 0, "{}", t0)
+            .unwrap();
+        assert_eq!(JobRepo::new(&mut c).claim_next(t0).unwrap(), Some(id));
+
+        // Failed, retry in 500ns.
+        let deadline = Timestamp::from_nanos(1_500);
+        JobRepo::new(&mut c)
+            .requeue(id, deadline, Some("connection reset"), t0)
+            .unwrap();
+
+        for too_early in [1_000, 1_499] {
+            assert_eq!(
+                JobRepo::new(&mut c)
+                    .claim_next(Timestamp::from_nanos(too_early))
+                    .unwrap(),
+                None,
+                "claimable at {too_early}, before its run_after of 1500"
+            );
+        }
+        assert_eq!(
+            JobRepo::new(&mut c).claim_next(deadline).unwrap(),
+            Some(id),
+            "the deadline is inclusive: at run_after the job is ready"
+        );
+    }
+
+    /// A backed-off job must not block a ready one behind it. Without the
+    /// `run_after` filter in the subquery the head-of-line job would be picked,
+    /// re-failed and the queue would stall on it.
+    #[test]
+    fn backoff_does_not_block_the_rest_of_the_queue() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(100);
+        let stalled = JobRepo::new(&mut c)
+            .enqueue(JobClass::Upload, 10, "{}", t)
+            .unwrap();
+        let ready = JobRepo::new(&mut c)
+            .enqueue(JobClass::Hash, 0, "{}", t)
+            .unwrap();
+
+        JobRepo::new(&mut c).claim_next(t).unwrap(); // takes `stalled`, higher priority
+        JobRepo::new(&mut c)
+            .requeue(stalled, Timestamp::from_nanos(9_999), Some("429"), t)
+            .unwrap();
+
+        assert_eq!(
+            JobRepo::new(&mut c).claim_next(t).unwrap(),
+            Some(ready),
+            "the lower-priority ready job must be served while the other waits"
+        );
+    }
+
+    /// `claim_next` already counted the attempt. If `requeue` counted it too,
+    /// a 5-attempt budget would be spent in 3 failures.
+    #[test]
+    fn requeue_does_not_double_count_the_attempt() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(1);
+        let id = JobRepo::new(&mut c)
+            .enqueue(JobClass::Hash, 0, "{}", t)
+            .unwrap();
+        JobRepo::new(&mut c).claim_next(t).unwrap();
+        JobRepo::new(&mut c)
+            .requeue(id, t, Some("boom"), t)
+            .unwrap();
+        assert_eq!(JobRepo::new(&mut c).get(id).unwrap().unwrap().attempts, 1);
+
+        JobRepo::new(&mut c).claim_next(t).unwrap();
+        assert_eq!(JobRepo::new(&mut c).get(id).unwrap().unwrap().attempts, 2);
+    }
+
+    /// Requeue preserves the resume point. AC-2 is "resume without re-sending
+    /// verified parts"; a retry that cleared the checkpoint would re-send them.
+    #[test]
+    fn requeue_preserves_the_checkpoint_and_records_the_error() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(1);
+        let id = JobRepo::new(&mut c)
+            .enqueue(JobClass::Upload, 0, "{}", t)
+            .unwrap();
+        JobRepo::new(&mut c).claim_next(t).unwrap();
+        JobRepo::new(&mut c)
+            .checkpoint(id, r#"{"parts_done":7}"#, t)
+            .unwrap();
+        JobRepo::new(&mut c)
+            .requeue(id, t, Some("connection reset"), t)
+            .unwrap();
+
+        let j = JobRepo::new(&mut c).get(id).unwrap().unwrap();
+        assert_eq!(j.state, JobState::Queued);
+        assert_eq!(j.checkpoint_json.as_deref(), Some(r#"{"parts_done":7}"#));
+        assert_eq!(j.last_error.as_deref(), Some("connection reset"));
+    }
+
+    /// Rows written before migration 0002 must be claimable immediately rather
+    /// than stranded behind a NULL or a bogus deadline.
+    #[test]
+    fn rows_predating_the_migration_default_to_ready() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(42);
+        let id = JobRepo::new(&mut c)
+            .enqueue(JobClass::Scan, 0, "{}", t)
+            .unwrap();
+        assert_eq!(JobRepo::new(&mut c).get(id).unwrap().unwrap().run_after, 0);
+        assert_eq!(JobRepo::new(&mut c).claim_next(t).unwrap(), Some(id));
     }
 
     #[test]

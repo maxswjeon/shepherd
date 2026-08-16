@@ -19,7 +19,7 @@
 //! allocates an already-used name and silently overwrites a valid pointer.
 
 /// Schema version applied by [`crate::migrate::migrate`].
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The full DDL for [`SCHEMA_VERSION`].
 ///
@@ -518,4 +518,58 @@ CREATE TABLE setting (
     key        TEXT PRIMARY KEY,
     value_json TEXT NOT NULL
 );
+"#;
+
+/// Retry backoff for the job queue (T6, §6 Phase 1 "retry with backoff").
+///
+/// # Why a column rather than arithmetic on `updated_at`
+///
+/// A retryable failure has to become invisible to `claim_next` until its
+/// backoff expires, and the queue has nowhere to record "not before". The
+/// obvious alternative — deriving the deadline as `updated_at + f(attempts)`
+/// inside the claim query — was rejected: it welds the backoff *policy* into
+/// the SQL, where it cannot be unit-tested or changed without a migration, and
+/// it silently couples to `updated_at`, which `checkpoint()` also writes.
+///
+/// With this column the split is clean: `job_repo` owns the atomic transition
+/// (claim skips a job whose `run_after` is in the future), and
+/// `shepherd-jobs::queue` owns the curve that decides what `run_after` should
+/// be. §4.4's schema sketch predates the queue, which is why the column was not
+/// there to begin with.
+///
+/// `0` means "ready now" and is the default, so every row written before this
+/// migration is immediately claimable — a backlog does not stall on an upgrade.
+/// Timestamps are nanoseconds since the epoch and therefore always positive, so
+/// `0` cannot collide with a real deadline.
+///
+/// The `job_state_priority` index is deliberately left as it is. `run_after`
+/// applies as a residual filter after the index narrows to `state = 'queued'`,
+/// which is the right trade while the pool is small and fixed.
+/// ponytail: residual filter, index on (state, run_after, priority) if a large
+/// backed-off backlog ever shows up in a claim profile.
+pub const MIGRATION_0002: &str = r#"
+ALTER TABLE job ADD COLUMN run_after INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// Migration 0003 — D-12's `destruction_ineligible` flag (§4.10.1, T8).
+///
+/// §4.10.1 admits a filesystem that supports neither identity-bound staging
+/// (`RENAME_NOREPLACE` returns `EINVAL` on some FUSE and exFAT mounts) nor
+/// enforceable writer exclusion. **There is no detect-only fallback**:
+/// iteration 2 fell back to pathname deletion and logged the residual, "which
+/// directly contradicted its own fail-closed gate — a plan cannot promise
+/// fail-closed and then ship the failure mode behind a log line".
+///
+/// So such a root is scanned, indexed, searched and may be *copied* to a
+/// target, but its originals are never destroyed. Detected by a **feasibility
+/// probe at enrollment**, not discovered at destroy time, and disclosed to the
+/// user as a real capability reduction (D-12).
+///
+/// A separate migration rather than an amendment to 0001: another task had
+/// already added 0002 on top of 0001 in the working tree, so rewriting 0001
+/// would have invalidated a migration someone else was mid-way through
+/// building on.
+pub const MIGRATION_0003: &str = r#"
+ALTER TABLE scan_root ADD COLUMN destruction_ineligible INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE scan_root ADD COLUMN destruction_ineligible_reason TEXT;
 "#;

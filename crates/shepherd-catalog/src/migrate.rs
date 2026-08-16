@@ -6,12 +6,20 @@
 
 use rusqlite::{Connection, params};
 
-use crate::schema::{MIGRATION_0001, SCHEMA_VERSION};
+use crate::schema::{MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, SCHEMA_VERSION};
 use crate::{CatalogError, Result};
 
 /// Every migration, in order. Adding one is appending a row here; the runner
 /// applies whatever is not yet recorded.
-const MIGRATIONS: &[(i64, &str, &str)] = &[(1, "initial schema (§4.4)", MIGRATION_0001)];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "initial schema (§4.4)", MIGRATION_0001),
+    (2, "job.run_after for retry backoff (T6)", MIGRATION_0002),
+    (
+        3,
+        "scan_root.destruction_ineligible (D-12, \u{a7}4.10.1)",
+        MIGRATION_0003,
+    ),
+];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(
@@ -112,7 +120,11 @@ mod tests {
                 .conn()
                 .query_row("SELECT COUNT(*) FROM schema_migration", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(rows, 1, "re-opening must not re-apply the migration");
+            assert_eq!(
+                rows,
+                MIGRATIONS.len() as i64,
+                "re-opening must not re-apply a migration"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }

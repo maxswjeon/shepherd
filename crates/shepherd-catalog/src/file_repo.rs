@@ -28,6 +28,12 @@ pub struct ScanRoot {
     /// refused.
     pub resync_required: bool,
     pub availability: Availability,
+    /// D-12 (§4.10.1): this root's filesystem supports neither identity-bound
+    /// staging nor enforceable writer exclusion, so its originals are NEVER
+    /// destroyed. Set by a feasibility probe at enrollment, never discovered at
+    /// destroy time.
+    pub destruction_ineligible: bool,
+    pub destruction_ineligible_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +70,38 @@ impl ScanRoot {
     /// "processes ZERO absences" — a file missing from an unmounted volume is
     /// not evidence the user deleted it.
     pub fn may_destroy(&self) -> bool {
-        !self.resync_required && self.availability == Availability::Available
+        !self.resync_required
+            && self.availability == Availability::Available
+            && !self.destruction_ineligible
+    }
+
+    /// Why destruction is refused, for the preview and the audit record. `None`
+    /// when it is permitted.
+    ///
+    /// One place rather than three call sites: a gate that has to be remembered
+    /// at each use is a gate that will eventually be forgotten at one of them.
+    pub fn destroy_refusal(&self) -> Option<String> {
+        if self.resync_required {
+            return Some(
+                "root requires resync: the watcher journal overflowed, so the catalog may \
+                 not reflect the disk (PM-3)"
+                    .into(),
+            );
+        }
+        if self.availability != Availability::Available {
+            return Some(format!(
+                "root is {}: an unavailable root processes zero absences (PM-3 #2)",
+                self.availability.as_str()
+            ));
+        }
+        if self.destruction_ineligible {
+            return Some(
+                self.destruction_ineligible_reason
+                    .clone()
+                    .unwrap_or_else(|| "root is destruction_ineligible (D-12)".into()),
+            );
+        }
+        None
     }
 
     /// The `norm_key` for a path under this root, using this root's policies.
@@ -119,7 +156,8 @@ impl<'a> FileRepo<'a> {
             .conn()
             .query_row(
                 "SELECT id, path, stub_mode, path_case_policy, path_norm_policy,
-                        atime_mode, volume_id, resync_required, availability
+                        atime_mode, volume_id, resync_required, availability,
+                        destruction_ineligible, destruction_ineligible_reason
                  FROM scan_root WHERE id = ?1",
                 params![id.get()],
                 row_to_root,
@@ -138,6 +176,29 @@ impl<'a> FileRepo<'a> {
         )?;
         if required {
             tracing::warn!(root = %id, "resync-required set: tier/destroy/discard refused for this root");
+        }
+        Ok(())
+    }
+
+    /// D-12: record the enrollment probe's verdict. Setting it is loud — it is
+    /// a user-visible capability reduction, not a tuning knob.
+    pub fn set_destruction_ineligible(
+        &mut self,
+        id: RootId,
+        ineligible: bool,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.0.conn_mut().execute(
+            "UPDATE scan_root SET destruction_ineligible = ?2,
+                 destruction_ineligible_reason = ?3 WHERE id = ?1",
+            params![id.get(), ineligible as i64, reason],
+        )?;
+        if ineligible {
+            tracing::warn!(
+                root = %id,
+                reason = reason.unwrap_or("unspecified"),
+                "root marked destruction_ineligible: originals under it will never be destroyed"
+            );
         }
         Ok(())
     }
@@ -290,6 +351,8 @@ fn row_to_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ScanRoot>> {
             resync_required: row.get::<_, i64>(7)? != 0,
             availability: Availability::parse(&avail)
                 .ok_or_else(|| CatalogError::Invalid(format!("availability `{avail}`")))?,
+            destruction_ineligible: row.get::<_, i64>(9)? != 0,
+            destruction_ineligible_reason: row.get(10)?,
         })
     })())
 }
