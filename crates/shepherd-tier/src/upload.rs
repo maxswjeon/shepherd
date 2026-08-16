@@ -138,6 +138,26 @@ pub async fn upload_item(
             // From the source, so it cannot disagree with what the driver will
             // re-read a moment later.
             let fp = source.fingerprint().await?;
+
+            // The driver's PM-1 guard starts at session creation, so a file
+            // edited between planning (where its hash and key were computed)
+            // and here is invisible to it until `Verifying` — after the whole
+            // object has been uploaded. Worse, the failed object then sits at a
+            // content-addressed key whose name does not describe its bytes, and
+            // v1 cannot reap it (D-10 disables GC and the delete verbs are
+            // gated), so it poisons conditional-create at that key until scrub
+            // flags it.
+            //
+            // A size change is the cheap half of that check and costs one stat.
+            // A same-size edit still slips through to the `Verifying` hash and
+            // is documented as scrub-caught rather than claimed closed.
+            if fp.size != item.size {
+                return Err(StorageError::ContentMismatch {
+                    key: item.path.clone(),
+                    expected: format!("{} bytes at planning time", item.size),
+                    actual: format!("{} bytes now — re-plan rather than upload", fp.size),
+                });
+            }
             let identity = SourceIdentity {
                 file_id: item.file,
                 rel_path: item.path.clone(),

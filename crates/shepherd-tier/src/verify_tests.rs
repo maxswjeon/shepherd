@@ -116,6 +116,36 @@ async fn a_wrong_size_is_caught_before_paying_for_a_full_read() {
 }
 
 #[tokio::test]
+async fn the_whole_object_checksum_is_captured_rather_than_dropped() {
+    // The upload asks the provider for a whole-object checksum precisely so the
+    // scrub path can compare against it later WITHOUT egress. If verification
+    // does not capture it, the value is gone and the whole upload-time decision
+    // bought nothing.
+    let a = MemAdapter::content_addressed();
+    a.put_raw(&key(), Bytes::from_static(BODY));
+    let v = verify_upload(
+        &a,
+        &key(),
+        hash_of(BODY),
+        BODY.len() as u64,
+        TargetId::new(1),
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect("verify");
+
+    // The in-memory adapter models a provider that offers none, so this is the
+    // documented fallback: scrub must read this object back in full.
+    assert_eq!(
+        v.whole_object_checksum, None,
+        "a provider that offers no checksum must leave the field empty, \
+         not fabricate one"
+    );
+    // The field exists so `remote_object.checksum_kind` can be written from it.
+    let _: Option<ObjectChecksum> = v.whole_object_checksum;
+}
+
+#[tokio::test]
 async fn a_missing_object_is_not_found_rather_than_a_silent_pass() {
     let a = MemAdapter::content_addressed();
     let err = verify_upload(

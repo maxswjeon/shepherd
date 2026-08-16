@@ -91,7 +91,17 @@ pub struct S3Config {
     /// bytes, and their ETags are digest-of-digests, so without this the only
     /// integrity check available for them is a full read.
     ///
-    /// `None` means the scrub path must read those objects back in full.
+    /// **Opt-in, and deliberately not defaulted on.** Verified working against
+    /// MinIO, but R2, B2 and the other S3-compatibles are unverified, and a
+    /// provider that rejects the parameter fails *every* multipart upload to
+    /// that target rather than degrading. Defaulting it on would trade a
+    /// scrub-cost optimisation for a total outage on an untested provider.
+    ///
+    /// The cost of that caution is real and belongs in target registration:
+    /// this cannot be retrofitted without re-uploading every object, so the
+    /// registration path must probe the provider and set it **then**, not leave
+    /// it to a later decision. `None` means the scrub path must read those
+    /// objects back in full.
     pub multipart_checksum: Option<ChecksumAlgorithm>,
 }
 

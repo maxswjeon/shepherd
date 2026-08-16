@@ -98,6 +98,42 @@ async fn an_upload_runs_end_to_end_and_the_object_is_byte_identical() {
     );
 }
 
+/// The plan-to-upload window, partially closed.
+#[tokio::test]
+async fn a_file_that_changed_size_since_planning_is_refused_rather_than_uploaded() {
+    // The driver's PM-1 guard starts at session creation, so an edit between
+    // planning and here would otherwise go unnoticed until `Verifying` — after
+    // the whole object was uploaded, and leaving residue at a content-addressed
+    // key whose name does not describe its bytes.
+    let f = TempFile::new("grew", BODY);
+    let hash = hash_file(&f.0).expect("hash");
+    let mut it = item(&f.0.to_string_lossy(), hash);
+    it.size = BODY.len() as u64 + 100; // planned against a larger file
+
+    let adapter = MemAdapter::content_addressed();
+    let store = MemStore::new();
+    let locks = FileLocks::new();
+
+    let err = upload_item(
+        JobId::new(2),
+        &it,
+        &adapter,
+        &store,
+        &locks,
+        FsId::new("vol:1"),
+    )
+    .await
+    .expect_err("a changed source must be re-planned, not uploaded");
+    assert!(
+        err.to_string().contains("re-plan"),
+        "the error must say what to do about it: {err}"
+    );
+    assert!(
+        adapter.object(&it.remote_key).is_none(),
+        "nothing may reach the target"
+    );
+}
+
 /// The reason this module holds `acquire_key` and not only `acquire`.
 #[tokio::test]
 async fn the_remote_key_lock_is_held_because_dedup_makes_the_mapping_many_to_one() {

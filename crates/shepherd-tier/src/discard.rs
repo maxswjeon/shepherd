@@ -32,7 +32,7 @@
 //! destruction, and a second call site would be a second place to forget it.
 
 use shepherd_catalog::job_repo::JobClass;
-use shepherd_core::{IntentId, ObjectKey, Timestamp};
+use shepherd_core::{IntentId, ObjectKey, TargetId, Timestamp};
 use shepherd_placeholder::mock::StubState;
 use shepherd_rules::delete_policy::{
     BreakerState, DiscardDecision, DiscardInputs, PermanentDeleteConfirmation, discard_permitted,
@@ -164,8 +164,15 @@ pub fn evaluate_discard(
 /// they are looking at the held target, and both now take the catalog's
 /// [`JobClass`] so there is one vocabulary rather than two.
 pub fn hold_blocks(class: JobClass) -> bool {
-    matches!(class, JobClass::Destroy)
+    // Delegates rather than repeating the match. Two typed copies of one
+    // predicate is the same drift shape as the string-vs-enum version this
+    // replaced — it just fails more quietly, because both compile.
+    crate::breaker::HoldScope { target: SENTINEL }.blocks(class, SENTINEL)
 }
+
+/// Any target: [`hold_blocks`] answers the class question only, so the target
+/// comparison is made trivially true rather than duplicated.
+const SENTINEL: TargetId = TargetId::new(0);
 
 /// Execute a discard that both gates have already permitted.
 ///
