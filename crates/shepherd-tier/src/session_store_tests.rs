@@ -10,12 +10,19 @@
 //! against the same file and drops it. Nothing is carried across in memory, so
 //! whatever the second scope sees came off disk.
 
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
 use super::*;
 use crate::plan::{TierItem, derive_object_key};
 use crate::serialize::FileLocks;
 use crate::upload::{hash_file, upload_item};
 use shepherd_catalog::Catalog;
+use shepherd_catalog::file_repo::FileRepo;
 use shepherd_catalog::writer::CatalogActor;
+use shepherd_core::{FileStat, RootId};
 use shepherd_storage::multipart::PartAction;
 use shepherd_storage::testing::MemAdapter;
 
@@ -344,6 +351,369 @@ async fn the_actor_backend_round_trips_identically_to_the_owned_one() {
         Some(back),
         "both backends must return the same session"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Contention: two writers on one WAL file
+// ---------------------------------------------------------------------------
+
+/// A session with one acknowledged part, ready to persist.
+fn session_for(job: JobId, item: &TierItem, tag: &str) -> TransferSession {
+    let adapter = MemAdapter::content_addressed();
+    let mut s = TransferSession::plan(
+        job,
+        item.target,
+        item.remote_key.clone(),
+        SourceIdentity {
+            file_id: item.file,
+            rel_path: item.path.clone(),
+            size: item.size,
+            mtime: Timestamp::from_nanos(7),
+            fs_id: FsId::new("vol-1:ino-9"),
+            blake3: item.blake3,
+        },
+        &adapter,
+        16,
+    )
+    .expect("plan");
+    s.state = TransferState::Uploading;
+    s.upload_id = Some(OpaqueToken::new(format!("upload-{tag}")));
+    s.parts.push(PartCheckpoint {
+        part_no: 1,
+        offset: 0,
+        len: 16,
+        local_blake3: Blake3Hash::from_bytes([5u8; 32]),
+        etag: Some(OpaqueToken::new(format!("etag-{tag}"))),
+    });
+    s
+}
+
+/// One row of the shape `shepherd-daemon`'s scan executor writes.
+fn scan_stat(i: usize) -> FileStat {
+    FileStat {
+        root: RootId::new(1),
+        rel_path: format!("scan/{i}.bin"),
+        size: 1,
+        mtime: Timestamp::from_nanos(1),
+        ctime: Timestamp::from_nanos(1),
+        atime: None,
+        blake3: None,
+    }
+}
+
+/// **The contention measurement, on the failing arrangement.**
+///
+/// `Backend::Owned` holds its own connection. Put it on the same file as a scan
+/// and the two are a second writer on one WAL database — many readers, one
+/// WRITER — so this measures what actually happens rather than reasoning about
+/// it.
+///
+/// # Why the overlap is proven rather than hoped for
+///
+/// `SQLITE_BUSY` **cannot** be produced without a live concurrent holder of the
+/// write lock: the error *is* the overlap. A free-running pair of threads would
+/// not do — both `save_blocking` and the scan's `upsert_batch` are write-first,
+/// and `busy_timeout = 5000` absorbs a 500-row batch commit without complaint,
+/// so the contention would show up as invisible latency and an assertion on it
+/// would measure nothing. That is instance #5's shape. So the scan side holds
+/// its transaction open across a barrier pair, and the session save is issued
+/// strictly inside that window with `holding` asserted first.
+///
+/// # What the elapsed-time assertion is for — the ADR-001 discriminator
+///
+/// SQLite has two failure modes here and they are **not** interchangeable:
+///
+/// * plain `SQLITE_BUSY` — the write lock is held by someone else. The busy
+///   handler runs, so the call blocks for the whole `busy_timeout` and the
+///   operation is retryable. `waited >= TEST_BUSY_TIMEOUT` is what identifies
+///   this one.
+/// * `SQLITE_BUSY_SNAPSHOT` (extended code 517) — a DEFERRED transaction took a
+///   read snapshot and *then* tried to write, and someone committed in between.
+///   It returns **immediately**; no `busy_timeout` can cure it, and the only
+///   recovery is to roll back and re-run the whole transaction. This is the
+///   shape ADR-001 rejected `sqlx` for.
+///
+/// Asserting that the call waited out the timeout is therefore the empirical
+/// proof that our write paths are write-first and have not reintroduced the
+/// read-then-write upgrade by hand.
+#[test]
+fn a_second_connection_writing_during_a_scan_batch_gets_sqlite_busy() {
+    let dir = TempDir::new("busy");
+    let db = dir.join("catalog.db");
+    let src = dir.join("a.bin");
+    std::fs::write(&src, BODY).expect("write source");
+    let item = item_for(&src);
+    let job = JobId::new(21);
+    seed(&db, job, item.target, item.file);
+    let session = session_for(job, &item, "busy");
+
+    // Opened before the scan side takes the lock: `Catalog::open` applies
+    // pragmas, and `journal_mode` is not something to negotiate mid-conflict.
+    let mut cat = Catalog::open(&db).expect("session connection");
+
+    /// The production budget is 5000ms (`shepherd_catalog::PRAGMAS`). Lowered
+    /// here only to bound the test — the mechanism is what is under
+    /// measurement, not the tuning. A test that waited out the real budget
+    /// would prove the same thing five seconds more slowly.
+    const TEST_BUSY_TIMEOUT: Duration = Duration::from_millis(200);
+    cat.conn()
+        .pragma_update(None, "busy_timeout", TEST_BUSY_TIMEOUT.as_millis() as i64)
+        .expect("lower busy_timeout");
+
+    let gate = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let holding = Arc::new(AtomicBool::new(false));
+
+    let scan = {
+        let db = db.clone();
+        let gate = Arc::clone(&gate);
+        let release = Arc::clone(&release);
+        let holding = Arc::clone(&holding);
+        std::thread::spawn(move || {
+            let mut cat = Catalog::open(&db).expect("scan connection");
+            let root = FileRepo::new(&mut cat)
+                .get_root(RootId::new(1))
+                .expect("get_root")
+                .expect("the seeded root");
+            // Exactly `shepherd-daemon::scan_exec::upsert_batch`'s shape:
+            // BEGIN, N x FileRepo::upsert_file, COMMIT. The first write takes
+            // the WAL writer lock and holds it until the commit.
+            cat.conn().execute_batch("BEGIN").expect("begin");
+            for i in 0..50 {
+                FileRepo::new(&mut cat)
+                    .upsert_file(&root, &scan_stat(i), Timestamp::from_nanos(1))
+                    .expect("upsert");
+            }
+            holding.store(true, Ordering::SeqCst);
+            gate.wait(); // the write lock is held from here...
+            release.wait(); // ...to here
+            cat.conn().execute_batch("COMMIT").expect("commit");
+            holding.store(false, Ordering::SeqCst);
+        })
+    };
+
+    gate.wait();
+    assert!(
+        holding.load(Ordering::SeqCst),
+        "precondition: the scan side must be inside its write transaction, \
+         or this test measures an uncontended write"
+    );
+
+    // The extended code, captured DIRECTLY rather than inferred from timing.
+    // `save_blocking` maps every `rusqlite::Error` to a `StorageError` string,
+    // so the discriminator has to be read off a raw statement on the same
+    // connection, inside the same held window.
+    let probe = cat
+        .conn()
+        .execute(
+            "UPDATE transfer_session SET updated_at = updated_at WHERE job_id = ?1",
+            [job.get()],
+        )
+        .expect_err("a raw write is refused for the same reason the store's is");
+    let extended = match &probe {
+        rusqlite::Error::SqliteFailure(e, _) => e.extended_code,
+        other => panic!("expected a SQLite failure, got {other:?}"),
+    };
+    assert_eq!(
+        extended,
+        rusqlite::ffi::SQLITE_BUSY,
+        "expected SQLITE_BUSY (5) — retryable, the busy handler ran. \
+         SQLITE_BUSY_SNAPSHOT (517) would mean a DEFERRED transaction read before it wrote, \
+         which returns immediately, no `busy_timeout` can cure, and ADR-001 rejected sqlx for"
+    );
+
+    let started = Instant::now();
+    let err = save_blocking(&mut cat, &session)
+        .expect_err("a second connection cannot write while the scan holds the WAL writer lock");
+    let waited = started.elapsed();
+
+    release.wait();
+    scan.join().expect("scan thread");
+
+    let detail = err.to_string();
+    assert!(
+        detail.to_lowercase().contains("locked"),
+        "expected SQLITE_BUSY (`database is locked`), got: {detail}"
+    );
+    assert!(
+        waited >= TEST_BUSY_TIMEOUT,
+        "the call returned after {waited:?}, short of the {TEST_BUSY_TIMEOUT:?} busy_timeout. \
+         An immediate return is SQLITE_BUSY_SNAPSHOT (517) — a DEFERRED transaction that read \
+         before it wrote — which no timeout can cure and which ADR-001 rejected sqlx for"
+    );
+
+    // And the failure is transient, not terminal: once the scan commits, the
+    // identical save lands. A store that had corrupted its own transaction on
+    // the way out would fail here too.
+    save_blocking(&mut cat, &session).expect("the retry must succeed once the lock is free");
+    let parts: i64 = cat
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM transfer_part p
+               JOIN transfer_session s ON s.id = p.session_id
+              WHERE s.job_id = ?1",
+            [job.get()],
+            |r| r.get(0),
+        )
+        .expect("count parts");
+    assert_eq!(parts, 1, "the retried save must have landed its part row");
+    let scanned: i64 = cat
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM file WHERE rel_path LIKE 'scan/%'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count scanned files");
+    assert_eq!(
+        scanned, 50,
+        "the scan batch must have committed all 50 rows"
+    );
+}
+
+/// **The same contention, routed through the one writer the daemon runs.**
+///
+/// This is the arrangement `CatalogSessionStore::with_writer` exists for, and
+/// the question it has to answer is not "does it work" but "does serialising
+/// the transfer path behind the scan path stall uploads".
+///
+/// # The overlap is a handshake, not a hope
+///
+/// The scan batch signals from **inside** the actor closure that it is running,
+/// waits for the test to say it has started timing, and only then holds the
+/// actor for a known `HOLD`. So the save is issued while a scan batch is
+/// demonstrably executing on the single writer, and the measured latency has
+/// exactly one explanation.
+///
+/// # What the number means
+///
+/// The save waits, it does not fail — no `SQLITE_BUSY` is reachable, because
+/// there is only ever one connection. The cost is queueing, and its bound is
+/// **one batch**, not one scan: `shepherd-daemon::scan_exec` submits 500 rows
+/// per blocking `try_with` and never holds a transaction across them
+/// (`UPSERT_BATCH`, scan_exec.rs). There is no long scan transaction for a
+/// transfer to stall behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_writer_actor_queues_a_session_save_behind_a_scan_batch_instead_of_failing() {
+    let dir = TempDir::new("queued");
+    let db = dir.join("catalog.db");
+    let src = dir.join("a.bin");
+    std::fs::write(&src, BODY).expect("write source");
+    let item = item_for(&src);
+    let job = JobId::new(23);
+    seed(&db, job, item.target, item.file);
+    let session = session_for(job, &item, "queued");
+
+    /// How long the scan batch occupies the actor once the save is timing.
+    const HOLD: Duration = Duration::from_millis(250);
+    /// The scan closure polls at 1ms; a few of those plus scheduling is the
+    /// only slack between the test's clock and the closure's sleep.
+    const SLACK: Duration = Duration::from_millis(25);
+    const BATCHES: usize = 4;
+    const PER_BATCH: usize = 50;
+
+    let actor = CatalogActor::start(Catalog::open(&db).expect("open"), Some(db.clone()));
+    let store = CatalogSessionStore::with_writer(actor.handle());
+
+    let running = Arc::new(AtomicBool::new(false));
+    let timing = Arc::new(AtomicBool::new(false));
+
+    let scan = {
+        let writer = actor.handle();
+        let running = Arc::clone(&running);
+        let timing = Arc::clone(&timing);
+        std::thread::spawn(move || {
+            for batch in 0..BATCHES {
+                let running = Arc::clone(&running);
+                let timing = Arc::clone(&timing);
+                writer
+                    .try_with(move |cat| {
+                        if batch == 0 {
+                            running.store(true, Ordering::SeqCst);
+                            // Waiting on a flag the TEST sets, never on the
+                            // actor: a closure that waited for actor work would
+                            // wedge the catalog permanently.
+                            let start = Instant::now();
+                            while !timing.load(Ordering::SeqCst)
+                                && start.elapsed() < Duration::from_secs(5)
+                            {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            std::thread::sleep(HOLD);
+                        }
+                        let root = FileRepo::new(cat)
+                            .get_root(RootId::new(1))?
+                            .expect("the seeded root");
+                        cat.conn().execute_batch("BEGIN")?;
+                        for i in 0..PER_BATCH {
+                            FileRepo::new(cat).upsert_file(
+                                &root,
+                                &scan_stat(batch * PER_BATCH + i),
+                                Timestamp::from_nanos(1),
+                            )?;
+                        }
+                        cat.conn().execute_batch("COMMIT")?;
+                        Ok(())
+                    })
+                    .expect("every scan batch must reach the actor");
+            }
+        })
+    };
+
+    let start = Instant::now();
+    while !running.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        running.load(Ordering::SeqCst),
+        "precondition: a scan batch must be executing on the actor, or this test \
+         measures an uncontended save"
+    );
+
+    timing.store(true, Ordering::SeqCst);
+    let t0 = Instant::now();
+    let saved = store.save(&session).await;
+    let waited = t0.elapsed();
+
+    scan.join().expect("scan thread");
+
+    saved.expect("the actor serialises rather than colliding: a save must not fail here");
+    assert!(
+        waited + SLACK >= HOLD,
+        "the save returned after {waited:?}, so it did NOT queue behind the {HOLD:?} scan \
+         batch and this test proved nothing about contention"
+    );
+
+    // Both writers' work is present. A lost row on either side would mean the
+    // actor was not the only writer after all.
+    let writer = actor.handle();
+    let (files, parts) = writer
+        .try_with(move |cat| {
+            let files: i64 = cat.conn().query_row(
+                "SELECT COUNT(*) FROM file WHERE rel_path LIKE 'scan/%'",
+                [],
+                |r| r.get(0),
+            )?;
+            let parts: i64 = cat.conn().query_row(
+                "SELECT COUNT(*) FROM transfer_part p
+                   JOIN transfer_session s ON s.id = p.session_id
+                  WHERE s.job_id = ?1",
+                [job.get()],
+                |r| r.get(0),
+            )?;
+            Ok((files, parts))
+        })
+        .expect("count through the actor");
+    assert_eq!(
+        files,
+        (BATCHES * PER_BATCH) as i64,
+        "every scan row must have landed"
+    );
+    assert_eq!(parts, 1, "the session's part row must have landed");
+
+    // The session is readable through the same writer that wrote it.
+    let back = store.load(job).await.expect("load").expect("row survived");
+    assert_eq!(back.upload_id, session.upload_id);
 }
 
 /// A store wrapper that stops persisting after `n` saves, modelling a process
