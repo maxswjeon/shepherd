@@ -909,3 +909,128 @@ pub fn load_trace(c: &Contract) -> Result<Vec<(String, String, u64)>, String> {
     }
     Ok(out)
 }
+
+// ---------------------------------------------------------------------------
+// Capacity primitives (T2b)
+// ---------------------------------------------------------------------------
+
+/// Measure the catalog's write-amplification primitives: bytes per row, WAL
+/// growth under a sustained write, and the cost of the checkpoint that drains
+/// it.
+///
+/// **Why this is a measurement and not arithmetic.** §9's 50 TB capacity model
+/// wants DB growth and checkpoint size with numeric reject thresholds. Both are
+/// properties of SQLite's page allocation and WAL frame accounting, not of the
+/// row's nominal field widths — a row whose columns sum to 60 bytes does not
+/// occupy 60 bytes, and a WAL frame carries a whole page regardless of how much
+/// of it changed. Deriving these from the schema would produce a confident
+/// number that is wrong in the direction that matters (too small).
+///
+/// The restart figure is deliberately NOT computed here: it is whatever the
+/// winning index's cold-start costs, which `bench-meta` already measures against
+/// the real fixture.
+pub fn capacity(a: &Args) -> Result<(), String> {
+    let c = Contract::load(&a.contract)?;
+    let db = catalog_path(&a.fixtures);
+    if !db.exists() {
+        return Err(format!(
+            "{} missing — run `shepherd-bench gen-catalog` first",
+            db.display()
+        ));
+    }
+    let rows = a.rows_override.unwrap_or(c.fixture.rows);
+    let base_bytes = crate::path_bytes(&db);
+
+    // Work on a copy: the capacity probe writes, and the catalog fixture is an
+    // input to the index legs that must not be mutated underneath them.
+    let probe = a.fixtures.join("capacity-probe.sqlite");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", probe.display()));
+    }
+    std::fs::copy(&db, &probe).map_err(|e| e.to_string())?;
+
+    let conn = rusqlite::Connection::open(&probe).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+        .map_err(|e| e.to_string())?;
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+
+    // A day of steady-state ingest at the contract's background rate. Long
+    // enough that WAL growth is a rate rather than a startup transient.
+    const PROBE_ROWS: u64 = 200_000;
+    let space = dir_space(rows);
+    let wal = std::path::PathBuf::from(format!("{}-wal", probe.display()));
+    let t0 = std::time::Instant::now();
+    {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let mut st = tx
+            .prepare("INSERT INTO file (id,parent,name,ext,size,mtime) VALUES (?,?,?,?,?,?)")
+            .map_err(|e| e.to_string())?;
+        for i in rows..rows + PROBE_ROWS {
+            let r = row(c.fixture.seed, i, space);
+            st.execute(rusqlite::params![
+                r.id as i64,
+                &r.parent,
+                &r.name,
+                r.ext,
+                r.size as i64,
+                r.mtime
+            ])
+            .map_err(|e| e.to_string())?;
+        }
+        drop(st);
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    let write_seconds = t0.elapsed().as_secs_f64();
+    let wal_peak = crate::path_bytes(&wal);
+
+    let t1 = std::time::Instant::now();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| e.to_string())?;
+    let checkpoint_seconds = t1.elapsed().as_secs_f64();
+    let wal_after = crate::path_bytes(&wal);
+    let db_after = crate::path_bytes(&probe);
+
+    let bytes_per_row_base = base_bytes as f64 / rows as f64;
+    let bytes_per_row_marginal = (db_after - base_bytes) as f64 / PROBE_ROWS as f64;
+    eprintln!(
+        "[capacity] base {:.2} GiB / {rows} rows = {bytes_per_row_base:.1} B/row; \
+         marginal {bytes_per_row_marginal:.1} B/row over {PROBE_ROWS} inserts",
+        base_bytes as f64 / 1073741824.0
+    );
+    eprintln!(
+        "[capacity] WAL peak {:.1} MiB after {PROBE_ROWS} rows ({:.1} B/row), \
+         {:.1} MiB after TRUNCATE checkpoint ({checkpoint_seconds:.2}s)",
+        wal_peak as f64 / 1048576.0,
+        wal_peak as f64 / PROBE_ROWS as f64,
+        wal_after as f64 / 1048576.0
+    );
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", probe.display()));
+    }
+
+    crate::emit(
+        &a.out,
+        "capacity_primitives",
+        serde_json::json!({
+            "catalog_rows": rows,
+            "catalog_bytes": base_bytes,
+            "page_size": page_size,
+            "bytes_per_row_base": bytes_per_row_base,
+            "bytes_per_row_marginal": bytes_per_row_marginal,
+            "probe_rows": PROBE_ROWS,
+            "probe_write_seconds": write_seconds,
+            "wal_peak_bytes": wal_peak,
+            "wal_bytes_per_row": wal_peak as f64 / PROBE_ROWS as f64,
+            "wal_after_truncate_checkpoint_bytes": wal_after,
+            "checkpoint_seconds": checkpoint_seconds,
+            "note": "Bench-schema catalog only (id, parent, name, ext, size, mtime). \
+                     The production schema in §4.4 carries remote_object, \
+                     object_location, job and tag tables; the 50 TB model states \
+                     the multiplier it applies and marks it extrapolated.",
+            "scaled_run_reason": a.scaled_run_reason,
+        }),
+    )
+}

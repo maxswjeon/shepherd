@@ -1,4 +1,19 @@
 {
+  "capacity_primitives": {
+    "bytes_per_row_base": 85.4011904,
+    "bytes_per_row_marginal": 85.6064,
+    "catalog_bytes": 854011904,
+    "catalog_rows": 10000000,
+    "checkpoint_seconds": 0.002559004,
+    "note": "Bench-schema catalog only (id, parent, name, ext, size, mtime). The production schema in §4.4 carries remote_object, object_location, job and tag tables; the 50 TB model states the multiplier it applies and marks it extrapolated.",
+    "page_size": 4096,
+    "probe_rows": 200000,
+    "probe_write_seconds": 0.823105141,
+    "scaled_run_reason": null,
+    "wal_after_truncate_checkpoint_bytes": 0,
+    "wal_bytes_per_row": 86.23176,
+    "wal_peak_bytes": 17246352
+  },
   "fixture_catalog": {
     "dir_space": 200000,
     "generate_seconds": 16.350792317,
@@ -211,7 +226,7 @@
         "mean_hits": 48.72272272272272,
         "p50_ms": 2.41342,
         "p95_ms": 54.047361,
-        "p99_ms": 219.33549399999998,
+        "p99_ms": 219.335494,
         "queries": 999,
         "zero_hit": 0,
         "zero_hit_pct": 0.0
@@ -269,7 +284,7 @@
       "accepted_p95_ms": 587.525616,
       "drift_flagged": true,
       "median_p50_ms": 2.249927,
-      "median_p99_ms": 1520.1654310000001,
+      "median_p99_ms": 1520.165431,
       "run_to_run_drift_pct": 16.56316428592963,
       "runs": [
         {
@@ -294,7 +309,7 @@
           "n": 1000,
           "p50_ms": 2.2018459999999997,
           "p95_ms": 616.310781,
-          "p99_ms": 1520.1654310000001
+          "p99_ms": 1520.165431
         }
       ]
     },

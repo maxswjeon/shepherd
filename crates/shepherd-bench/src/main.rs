@@ -550,6 +550,7 @@ COMMANDS:
   machine                  Print the probed machine record as JSON.
   gen-trace                Write the committed query trace from the contract seed.
   gen-catalog              Generate the SQLite catalog fixture (contract rows).
+  capacity                 Measure the 50 TB model's DB/WAL/checkpoint primitives.
   build-meta   <candidate> Build one metadata index: arena | tantivy | fts5
   bench-meta   <candidate> Benchmark one metadata candidate.
   build-ann    <precision> Build usearch shards: f32 | f16 | i8
@@ -661,6 +662,7 @@ fn run() -> Result<(), String> {
         }
         "gen-trace" => generate::gen_trace(&args),
         "gen-catalog" => generate::gen_catalog(&args),
+        "capacity" => generate::capacity(&args),
         "build-meta" => meta_bench::build(&args),
         "bench-meta" => meta_bench::bench(&args),
         "build-ann" => ann_bench::build(&args),
