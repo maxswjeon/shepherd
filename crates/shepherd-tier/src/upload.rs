@@ -35,7 +35,6 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use shepherd_core::{Blake3Hash, FsId, JobId, Timestamp};
 use shepherd_storage::adapter::{ByteRange, StorageAdapter, StorageError, StorageResult};
-use shepherd_storage::multipart::DEFAULT_PART_SIZE;
 use shepherd_storage::transfer_session::{
     SourceFingerprint, SourceIdentity, SourceReader, TransferDriver, TransferOutcome,
     TransferSession, TransferSessionStore,
@@ -109,6 +108,13 @@ impl SourceReader for FileSource {
 ///
 /// Holds the **remote-key** lock across the whole run — see the module docs.
 ///
+/// `preferred_part_size` is a hint — [`PartPlan::new`] clamps it into the
+/// provider's band. It is a parameter for the same reason
+/// `TransferSession::plan` takes one: §4.5 treats part size as a real
+/// per-target tuning knob, since a LAN NAS and a metered WAN link do not want
+/// the same one, and the plan is persisted so it must be chosen once and then
+/// honoured by every resume. [`shepherd_storage::multipart::DEFAULT_PART_SIZE`] is the ordinary argument.
+///
 /// `size` and `mtime` are read from the source rather than taken as arguments,
 /// deliberately. The driver's first act is to compare the session's recorded
 /// fingerprint against a fresh one (PM-1's modify-during-upload guard), so a
@@ -123,6 +129,7 @@ pub async fn upload_item(
     store: &dyn TransferSessionStore,
     locks: &FileLocks,
     fs_id: FsId,
+    preferred_part_size: u64,
 ) -> StorageResult<TransferOutcome> {
     // Both keyspaces, in the fixed order `acquire_both` imposes, so two call
     // sites cannot deadlock each other.
@@ -172,7 +179,7 @@ pub async fn upload_item(
                 item.remote_key.clone(),
                 identity,
                 adapter,
-                DEFAULT_PART_SIZE,
+                preferred_part_size,
             )?;
             store.save(&s).await?;
             s

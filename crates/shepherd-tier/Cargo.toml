@@ -24,6 +24,12 @@ shepherd-catalog.workspace = true
 shepherd-rules.workspace = true
 shepherd-scan.workspace = true
 shepherd-storage.workspace = true
+# `session_store.rs` implements the storage-defined `TransferSessionStore`
+# against the catalog's committed `transfer_session` table. The trait lives in
+# `shepherd-storage` and the rows live in `shepherd-catalog`, so the impl has to
+# sit in the one crate that already depends on both — putting it in the catalog
+# would make the bottom of the stack depend on a peer to satisfy a peer's trait.
+rusqlite = { workspace = true }
 blake3 = { workspace = true }
 # `upload.rs`'s `SourceReader` hands ranges to the transfer driver as `Bytes`.
 # Was dev-only until the real upload path landed.

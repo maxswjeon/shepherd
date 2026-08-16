@@ -22,6 +22,7 @@ pub mod plan;
 pub mod restore;
 pub mod revalidate;
 pub mod serialize;
+pub mod session_store;
 pub mod upload;
 pub mod verify;
 
@@ -43,5 +44,6 @@ pub use plan::{PlanRefusal, SelectedFile, TierItem, TierPlan, derive_object_key,
 pub use restore::{RestoreError, RestoreOutcome, read_back, restore_file};
 pub use revalidate::{ClosingCheck, DestroyRefusal, Location, LocationState, destroy_permitted};
 pub use serialize::FileLocks;
+pub use session_store::CatalogSessionStore;
 pub use upload::{FileSource, hash_file, upload_item};
 pub use verify::{VerifiedLocation, verify_upload};

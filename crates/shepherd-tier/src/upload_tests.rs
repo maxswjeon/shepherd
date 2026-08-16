@@ -84,6 +84,7 @@ async fn an_upload_runs_end_to_end_and_the_object_is_byte_identical() {
         &store,
         &locks,
         FsId::new("vol:1"),
+        shepherd_storage::multipart::DEFAULT_PART_SIZE,
     )
     .await
     .expect("upload");
@@ -121,6 +122,7 @@ async fn a_file_that_changed_size_since_planning_is_refused_rather_than_uploaded
         &store,
         &locks,
         FsId::new("vol:1"),
+        shepherd_storage::multipart::DEFAULT_PART_SIZE,
     )
     .await
     .expect_err("a changed source must be re-planned, not uploaded");
