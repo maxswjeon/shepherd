@@ -444,9 +444,14 @@ mod tests {
         match outcome {
             CheckOutcome::Failed { detail } => {
                 assert!(detail.contains("BUILD failure"), "got: {detail}");
-                assert!(detail.contains("E0432"), "stderr must be surfaced: {detail}");
+                assert!(
+                    detail.contains("E0432"),
+                    "stderr must be surfaced: {detail}"
+                );
             }
-            other => panic!("a non-zero exit with no test results must FAIL as a build error, got {other:?}"),
+            other => panic!(
+                "a non-zero exit with no test results must FAIL as a build error, got {other:?}"
+            ),
         }
     }
 
