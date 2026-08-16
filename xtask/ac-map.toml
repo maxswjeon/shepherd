@@ -26,6 +26,49 @@ phase_order = ["0a", "0b", "0c", "0d", "1", "2", "3", "4", "5", "6", "7", "8", "
 expected_ac_count = 65
 
 # ---------------------------------------------------------------------------
+# KNOWN GAP — `gate --phase 1` PASSES while Phase 1 is NOT done.
+# ---------------------------------------------------------------------------
+#
+# Only TWO ACs carry `owning_gate = "1"` (AC-13, AC-56). Both are now backed by
+# evidence that runs, so the gate reports PASS. §9's Phase 1 row demands
+# considerably more, and none of it is encoded here as a phase-1-owned AC:
+#
+#   * M1 both legs — the functional pipeline over a 1M-file ON-DISK corpus, and
+#     the < 50 ms p95 over a 10M-row injected catalog. The index leg is measured
+#     (14.66 ms p95 at 10M, 0dab668) but is an #[ignore]d bench, not gate
+#     evidence; the functional leg's largest run is the daemon e2e at NINE
+#     entries.
+#   * AC-54's `CLI == registered_methods` running in CI from this phase.
+#   * The identity layer: content-addressed keys collision-free under a
+#     case/normalisation fuzz corpus, and `fs_id` stable across a simulated
+#     remount.
+#   * `atime_mode` detection correct on all three platforms.
+#   * Job-queue core: kill-and-resume of a checkpointed job. (A test exists —
+#     `kill_and_resume_of_a_checkpointed_job` — it is simply not cited here.)
+#   * Catalog write discipline: single-writer actor and dedicated PASSIVE
+#     checkpoint connection. (Tests exist —
+#     `concurrent_writers_over_one_file_serialize` and the contention pair in
+#     `session_store_tests.rs` — also not cited here.)
+#   * Daemon installation on Linux (systemd user unit, lingering checked and
+#     warned, never forced) and macOS (LaunchAgent).
+#
+# **This is the vacuous pass `gate --audit` states it cannot catch.** Its own
+# closing NOTE says it detects owned-too-early only, and that "an AC owned late
+# enough to compile but too early to be non-trivial" stays a human review
+# property. That limit has now been reached in practice, at Phase 1.
+#
+# So: a PASS from `gate --phase 1` currently means "AC-13 and AC-56 hold", NOT
+# "Phase 1 is done". Several of the missing items ALREADY HAVE PASSING TESTS and
+# need only citing; others (the 1M corpus, the three-platform atime check, the
+# macOS LaunchAgent) need machinery or hardware this run did not have.
+#
+# The structural fix is a phase-completeness check that reconciles this file
+# against §9's per-phase rows, so a phase cannot be under-specified silently.
+# Deliberately NOT added in the same pass that discovered the gap — a checker
+# written by the person whose omission it is auditing, at the end of a run, is
+# how the next vacuous pass gets built.
+
+# ---------------------------------------------------------------------------
 # [machinery] — key -> the phase whose §6 creates-list produces it.
 # ---------------------------------------------------------------------------
 [machinery]
@@ -308,6 +351,54 @@ owning_gate = "1"
 exercises = ["shepherd-rules::match", "shepherd-catalog::file_repo", "shepherd-index::meta"]
 note = "passable now — §6 moves rules/match.rs into Phase 1"
 
+# All seven predicate kinds, each cited to the test that reads THAT field.
+# Four rows rather than one, because a single "the matcher works" test is how a
+# predicate kind goes quietly unimplemented — the row that would fail is the one
+# nobody wrote.
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::extension_matches_case_insensitively_and_ignores_dotfiles"
+proves = "predicate kind 1/7 — extension, case-folded, dotfiles not treated as extensions"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::path_glob_matches_and_does_not_over_match"
+proves = "predicate kind 2/7 — path glob, asserted in BOTH directions: an over-matching glob selects files the user never named, and `is_destructive` is true for Tier and Archive alike"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::size_bounds_are_inclusive_and_combine"
+proves = "predicate kind 3/7 — size, bounds inclusive and combinable"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::mtime_ctime_and_atime_age_predicates_each_read_their_own_field"
+proves = "predicate kinds 4-6/7 — mtime, ctime and atime, each proven to read its OWN field. One test rather than three because the failure it guards is the three collapsing onto one timestamp, which only a comparison can catch"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::tag_and_tags_predicates"
+proves = "predicate kind 7/7 — tag and tags"
+
+# The guards. Without these the seven rows above pass against a matcher that
+# says yes to everything.
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::an_empty_predicate_is_refused_because_it_would_match_everything"
+proves = "the negative that gives the seven meaning: a matcher that matched everything would satisfy every positive row above"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::an_unknown_predicate_key_is_refused_not_ignored"
+proves = "an unrecognised key fails loudly rather than being silently dropped — a dropped predicate widens a destructive rule"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::an_invalid_glob_is_reported_rather_than_matching_nothing"
+proves = "a bad glob is an error, not a silent zero-match — §4.12's rule that a rule which cannot be evaluated must not be treated as evaluated"
+
 [[ac]]
 id = "AC-14"
 owning_gate = "2"
@@ -556,6 +647,30 @@ id = "AC-56"
 owning_gate = "1"
 exercises = ["shepherd-proto", "shepherd-cli", "xtask::codegen"]
 note = "schema stability at 1; re-asserted at 8"
+
+# "Stable machine-readable output" is only meaningful if drift is DETECTABLE.
+# Determinism alone is not stability — a generator that is deterministic and a
+# checker that never fails would satisfy the word and none of the intent.
+
+[[ac.evidence]]
+package = "xtask"
+test = "codegen::tests::generation_is_deterministic"
+proves = "the same method table produces byte-identical artifacts, so a diff means a real change rather than generator noise"
+
+[[ac.evidence]]
+package = "xtask"
+test = "codegen::tests::check_reports_missing_differing_and_stale_files"
+proves = "the half that makes determinism load-bearing: --check actually FAILS on missing, differing and stale artifacts. Without this the checker could pass unconditionally and `codegen --check` in CI would assert nothing"
+
+[[ac.evidence]]
+package = "xtask"
+test = "codegen::tests::every_method_gets_a_request_and_a_result_schema"
+proves = "coverage is derived from the method table rather than a hand-kept list, so a new method cannot ship without schemas"
+
+[[ac.evidence]]
+package = "shepherd-proto"
+test = "method::tests::schemas_are_deterministic"
+proves = "determinism at the source, upstream of codegen — so a drift reported by --check is attributable to the table rather than to schemars ordering"
 
 [[ac]]
 id = "AC-57"
