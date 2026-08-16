@@ -161,6 +161,23 @@ globset = "0.4"
 
 libc = "0.2"
 
+# The SIMD substring scan that IS the §4.6 metadata index, promoted from a
+# `shepherd-bench` spike dependency to a workspace one now that `shepherd-index`
+# consumes it too.
+#
+# Not an optimisation to be swapped for a hand-rolled scan later. Phase 0b
+# measured candidate (a) at **22.20 ms warm p95** against tantivy's 68.08 and
+# FTS5-trigram's 378.59, and `memmem`'s throughput is the whole reason it won:
+# a naive byte scan runs around 1 GB/s where `memmem` runs at several, so a
+# ~700 MB arena would cross the 50 ms bar single-threaded on arithmetic alone.
+# Replacing it would mean shipping a candidate the bake-off never measured while
+# citing the bake-off's number for it — the same defect as benchmarking FTS5 on a
+# SQLite the product does not ship (see `rusqlite` in `shepherd-bench`).
+#
+# Already in `Cargo.lock` via `shepherd-bench`, so this adds an edge, not a
+# resolution.
+memchr = "2"
+
 # DEV-ONLY, `shepherd-tier`. §8.2 names an mmap hazard test for the destroy
 # path: OQ-J's residual must be EXERCISED, not assumed away, and a held mmap is
 # the case `rename()` cannot invalidate. Never ships.
