@@ -677,3 +677,164 @@ fn nothing_the_daemon_runs_enables_lingering() {
         "OQ-F: Shepherd must never change the lingering setting"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The scan executor
+// ---------------------------------------------------------------------------
+
+/// Poll `scan.status` until the root's scan stops running, or give up.
+fn wait_for_scan(c: &mut Client, root_id: i64) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        let state = c.call("scan.status", serde_json::json!({"root_id": root_id}));
+        if let Some(scan) = state["scans"].as_array().and_then(|a| a.first()) {
+            last = scan.clone();
+            // `running` false with a finish timestamp means the job left the
+            // queue; a queued job has neither.
+            if scan["running"] == serde_json::json!(false) && !scan["finished_at"].is_null() {
+                return last;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the scan never finished; last status was {last}");
+}
+
+/// **§6 Phase 1's M1 demo, minus the search leg.**
+///
+/// `shepctl root add && shepctl scan` now reaches the catalog: the walker runs,
+/// rows land, and `status` counts them. The third leg (`shepctl search`) needs
+/// T7's index and still answers `MethodNotImplemented`.
+#[test]
+fn a_scan_walks_the_root_and_the_files_land_in_the_catalog() {
+    let d = Daemon::start("scanexec");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-m1");
+    std::fs::create_dir_all(root_dir.join("nested/deeper")).unwrap();
+    std::fs::write(root_dir.join("report.txt"), b"0123456789").unwrap();
+    std::fs::write(root_dir.join("nested/notes.md"), b"abc").unwrap();
+    std::fs::write(root_dir.join("nested/deeper/data.csv"), b"xy").unwrap();
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+
+    let started = c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    assert_eq!(started["job_ids"].as_array().unwrap().len(), 1);
+
+    let scan = wait_for_scan(&mut c, root_id);
+    assert_eq!(
+        scan["files_seen"],
+        serde_json::json!(3),
+        "three files were written, three should be seen: {scan}"
+    );
+    assert_eq!(
+        scan["bytes_seen"],
+        serde_json::json!(15),
+        "10 + 3 + 2 bytes: {scan}"
+    );
+    assert!(scan["last_error"].is_null(), "{scan}");
+
+    // The rows really landed, not just the counter.
+    let status = c.call("status", serde_json::json!({}));
+    assert_eq!(status["files_catalogued"], serde_json::json!(3));
+    assert_eq!(status["bytes_catalogued"], serde_json::json!(15));
+
+    let listed = c.call("root.list", serde_json::json!({}));
+    assert_eq!(listed["roots"][0]["file_count"], serde_json::json!(3));
+
+    // And the job is done, not failed or stuck.
+    let scan_depth = status["jobs_pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["class"] == serde_json::json!("scan"))
+        .expect("a scan row");
+    assert_eq!(scan_depth["failed"], serde_json::json!(0), "{status}");
+    assert_eq!(scan_depth["pending"], serde_json::json!(0), "{status}");
+}
+
+/// Re-scanning must converge, not duplicate. `upsert_file` is
+/// `ON CONFLICT DO UPDATE`, which is exactly what makes the executor's
+/// "restart re-walks from the beginning" position safe.
+#[test]
+fn scanning_twice_converges_rather_than_duplicating() {
+    let d = Daemon::start("rescan");
+    let mut c = d.connect();
+    let root_dir = d.dir.join("corpus-rescan");
+    std::fs::create_dir_all(&root_dir).unwrap();
+    std::fs::write(root_dir.join("a.txt"), b"aa").unwrap();
+    std::fs::write(root_dir.join("b.txt"), b"bbb").unwrap();
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    wait_for_scan(&mut c, root_id);
+    assert_eq!(
+        c.call("status", serde_json::json!({}))["files_catalogued"],
+        serde_json::json!(2)
+    );
+
+    // A file appears between scans; the second scan must pick it up and must
+    // not double-count the first two.
+    std::fs::write(root_dir.join("c.txt"), b"c").unwrap();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    std::thread::sleep(Duration::from_millis(200));
+    wait_for_scan(&mut c, root_id);
+
+    let status = c.call("status", serde_json::json!({}));
+    assert_eq!(
+        status["files_catalogued"],
+        serde_json::json!(3),
+        "re-scan must converge on 3 rows, not accumulate 5: {status}"
+    );
+}
+
+/// A scan subscriber sees progress events, ending with `done`.
+#[test]
+fn a_scan_publishes_progress_events_ending_in_done() {
+    let d = Daemon::start("scanevents");
+    let mut sub = d.connect();
+    sub.call("events.subscribe", serde_json::json!({"streams": ["scan"]}));
+
+    let mut c = d.connect();
+    let root_dir = d.dir.join("corpus-events");
+    std::fs::create_dir_all(&root_dir).unwrap();
+    std::fs::write(root_dir.join("x.bin"), b"1234").unwrap();
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    wait_for_scan(&mut c, root_id);
+
+    // Drain the notifications the subscriber received.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_done = false;
+    let mut seqs: Vec<u64> = Vec::new();
+    while Instant::now() < deadline && !saw_done {
+        let frame = sub.read_frame();
+        assert_eq!(frame["method"], serde_json::json!("event"), "{frame}");
+        let params = &frame["params"];
+        assert_eq!(params["stream"], serde_json::json!("scan"));
+        seqs.push(params["seq"].as_u64().unwrap());
+        if params["payload"]["done"] == serde_json::json!(true) {
+            saw_done = true;
+            assert_eq!(params["payload"]["files_seen"], serde_json::json!(1));
+        }
+    }
+    assert!(saw_done, "the scan never published a done event");
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "sequence numbers must be strictly increasing: {seqs:?}"
+    );
+}

@@ -24,6 +24,7 @@ shepherd-core.workspace = true
 shepherd-jobs.workspace = true
 shepherd-obs.workspace = true
 shepherd-proto.workspace = true
+shepherd-scan.workspace = true
 shepherd-secrets.workspace = true
 
 rusqlite.workspace = true

@@ -27,6 +27,7 @@ use std::sync::atomic::AtomicBool;
 
 use shepherd_daemon::events::EventHub;
 use shepherd_daemon::paths::Paths;
+use shepherd_daemon::scan_exec::ScanExecutor;
 use shepherd_daemon::state::Daemon;
 use shepherd_daemon::{EVENT_BUFFER, server, service};
 use shepherd_jobs::worker::{CatalogActor, Pool, Registry};
@@ -108,13 +109,13 @@ fn cmd_run() -> Result<(), String> {
         "shepherdd listening"
     );
 
-    // No executors are registered at Phase 1: the scan executor needs the
-    // walker wired to the catalog upsert path, which is T4/T7's half of the
-    // pipeline. Jobs enqueued by `scan.start` therefore stay queued rather than
-    // failing, which is `Registry`'s documented behaviour for an unknown class.
-    // ponytail: empty registry; the scan executor lands with the T4 walk
-    // integration, and this is where it registers.
-    let registry = Arc::new(Registry::new());
+    // The `scan` executor is registered; every other class is still
+    // unregistered, and a worker never claims a class it cannot run, so those
+    // jobs wait at zero attempts rather than burning their retry budget.
+    let registry = Arc::new(Registry::new().with(
+        shepherd_catalog::job_repo::JobClass::Scan,
+        ScanExecutor::new(Arc::clone(&daemon)),
+    ));
     let pool = Pool::start(daemon.writer.clone(), registry, POOL_SIZE);
 
     let stop = shutdown_flag();

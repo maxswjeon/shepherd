@@ -16,6 +16,7 @@
 //!   dispatch.rs    the generated `ShepherdApi` impl — the product surface
 //!   state.rs       process-wide state shared by every connection
 //!   events.rs      fan-out over shepherd-proto's EventBuffer
+//!   scan_exec.rs   the `scan` job executor: walk a root, upsert what it finds
 //!   paths.rs       where the socket and the catalog live
 //!   service/       systemd user unit, launchd LaunchAgent
 //! ```
@@ -23,6 +24,7 @@
 pub mod dispatch;
 pub mod events;
 pub mod paths;
+pub mod scan_exec;
 #[cfg(unix)]
 pub mod server;
 pub mod service;
