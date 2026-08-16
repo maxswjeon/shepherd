@@ -232,6 +232,29 @@ enough: FTS5 misses the bar it had to clear by 7.6×.
 
 ---
 
+## 5a. A confound that applies to every number in this document
+
+**This machine was shared with four other agents building the same workspace
+throughout the measurement window.** Load average during the metadata cells was
+8–10 against 8 pinned cores, and `taskset -c 0-7` restricts *this* process to
+cores 0–7 without excluding anyone else from them.
+
+What that does and does not threaten:
+
+- **The comparison is sound.** All three candidates were measured inside the same
+  three-minute window under the same ambient conditions, so the ranking is not an
+  artefact of one candidate getting a quieter box.
+- **The absolute numbers carry ambient noise**, and the contract's run-to-run
+  drift metric is what exposes it — FTS5 warm drifted 51.3% run to run, which is
+  larger than any index effect and is mostly this.
+- **One verdict sits close enough to the bar to deserve a re-check**: tantivy
+  fails at 68.08 ms against a 50 ms bar, only 36% over, which is not obviously
+  outside ambient noise. §5b records the confirmation run.
+
+Reported rather than left implicit: a benchmark run on a contended box is a
+weaker measurement than one run on a quiet box, and saying so is cheaper than
+having a reader discover it.
+
 ## 6. What survives into Phase 1
 
 **Survives (harness):** `generate.rs` in full, the contract loader, the machine
