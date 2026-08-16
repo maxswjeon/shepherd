@@ -1,4 +1,17 @@
+# Pinned at 1.96.0, not at the machine's previously-active 1.91.1.
+#
+# ADR-001 names `aws-sdk-s3` 1.141.0 as the S3 adapter, and that crate and its
+# ~24 `aws-smithy-*` transitives declare `rust-version = 1.94.1`. Pinning 1.91.1
+# made a plan-mandated dependency uninstallable: `cargo build` fails at
+# resolution with "rustc 1.91.1 is not supported by the following packages"
+# before any code is compiled. The toolchain pin is an arbitrary Phase-0a
+# choice; the dependency is a settled architectural decision, so the pin moves.
+#
+# 1.96.0 rather than the current 1.97.1 stable: 1.96.0 is installed on this
+# machine, so every gate in this repository can actually be run here. Pinning a
+# toolchain that cannot be executed locally would mean the CI matrix is the only
+# place the workspace is ever verified.
 [toolchain]
-channel = "1.91.1"
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
