@@ -6,27 +6,24 @@
 # `crates/shepherd-tier/src/destroy.rs`; `cargo xtask check-deps` (rule 4b)
 # fails if that allow appears anywhere else.
 #
-# The list is EMPTY at Phase 0a and that is deliberate: clippy resolves each
-# entry to a real item path, and none of these items exist yet. Populating it
-# with paths to items that do not exist would make `cargo clippy` emit
-# unresolved-path warnings and would put a decorative, non-firing rule in the
-# tree — exactly the "tooling credited with running that did not exist" defect
-# §9 rule 6 records.
+# POPULATED AT PHASE 2 (T8), in the change that created the items — which is
+# exactly what the Phase-0a version of this file said had to happen. Clippy
+# resolves each entry to a real item path, so an entry for an item that does not
+# exist is a warning rather than a rule; that is why the list waited.
 #
-# The Phase 2 owner (T8) MUST add these entries in the same change that creates
-# the items, and `cargo xtask check-deps` rule 4a — a source-level scan that
-# works today and is proved by `xtask/tests/rule4.rs` — is what holds the
-# invariant in the meantime:
+# `dehydrate_placeholder` and `evict_placeholder` are STILL absent, deliberately:
+# `cfapi.rs` and `fileprovider.rs` are Phase 3, so those methods do not exist
+# yet. They go in with the code, not before it. `check-deps` rule 4a — a source
+# scan that needs no resolution — is what covers them meanwhile.
 #
-#   disallowed-methods = [
-#     { path = "shepherd_placeholder::PlaceholderProvider::destroy_local",
-#       reason = "§4.1 rule 4: only shepherd-tier::destroy may call this" },
-#     { path = "shepherd_placeholder::PlaceholderProvider::dehydrate_placeholder", reason = "..." },
-#     { path = "shepherd_placeholder::PlaceholderProvider::evict_placeholder", reason = "..." },
-#     { path = "shepherd_storage::StorageAdapter::delete_object", reason = "..." },
-#   ]
-#
-# `StorageAdapter::delete_system_object` is deliberately NOT listed. It is
+# `StorageAdapter::delete_system_object` is NOT listed and must not be. It is
 # scoped by construction to the `_shepherd/` prefix, is callable by replica
 # maintenance, and is never counted by the discard breaker (§4.1 rule 4).
-disallowed-methods = []
+#
+# The single permitted `#![allow(clippy::disallowed_methods)]` lives at the top
+# of `crates/shepherd-tier/src/destroy.rs`. `check-deps` rule 4b fails the build
+# if it appears anywhere else.
+disallowed-methods = [
+    { path = "shepherd_placeholder::provider::PlaceholderProvider::destroy_local", reason = "§4.1 rule 4: only shepherd-tier::destroy may call this" },
+    { path = "shepherd_storage::adapter::StorageAdapter::delete_object", reason = "§4.1 rule 4: only shepherd-tier::destroy may call this" },
+]

@@ -11,5 +11,20 @@ publish = false
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 shepherd-core.workspace = true
+# §4.1 rule 2: THE permitted edge. No other crate may draw it.
 shepherd-placeholder.workspace = true
+shepherd-catalog.workspace = true
+shepherd-scan.workspace = true
+shepherd-storage.workspace = true
+blake3 = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+memmap2 = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

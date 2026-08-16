@@ -500,6 +500,61 @@ mod tests {
         );
     }
 
+    /// D-12 (§4.10.1): a root whose filesystem cannot host identity-bound
+    /// staging is still scanned, indexed and copyable — its originals are just
+    /// never destroyed. Refusing at destroy time instead would be discovering
+    /// the constraint at the worst possible moment.
+    #[test]
+    fn a_destruction_ineligible_root_may_not_destroy_but_is_otherwise_usable() {
+        let (mut cat, root) = fixture();
+        assert!(root.may_destroy());
+        assert_eq!(root.destroy_refusal(), None);
+
+        FileRepo::new(&mut cat)
+            .set_destruction_ineligible(
+                root.id,
+                true,
+                Some("RENAME_NOREPLACE returned EINVAL on this filesystem"),
+            )
+            .unwrap();
+        let r = FileRepo::new(&mut cat).get_root(root.id).unwrap().unwrap();
+
+        assert!(!r.may_destroy());
+        assert!(r.destroy_refusal().unwrap().contains("EINVAL"));
+        // Still fully usable for everything that is not destruction.
+        FileRepo::new(&mut cat)
+            .upsert_file(&r, &stat(r.id, "a.txt"), Timestamp::from_nanos(2))
+            .unwrap();
+        assert_eq!(
+            FileRepo::new(&mut cat)
+                .find_by_norm_key(&r, "a.txt")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The refusal reason names WHICH gate refused — a preview and an audit
+    /// record both need that, and "cannot destroy" alone helps nobody.
+    #[test]
+    fn each_gate_reports_itself_by_name() {
+        let (mut cat, root) = fixture();
+        FileRepo::new(&mut cat)
+            .set_resync_required(root.id, true)
+            .unwrap();
+        let r = FileRepo::new(&mut cat).get_root(root.id).unwrap().unwrap();
+        assert!(r.destroy_refusal().unwrap().contains("resync"));
+
+        FileRepo::new(&mut cat)
+            .set_resync_required(root.id, false)
+            .unwrap();
+        FileRepo::new(&mut cat)
+            .set_availability(root.id, Availability::Unmounted)
+            .unwrap();
+        let r = FileRepo::new(&mut cat).get_root(root.id).unwrap().unwrap();
+        assert!(r.destroy_refusal().unwrap().contains("unmounted"));
+    }
+
     #[test]
     fn upserting_against_the_wrong_root_is_refused() {
         let (mut cat, root) = fixture();

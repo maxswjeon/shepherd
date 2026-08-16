@@ -12,3 +12,10 @@ workspace = true
 
 [dependencies]
 shepherd-core.workspace = true
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# §4.10.1's identity-bound acquisition primitive: `renameat2(RENAME_NOREPLACE)`
+# on Linux, `renameatx_np(RENAME_EXCL)` on macOS. Neither is in std.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

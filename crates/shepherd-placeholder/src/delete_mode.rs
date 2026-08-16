@@ -1,0 +1,544 @@
+//! Delete-mode: the reference `PlaceholderProvider` (§4.10.1, Unix roots).
+//!
+//! Linux is delete-mode only — there are no placeholders — and it is the
+//! platform M2 ships on, so this is the implementation every §4.10 invariant is
+//! first proven against.
+//!
+//! # `RENAME_NOREPLACE` is the whole design
+//!
+//! The rename must fail if the destination exists. A plain `rename(2)` silently
+//! replaces, which would let a staging-name collision destroy a *different*
+//! staged file. Linux gets `renameat2(RENAME_NOREPLACE)` (≥ 3.15), macOS gets
+//! `renameatx_np(RENAME_EXCL)`; the plan cites `libc` as exposing both.
+//!
+//! `EINVAL` from `renameat2` means the filesystem does not implement the flag —
+//! true of some FUSE and exFAT mounts. §4.10.1 is emphatic that **there is no
+//! detect-only fallback**: iteration 2 fell back to pathname deletion and logged
+//! the residual, "which directly contradicted its own fail-closed gate — a plan
+//! cannot promise fail-closed and then ship the failure mode behind a log line".
+//! So the probe reports [`Feasibility::Ineligible`] and the root never destroys.
+//!
+//! # One staging directory per mount
+//!
+//! `rename` cannot cross filesystems (`EXDEV`), so staging lives beside the
+//! file, at the root of its own mount, created lazily. It is deny-listed from
+//! scan and watch (`shepherd-scan::denylist::STAGING_DIR_NAME`) so its entries
+//! never read as user data appearing and vanishing.
+//!
+//! # What `0700` on the staging directory does not buy
+//!
+//! Nothing that matters here. Shepherd is a **per-user daemon**, so every
+//! process the user runs shares its UID and can still reach the staged entry by
+//! name. §4.10.1 records that iteration 4's test expected `0700` to deny a
+//! same-UID reopen and "would have passed while the hazard remained". The mode
+//! is set because excluding *other* users is still worth doing — but it is not
+//! the boundary, and the staged-path-reopen test asserts the hazard is real.
+
+use std::path::{Path, PathBuf};
+
+use shepherd_core::Blake3Hash;
+
+use crate::provider::{
+    Feasibility, FileIdentity, PlaceholderProvider, ProviderError, ProviderMode, RestoreOutcome,
+    Result, Staged,
+};
+
+/// Directory name used for staging. Must match
+/// `shepherd_scan::denylist::STAGING_DIR_NAME`; the walker denies it by that
+/// name so staged entries are never catalogued.
+pub const STAGING_DIR_NAME: &str = ".shepherd-staging";
+
+#[derive(Debug, Default, Clone)]
+pub struct DeleteModeProvider;
+
+impl DeleteModeProvider {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// The staging directory for the mount holding `path`.
+    ///
+    /// Placed at the scan root rather than beside each file: one directory per
+    /// mount is what §4.10.1 asks for, and it keeps recovery to a single
+    /// listing.
+    fn staging_dir(root: &Path) -> PathBuf {
+        root.join(STAGING_DIR_NAME)
+    }
+
+    fn ensure_staging(root: &Path) -> Result<PathBuf> {
+        let dir = Self::staging_dir(root);
+        std::fs::create_dir_all(&dir).map_err(|e| ProviderError::Io {
+            path: dir.display().to_string(),
+            detail: e.to_string(),
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Excludes other users. NOT a boundary against the same UID — see
+            // the module docs.
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(dir)
+    }
+}
+
+/// `rename(old -> new)` that fails if `new` exists.
+///
+/// Returns `Ok(false)` when the filesystem does not implement the flag
+/// (`EINVAL`), which the caller turns into `destruction_ineligible` rather than
+/// into a fallback.
+#[cfg(target_os = "linux")]
+fn rename_noreplace(old: &Path, new: &Path) -> std::result::Result<bool, std::io::Error> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_old = CString::new(old.as_os_str().as_bytes())?;
+    let c_new = CString::new(new.as_os_str().as_bytes())?;
+    // `renameat2` has no libc wrapper on all targets, so it goes through
+    // `syscall`. AT_FDCWD with absolute paths; RENAME_NOREPLACE = 1.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            c_old.as_ptr(),
+            libc::AT_FDCWD,
+            c_new.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        // The filesystem does not implement the flag. Not a fallback trigger.
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) => Ok(false),
+        _ => Err(err),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_noreplace(old: &Path, new: &Path) -> std::result::Result<bool, std::io::Error> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_old = CString::new(old.as_os_str().as_bytes())?;
+    let c_new = CString::new(new.as_os_str().as_bytes())?;
+    let rc = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            c_old.as_ptr(),
+            libc::AT_FDCWD,
+            c_new.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EINVAL) | Some(libc::ENOTSUP) => Ok(false),
+        _ => Err(err),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_noreplace(_old: &Path, _new: &Path) -> std::result::Result<bool, std::io::Error> {
+    // Windows uses `FileDispositionInfoEx` on the held handle and does not
+    // stage at all (§4.10.1). Reporting "unsupported" here means a delete-mode
+    // root on Windows is destruction-ineligible, which is the fail-closed
+    // direction while `cfapi.rs` is Phase 3 work.
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn identity_of(handle: &std::fs::File) -> Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let md = handle.metadata().map_err(|e| ProviderError::Io {
+        path: "<held handle>".into(),
+        detail: e.to_string(),
+    })?;
+    Ok(FileIdentity {
+        dev: md.dev(),
+        ino: md.ino(),
+        nlink: md.nlink(),
+    })
+}
+
+#[cfg(not(unix))]
+fn identity_of(_handle: &std::fs::File) -> Result<FileIdentity> {
+    Err(ProviderError::Unsupported("file identity"))
+}
+
+impl PlaceholderProvider for DeleteModeProvider {
+    fn mode(&self) -> ProviderMode {
+        ProviderMode::DeleteMode
+    }
+
+    /// D-12's enrollment probe: create a throwaway file, attempt a
+    /// `RENAME_NOREPLACE` onto an occupied name and onto a free one, clean up.
+    ///
+    /// Both directions are checked. A filesystem that fails the rename outright
+    /// cannot stage; one that *succeeds* when the destination exists is worse —
+    /// it silently replaces, which is the collision the flag exists to prevent.
+    fn probe_feasibility(&self, root: &Path) -> Result<Feasibility> {
+        let dir = Self::ensure_staging(root)?;
+        let a = dir.join(".probe-a");
+        let b = dir.join(".probe-b");
+        let cleanup = || {
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        };
+
+        if let Err(e) = std::fs::write(&a, b"probe") {
+            cleanup();
+            return Err(ProviderError::Io {
+                path: a.display().to_string(),
+                detail: e.to_string(),
+            });
+        }
+        if let Err(e) = std::fs::write(&b, b"probe") {
+            cleanup();
+            return Err(ProviderError::Io {
+                path: b.display().to_string(),
+                detail: e.to_string(),
+            });
+        }
+
+        // 1. Onto an OCCUPIED name: must refuse.
+        match rename_noreplace(&a, &b) {
+            Ok(true) => {
+                cleanup();
+                return Ok(Feasibility::Ineligible {
+                    reason: "rename replaced an existing destination: this filesystem does not \
+                             honour RENAME_NOREPLACE, so staging cannot detect a collision"
+                        .into(),
+                });
+            }
+            Ok(false) => {
+                cleanup();
+                return Ok(Feasibility::Ineligible {
+                    reason: "RENAME_NOREPLACE is not implemented on this filesystem (EINVAL). \
+                             §4.10.1 permits no detect-only fallback, so this root is \
+                             destruction_ineligible"
+                        .into(),
+                });
+            }
+            Err(_) => { /* refused, as it must */ }
+        }
+
+        // 2. Onto a FREE name: must succeed.
+        let free = dir.join(".probe-c");
+        let _ = std::fs::remove_file(&free);
+        let ok = rename_noreplace(&a, &free);
+        let _ = std::fs::remove_file(&free);
+        cleanup();
+
+        match ok {
+            Ok(true) => Ok(Feasibility::Supported),
+            Ok(false) => Ok(Feasibility::Ineligible {
+                reason: "RENAME_NOREPLACE is not implemented on this filesystem".into(),
+            }),
+            Err(e) => Ok(Feasibility::Ineligible {
+                reason: format!("staging rename failed: {e}"),
+            }),
+        }
+    }
+
+    fn stage_for_destruction(&self, path: &Path) -> Result<Staged> {
+        // Step 1: acquire the handle FIRST. Everything after this point works
+        // through it, so no pathname is re-resolved.
+        let handle = std::fs::File::open(path).map_err(|e| ProviderError::Acquire {
+            path: path.display().to_string(),
+            detail: e.to_string(),
+        })?;
+
+        let root = path.parent().unwrap_or(Path::new("."));
+        let dir = Self::ensure_staging(root)?;
+
+        // Staged name is derived from identity, not from the user's filename:
+        // two files with the same basename in different directories must not
+        // collide, and a name the user controls should not steer where the
+        // destroy path writes.
+        let pre = identity_of(&handle)?;
+        let staged = dir.join(format!("{}-{}.staged", pre.dev, pre.ino));
+
+        // Step 2.
+        match rename_noreplace(path, &staged) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(ProviderError::NotFeasible {
+                    path: path.display().to_string(),
+                });
+            }
+            Err(e) if e.raw_os_error() == Some(libc_eexist()) => {
+                return Err(ProviderError::DestinationExists {
+                    path: staged.display().to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(ProviderError::Io {
+                    path: path.display().to_string(),
+                    detail: e.to_string(),
+                });
+            }
+        }
+
+        // Step 3: identity read back from the HELD handle. `rename` does not
+        // invalidate descriptors, so this is the same open file — which is the
+        // property that makes the staging design identity-bound.
+        let identity = identity_of(&handle)?;
+
+        Ok(Staged {
+            original: path.to_path_buf(),
+            staged,
+            identity,
+            handle,
+        })
+    }
+
+    fn destroy_local(&self, staged: &Staged, expected: Blake3Hash) -> Result<()> {
+        tracing::warn!(
+            original = %staged.original.display(),
+            staged = %staged.staged.display(),
+            identity = %staged.identity,
+            hash = %expected,
+            "destroying local file"
+        );
+        std::fs::remove_file(&staged.staged).map_err(|e| ProviderError::Io {
+            path: staged.staged.display().to_string(),
+            detail: e.to_string(),
+        })
+    }
+
+    fn restore_staged(&self, staged: Staged) -> Result<RestoreOutcome> {
+        // Move-back is itself RENAME_NOREPLACE: the original path may have been
+        // reoccupied while the file was staged, and overwriting whatever is
+        // there would destroy a file the user created.
+        match rename_noreplace(&staged.staged, &staged.original) {
+            Ok(true) => Ok(RestoreOutcome::Restored {
+                path: staged.original.clone(),
+            }),
+            Ok(false) | Err(_) => {
+                let conflict = conflict_name(&staged.original);
+                match rename_noreplace(&staged.staged, &conflict) {
+                    Ok(true) => {
+                        tracing::error!(
+                            original = %staged.original.display(),
+                            restored_to = %conflict.display(),
+                            "original path was reoccupied during staging; restored under a \
+                             conflict name — this needs a human"
+                        );
+                        Ok(RestoreOutcome::Conflicted {
+                            path: conflict,
+                            original: staged.original.clone(),
+                        })
+                    }
+                    _ => Err(ProviderError::DestinationExists {
+                        path: staged.original.display().to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    fn list_staged(&self, root: &Path) -> Result<Vec<PathBuf>> {
+        let dir = Self::staging_dir(root);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(Vec::new());
+        };
+        Ok(entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "staged"))
+            .collect())
+    }
+}
+
+fn conflict_name(original: &Path) -> PathBuf {
+    let mut name = original
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "restored".into());
+    name.push_str(".shepherd-restored");
+    original.with_file_name(name)
+}
+
+#[cfg(unix)]
+fn libc_eexist() -> i32 {
+    libc::EEXIST
+}
+#[cfg(not(unix))]
+fn libc_eexist() -> i32 {
+    17
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("shepherd-dm-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Tmp(d)
+        }
+        fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn tmpfs_supports_identity_bound_staging() {
+        let t = Tmp::new("probe");
+        let f = DeleteModeProvider::new().probe_feasibility(&t.0).unwrap();
+        assert!(
+            f.is_supported(),
+            "the temp filesystem should support RENAME_NOREPLACE: {f:?}"
+        );
+    }
+
+    #[test]
+    fn staging_moves_the_file_and_binds_identity_to_the_handle() {
+        let t = Tmp::new("stage");
+        let p = t.file("a.bin", b"hello");
+        let before = std::fs::symlink_metadata(&p).unwrap();
+
+        let staged = DeleteModeProvider::new().stage_for_destruction(&p).unwrap();
+
+        assert!(!p.exists(), "the original path no longer resolves");
+        assert!(staged.staged.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                staged.identity.ino,
+                before.ino(),
+                "identity must be the SAME file, read back from the held handle"
+            );
+        }
+    }
+
+    /// `rename()` does not invalidate an already-open descriptor. That is the
+    /// property step 4 rests on — it hashes through this handle rather than
+    /// reopening a path that could now resolve elsewhere.
+    #[test]
+    fn the_held_handle_still_reads_after_staging() {
+        use std::io::Read;
+        let t = Tmp::new("handle");
+        let p = t.file("a.bin", b"content-that-must-survive");
+        let mut staged = DeleteModeProvider::new().stage_for_destruction(&p).unwrap();
+
+        let mut buf = String::new();
+        staged.handle.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "content-that-must-survive");
+    }
+
+    /// §4.10.4: recovery is move-back, never complete-forward.
+    #[test]
+    fn move_back_restores_the_original_path() {
+        let t = Tmp::new("moveback");
+        let p = t.file("a.bin", b"payload");
+        let provider = DeleteModeProvider::new();
+        let staged = provider.stage_for_destruction(&p).unwrap();
+        assert!(!p.exists());
+
+        let outcome = provider.restore_staged(staged).unwrap();
+        assert_eq!(outcome, RestoreOutcome::Restored { path: p.clone() });
+        assert_eq!(std::fs::read(&p).unwrap(), b"payload");
+    }
+
+    /// The original path was reoccupied while the file was staged. Overwriting
+    /// would destroy a file the user created, so the move-back takes a conflict
+    /// name and alerts.
+    #[test]
+    fn move_back_onto_an_occupied_path_takes_a_conflict_name() {
+        let t = Tmp::new("conflict");
+        let p = t.file("a.bin", b"original");
+        let provider = DeleteModeProvider::new();
+        let staged = provider.stage_for_destruction(&p).unwrap();
+
+        // Someone recreates the path.
+        std::fs::write(&p, b"the user's new file").unwrap();
+
+        let outcome = provider.restore_staged(staged).unwrap();
+        match outcome {
+            RestoreOutcome::Conflicted { path, original } => {
+                assert_eq!(original, p);
+                assert_eq!(std::fs::read(&path).unwrap(), b"original");
+                assert_eq!(
+                    std::fs::read(&p).unwrap(),
+                    b"the user's new file",
+                    "the occupant must be untouched"
+                );
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staged_entries_are_discoverable_for_crash_recovery() {
+        let t = Tmp::new("recover");
+        let p = t.file("a.bin", b"x");
+        let provider = DeleteModeProvider::new();
+        let staged = provider.stage_for_destruction(&p).unwrap();
+        // Simulate a crash: forget the handle without destroying or restoring.
+        let staged_path = staged.staged.clone();
+        drop(staged);
+
+        let found = provider.list_staged(&t.0).unwrap();
+        assert_eq!(found, vec![staged_path]);
+    }
+
+    /// The staged entry is still named and still reachable by any process
+    /// running as the same user. §4.10.1 corrects iteration 3's claim that
+    /// staging leaves "no name in user space", and this asserts the hazard is
+    /// real rather than assumed away — `0700` excludes other users, who were
+    /// never the threat.
+    #[test]
+    fn a_staged_entry_is_still_reachable_by_the_same_uid() {
+        let t = Tmp::new("reopen");
+        let p = t.file("a.bin", b"still-here");
+        let staged = DeleteModeProvider::new().stage_for_destruction(&p).unwrap();
+
+        let reread = std::fs::read(&staged.staged).expect(
+            "staging is not an exclusion boundary against the same UID — if this ever \
+             starts failing, the design changed and §4.10.1's residual text needs revisiting",
+        );
+        assert_eq!(reread, b"still-here");
+    }
+
+    /// A writer holding a descriptor from before staging can still modify the
+    /// bytes afterwards. §4.10.1: "rename() does not invalidate descriptors
+    /// that are already open." This is OQ-J's accepted residual, exercised
+    /// rather than assumed away.
+    #[test]
+    fn a_writable_handle_opened_before_staging_still_writes_after_it() {
+        let t = Tmp::new("writable-fd");
+        let p = t.file("a.bin", b"aaaa");
+
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let staged = DeleteModeProvider::new().stage_for_destruction(&p).unwrap();
+
+        writer.write_all(b"bbbb").unwrap();
+        writer.sync_all().unwrap();
+
+        let after = std::fs::read(&staged.staged).unwrap();
+        assert_eq!(
+            after, b"aaaabbbb",
+            "the pre-existing writable fd wrote through the rename — this is D-8/OQ-J's \
+             residual, and it is documented, not fixed"
+        );
+    }
+}
