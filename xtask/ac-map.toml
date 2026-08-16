@@ -56,6 +56,11 @@ expected_ac_count = 65
 "shepherd-catalog::job_repo" = "1"
 "shepherd-catalog::intent" = "1"
 "shepherd-catalog::identity" = "1"
+# Landed with T3. §4.9 splits identity across key derivation + path policy
+# (identity.rs), stable volume identity (volume.rs) and §4.12's atime fidelity
+# (atime.rs); they are separate machinery because different ACs exercise them.
+"shepherd-catalog::volume" = "1"
+"shepherd-catalog::atime" = "1"
 "shepherd-scan::walk" = "1"
 "shepherd-scan::denylist" = "1"
 "shepherd-scan::ignore" = "1"

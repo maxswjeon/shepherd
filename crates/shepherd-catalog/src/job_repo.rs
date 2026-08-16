@@ -1,0 +1,349 @@
+//! Reads and writes over `job`.
+//!
+//! **Scope.** This is storage for the job queue, not the queue. Durable
+//! enqueue/dequeue semantics, the worker pool, checkpoint-and-resume and retry
+//! backoff are T6's `shepherd-jobs::queue`/`::worker`. What lives here is the
+//! row shape and the transitions that must be atomic against it, so that the
+//! queue T6 builds has something correct to build on.
+
+use rusqlite::{OptionalExtension, params};
+use shepherd_core::{JobId, Timestamp};
+
+use crate::{Catalog, CatalogError, Result};
+
+/// Job classes, from §4.4.
+///
+/// `Scrub` is a first-class class rather than a background chore so it inherits
+/// per-class power and network gating (OQ-2) and never runs on battery or a
+/// metered link under the default preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobClass {
+    Scan,
+    Hash,
+    Extract,
+    Tag,
+    Embed,
+    Upload,
+    Verify,
+    Destroy,
+    Restore,
+    Replicate,
+    Scrub,
+}
+
+impl JobClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobClass::Scan => "scan",
+            JobClass::Hash => "hash",
+            JobClass::Extract => "extract",
+            JobClass::Tag => "tag",
+            JobClass::Embed => "embed",
+            JobClass::Upload => "upload",
+            JobClass::Verify => "verify",
+            JobClass::Destroy => "destroy",
+            JobClass::Restore => "restore",
+            JobClass::Replicate => "replicate",
+            JobClass::Scrub => "scrub",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "scan" => JobClass::Scan,
+            "hash" => JobClass::Hash,
+            "extract" => JobClass::Extract,
+            "tag" => JobClass::Tag,
+            "embed" => JobClass::Embed,
+            "upload" => JobClass::Upload,
+            "verify" => JobClass::Verify,
+            "destroy" => JobClass::Destroy,
+            "restore" => JobClass::Restore,
+            "replicate" => JobClass::Replicate,
+            "scrub" => JobClass::Scrub,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Queued,
+    Running,
+    Done,
+    Failed,
+}
+
+impl JobState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobState::Queued => "queued",
+            JobState::Running => "running",
+            JobState::Done => "done",
+            JobState::Failed => "failed",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "queued" => JobState::Queued,
+            "running" => JobState::Running,
+            "done" => JobState::Done,
+            "failed" => JobState::Failed,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub id: JobId,
+    pub class: JobClass,
+    pub state: JobState,
+    pub priority: i64,
+    pub payload_json: String,
+    pub checkpoint_json: Option<String>,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+}
+
+pub struct JobRepo<'a>(pub &'a mut Catalog);
+
+impl<'a> JobRepo<'a> {
+    pub fn new(cat: &'a mut Catalog) -> Self {
+        Self(cat)
+    }
+
+    pub fn enqueue(
+        &mut self,
+        class: JobClass,
+        priority: i64,
+        payload_json: &str,
+        now: Timestamp,
+    ) -> Result<JobId> {
+        self.0.conn_mut().execute(
+            "INSERT INTO job (class, state, priority, payload_json, created_at, updated_at)
+             VALUES (?1, 'queued', ?2, ?3, ?4, ?4)",
+            params![class.as_str(), priority, payload_json, now.as_nanos()],
+        )?;
+        Ok(JobId::new(self.0.conn().last_insert_rowid()))
+    }
+
+    pub fn get(&self, id: JobId) -> Result<Option<Job>> {
+        self.0
+            .conn()
+            .query_row(
+                "SELECT id, class, state, priority, payload_json, checkpoint_json,
+                        attempts, last_error
+                 FROM job WHERE id = ?1",
+                params![id.get()],
+                row_to_job,
+            )
+            .optional()
+            .map_err(CatalogError::from)?
+            .transpose()
+    }
+
+    /// Claim the highest-priority queued job atomically.
+    ///
+    /// The `UPDATE … WHERE state = 'queued'` with a subquery is one statement on
+    /// purpose: a select-then-update would let two workers read the same row
+    /// before either wrote. Single-writer discipline makes that unlikely, not
+    /// impossible — the catalog is also opened by tests and by `shepctl
+    /// doctor` — and a job claimed twice is a duplicated upload or, for the
+    /// `destroy` class, a duplicated destruction attempt.
+    pub fn claim_next(&mut self, now: Timestamp) -> Result<Option<JobId>> {
+        let tx = self.0.conn_mut().transaction()?;
+        let claimed: Option<i64> = tx
+            .query_row(
+                "UPDATE job SET state = 'running', attempts = attempts + 1, updated_at = ?1
+                 WHERE id = (
+                     SELECT id FROM job WHERE state = 'queued'
+                     ORDER BY priority DESC, id ASC LIMIT 1
+                 )
+                 RETURNING id",
+                params![now.as_nanos()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(claimed.map(JobId::new))
+    }
+
+    /// Persist a resume point. T6's worker calls this; the row shape is what
+    /// makes "kill the daemon mid-upload, restart, resume without re-sending
+    /// verified parts" (AC-2) expressible at all.
+    pub fn checkpoint(&mut self, id: JobId, checkpoint_json: &str, now: Timestamp) -> Result<()> {
+        self.0.conn_mut().execute(
+            "UPDATE job SET checkpoint_json = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id.get(), checkpoint_json, now.as_nanos()],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish(
+        &mut self,
+        id: JobId,
+        state: JobState,
+        last_error: Option<&str>,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.0.conn_mut().execute(
+            "UPDATE job SET state = ?2, last_error = ?3, updated_at = ?4 WHERE id = ?1",
+            params![id.get(), state.as_str(), last_error, now.as_nanos()],
+        )?;
+        Ok(())
+    }
+
+    /// Jobs left `running` by a crash.
+    ///
+    /// Requeueing is T6's decision, not this layer's: a `destroy` job found
+    /// mid-flight must go through §4.10.4's abort-forward-never recovery, not be
+    /// naively retried. This only reports them.
+    pub fn interrupted(&self) -> Result<Vec<Job>> {
+        let mut stmt = self.0.conn().prepare(
+            "SELECT id, class, state, priority, payload_json, checkpoint_json,
+                    attempts, last_error
+             FROM job WHERE state = 'running' ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_job)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+}
+
+fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Job>> {
+    let class: String = row.get(1)?;
+    let state: String = row.get(2)?;
+    Ok((|| {
+        Ok(Job {
+            id: JobId::new(row.get(0)?),
+            class: JobClass::parse(&class)
+                .ok_or_else(|| CatalogError::Invalid(format!("job class `{class}`")))?,
+            state: JobState::parse(&state)
+                .ok_or_else(|| CatalogError::Invalid(format!("job state `{state}`")))?,
+            priority: row.get(3)?,
+            payload_json: row.get(4)?,
+            checkpoint_json: row.get(5)?,
+            attempts: row.get(6)?,
+            last_error: row.get(7)?,
+        })
+    })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cat() -> Catalog {
+        Catalog::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn claim_order_is_priority_then_insertion() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(1);
+        let mut r = JobRepo::new(&mut c);
+        let low = r.enqueue(JobClass::Scan, 0, "{}", t).unwrap();
+        let high = r.enqueue(JobClass::Upload, 10, "{}", t).unwrap();
+        let low2 = r.enqueue(JobClass::Scan, 0, "{}", t).unwrap();
+
+        assert_eq!(JobRepo::new(&mut c).claim_next(t).unwrap(), Some(high));
+        assert_eq!(JobRepo::new(&mut c).claim_next(t).unwrap(), Some(low));
+        assert_eq!(JobRepo::new(&mut c).claim_next(t).unwrap(), Some(low2));
+        assert_eq!(JobRepo::new(&mut c).claim_next(t).unwrap(), None);
+    }
+
+    /// A claimed job must not be claimable again. For the `destroy` class this
+    /// is the difference between one destruction attempt and two.
+    #[test]
+    fn a_claimed_job_is_not_handed_out_twice() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(1);
+        JobRepo::new(&mut c)
+            .enqueue(JobClass::Destroy, 0, "{}", t)
+            .unwrap();
+        assert!(JobRepo::new(&mut c).claim_next(t).unwrap().is_some());
+        assert!(
+            JobRepo::new(&mut c).claim_next(t).unwrap().is_none(),
+            "a running job must not be re-claimed"
+        );
+    }
+
+    #[test]
+    fn claiming_counts_the_attempt() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(1);
+        let id = JobRepo::new(&mut c)
+            .enqueue(JobClass::Hash, 0, "{}", t)
+            .unwrap();
+        JobRepo::new(&mut c).claim_next(t).unwrap();
+        assert_eq!(JobRepo::new(&mut c).get(id).unwrap().unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn checkpoints_round_trip() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(1);
+        let id = JobRepo::new(&mut c)
+            .enqueue(JobClass::Upload, 0, "{}", t)
+            .unwrap();
+        JobRepo::new(&mut c)
+            .checkpoint(id, r#"{"parts_done":7}"#, t)
+            .unwrap();
+        let j = JobRepo::new(&mut c).get(id).unwrap().unwrap();
+        assert_eq!(j.checkpoint_json.as_deref(), Some(r#"{"parts_done":7}"#));
+    }
+
+    /// A crash leaves `running` rows. They are REPORTED, not auto-requeued: a
+    /// destroy job mid-flight needs §4.10.4's recovery, not a naive retry.
+    #[test]
+    fn interrupted_jobs_are_reported_not_requeued() {
+        let mut c = cat();
+        let t = Timestamp::from_nanos(1);
+        JobRepo::new(&mut c)
+            .enqueue(JobClass::Destroy, 0, "{}", t)
+            .unwrap();
+        JobRepo::new(&mut c).claim_next(t).unwrap();
+
+        let stranded = JobRepo::new(&mut c).interrupted().unwrap();
+        assert_eq!(stranded.len(), 1);
+        assert_eq!(stranded[0].class, JobClass::Destroy);
+        assert_eq!(stranded[0].state, JobState::Running);
+        // Still running: nothing put it back in the queue behind our back.
+        assert!(JobRepo::new(&mut c).claim_next(t).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unknown_class_is_refused_by_the_schema() {
+        let mut c = cat();
+        let err = c.conn_mut().execute(
+            "INSERT INTO job (class, state, payload_json, created_at, updated_at)
+             VALUES ('mine-bitcoin', 'queued', '{}', 1, 1)",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "job.class is CHECK-constrained to §4.4's list"
+        );
+    }
+
+    #[test]
+    fn class_strings_round_trip_with_the_check_constraint() {
+        for c in [
+            JobClass::Scan,
+            JobClass::Hash,
+            JobClass::Extract,
+            JobClass::Tag,
+            JobClass::Embed,
+            JobClass::Upload,
+            JobClass::Verify,
+            JobClass::Destroy,
+            JobClass::Restore,
+            JobClass::Replicate,
+            JobClass::Scrub,
+        ] {
+            assert_eq!(JobClass::parse(c.as_str()), Some(c));
+        }
+    }
+}

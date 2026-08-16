@@ -5,7 +5,10 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
+# Tracks `rust-toolchain.toml`. Both moved from 1.91 together: `aws-sdk-s3`
+# 1.141.0 and its `aws-smithy-*` transitives declare `rust-version = 1.94.1`,
+# which made the old pin and §4.5's settled SDK choice mutually unsatisfiable.
+rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/swjeon/shepherd"
 publish = false
@@ -47,12 +50,84 @@ shepherd-tier = { path = "crates/shepherd-tier" }
 shepherd-watch = { path = "crates/shepherd-watch" }
 
 # Third-party.
+#
+# `clap` builder API only — `shepctl`'s command tree is constructed at runtime
+# from `shepherd_proto::MethodKind::ALL`, never from `#[derive(Parser)]`. A
+# derived tree would be a second hand-maintained copy of the method table and
+# `CLI == registered_methods` (AC-54) would become a check instead of a
+# property. The `derive` feature is therefore deliberately not enabled.
+clap = { version = "4.6", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+    "wrap_help",
+    # Required, not cosmetic: command and argument names are computed at run
+    # time from the method table and each request's JSON Schema, and without
+    # `string` clap only accepts `&'static str`. The alternative is leaking every
+    # derived name to get a `'static` lifetime.
+    "string",
+] }
+# JSON Schema derivation for the IPC request/result types. `xtask codegen`
+# writes the derived schemas to `schemas/` and `xtask codegen --check` fails on
+# drift, which is what makes AC-56's "stable machine-readable output" a
+# reviewable diff rather than a claim.
+schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+
+# `bundled` compiles SQLite from source rather than linking the system library.
+# The Windows CI leg has no system sqlite3, and a catalog that builds only where
+# a distro happens to ship the right version is not a three-platform product.
+# `rusqlite` over `sqlx` is an ADR-001 decision: SQLite's WAL model is
+# many-readers/one-writer, and sqlx silently upgrades a SELECT that later writes
+# in the same transaction into an exclusive write transaction, starving the pool.
+rusqlite = { version = "0.40.2", features = ["bundled", "blob", "functions"] }
+# §4.9 path normalisation. NFC/NFD folding for `file.norm_key`, so a macOS
+# watcher event in NFD matches a catalog row stored from a Linux scan in NFC.
+unicode-normalization = "0.1.25"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- Phase 2 transfer layer (§4.5, task T9) ----------------------------------
+#
+# `opendal` is deliberately ABSENT from this table. Its high-level `Writer`
+# hides the upload id and per-part state, so parts cannot be resumed after a
+# disconnection, and spec:89 requires EVERY transfer to be multipart/resumable.
+# `cargo xtask check-deps` rule 5 plus §4.5 confine it to `_shepherd/` control
+# objects inside `shepherd-storage` if a later phase ever needs it; Phase 2 does
+# not, so it is not added.
+#
+# `aws-sdk-s3` 1.141.0 and its ~24 `aws-smithy-*` transitives declare
+# `rust-version = 1.94.1`. That is why `rust-toolchain.toml` moved to 1.96.0:
+# under the old 1.91.1 pin `cargo build` failed at resolution, before compiling
+# anything, with "rustc 1.91.1 is not supported by the following packages".
+# 1.137.0 was the highest release that would have built on 1.91.1, and pinning
+# the transitive closure back that far was not viable — the `aws-smithy-*`
+# crates arrive through caret requirements, so cargo takes the maximum
+# regardless of what the two direct deps are pinned to.
+#
+# `behavior-version-latest` is not optional: without it the SDK panics at client
+# construction rather than failing to compile.
+aws-config = { version = "1.8", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.141", features = ["behavior-version-latest"] }
+
+# `async-trait` rather than native `async fn` in traits: one `target` row
+# selects one adapter at runtime, so `StorageAdapter` must be usable as
+# `dyn StorageAdapter`, and AFIT is still not dyn-compatible on 1.96.
+async-trait = "0.1"
+
+blake3 = "1"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+# OQ-1's replica layout names its segments `.zst`. Real compression, so the
+# extension describes the bytes rather than decorating them.
+zstd = "0.13"
 
 [profile.release]
 debug = 1
