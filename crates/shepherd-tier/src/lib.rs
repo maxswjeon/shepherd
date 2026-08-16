@@ -16,10 +16,9 @@
 pub mod audit;
 pub mod breaker;
 pub mod destroy;
+pub mod fidelity;
 pub mod revalidate;
 pub mod serialize;
-#[cfg(test)]
-mod test_adapter;
 
 pub use audit::{AuditLog, AuditRecord};
 pub use breaker::{
@@ -27,5 +26,9 @@ pub use breaker::{
     candidate_set_hash,
 };
 pub use destroy::{LocalDestroyRequest, execute_local_destruction, execute_remote_discard};
+pub use fidelity::{
+    AttrCapture, AttrClass, CoreAttrs, FidelityBreach, FidelityManifest, RestoreTarget,
+    RestoredAttrs, choose_restore_path, verify_restore,
+};
 pub use revalidate::{ClosingCheck, DestroyRefusal, Location, LocationState, destroy_permitted};
 pub use serialize::FileLocks;

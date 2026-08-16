@@ -1,0 +1,227 @@
+//! Tests for §4.10.6's restore fidelity contract.
+
+use super::*;
+
+fn h(seed: u8) -> Blake3Hash {
+    Blake3Hash::from_bytes([seed; 32])
+}
+
+fn core() -> CoreAttrs {
+    CoreAttrs {
+        blake3: h(1),
+        size: 4096,
+        mtime: Timestamp::from_nanos(1_700_000_000_000_000_000),
+        mode: 0o644,
+    }
+}
+
+fn restored() -> RestoredAttrs {
+    RestoredAttrs {
+        blake3: h(1),
+        size: 4096,
+        mtime: Timestamp::from_nanos(1_700_000_000_000_000_000),
+        mode: 0o644,
+    }
+}
+
+#[test]
+fn a_faithful_restore_passes() {
+    let m = FidelityManifest::new(core());
+    assert_eq!(verify_restore(&m, &restored()), Ok(()));
+}
+
+#[test]
+fn wrong_content_is_a_breach() {
+    let m = FidelityManifest::new(core());
+    let mut a = restored();
+    a.blake3 = h(2);
+    let breaches = verify_restore(&m, &a).expect_err("must fail");
+    assert!(matches!(breaches[0], FidelityBreach::Content { .. }));
+}
+
+/// mtime is in the floor for a reason beyond tidiness.
+#[test]
+fn a_wrong_mtime_is_a_breach_because_it_would_re_match_an_age_rule() {
+    let m = FidelityManifest::new(core());
+    let mut a = restored();
+    // "now" — what a naive restore leaves behind.
+    a.mtime = Timestamp::from_nanos(1_900_000_000_000_000_000);
+    let breaches = verify_restore(&m, &a).expect_err("must fail");
+    assert!(
+        breaches
+            .iter()
+            .any(|b| matches!(b, FidelityBreach::Mtime { .. })),
+        "a restored file whose mtime is now instantly re-matches an age rule: {breaches:?}"
+    );
+}
+
+#[test]
+fn a_wrong_mode_is_a_breach() {
+    let m = FidelityManifest::new(core());
+    let mut a = restored();
+    a.mode = 0o600;
+    assert!(
+        verify_restore(&m, &a)
+            .expect_err("must fail")
+            .iter()
+            .any(|b| matches!(b, FidelityBreach::Mode { .. }))
+    );
+}
+
+#[test]
+fn every_breach_is_reported_not_just_the_first() {
+    let m = FidelityManifest::new(core());
+    let a = RestoredAttrs {
+        blake3: h(9),
+        size: 1,
+        mtime: Timestamp::from_nanos(0),
+        mode: 0o600,
+    };
+    assert_eq!(verify_restore(&m, &a).expect_err("must fail").len(), 4);
+}
+
+// --- the disclosure rule ---------------------------------------------------
+
+/// The distinction the whole type exists for.
+#[test]
+fn absent_and_unsupported_are_different_and_only_one_is_a_gap() {
+    let m = FidelityManifest::new(core())
+        // The file genuinely had no xattrs — nothing was lost.
+        .with(AttrClass::Xattrs, AttrCapture::Absent)
+        // The file HAD a resource fork and the target cannot carry it.
+        .with(
+            AttrClass::ResourceFork,
+            AttrCapture::Unsupported {
+                reason: "S3 objects carry no resource fork".into(),
+            },
+        );
+
+    let gaps = m.gaps();
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].0, AttrClass::ResourceFork);
+    assert!(gaps[0].1.contains("resource fork"));
+    assert!(!m.is_full_fidelity());
+}
+
+#[test]
+fn a_manifest_with_nothing_missing_is_full_fidelity() {
+    let m = FidelityManifest::new(core())
+        .with(AttrClass::Xattrs, AttrCapture::Absent)
+        .with(
+            AttrClass::PosixAcl,
+            AttrCapture::Captured {
+                values: BTreeMap::from([("user::rw".into(), "granted".into())]),
+            },
+        );
+    assert!(m.is_full_fidelity());
+    assert!(m.gaps().is_empty());
+}
+
+#[test]
+fn a_manifest_that_records_only_successes_could_not_satisfy_the_rule() {
+    // If `Unsupported` did not exist, an omitted class would be ambiguous
+    // between "had none" and "had some and we dropped them", and the user needs
+    // the second to be visible. This asserts the arms really are distinct.
+    assert!(AttrCapture::Unsupported { reason: "x".into() }.is_gap());
+    assert!(!AttrCapture::Absent.is_gap());
+    assert!(
+        !AttrCapture::Captured {
+            values: BTreeMap::new()
+        }
+        .is_gap()
+    );
+}
+
+#[test]
+fn the_manifest_round_trips_through_serde() {
+    // It is a sidecar written at tier time and read back at restore time,
+    // possibly by a different build.
+    let m = FidelityManifest::new(core()).with(
+        AttrClass::AlternateDataStreams,
+        AttrCapture::Unsupported {
+            reason: "not an NTFS volume".into(),
+        },
+    );
+    let json = serde_json::to_string(&m).expect("serialize");
+    let back: FidelityManifest = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, m);
+    assert_eq!(back.gaps().len(), 1);
+}
+
+// --- exclusive-create restore ----------------------------------------------
+
+#[test]
+fn a_free_path_is_used_directly() {
+    let target = choose_restore_path("/root/photo.raw", &|_| false);
+    assert_eq!(
+        target,
+        RestoreTarget::Original("/root/photo.raw".to_string())
+    );
+}
+
+/// §4.10.5: Shepherd never destroys data by writing.
+#[test]
+fn an_occupied_path_never_overwrites_and_keeps_the_extension() {
+    let target = choose_restore_path("/root/photo.raw", &|p| p == "/root/photo.raw");
+    match target {
+        RestoreTarget::Conflict { original, chosen } => {
+            assert_eq!(original, "/root/photo.raw");
+            assert_eq!(chosen, "/root/photo (restored 1).raw");
+            assert!(
+                chosen.ends_with(".raw"),
+                "the extension must survive, or tools stop recognising the file"
+            );
+        }
+        other => panic!("must not overwrite an occupant: {other:?}"),
+    }
+}
+
+#[test]
+fn conflict_names_keep_climbing_until_one_is_free() {
+    let occupied = |p: &str| {
+        p == "/root/a.txt" || p == "/root/a (restored 1).txt" || p == "/root/a (restored 2).txt"
+    };
+    match choose_restore_path("/root/a.txt", &occupied) {
+        RestoreTarget::Conflict { chosen, .. } => {
+            assert_eq!(chosen, "/root/a (restored 3).txt");
+        }
+        other => panic!("expected a conflict name: {other:?}"),
+    }
+}
+
+#[test]
+fn an_extensionless_path_still_gets_a_conflict_name() {
+    match choose_restore_path("/root/README", &|p| p == "/root/README") {
+        RestoreTarget::Conflict { chosen, .. } => {
+            assert_eq!(chosen, "/root/README (restored 1)");
+        }
+        other => panic!("expected a conflict name: {other:?}"),
+    }
+}
+
+#[test]
+fn a_dotfile_is_not_mistaken_for_an_extension() {
+    // `.bashrc` is a name, not an extension — splitting it would produce
+    // ` (restored 1).bashrc` with an empty stem.
+    match choose_restore_path("/root/.bashrc", &|p| p == "/root/.bashrc") {
+        RestoreTarget::Conflict { chosen, .. } => {
+            assert!(
+                chosen.contains(".bashrc"),
+                "the name must survive intact: {chosen}"
+            );
+            assert!(!chosen.starts_with("/root/ ("), "empty stem: {chosen}");
+        }
+        other => panic!("expected a conflict name: {other:?}"),
+    }
+}
+
+#[test]
+fn a_dot_in_a_parent_directory_is_not_treated_as_an_extension() {
+    // `/root/v1.2/README` has a dot, but not in the file name.
+    match choose_restore_path("/root/v1.2/README", &|p| p == "/root/v1.2/README") {
+        RestoreTarget::Conflict { chosen, .. } => {
+            assert_eq!(chosen, "/root/v1.2/README (restored 1)");
+        }
+        other => panic!("expected a conflict name: {other:?}"),
+    }
+}

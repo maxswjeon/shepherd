@@ -1,0 +1,273 @@
+//! §4.10.6 — the restore fidelity contract.
+//!
+//! # "Byte-compare identical" is silent about metadata
+//!
+//! AC-63 asserts bytes. That leaves every other attribute of a file
+//! unaddressed, and a restore that returns the right bytes with the wrong
+//! `mtime` is not a restore in any sense the user recognises. So the contract
+//! names a floor and a disclosure rule:
+//!
+//! * **Preserved at minimum: bytes, `mtime`, and `mode`.**
+//! * Captured where the provider allows: xattrs, POSIX ACLs, macOS resource
+//!   forks and Finder tags, NTFS alternate data streams.
+//! * **Anything not captured is documented as not preserved** rather than
+//!   silently dropped.
+//!
+//! `mtime` is in the floor for a second reason beyond user expectation: a
+//! restored file whose `mtime` is "now" **instantly re-matches an age rule**
+//! and is a candidate for re-tiering on the next pass. Getting it wrong turns
+//! restore into a loop.
+//!
+//! # Why the manifest records what it COULD NOT capture
+//!
+//! The disclosure rule is unsatisfiable if the manifest only records successes.
+//! An absent xattr entry would then be ambiguous between "this file had no
+//! xattrs" and "this target cannot carry xattrs and we dropped them" — and the
+//! user needs the second one to be visible. [`AttrCapture`] therefore has an
+//! explicit [`AttrCapture::Unsupported`] arm, and [`FidelityManifest::gaps`]
+//! reports them. A silent omission is the failure this type exists to prevent.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use shepherd_core::{Blake3Hash, Timestamp};
+
+/// The floor. Every restore must reproduce all three.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreAttrs {
+    pub blake3: Blake3Hash,
+    pub size: u64,
+    /// Restored so an age rule does not immediately re-match the file.
+    pub mtime: Timestamp,
+    /// Unix permission bits. On Windows this carries the read-only flag; the
+    /// richer ACL story is an optional attribute, not part of the floor.
+    pub mode: u32,
+}
+
+/// An optional attribute class, and what happened to it at tier time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "capture")]
+pub enum AttrCapture {
+    /// Captured, with the payload.
+    Captured { values: BTreeMap<String, String> },
+    /// The source had none. Distinct from `Unsupported`: nothing was lost.
+    Absent,
+    /// The source had them but this target or platform cannot carry them.
+    /// **This is the arm that must reach the user.**
+    Unsupported { reason: String },
+}
+
+impl AttrCapture {
+    /// Whether something existed on the source and did **not** survive.
+    pub fn is_gap(&self) -> bool {
+        matches!(self, AttrCapture::Unsupported { .. })
+    }
+}
+
+/// Optional attribute classes, per §4.10.6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttrClass {
+    Xattrs,
+    PosixAcl,
+    /// macOS resource fork.
+    ResourceFork,
+    /// macOS Finder tags.
+    FinderTags,
+    /// NTFS alternate data streams.
+    AlternateDataStreams,
+}
+
+impl AttrClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttrClass::Xattrs => "xattrs",
+            AttrClass::PosixAcl => "posix-acl",
+            AttrClass::ResourceFork => "resource-fork",
+            AttrClass::FinderTags => "finder-tags",
+            AttrClass::AlternateDataStreams => "alternate-data-streams",
+        }
+    }
+}
+
+/// The sidecar manifest written at tier time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FidelityManifest {
+    pub core: CoreAttrs,
+    pub optional: BTreeMap<AttrClass, AttrCapture>,
+}
+
+impl FidelityManifest {
+    pub fn new(core: CoreAttrs) -> Self {
+        Self {
+            core,
+            optional: BTreeMap::new(),
+        }
+    }
+
+    pub fn with(mut self, class: AttrClass, capture: AttrCapture) -> Self {
+        self.optional.insert(class, capture);
+        self
+    }
+
+    /// Attribute classes that existed on the source and were **not** preserved.
+    ///
+    /// This is what §7's DOCUMENT obligation is reported from. An empty result
+    /// means full fidelity; a non-empty one is a disclosure the user is owed,
+    /// not a warning to swallow.
+    pub fn gaps(&self) -> Vec<(AttrClass, &str)> {
+        self.optional
+            .iter()
+            .filter_map(|(class, cap)| match cap {
+                AttrCapture::Unsupported { reason } => Some((*class, reason.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether every optional class was either captured or genuinely absent.
+    pub fn is_full_fidelity(&self) -> bool {
+        self.gaps().is_empty()
+    }
+}
+
+/// What a restore actually produced, read back from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredAttrs {
+    pub blake3: Blake3Hash,
+    pub size: u64,
+    pub mtime: Timestamp,
+    pub mode: u32,
+}
+
+/// A floor attribute that did not survive the round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FidelityBreach {
+    Content {
+        expected: Blake3Hash,
+        actual: Blake3Hash,
+    },
+    Size {
+        expected: u64,
+        actual: u64,
+    },
+    /// Not cosmetic: a wrong `mtime` makes the restored file re-match an age
+    /// rule and become a re-tiering candidate on the next pass.
+    Mtime {
+        expected: Timestamp,
+        actual: Timestamp,
+    },
+    Mode {
+        expected: u32,
+        actual: u32,
+    },
+}
+
+/// Check a restore against its manifest's floor.
+///
+/// Returns **every** breach rather than the first, so one restore report names
+/// everything that went wrong.
+pub fn verify_restore(
+    manifest: &FidelityManifest,
+    actual: &RestoredAttrs,
+) -> Result<(), Vec<FidelityBreach>> {
+    let mut breaches = Vec::new();
+    let c = &manifest.core;
+
+    if actual.blake3 != c.blake3 {
+        breaches.push(FidelityBreach::Content {
+            expected: c.blake3,
+            actual: actual.blake3,
+        });
+    }
+    if actual.size != c.size {
+        breaches.push(FidelityBreach::Size {
+            expected: c.size,
+            actual: actual.size,
+        });
+    }
+    if actual.mtime != c.mtime {
+        breaches.push(FidelityBreach::Mtime {
+            expected: c.mtime,
+            actual: actual.mtime,
+        });
+    }
+    if actual.mode != c.mode {
+        breaches.push(FidelityBreach::Mode {
+            expected: c.mode,
+            actual: actual.mode,
+        });
+    }
+
+    if breaches.is_empty() {
+        Ok(())
+    } else {
+        Err(breaches)
+    }
+}
+
+/// Where a restore may write.
+///
+/// §4.10.5: "Restore and hydration writes are exclusive-create, never replace.
+/// Restoring to a path now occupied by a newer file uses a conflict name and
+/// alerts. **Shepherd never destroys data by writing**, only by the audited
+/// destroy path."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreTarget {
+    /// The original path, which is free.
+    Original(String),
+    /// Occupied by something else, so the restore lands beside it under a
+    /// conflict name and raises an alert. The occupant may be a file the user
+    /// created while this one was gone, and it is not ours to overwrite.
+    Conflict { original: String, chosen: String },
+}
+
+/// Choose a restore path without ever replacing an existing file.
+///
+/// `exists` is injected rather than probed so the occupied case is testable
+/// without a filesystem — and because the caller has already had to stat the
+/// path, so probing again would widen the race rather than narrow it.
+pub fn choose_restore_path(original: &str, exists: &dyn Fn(&str) -> bool) -> RestoreTarget {
+    if !exists(original) {
+        return RestoreTarget::Original(original.to_owned());
+    }
+    // Split off the extension so `photo.raw` becomes `photo (restored 1).raw`
+    // rather than `photo.raw (restored 1)`, which some tools would stop
+    // recognising as a raw file.
+    // The dot must be searched for INSIDE THE FILE NAME, not across the whole
+    // path, and must not be its first character. Searching the whole path sends
+    // `/root/.bashrc` to `/root (restored 1).bashrc` — which does not merely
+    // pick an odd name, it writes into a **different directory**. A dotfile has
+    // no extension, and a dot in a parent directory is not one either.
+    let name_start = original.rfind('/').map_or(0, |i| i + 1);
+    let name = &original[name_start..];
+    let (stem, ext) = match name.rfind('.') {
+        // `i > 0` is relative to the NAME, so `.bashrc` (i == 0) is excluded.
+        Some(i) if i > 0 => (&original[..name_start + i], &name[i..]),
+        _ => (original, ""),
+    };
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("{stem} (restored {n}){ext}");
+        if !exists(&candidate) {
+            return RestoreTarget::Conflict {
+                original: original.to_owned(),
+                chosen: candidate,
+            };
+        }
+        n += 1;
+        // Astronomically unlikely, but a loop that cannot terminate on a
+        // destructive path is not something to leave to optimism.
+        if n > 10_000 {
+            return RestoreTarget::Conflict {
+                original: original.to_owned(),
+                chosen: format!("{stem} (restored {n}){ext}"),
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "fidelity_tests.rs"]
+mod tests;
