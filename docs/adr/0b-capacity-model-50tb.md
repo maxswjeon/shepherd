@@ -170,10 +170,50 @@ consequences, none of which are mine to choose:
    objects, so a policy that verifies large multipart objects on a longer cycle
    than small ones would cut it by orders of magnitude at a stated loss of
    assurance;
-3. **enabling S3 multipart checksums (`ChecksumAlgorithm`, whole-object) at
-   upload time would move the large bucket onto the cheap HEAD path entirely**,
-   and is the change most worth investigating before accepting (1) or (2). It is
-   a Phase 2 upload-path decision, not a scrub-path one.
+3. **enabling S3 multipart checksums (whole-object) at upload time would move the
+   large bucket onto the cheap HEAD path entirely**, and is the change most worth
+   investigating before accepting (1) or (2). It is a Phase 2 upload-path
+   decision, not a scrub-path one.
+
+### 3a. Response 3 is now built — and unverified on the provider this model prices
+
+**The verdict above is unchanged.** This subsection exists so the mitigation is
+not mistaken for a fix already banked.
+
+`ChecksumType::FULL_OBJECT` on `CreateMultipartUpload` is **implemented**
+(`8766be2`, worker-4). Only CRC32 / CRC32C / CRC64NVME support `FULL_OBJECT`;
+the SHA algorithms are composite-only for multipart, which is the same
+digest-of-digests problem that makes the ETag untrustworthy to begin with — so
+the choice of algorithm is not free.
+
+Its payoff is **per-provider**, and the only provider it has been exercised
+against is an emulator:
+
+| provider | whole-object checksum on HEAD | |
+|---|---|---|
+| MinIO | **none returned — scrub must still read multipart objects in full** | `[M]` |
+| AWS S3 | **unknown** | — |
+| Cloudflare R2 | unknown | — |
+| Backblaze B2 | unknown | — |
+
+**MinIO's behaviour does not predict S3's**, and emulator-versus-real-service
+divergence is exactly the class of difference this would be. There is no AWS
+account on this machine, so the question is a **Phase 6 prerequisite**, not
+something Phase 0b can close. The probe test reports what the server actually
+returned rather than asserting an expected outcome, so pointing it at a real
+endpoint settles it in one run.
+
+Therefore: **§3's $441/month FAIL stands as written.** If S3 does return a
+whole-object checksum, the 100,000 full GETs collapse into HEADs and the figure
+falls by roughly three orders of magnitude. That is a large enough swing that it
+must be measured rather than assumed, and the model is not revised down on the
+strength of an emulator that reported the opposite.
+
+**This does not become a cheap path to gating destruction.** A provider-computed
+CRC detects bit rot; it is worthless against a provider that is wrong about its
+own bytes, and it is not BLAKE3. It addresses scrub *cost* only. §4.10's
+attestation requirements are untouched by it, and the assurance framing above is
+unchanged.
 
 ---
 
