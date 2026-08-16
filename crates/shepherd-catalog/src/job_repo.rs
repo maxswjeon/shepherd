@@ -191,20 +191,41 @@ impl<'a> JobRepo<'a> {
         if classes.is_some_and(<[JobClass]>::is_empty) {
             return Ok(None);
         }
-        let filter = match classes {
-            None => String::new(),
-            Some(cs) => {
-                let list = cs
-                    .iter()
-                    .map(|c| format!("'{}'", c.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                // Interpolation is safe here and only here: `JobClass::as_str`
-                // returns one of a closed set of literals, never user input.
-                // The same CHECK constraint that guards `job.class` guards this.
-                format!(" AND class IN ({list})")
-            }
+        // Bound parameters, not interpolation.
+        //
+        // Interpolating `JobClass::as_str()` would be safe TODAY — it returns
+        // one of a closed set of `&'static str` and never user input — and the
+        // first version did exactly that with a comment saying so. The comment
+        // was accurate; the shape was still wrong, because the safety rests on
+        // an invariant held by nothing but the body of `as_str`, and the blast
+        // radius is THIS statement: the single-statement claim whose atomicity
+        // is what stops a `destroy` job being handed to two workers.
+        //
+        // A later variant carrying a runtime `String`, or a refactor letting a
+        // plugin-supplied class through, would turn a correct comment into an
+        // injection into the destroy claim — and would not look like a change
+        // touching SQL. Placeholders cannot fail that way whatever `as_str`
+        // becomes.
+        //
+        // `?1` is `now`, referenced twice; classes start at `?2`. Numbered
+        // parameters handle the repeat, which positional `?` would not.
+        let now_nanos = now.as_nanos();
+        let class_names: Vec<&'static str> = classes
+            .map(|cs| cs.iter().map(|c| c.as_str()).collect())
+            .unwrap_or_default();
+        let filter = if class_names.is_empty() {
+            String::new()
+        } else {
+            let holes: Vec<String> = (0..class_names.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect();
+            format!(" AND class IN ({})", holes.join(", "))
         };
+        let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(class_names.len() + 1);
+        binds.push(&now_nanos);
+        for name in &class_names {
+            binds.push(name);
+        }
         let sql = format!(
             "UPDATE job SET state = 'running', attempts = attempts + 1, updated_at = ?1
              WHERE id = (
@@ -216,7 +237,7 @@ impl<'a> JobRepo<'a> {
         );
         let tx = self.0.conn_mut().transaction()?;
         let claimed: Option<i64> = tx
-            .query_row(&sql, params![now.as_nanos()], |r| r.get(0))
+            .query_row(&sql, rusqlite::params_from_iter(binds), |r| r.get(0))
             .optional()?;
         tx.commit()?;
         Ok(claimed.map(JobId::new))

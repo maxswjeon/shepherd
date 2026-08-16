@@ -372,7 +372,21 @@ CREATE INDEX job_state_priority ON job(state, run_after ASC, priority DESC, id A
 -- ambiguous crash against.
 CREATE TABLE transfer_session (
     id                   INTEGER PRIMARY KEY,
-    job_id               INTEGER NOT NULL REFERENCES job(id) ON DELETE CASCADE,
+    -- UNIQUE because the consumer's `load(job_id)` expects one row and resume
+    -- is per job. Without it the database permits a state the code cannot
+    -- represent: two sessions for one job would make SQLite return whichever it
+    -- liked, and a resumed transfer would reconcile against the wrong part set
+    -- — silently, and only on a resume, which is the worst pair of properties.
+    --
+    -- Same reasoning as `src_blake3` being NOT NULL. A column permitting a
+    -- state the consumer cannot express is a column that will eventually hold
+    -- one.
+    --
+    -- It is a BACKSTOP, not the mechanism. The store writes with an explicit
+    -- UPDATE-then-INSERT inside a transaction, correct under single-writer and
+    -- not dependent on this constraint, so if it ever fires it means something
+    -- upstream is wrong rather than that the happy path needed it.
+    job_id               INTEGER NOT NULL UNIQUE REFERENCES job(id) ON DELETE CASCADE,
     target_id            INTEGER NOT NULL REFERENCES target(id) ON DELETE CASCADE,
     file_id              INTEGER REFERENCES file(id) ON DELETE SET NULL,  -- NULL: control object
     remote_key           TEXT    NOT NULL,
