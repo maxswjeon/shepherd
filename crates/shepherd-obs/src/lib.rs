@@ -14,6 +14,8 @@
 //!   before someone writes the check.
 
 pub mod doctor;
+/// systemd user-lingering detection (OQ-F): detect, warn, never modify.
+pub mod lingering;
 pub mod metrics;
 pub mod tracing_setup;
 
