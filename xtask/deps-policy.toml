@@ -105,9 +105,38 @@ allowed_internal_deps = ["shepherd-core", "shepherd-proto", "shepherd-obs"]
 # is callable by replica maintenance, and is never counted by the discard
 # breaker (§4.1 rule 4).
 #
-# The symbol names are the ones §4.1/§4.10 name. If Phase 2 lands a destructive
-# method under a different name, ADD IT HERE - an unlisted symbol is unchecked.
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# NAMING CONTRACT - read this before adding a destructive method.
+#
+# This scan is only as complete as the list below. An unlisted symbol is
+# UNCHECKED. So the names are a contract, not a description:
+#
+#   * every destructive `PlaceholderProvider` method MUST be named
+#     `destroy_local`, `dehydrate_placeholder` or `evict_placeholder`;
+#   * a destructive method under any other name MUST be added here in the same
+#     change that introduces it.
+#
+# The names are deliberately specific rather than natural. A bare `dehydrate`
+# was tried first and had to be replaced: it collides with `StubMode::Dehydrate`
+# and with its serde form `"dehydrate"`, both of which are ordinary domain
+# vocabulary appearing in crates that have no business calling anything
+# destructive. A token that fires on legitimate code trains people to widen the
+# policy, which is worse than a token that fires on nothing.
+#
+# What still backstops an unlisted name: rule 2. `shepherd-placeholder` is
+# reachable from `shepherd-tier` alone, so a destructive method invented under a
+# name this list misses is still unreachable from any other crate. Rule 4
+# refines the invariant *within* `shepherd-tier`; rule 2 is what confines it to
+# `shepherd-tier` at all.
+#
+# DEFERRED, recorded rather than silently omitted: tracking raw filesystem
+# mutation (`remove_file`, `remove_dir_all`, `set_permissions`) outside
+# `shepherd-placeholder` was considered and NOT implemented. Those appear in
+# legitimate non-destructive code (temp files, staging, test cleanup), so the
+# rule would need a per-call-site exemption list, and an exemption list that
+# grows on every unrelated change stops being read. If a phase owner wants it,
+# it belongs behind its own rule with its own exemptions, not folded in here.
+# ===========================================================================
 [rule4]
 scan_roots = ["crates", "xtask/src"]
 escape_hatch = "allow(clippy::disallowed_methods)"
@@ -127,14 +156,23 @@ implemented_in = ["crates/shepherd-placeholder/src/"]
 sole_caller = "crates/shepherd-tier/src/destroy.rs"
 
 [[rule4.symbols]]
-name = "dehydrate"
+name = "dehydrate_placeholder"
 owner = "PlaceholderProvider"
 implemented_in = ["crates/shepherd-placeholder/src/"]
 sole_caller = "crates/shepherd-tier/src/destroy.rs"
 
 [[rule4.symbols]]
-name = "evict"
+name = "evict_placeholder"
 owner = "PlaceholderProvider"
+implemented_in = ["crates/shepherd-placeholder/src/"]
+sole_caller = "crates/shepherd-tier/src/destroy.rs"
+
+# The raw Win32 primitive §4.1 names. `cfapi.rs` calls it, which is why the
+# placeholder crate is its `implemented_in`; no other crate may so much as name
+# it.
+[[rule4.symbols]]
+name = "CfDehydratePlaceholder"
+owner = "cfapi"
 implemented_in = ["crates/shepherd-placeholder/src/"]
 sole_caller = "crates/shepherd-tier/src/destroy.rs"
 

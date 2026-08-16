@@ -21,8 +21,8 @@
 #   disallowed-methods = [
 #     { path = "shepherd_placeholder::PlaceholderProvider::destroy_local",
 #       reason = "§4.1 rule 4: only shepherd-tier::destroy may call this" },
-#     { path = "shepherd_placeholder::PlaceholderProvider::dehydrate", reason = "..." },
-#     { path = "shepherd_placeholder::PlaceholderProvider::evict", reason = "..." },
+#     { path = "shepherd_placeholder::PlaceholderProvider::dehydrate_placeholder", reason = "..." },
+#     { path = "shepherd_placeholder::PlaceholderProvider::evict_placeholder", reason = "..." },
 #     { path = "shepherd_storage::StorageAdapter::delete_object", reason = "..." },
 #   ]
 #
