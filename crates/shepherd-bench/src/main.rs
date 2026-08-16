@@ -84,7 +84,7 @@ pub struct Fixture {
 #[serde(deny_unknown_fields)]
 pub struct QueryTrace {
     pub file: String,
-    pub queries: usize,
+    pub total_queries: usize,
     pub pct_prefix: u32,
     pub pct_infix: u32,
     pub pct_path_fragment: u32,
