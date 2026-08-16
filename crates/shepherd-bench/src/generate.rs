@@ -477,7 +477,12 @@ pub fn gen_catalog(a: &Args) -> Result<(), String> {
     let space = dir_space(rows);
 
     std::fs::create_dir_all(&a.fixtures).map_err(|e| e.to_string())?;
-    crate::disk_guard(&a.fixtures, c.disk_guard.abort_below_free_gib)?;
+    // ~0.10 GiB per million rows, measured on the 200k pilot.
+    crate::disk_guard_start(
+        &a.fixtures,
+        c.disk_guard.abort_below_free_gib,
+        0.10 * rows as f64 / 1e6,
+    )?;
 
     let db = catalog_path(&a.fixtures);
     let _ = std::fs::remove_file(&db);

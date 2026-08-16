@@ -12,3 +12,17 @@ workspace = true
 
 [dependencies]
 shepherd-core.workspace = true
+# §4.12's `AtimeMode` lives in `shepherd-catalog`, and its author wrote it
+# expecting this crate to consume it: "That predicate is the rules engine's;
+# `AtimeMode::supports_destructive_age_rule` is where the decision is written
+# down so both sides agree on it." Depending on it beats keeping a second copy
+# of a four-state safety enum in sync by hand.
+#
+# NOT `shepherd-placeholder` — §4.1 rule 2 forbids the edge, and nothing here
+# needs it: every input to the discard predicate is a value, not a provider
+# call. See `delete_policy.rs`.
+shepherd-catalog.workspace = true
+
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true

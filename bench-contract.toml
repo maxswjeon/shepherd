@@ -259,6 +259,23 @@ as OQ-E) with the option of redefining AC-40's as-you-type semantics as
 prefix/token matching and moving infix substring to the explicit-search path.
 """
 latency_tie_pct = 20.0
+# WHICH NUMBER "index_rss" MEANS, fixed before the 10M results exist.
+#
+# The rule says "pick the lowest-RAM candidate" and "pick the lower RSS", but the
+# three candidates hold memory in three different places: the arena on the heap,
+# tantivy in mmap'd pages the kernel may evict at will, FTS5 in a mix of its own
+# page cache and the OS's. Choosing the definition after seeing the numbers would
+# be exactly the rationalisation this file exists to prevent — and arena vs
+# tantivy could plausibly land inside the 20% latency tie, where this definition
+# alone decides the winner.
+#
+# The definition is: **peak VmHWM of a freshly-spawned bench process**, i.e. the
+# high-water mark of memory the daemon must actually hold to serve queries. It is
+# uniform across candidates, it is what an AC-46 ceiling would have to be set
+# against, and it does not flatter an mmap'd index for memory the kernel is
+# holding on its behalf. On-disk index bytes and post-query VmRSS are reported
+# alongside every figure so a reader can check the choice rather than trust it.
+index_rss_definition = "peak VmHWM of a freshly-spawned bench process; on-disk bytes and post-query VmRSS reported alongside"
 scored_axes = [
     "latency_p95",
     "index_rss",
@@ -276,4 +293,15 @@ scored_axes = [
 # this floor and escalates instead of quietly running a smaller workload.
 # ---------------------------------------------------------------------------
 [disk_guard]
-abort_below_free_gib = 25.0
+# Reserve kept free at the START of a leg, on top of what that leg is projected
+# to write. Checking a flat floor alone would let a leg begin with room for the
+# floor and not for itself, which is how a build gets half an hour in before
+# failing.
+abort_below_free_gib = 12.0
+
+# Emergency floor re-checked DURING a long leg. Deliberately far below the
+# start-of-leg reserve: the start check already asked whether the leg fits, and
+# re-applying the full reserve mid-leg would make a correctly-sized f32 build
+# abort itself around shard 7 having kept none of the work. This one exists only
+# to stop us wedging a machine other agents are also using.
+emergency_free_gib = 6.0

@@ -53,6 +53,10 @@ const CONNECTIVITY: usize = 16;
 const EXPANSION_ADD: usize = 128;
 const EXPANSION_SEARCH: usize = 64;
 
+/// Recall is measured at 10, which is the neighbourhood a user actually sees
+/// after RRF fusion trims the top-200 down.
+const K: usize = 10;
+
 fn scalar(prec: &str) -> Result<ScalarKind, String> {
     match prec {
         "f32" => Ok(ScalarKind::F32),
@@ -107,7 +111,19 @@ pub fn build(a: &Args) -> Result<(), String> {
     let per_shard = c.fixture.vectors_per_shard.min(total);
     let shards = total.div_ceil(per_shard);
 
-    crate::disk_guard(&a.fixtures, c.disk_guard.abort_below_free_gib)?;
+    // Projected from the smoke run's measured bytes-per-vector at 384 dims:
+    // f32 ~1678 B, f16 ~944 B, i8 ~524 B (vectors plus HNSW links).
+    let projected_gib = match prec.as_str() {
+        "f32" => 1678.0,
+        "f16" => 944.0,
+        _ => 524.0,
+    } * total as f64
+        / 1073741824.0;
+    crate::disk_guard_start(
+        &a.fixtures,
+        c.disk_guard.abort_below_free_gib,
+        projected_gib,
+    )?;
     let dir = shard_dir(&a.fixtures, &prec);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -115,14 +131,18 @@ pub fn build(a: &Args) -> Result<(), String> {
     let dims = c.fixture.dimensions;
     let t0 = Instant::now();
     for s in 0..shards {
-        // Re-check between shards: this loop is the largest disk consumer in the
-        // whole spike and the box is shared.
-        crate::disk_guard(&a.fixtures, c.disk_guard.abort_below_free_gib)?;
+        // Re-check between shards against the EMERGENCY floor, not the
+        // start-of-leg reserve. The start check already asked whether this leg
+        // fits; re-applying the full reserve here would make a correctly-sized
+        // f32 build abort itself partway through, having done the work and kept
+        // none of it. This check exists only to stop us wedging a shared machine
+        // if something else consumes the space we were counting on.
+        crate::disk_guard_continue(&a.fixtures, c.disk_guard.emergency_free_gib)?;
         let lo = s * per_shard;
         let hi = (lo + per_shard).min(total);
         let index = Index::new(&opts).map_err(|e| e.to_string())?;
         index
-            .reserve(( hi - lo) as usize)
+            .reserve((hi - lo) as usize)
             .map_err(|e| e.to_string())?;
 
         // usearch takes concurrent adds; generation is the expensive half and it
@@ -143,7 +163,9 @@ pub fn build(a: &Args) -> Result<(), String> {
             })?;
 
         let p = shard_path(&a.fixtures, &prec, s);
-        index.save(p.to_str().ok_or("non-UTF8 path")?).map_err(|e| e.to_string())?;
+        index
+            .save(p.to_str().ok_or("non-UTF8 path")?)
+            .map_err(|e| e.to_string())?;
         eprintln!(
             "[build-ann {prec}] shard {s}/{shards} sealed, {:.0}s elapsed, \
              {:.2} GiB on disk, peak RSS {:.2} GiB",
@@ -198,7 +220,12 @@ struct Shards {
 }
 
 impl Shards {
-    fn open(fixtures: &Path, prec: &str, opts: &IndexOptions) -> Result<(Self, f64), String> {
+    fn open(
+        fixtures: &Path,
+        prec: &str,
+        opts: &IndexOptions,
+        k: usize,
+    ) -> Result<(Self, f64), String> {
         let dir = shard_dir(fixtures, prec);
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(|e| format!("{}: {e} — run `build-ann {prec}` first", dir.display()))?
@@ -216,6 +243,18 @@ impl Shards {
             let idx = Index::new(opts).map_err(|e| e.to_string())?;
             idx.view(p.to_str().ok_or("non-UTF8 path")?)
                 .map_err(|e| format!("view() failed on {}: {e}", p.display()))?;
+            // HNSW's search-time beam width must be at least the number of
+            // neighbours asked for, or the walk is truncated below the requested
+            // depth and returns fewer (or worse) results while looking fast.
+            //
+            // This is not hypothetical here: the index is BUILT with
+            // `expansion_search = 64` and the contract now queries at
+            // `top_k = 200`. Worse, the recall check could not have caught it —
+            // `recall-ann` probes at k = 10, where ef = 64 is ample, while
+            // `bench-ann` runs at k = 200. Latency would have been measured at a
+            // silently shallower retrieval depth than the 300 ms bar was costed
+            // against.
+            idx.change_expansion_search(k.max(EXPANSION_SEARCH));
             indexes.push(idx);
         }
         Ok((Self { indexes }, t0.elapsed().as_secs_f64()))
@@ -223,6 +262,18 @@ impl Shards {
 
     fn count(&self) -> usize {
         self.indexes.iter().map(|i| i.size()).sum()
+    }
+
+    /// Read `expansion_search` back off every shard.
+    ///
+    /// The setter is called after `view()`, and a setter that silently no-ops on
+    /// a memory-mapped index would leave every ANN cell measuring a shallower
+    /// search than the 300 ms bar was costed against — **in the direction of a
+    /// false PASS**. A configuration that is set but never read back is an
+    /// assumption, so this reads it back and the value is emitted with the
+    /// results.
+    fn effective_ef(&self) -> Vec<usize> {
+        self.indexes.iter().map(|i| i.expansion_search()).collect()
     }
 
     /// Query every shard in parallel and merge, which is §4.6's "ANN top-K
@@ -297,32 +348,54 @@ pub fn bench(a: &Args) -> Result<(), String> {
         ));
     }
 
-    // Cold BEFORE open, so the mmap open and its first page faults are inside
-    // the cold measurement rather than warmed up ahead of it.
-    if a.cache == "cold" {
-        crate::drop_page_cache()
-            .map_err(|e| format!("{e}\n(precision {prec}: refusing to report this run as cold)"))?;
-        eprintln!("[cache] page cache dropped — this run is genuinely cold");
-    }
-
-    let (shards, open_seconds) = Shards::open(&a.fixtures, &prec, &opts)?;
-    let shards = Arc::new(shards);
     let on_disk = crate::path_bytes(&shard_dir(&a.fixtures, &prec));
-    let rss_after_open = crate::vm_rss_bytes();
-    eprintln!(
-        "[bench-ann {prec}] {} vectors across {} shards viewed in {open_seconds:.2}s, \
-         RSS after open {:.2} GiB vs {:.2} GiB on disk",
-        shards.count(),
-        shards.indexes.len(),
-        rss_after_open as f64 / 1073741824.0,
-        on_disk as f64 / 1073741824.0
-    );
-
     let k = c.execution.top_k;
     let queries = Arc::new(queries);
     let mut run_stats = Vec::new();
+    let mut open_secs: Vec<f64> = Vec::new();
+    let mut rss_after_open = 0u64;
+    let mut vectors = 0usize;
+    let mut shard_count = 0usize;
+    let mut effective_ef: Vec<usize> = Vec::new();
+    let mut returned_total = 0u64;
+    let mut queries_done = 0u64;
 
+    // Per-run drop-and-reopen, for the same reason as the metadata leg: dropping
+    // the cache once and then running three times back-to-back would let runs 1
+    // and 2 be warmed by run 0, and median-of-runs would report the warm number
+    // under a cold label. For an mmap'd index that failure is especially easy to
+    // miss, because nothing in the process looks different — only the page cache
+    // does.
     for run in 0..c.statistics.runs {
+        if a.cache == "cold" {
+            crate::drop_page_cache().map_err(|e| {
+                format!("{e}\n(precision {prec}: refusing to report this run as cold)")
+            })?;
+        }
+        let (s_open, open_seconds) = Shards::open(&a.fixtures, &prec, &opts, k)?;
+        let shards = Arc::new(s_open);
+        open_secs.push(open_seconds);
+        rss_after_open = crate::vm_rss_bytes();
+        vectors = shards.count();
+        shard_count = shards.indexes.len();
+        effective_ef = shards.effective_ef();
+        if effective_ef.iter().any(|&e| e < k) {
+            return Err(format!(
+                "expansion_search read back as {effective_ef:?} but top_k = {k}. \
+                 The beam width is narrower than the requested neighbour count, \
+                 so this run would measure a truncated search and report it \
+                 against the 300 ms bar. Refusing to produce that number."
+            ));
+        }
+        eprintln!(
+            "[bench-ann {prec}/{}] run {run}: {vectors} vectors across {shard_count} \
+             shards viewed in {open_seconds:.2}s, RSS after open {:.2} GiB vs \
+             {:.2} GiB on disk",
+            a.cache,
+            rss_after_open as f64 / 1073741824.0,
+            on_disk as f64 / 1073741824.0
+        );
+
         let next = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for _ in 0..c.execution.query_clients {
@@ -332,21 +405,32 @@ pub fn bench(a: &Args) -> Result<(), String> {
             let n = c.statistics.queries_per_run;
             handles.push(std::thread::spawn(move || {
                 let mut lat = Vec::new();
+                let (mut returned, mut done) = (0u64, 0u64);
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= n {
                         break;
                     }
                     let t = Instant::now();
-                    let _ = shards.search(&queries[i], k);
+                    let got = shards.search(&queries[i], k);
                     lat.push(t.elapsed());
+                    // A search that quietly returns fewer than k neighbours is
+                    // the visible symptom of a truncated graph walk. Reported
+                    // rather than assumed, for the same reason the metadata leg
+                    // reports hit counts: a fast number over a shallower search
+                    // is not the number the bar asks for.
+                    returned += got.len() as u64;
+                    done += 1;
                 }
-                lat
+                (lat, returned, done)
             }));
         }
         let mut lat = Vec::new();
         for h in handles {
-            lat.extend(h.join().map_err(|_| "query client panicked")?);
+            let (l, r, d) = h.join().map_err(|_| "query client panicked")?;
+            lat.extend(l);
+            returned_total += r;
+            queries_done += d;
         }
         let p = Percentiles::of(lat);
         eprintln!(
@@ -376,13 +460,16 @@ pub fn bench(a: &Args) -> Result<(), String> {
         serde_json::json!({
             "precision": prec,
             "cache": a.cache,
-            "vectors": shards.count(),
-            "shards": shards.indexes.len(),
+            "vectors": vectors,
+            "shards": shard_count,
             "top_k": k,
             "stats": rs,
             "bar_ms": c.bars.vector_p95_ms,
             "pass": pass,
-            "view_open_seconds": open_seconds,
+            "view_open_seconds_per_run": open_secs,
+            "expansion_search_requested": k.max(EXPANSION_SEARCH),
+            "expansion_search_read_back_per_shard": effective_ef,
+            "mean_neighbours_returned": returned_total as f64 / queries_done.max(1) as f64,
             // The three numbers the RSS method note in main.rs insists on
             // reporting together, because for a view()-mmap'd index no single
             // one of them is a falsifiable claim about memory.
@@ -431,6 +518,7 @@ pub fn recall(a: &Args) -> Result<(), String> {
     index
         .view(path.to_str().ok_or("non-UTF8 path")?)
         .map_err(|e| format!("view() failed on {}: {e}", path.display()))?;
+    index.change_expansion_search(K.max(EXPANSION_SEARCH));
     let n = index.size() as u64;
 
     // Regenerate shard 0's vectors as f32 ground truth.
@@ -453,7 +541,6 @@ pub fn recall(a: &Args) -> Result<(), String> {
     );
 
     const PROBES: usize = 100;
-    const K: usize = 10;
     let queries = query_vectors(&c)?;
     let probes: Vec<&Vec<f32>> = queries.iter().take(PROBES).collect();
 

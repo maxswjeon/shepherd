@@ -37,7 +37,17 @@ tantivy = "0.26.1"
 
 # Candidate (c): SQLite FTS5-trigram. `bundled` pins the SQLite build so the
 # measurement does not silently depend on whatever libsqlite3 the host ships.
-rusqlite = { version = "0.37", features = ["bundled"] }
+# Inherits the workspace pin (0.40.2, ADR-001). Do NOT pin a version here:
+# `libsqlite3-sys` carries `links = "sqlite3"`, so cargo permits exactly one
+# version in the graph — a local pin here collides with `shepherd-catalog` and
+# takes out every workspace-scoped command for every worker.
+#
+# It also matters for the measurement, not just the build: 0.37 and 0.40.2
+# bundle different SQLite versions, and this crate benchmarks FTS5-trigram.
+# Benchmarking FTS5 on a SQLite the product does not ship would make the 0b
+# index decision describe something other than the product. Record the actual
+# bundled SQLite version in `bench-contract.toml` alongside the rustc version.
+rusqlite = { workspace = true }
 
 # Vector ANN under test (§4.6 primary; not a bake-off candidate — the bake-off
 # there is over f32/f16/i8 precision, not over crates).

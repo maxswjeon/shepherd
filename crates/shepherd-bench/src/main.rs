@@ -129,12 +129,18 @@ pub struct Tiebreak {
     pub rule_text: String,
     pub latency_tie_pct: f64,
     pub scored_axes: Vec<String>,
+    /// Which measured quantity the rule's "RSS" means. Fixed in the contract
+    /// because the three candidates hold memory in three different places and
+    /// choosing after seeing the numbers would be the rationalisation the
+    /// precommitment exists to prevent.
+    pub index_rss_definition: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiskGuard {
     pub abort_below_free_gib: f64,
+    pub emergency_free_gib: f64,
 }
 
 impl Contract {
@@ -413,19 +419,50 @@ pub fn free_bytes(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Abort rather than fill a shared box. §9 has no opinion on this; operating a
-/// dev machine at 87% full does.
-pub fn disk_guard(path: &Path, min_free_gib: f64) -> Result<(), String> {
+/// Refuse to *start* a leg that cannot fit. §9 has no opinion on this; operating
+/// a shared dev machine at 91% full does.
+///
+/// `projected_gib` is what this leg is expected to write. Checking only a flat
+/// floor would let a leg start with enough room for the floor and not enough for
+/// itself — which is how a build gets thirty minutes in before failing.
+pub fn disk_guard_start(path: &Path, min_free_gib: f64, projected_gib: f64) -> Result<(), String> {
     let free = free_bytes(path) as f64 / (1024.0 * 1024.0 * 1024.0);
-    if free < min_free_gib {
+    let need = min_free_gib + projected_gib;
+    if free < need {
         return Err(format!(
-            "disk guard: {free:.1} GiB free at {} is below the contract's \
-             {min_free_gib:.1} GiB floor. Refusing to start this leg. \
-             This is an escalation, not a retry-with-less.",
+            "disk guard: {free:.1} GiB free at {}, but this leg needs \
+             {projected_gib:.1} GiB and the reserve floor is {min_free_gib:.1} GiB \
+             ({need:.1} GiB required). Refusing to start.\n\
+             This is an escalation, not a retry-with-less: a leg run at reduced \
+             scale to fit the disk is a different measurement and must be \
+             reported as one (--rows with --scaled-run-reason).",
             path.display()
         ));
     }
-    eprintln!("[disk] {free:.1} GiB free (floor {min_free_gib:.1} GiB) — ok");
+    eprintln!(
+        "[disk] {free:.1} GiB free, leg needs ~{projected_gib:.1} GiB + {min_free_gib:.1} GiB reserve — ok"
+    );
+    Ok(())
+}
+
+/// Emergency floor, re-checked *during* a long leg.
+///
+/// Deliberately far below the start-of-leg reserve. The start check already
+/// asked whether the leg fits; this one exists only to stop us wedging a shared
+/// machine if something else on it consumes the space we were counting on. Using
+/// the start-of-leg floor here would make a correctly-sized f32 build abort
+/// itself around shard 7, having done the work and kept none of it.
+pub fn disk_guard_continue(path: &Path, emergency_gib: f64) -> Result<(), String> {
+    let free = free_bytes(path) as f64 / (1024.0 * 1024.0 * 1024.0);
+    if free < emergency_gib {
+        return Err(format!(
+            "disk guard: {free:.1} GiB free at {} has fallen below the \
+             {emergency_gib:.1} GiB emergency floor mid-leg. Stopping to avoid \
+             filling a shared machine. Partial results already emitted stand; \
+             this leg does not.",
+            path.display()
+        ));
+    }
     Ok(())
 }
 

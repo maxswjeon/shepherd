@@ -681,8 +681,20 @@ pub fn build(a: &Args) -> Result<(), String> {
             catalog.display()
         ));
     }
-    crate::disk_guard(&a.fixtures, c.disk_guard.abort_below_free_gib)?;
+
     let rows = a.rows_override.unwrap_or(c.fixture.rows);
+    // Projected from the 200k pilot, scaled: fts5 ~0.45 GiB per million rows,
+    // tantivy ~0.25 GiB per million. The arena writes nothing to disk.
+    let projected_gib = match which.as_str() {
+        "fts5" => 0.45 * rows as f64 / 1e6,
+        "tantivy" => 0.25 * rows as f64 / 1e6,
+        _ => 0.0,
+    };
+    crate::disk_guard_start(
+        &a.fixtures,
+        c.disk_guard.abort_below_free_gib,
+        projected_gib,
+    )?;
 
     let (secs, bytes, note) = match which.as_str() {
         "fts5" => {
@@ -764,68 +776,71 @@ pub fn bench(a: &Args) -> Result<(), String> {
         ));
     }
 
-    // Cold cache is dropped BEFORE the index is opened, so the open itself pays
-    // cold I/O. Dropping it afterwards would measure a warm index behind a
-    // cold-looking label.
-    if a.cache == "cold" {
-        crate::drop_page_cache().map_err(|e| {
-            format!("{e}\n(candidate {which}: refusing to report this run as cold)")
-        })?;
-        eprintln!("[cache] page cache dropped — this run is genuinely cold");
-    }
-
-    let t_open = Instant::now();
-    let shared: Shared = match which.as_str() {
-        "arena" => {
-            let (arena, d) = Arena::rebuild_from_catalog(&catalog, rows)?;
-            eprintln!(
-                "[arena] rebuild {:.1}s (paid at every daemon start)",
-                d.as_secs_f64()
-            );
-            Shared::Arena(Arc::new(arena))
-        }
-        "tantivy" => {
-            let (t, d) = Tantivy::open(&a.fixtures)?;
-            eprintln!("[tantivy] open {:.3}s", d.as_secs_f64());
-            Shared::Tantivy(Arc::new(t))
-        }
-        "fts5" => Shared::Fts5,
-        other => return Err(format!("unknown candidate {other}")),
-    };
-    let open_seconds = t_open.elapsed().as_secs_f64();
-    let index_bytes = match &shared {
-        Shared::Arena(x) => x.resident_bytes(),
-        Shared::Tantivy(_) => crate::path_bytes(&Tantivy::index_path(&a.fixtures)),
-        Shared::Fts5 => crate::path_bytes(&Fts5::index_path(&a.fixtures)),
-    };
-
-    // Background ingest — §9's "under a background ingest load", and fairness
-    // rule 2: all three candidates take it.
-    let stop = Arc::new(AtomicBool::new(false));
-    let ingested = Arc::new(AtomicUsize::new(0));
-    let ingest = if c.execution.background_ingest {
-        Some(spawn_ingest(
-            &shared,
-            &a.fixtures,
-            c.fixture.seed,
-            rows,
-            c.execution.background_ingest_rows_per_sec,
-            Arc::clone(&stop),
-            Arc::clone(&ingested),
-        )?)
-    } else {
-        None
-    };
-
     let limit = c.execution.result_limit;
     let clients = c.execution.query_clients;
     let mut run_stats = Vec::new();
+    let mut index_bytes = 0u64;
     let mut total_hits = 0u64;
     let mut zero_hit = 0u64;
     let mut by_class: std::collections::BTreeMap<String, ClassStat> =
         std::collections::BTreeMap::new();
 
+    // EVERY RUN OPENS ITS OWN INDEX, and for a cold cell every run drops the page
+    // cache first.
+    //
+    // An earlier draft dropped the cache once and then ran all three runs
+    // back-to-back. Run 0 was cold; runs 1 and 2 were warmed by run 0 — so
+    // median-of-runs-p95 over [cold, warm, warm] reported the WARM number under
+    // a cold label. "Cold over budget while warm passes" is an explicit
+    // escalation trigger, so that defect would have suppressed precisely the
+    // escalation the cold cell exists to raise. Re-opening on warm runs too
+    // costs a little wall clock and makes the two cells structurally identical,
+    // differing only by the cache drop.
+    //
+    // Re-opening matters for FTS5 in particular: each connection holds SQLite's
+    // own multi-MiB heap page cache, which `drop_caches` cannot touch, so a cold
+    // run reusing its connection would query a warm cache behind a cold label.
+    let mut open_secs: Vec<f64> = Vec::new();
+    let mut ingest_total = 0usize;
     for run in 0..c.statistics.runs {
+        if a.cache == "cold" {
+            crate::drop_page_cache().map_err(|e| {
+                format!("{e}\n(candidate {which}: refusing to report this run as cold)")
+            })?;
+        }
+        let t_open = Instant::now();
+        let shared: Shared = match which.as_str() {
+            "arena" => Shared::Arena(Arc::new(Arena::rebuild_from_catalog(&catalog, rows)?.0)),
+            "tantivy" => Shared::Tantivy(Arc::new(Tantivy::open(&a.fixtures)?.0)),
+            "fts5" => Shared::Fts5,
+            other => return Err(format!("unknown candidate {other}")),
+        };
+        open_secs.push(t_open.elapsed().as_secs_f64());
+        index_bytes = match &shared {
+            Shared::Arena(x) => x.resident_bytes(),
+            Shared::Tantivy(_) => crate::path_bytes(&Tantivy::index_path(&a.fixtures)),
+            Shared::Fts5 => crate::path_bytes(&Fts5::index_path(&a.fixtures)),
+        };
+
+        // Background ingest — §9's "under a background ingest load", and
+        // fairness rule 2. Spawned per run so it writes to the index this run is
+        // actually querying.
+        let stop = Arc::new(AtomicBool::new(false));
+        let ingested = Arc::new(AtomicUsize::new(0));
+        let ingest = if c.execution.background_ingest {
+            Some(spawn_ingest(
+                &shared,
+                &a.fixtures,
+                c.fixture.seed,
+                rows,
+                c.execution.background_ingest_rows_per_sec,
+                Arc::clone(&stop),
+                Arc::clone(&ingested),
+            )?)
+        } else {
+            None
+        };
+
         let slice: Arc<Vec<(String, String)>> = Arc::new(
             lexical[run * c.statistics.queries_per_run..(run + 1) * c.statistics.queries_per_run]
                 .to_vec(),
@@ -881,17 +896,18 @@ pub fn bench(a: &Args) -> Result<(), String> {
                 e.merge(v);
             }
         }
+        stop.store(true, Ordering::Relaxed);
+        if let Some(h) = ingest {
+            let _ = h.join();
+        }
+        ingest_total += ingested.load(Ordering::Relaxed);
+
         let p = Percentiles::of(lat);
         eprintln!(
-            "[bench-meta {which}/{}] run {run}: p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2} ms",
-            a.cache, p.p50_ms, p.p95_ms, p.p99_ms, p.max_ms
+            "[bench-meta {which}/{}] run {run}: p50 {:.2}  p95 {:.2}  p99 {:.2}               max {:.2} ms  (open {:.1}s)",
+            a.cache, p.p50_ms, p.p95_ms, p.p99_ms, p.max_ms, open_secs[run]
         );
         run_stats.push(p);
-    }
-
-    stop.store(true, Ordering::Relaxed);
-    if let Some(h) = ingest {
-        let _ = h.join();
     }
 
     let rs = RunSet::reduce(run_stats, c.statistics.drift_flag_pct);
@@ -914,12 +930,12 @@ pub fn bench(a: &Args) -> Result<(), String> {
             "stats": rs,
             "bar_ms": c.bars.metadata_p95_ms,
             "pass": pass,
-            "open_or_rebuild_seconds": open_seconds,
+            "open_or_rebuild_seconds_per_run": open_secs,
             "index_bytes": index_bytes,
             "peak_vm_hwm_bytes": crate::vm_hwm_bytes(),
             "vm_rss_after_queries_bytes": crate::vm_rss_bytes(),
             "query_clients": clients,
-            "background_rows_ingested": ingested.load(Ordering::Relaxed),
+            "background_rows_ingested": ingest_total,
             "mean_hits_per_query": total_hits as f64 / need as f64,
             "zero_hit_queries": zero_hit,
             "by_class": by_class.iter().map(|(k, v)| (k.clone(), v.report())).collect::<serde_json::Map<_,_>>(),
