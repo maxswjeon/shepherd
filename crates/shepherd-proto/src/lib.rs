@@ -79,6 +79,23 @@ pub use version::{
 mod tests {
     use super::*;
 
+    /// A tripwire, not a tautology.
+    ///
+    /// `PROTO_VERSION` is asserted against a literal in exactly one place —
+    /// here — so an accidental bump fails a test with an obvious name, while a
+    /// deliberate one is a two-line diff next to the minor history in
+    /// `version.rs`. Everywhere else compares against the constant, so a
+    /// deliberate bump does not ripple.
+    #[test]
+    fn the_protocol_version_is_what_the_minor_history_says() {
+        assert_eq!(
+            (PROTO_VERSION.major, PROTO_VERSION.minor),
+            (1, 1),
+            "if this bump is deliberate, update `version.rs`'s minor history in \
+             the same change and set every new method's `since` to the new minor"
+        );
+    }
+
     #[test]
     fn the_crate_speaks_one_protocol_version() {
         assert_eq!(PROTO_VERSION.major, 1);

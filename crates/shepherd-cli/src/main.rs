@@ -350,6 +350,7 @@ fn positional_field(kind: MethodKind) -> Option<&'static str> {
         | MethodKind::TierPlan
         | MethodKind::TierRun
         | MethodKind::Restore
+        | MethodKind::Doctor
         | MethodKind::EventsSubscribe => None,
     }
 }
@@ -909,6 +910,7 @@ mod tests {
             ],
             vec!["shepctl", "restore", "--file-id", "9"],
             vec!["shepctl", "events", "subscribe", "--resume-from", "12"],
+            vec!["shepctl", "doctor"],
         ];
         assert_eq!(
             cases.len(),

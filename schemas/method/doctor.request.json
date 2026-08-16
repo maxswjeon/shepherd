@@ -1,18 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "`scan.status`.",
-  "properties": {
-    "root_id": {
-      "default": null,
-      "description": "The root to report on. Omit for every root.",
-      "format": "int64",
-      "type": [
-        "integer",
-        "null"
-      ]
-    }
-  },
-  "title": "scan.status request",
+  "description": "`doctor` — run the daemon's self-checks.",
+  "title": "doctor request",
   "type": "object",
   "x-shepherd": {
     "generator": "cargo xtask codegen",

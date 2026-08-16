@@ -44,7 +44,14 @@ use serde::{Deserialize, Serialize};
 /// `minor` is bumped by **any** additive change to the method table or to a
 /// request/result schema. `major` is bumped only by a change that an old client
 /// cannot be expected to tolerate; see [`COMPATIBILITY_POLICY`].
-pub const PROTO_VERSION: ProtoVersion = ProtoVersion::new(1, 0);
+/// Minor history, so a reader can see the additive policy actually being used
+/// rather than only described:
+///
+/// * **1.0** — the initial Phase 1 surface.
+/// * **1.1** — added `doctor` (§4.2 and the §9 gate both require
+///   `shepctl doctor`; it is a real capability, so it is a registered method
+///   rather than an exemption from AC-54's `CLI == registered_methods`).
+pub const PROTO_VERSION: ProtoVersion = ProtoVersion::new(1, 1);
 
 /// The additive-evolution rules, stated once so they can be quoted in review.
 ///

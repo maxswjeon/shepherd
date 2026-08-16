@@ -1,0 +1,93 @@
+{
+  "$defs": {
+    "CheckStatus": {
+      "description": "The outcome of one `doctor` check.\n\n`Warn` is not a failure. §4.2's lingering check is the reason: on a headless\nLinux node with lingering disabled the daemon correctly does not start, and\nOQ-F forbids Shepherd from enabling it. If a warning made `doctor` unclean,\nthe pressure to get a green doctor would become pressure to change a user's\nsystem setting on their behalf.",
+      "enum": [
+        "ok",
+        "warn",
+        "fail",
+        "not_applicable"
+      ],
+      "type": "string"
+    },
+    "DoctorCheck": {
+      "description": "One named self-check.",
+      "properties": {
+        "detail": {
+          "default": null,
+          "description": "What was observed. Empty for a plain `ok`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "remediation": {
+          "default": null,
+          "description": "A command the **user** may choose to run. Shepherd never runs it — see\nOQ-F and `shepherd_obs::lingering`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/CheckStatus"
+        }
+      },
+      "required": [
+        "name",
+        "status"
+      ],
+      "type": "object"
+    },
+    "DoctorSource": {
+      "oneOf": [
+        {
+          "enum": [
+            "daemon"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "offline_client",
+          "description": "Produced by `shepctl` with no daemon reachable.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`doctor`.",
+  "properties": {
+    "checks": {
+      "items": {
+        "$ref": "#/$defs/DoctorCheck"
+      },
+      "type": "array"
+    },
+    "clean": {
+      "description": "True when nothing failed. Warnings do not make it false.",
+      "type": "boolean"
+    },
+    "source": {
+      "$ref": "#/$defs/DoctorSource",
+      "description": "Whether these checks came from a running daemon or were run locally by\nthe client because the daemon was unreachable.\n\nThe distinction matters: an offline run can only see what a client\nprocess can see, so a clean offline result is a much weaker statement\nthan a clean online one, and a reader must be able to tell them apart."
+    }
+  },
+  "required": [
+    "checks",
+    "clean",
+    "source"
+  ],
+  "title": "doctor result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.1",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

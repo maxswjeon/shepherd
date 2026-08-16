@@ -622,6 +622,18 @@ methods! {
         call = restore,
     },
 
+    Doctor {
+        id = 1901,
+        name = "doctor",
+        cli = ["doctor"],
+        summary = "Run the daemon's self-checks",
+        since = 1,
+        mutates = false,
+        request = DoctorRequest,
+        result = DoctorResult,
+        call = doctor,
+    },
+
     EventsSubscribe {
         id = 1801,
         name = "events.subscribe",
@@ -709,10 +721,18 @@ mod tests {
         }
     }
 
+    /// The additive policy, exercised on the real table rather than only on the
+    /// synthetic one: `doctor` arrived at 1.1, so a connection that negotiated
+    /// minor 0 must not see it, and one at 1.1 must.
     #[test]
-    fn phase_1_methods_are_all_available_at_minor_zero() {
+    fn a_method_added_at_a_later_minor_is_gated_on_the_real_table() {
+        assert!(!MethodKind::Doctor.available_at(0));
+        assert!(MethodKind::Doctor.available_at(1));
         for k in MethodKind::ALL {
-            assert!(k.available_at(0), "{}", k.name());
+            if *k == MethodKind::Doctor {
+                continue;
+            }
+            assert!(k.available_at(0), "{} is part of the 1.0 surface", k.name());
         }
     }
 
@@ -901,6 +921,10 @@ mod tests {
             }
             fn restore(&mut self, _: RestoreRequest) -> Result<RestoreResult, RpcError> {
                 self.called.push("restore");
+                Err(RpcError::new(ErrorCode::MethodNotImplemented, "probe"))
+            }
+            fn doctor(&mut self, _: DoctorRequest) -> Result<DoctorResult, RpcError> {
+                self.called.push("doctor");
                 Err(RpcError::new(ErrorCode::MethodNotImplemented, "probe"))
             }
             fn events_subscribe(

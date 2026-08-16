@@ -424,6 +424,59 @@ pub struct TierRunResult {
     pub accepted: u64,
 }
 
+/// The outcome of one `doctor` check.
+///
+/// `Warn` is not a failure. §4.2's lingering check is the reason: on a headless
+/// Linux node with lingering disabled the daemon correctly does not start, and
+/// OQ-F forbids Shepherd from enabling it. If a warning made `doctor` unclean,
+/// the pressure to get a green doctor would become pressure to change a user's
+/// system setting on their behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Ok,
+    Warn,
+    Fail,
+    NotApplicable,
+}
+
+/// One named self-check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: CheckStatus,
+    /// What was observed. Empty for a plain `ok`.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// A command the **user** may choose to run. Shepherd never runs it — see
+    /// OQ-F and `shepherd_obs::lingering`.
+    #[serde(default)]
+    pub remediation: Option<String>,
+}
+
+/// `doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DoctorResult {
+    pub checks: Vec<DoctorCheck>,
+    /// True when nothing failed. Warnings do not make it false.
+    pub clean: bool,
+    /// Whether these checks came from a running daemon or were run locally by
+    /// the client because the daemon was unreachable.
+    ///
+    /// The distinction matters: an offline run can only see what a client
+    /// process can see, so a clean offline result is a much weaker statement
+    /// than a clean online one, and a reader must be able to tell them apart.
+    pub source: DoctorSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorSource {
+    Daemon,
+    /// Produced by `shepctl` with no daemon reachable.
+    OfflineClient,
+}
+
 /// `restore`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RestoreResult {

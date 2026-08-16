@@ -364,6 +364,10 @@ pub struct RestoreRequest {
     pub overwrite: bool,
 }
 
+/// `doctor` — run the daemon's self-checks.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DoctorRequest {}
+
 /// `events.subscribe` — see [`crate::event`] for the resume and overflow
 /// contract.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]

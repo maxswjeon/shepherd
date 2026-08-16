@@ -156,9 +156,17 @@ fn a_successful_call_produces_the_stable_envelope_and_exit_zero() {
     // The client's side of the conversation.
     assert_eq!(observed.hello["jsonrpc"], serde_json::json!("2.0"));
     assert_eq!(observed.hello["method"], serde_json::json!("hello"));
+    // Against `PROTO_VERSION`, not a literal: the property is "the client
+    // announces what this build actually speaks". A literal here would have to
+    // be edited on every additive minor bump, and a test edited that often
+    // stops being read. The literal is pinned once, in `shepherd-proto`, where
+    // an accidental bump is the thing being guarded.
     assert_eq!(
         observed.hello["params"]["proto_version"],
-        serde_json::json!({"major": 1, "minor": 0})
+        serde_json::json!({
+            "major": shepherd_proto::PROTO_VERSION.major,
+            "minor": shepherd_proto::PROTO_VERSION.minor,
+        })
     );
     assert_eq!(
         observed.hello["params"]["client"]["name"],
