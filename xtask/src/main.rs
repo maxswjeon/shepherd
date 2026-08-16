@@ -15,7 +15,7 @@
 //! defect §9 rule 6 records ("a tool credited with running that did not
 //! exist"), so it is a deliberate design point that this binary never does so.
 
-use xtask::{check_deps, claim_ledger, codegen, gate_audit};
+use xtask::{check_deps, claim_ledger, codegen, gate_audit, gate_phase};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -125,15 +125,18 @@ fn cmd_codegen(root: &Path, args: &[String]) -> Result<ExitCode, String> {
 
 fn cmd_gate(root: &Path, args: &[String]) -> Result<ExitCode, String> {
     if let Some(phase) = flag_value(args, "--phase") {
-        eprintln!(
-            "xtask gate --phase {phase}: NOT IMPLEMENTED.\n\
-             The phase gates in §9 require evidence this repository cannot yet produce \
-             (bench baselines, MinIO E2E runs, signed packages). This command deliberately \
-             exits {EXIT_UNIMPLEMENTED} instead of returning success, because a gate that \
-             passes without evidence is the exact defect §9 rule 6 records."
-        );
-        return Ok(ExitCode::from(EXIT_UNIMPLEMENTED));
+        let map_path = flag_value(args, "--map")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("xtask/ac-map.toml"));
+        let report = gate_phase::run(root, &map_path, &phase)?;
+        print!("{}", report.render());
+        return Ok(if report.failed() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        });
     }
+
     if !args.iter().any(|a| a == "--audit") {
         return Err("gate: expected `--audit` or `--phase <id>`".into());
     }

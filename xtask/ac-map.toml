@@ -162,11 +162,24 @@ id = "AC-1"
 owning_gate = "2"
 exercises = ["shepherd-tier::destroy", "shepherd-tier::verify", "shepherd-storage::s3"]
 
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::the_happy_path_destroys_and_audits"
+proves = "destruction happens only after a verified remote copy, and is audited"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "m2_round_trip_mechanism_a_versioned"
+ignored = true
+requires_env = "SHEPHERD_MINIO_ENDPOINT"
+proves = "AC-1's full remote re-read against real MinIO before any destruction"
+
 [[ac]]
 id = "AC-2"
 owning_gate = "2"
 exercises = ["shepherd-storage::multipart", "shepherd-storage::transfer_session", "shepherd-jobs::queue"]
 note = "the required 50 GB resume artifact is produced in the owning gate, not deferred to nightly"
+evidence_missing = "shepherd-tier::upload is not landed, so the checkpointed multipart resume AC-2 requires cannot be exercised end to end. shepherd-storage's MinIO suite covers ListParts reconciliation at the adapter layer, but the 50 GB kill-and-resume artifact §9 demands in THIS gate does not exist."
 
 [[ac]]
 id = "AC-3"
@@ -185,26 +198,69 @@ id = "AC-5"
 owning_gate = "2"
 exercises = ["shepherd-tier::restore", "shepherd-tier::fidelity"]
 
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "restore::tests::a_restore_reproduces_bytes_mtime_and_mode_on_a_real_filesystem"
+proves = "restore returns the bytes"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "m2_round_trip_mechanism_b_content_addressed"
+ignored = true
+requires_env = "SHEPHERD_MINIO_ENDPOINT"
+proves = "byte-identical restore over a real round trip, asserted by hash and by path"
+
 [[ac]]
 id = "AC-6"
 owning_gate = "2"
 exercises = ["shepherd-catalog::schema", "shepherd-storage::replica_bundle", "shepherd-tier::destroy"]
 note = "moved from 1 — Phase 1 had no tiering, so it could not exercise remote-only custody state"
+evidence_missing = "requires dropping all local state after tiering-and-destroying and rebuilding from the filesystem plus the four-class recovery bundle. The bundle exists (shepherd-storage::replica) but no test performs the drop-and-rebuild, so the custody invariant is unproven."
 
 [[ac]]
 id = "AC-7"
 owning_gate = "2"
 exercises = ["shepherd-scan::floors", "shepherd-tier::plan"]
 
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "floors::tests::hardlinked_files_are_refused"
+proves = "the hard safety floors refuse"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "floors::tests::acquisition_is_a_second_gate_not_a_cached_verdict"
+proves = "floors are RE-validated at acquisition, not reused from planning"
+
 [[ac]]
 id = "AC-8"
 owning_gate = "2"
 exercises = ["shepherd-scan::denylist", "shepherd-tier::plan"]
 
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "denylist::tests::a_substring_is_not_a_component"
+proves = "the built-in deny-list matches components, never substrings"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "each_negative_is_excluded_for_its_own_stated_reason"
+proves = "a deny-listed tree is pruned before any rule sees it"
+
 [[ac]]
 id = "AC-9"
 owning_gate = "2"
 exercises = ["shepherd-scan::ignore", "shepherd-tier::plan"]
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "ignore::tests::the_parent_aware_form_refuses_a_file_under_an_excluded_directory"
+proves = "gitignore semantics incl. the parent-exclusion rule"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::an_excluded_directory_is_pruned_so_a_negation_inside_it_does_not_apply"
+proves = "ignores honoured on the scan side by pruning"
 
 [[ac]]
 id = "AC-10"
@@ -233,10 +289,25 @@ id = "AC-14"
 owning_gate = "2"
 exercises = ["shepherd-rules::preview", "shepherd-rules::engine", "shepherd-rules::delete_policy"]
 
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "preview::tests::a_rule_with_no_preview_cannot_be_enabled"
+proves = "a rule cannot be enabled without a dry-run"
+
 [[ac]]
 id = "AC-15"
 owning_gate = "2"
 exercises = ["shepherd-tier::verify", "shepherd-tier::revalidate"]
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::a_changed_remote_version_aborts_and_restores"
+proves = "version-bound revalidation after the final local hash"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "revalidate::tests::mechanism_b_head_catches_deletion_and_truncation_only"
+proves = "the closing check's real strength under each mechanism"
 
 [[ac]]
 id = "AC-16"
@@ -410,6 +481,11 @@ id = "AC-47"
 owning_gate = "2"
 exercises = ["shepherd-catalog::intent", "shepherd-tier::audit"]
 
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::the_happy_path_destroys_and_audits"
+proves = "the intent journal and audit record are written for a destruction"
+
 [[ac]]
 id = "AC-48"
 owning_gate = "8"
@@ -517,11 +593,36 @@ owning_gate = "2"
 exercises = ["shepherd-tier::destroy", "shepherd-tier::revalidate", "shepherd-tier::serialize"]
 note = "handle/staging-bound destruction, adversarial path-swap at the syscall boundary"
 
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::identity_mismatch_aborts_and_restores"
+proves = "handle/staging-bound destruction with an adversarial identity swap"
+
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::a_handle_opened_after_the_floor_check_is_not_seen_by_it"
+proves = "OQ-J's residual exercised rather than assumed away"
+
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "serialize::key_tests::two_files_sharing_one_key_serialize_on_the_key_not_the_file"
+proves = "per-file and per-key serialization"
+
 [[guard]]
 id = "PM-2"
 owning_gate = "2"
 exercises = ["shepherd-tier::discard", "shepherd-tier::breaker", "shepherd-tier::audit", "shepherd-catalog::intent"]
 note = "remote-destroy guard: discard routed through the same intent+audit apparatus"
+
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::remote_discard_deletes_and_audits_through_the_same_apparatus"
+proves = "the discard branch routes through the same intent+audit apparatus"
+
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "breaker::tests::repeated_sub_threshold_passes_cannot_evade_the_window"
+proves = "the rate-based bulk-discard breaker survives restart"
 
 [[guard]]
 id = "PM-3"
