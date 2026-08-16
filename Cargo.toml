@@ -122,6 +122,23 @@ async-trait = "0.1"
 
 blake3 = "1"
 bytes = "1"
+
+# `.gitignore` semantics for `shepherd-scan::ignore` (AC-9) — BurntSushi's
+# matcher, the one ripgrep ships. Used as a LIBRARY via
+# `ignore::gitignore::GitignoreBuilder`, never its walker, which cannot carry
+# the symlink/junction cycle guard §6 requires.
+#
+# A dependency rather than hand-rolled because §8.1 specifies the full
+# semantics — negation, `**`, trailing `/`, anchoring, precedence — and the
+# subtle parts (a negation cannot re-include a file whose parent directory was
+# excluded; `**` differs leading vs trailing vs embedded; last-match-wins across
+# layered per-directory files) are each a way to be QUIETLY wrong. The direction
+# of failure decides the trade: an ignore rule that fails to match makes a file
+# the user explicitly excluded eligible for tiering and, under a `discard`
+# policy, destruction. That is a safety path, so the smaller-but-flimsier
+# implementation is the wrong call. Same reasoning that kept
+# `unicode-normalization` rather than hand-folding NFC.
+ignore = "0.4.33"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
