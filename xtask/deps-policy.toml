@@ -1,0 +1,151 @@
+# Dependency policy for `cargo xtask check-deps`.
+#
+# This file is the machine-readable form of §4.1's four dependency rules, plus
+# the §4.5 `opendal` boundary and a workspace-completeness check. It is data on
+# purpose: every future widening of the policy is a one-line diff in a file
+# whose only reason to exist is safety enforcement, so it shows up in review
+# instead of hiding inside a manifest.
+#
+# Rules 1-3 and 5 are evaluated against the workspace dependency GRAPH
+# (`cargo metadata --no-deps`), not against source text. §4.1 is explicit about
+# why: "Cargo cannot forbid a syscall; it can forbid an edge."
+#
+# Rule 4 is a call-site constraint and is evaluated as a source scan, paired
+# with the `clippy::disallowed_methods` deny in the root Cargo.toml.
+
+# ---------------------------------------------------------------------------
+# Rule 0 - workspace completeness.
+#
+# Not from §4.1. It closes the hole that would make every other rule bypassable:
+# a crate that is not a workspace member is not in `cargo metadata`'s graph, so
+# it would be invisible to rules 1-3 and 5.
+# ---------------------------------------------------------------------------
+expected_crates = [
+    "shepherd-bench",
+    "shepherd-catalog",
+    "shepherd-cli",
+    "shepherd-core",
+    "shepherd-daemon",
+    "shepherd-extract",
+    "shepherd-index",
+    "shepherd-infer",
+    "shepherd-jobs",
+    "shepherd-net",
+    "shepherd-obs",
+    "shepherd-placeholder",
+    "shepherd-plugin",
+    "shepherd-proto",
+    "shepherd-rules",
+    "shepherd-scan",
+    "shepherd-secrets",
+    "shepherd-storage",
+    "shepherd-tier",
+    "shepherd-usnhelper",
+    "shepherd-watch",
+]
+
+# ---------------------------------------------------------------------------
+# Rule 1 - `shepherd-core` and `shepherd-proto` depend on nothing internal.
+# ---------------------------------------------------------------------------
+[rule1]
+crates = ["shepherd-core", "shepherd-proto"]
+
+# ---------------------------------------------------------------------------
+# Rule 2 - no crate except `shepherd-tier` may depend on `shepherd-placeholder`.
+#
+# This is the edge that makes `shepherd-tier::destroy` the only path to any
+# destructive syscall: `delete_mode.rs`'s `unlink`, `cfapi.rs`'s
+# `CfDehydratePlaceholder` and `fileprovider.rs`'s eviction all live behind it.
+#
+# Enforced across normal, build AND dev dependencies. A dev-dependency is a real
+# compiled edge; permitting it would let a test binary reach the destroy
+# primitives without going through `shepherd-tier`.
+#
+# KNOWN TENSION, recorded rather than pre-approved: Phase 2 creates
+# `shepherd-placeholder/src/mock.rs` so that the delete-policy engine, the
+# discard apparatus and the bulk breaker are testable on Linux. If the Phase 2
+# owner wants `shepherd-rules` or `shepherd-jobs` to hold a dev-dependency on
+# `shepherd-placeholder`, this gate blocks it, and that block is intended: the
+# escalation is to move the mock behind `shepherd-tier`, or to add an explicit
+# `dev_exemptions` entry here in a reviewed change. Do not silently relax it.
+# ---------------------------------------------------------------------------
+[rule2]
+protected = "shepherd-placeholder"
+sole_dependent = "shepherd-tier"
+dev_exemptions = []
+
+# ---------------------------------------------------------------------------
+# Rule 3 - `shepherd-plugin` may depend on neither `shepherd-tier` nor
+# `shepherd-placeholder`, and on no filesystem-mutating crate.
+#
+# Phrased as an ALLOWLIST rather than the denylist §4.1's prose uses, because a
+# denylist fails open: a crate added in a later phase is permitted by default
+# and nobody is asked. The allowlist forces every widening through this file.
+#
+# `shepherd-net` is deliberately NOT pre-allowed even though Phase 7's
+# `http_gate.rs` may want it - AC-38's "plugins cannot trigger dehydrate/delete"
+# is a compile-time property, and the moment to re-examine it is when someone
+# needs the edge, not now.
+# ---------------------------------------------------------------------------
+[rule3]
+crate_name = "shepherd-plugin"
+allowed_internal_deps = ["shepherd-core", "shepherd-proto", "shepherd-obs"]
+
+# ---------------------------------------------------------------------------
+# Rule 4 - within `shepherd-tier`, `destroy.rs` is the sole caller of any
+# `PlaceholderProvider` destructive method and of `StorageAdapter::delete_object`.
+#
+# `implemented_in` are path prefixes whose files may declare and implement the
+# symbol - the destructive calls genuinely must live in the platform crate,
+# since each is a different OS API. `sole_caller` is the one file allowed to
+# call it. Any other file mentioning the symbol is a violation.
+#
+# `not_tracked` records the symbol this rule deliberately does NOT constrain:
+# `delete_system_object` is scoped by construction to the `_shepherd/` prefix,
+# is callable by replica maintenance, and is never counted by the discard
+# breaker (§4.1 rule 4).
+#
+# The symbol names are the ones §4.1/§4.10 name. If Phase 2 lands a destructive
+# method under a different name, ADD IT HERE - an unlisted symbol is unchecked.
+# ---------------------------------------------------------------------------
+[rule4]
+scan_roots = ["crates", "xtask/src"]
+escape_hatch = "allow(clippy::disallowed_methods)"
+escape_hatch_allowed_in = ["crates/shepherd-tier/src/destroy.rs"]
+not_tracked = ["delete_system_object"]
+
+[[rule4.symbols]]
+name = "delete_object"
+owner = "StorageAdapter"
+implemented_in = ["crates/shepherd-storage/src/"]
+sole_caller = "crates/shepherd-tier/src/destroy.rs"
+
+[[rule4.symbols]]
+name = "destroy_local"
+owner = "PlaceholderProvider"
+implemented_in = ["crates/shepherd-placeholder/src/"]
+sole_caller = "crates/shepherd-tier/src/destroy.rs"
+
+[[rule4.symbols]]
+name = "dehydrate"
+owner = "PlaceholderProvider"
+implemented_in = ["crates/shepherd-placeholder/src/"]
+sole_caller = "crates/shepherd-tier/src/destroy.rs"
+
+[[rule4.symbols]]
+name = "evict"
+owner = "PlaceholderProvider"
+implemented_in = ["crates/shepherd-placeholder/src/"]
+sole_caller = "crates/shepherd-tier/src/destroy.rs"
+
+# ---------------------------------------------------------------------------
+# Rule 5 - the `opendal` boundary (§4.5, ADR-001).
+#
+# `opendal` parts cannot be resumed after disconnection, and spec:89 requires
+# every transfer to be resumable, so it is excluded from all user-data paths and
+# retained only for `_shepherd/` control objects. §4.5 states `xtask check-deps`
+# enforces that boundary; this is that enforcement.
+# ---------------------------------------------------------------------------
+[rule5]
+external_crate = "opendal"
+sole_dependent = "shepherd-storage"
