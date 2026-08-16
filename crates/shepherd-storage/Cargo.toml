@@ -12,3 +12,23 @@ workspace = true
 
 [dependencies]
 shepherd-core.workspace = true
+
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+zstd.workspace = true
+
+# The S3-family adapter (§4.5). Confined to `s3.rs`; every other module in this
+# crate is provider-agnostic and depends only on the `adapter` traits, which is
+# what lets the transfer state machine and the replica chain be unit-tested with
+# no network and no AWS types in scope.
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
