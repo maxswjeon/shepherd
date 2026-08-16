@@ -1,0 +1,58 @@
+[workspace]
+members = ["crates/*", "xtask"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/swjeon/shepherd"
+publish = false
+
+# Workspace-wide lint policy.
+#
+# `clippy::disallowed_methods` is DENY across every crate. It is the lint half of
+# §4.1 dependency rule 4: the destructive `PlaceholderProvider` methods and
+# `StorageAdapter::delete_object` are listed in `clippy.toml`, and the only
+# module permitted to carry `#![allow(clippy::disallowed_methods)]` is
+# `crates/shepherd-tier/src/destroy.rs`. `cargo xtask check-deps` asserts that
+# the escape hatch appears nowhere else, so the allow cannot be quietly copied.
+#
+# This lint only fires under `cargo clippy`, so CI runs
+# `cargo clippy --workspace --all-targets -- -D warnings`.
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+
+[workspace.dependencies]
+# Internal crates. Declared here so member manifests carry a single
+# `shepherd-core.workspace = true` line and the dependency graph that
+# `cargo xtask check-deps` parses has exactly one place to edit.
+shepherd-catalog = { path = "crates/shepherd-catalog" }
+shepherd-core = { path = "crates/shepherd-core" }
+shepherd-extract = { path = "crates/shepherd-extract" }
+shepherd-index = { path = "crates/shepherd-index" }
+shepherd-infer = { path = "crates/shepherd-infer" }
+shepherd-jobs = { path = "crates/shepherd-jobs" }
+shepherd-net = { path = "crates/shepherd-net" }
+shepherd-obs = { path = "crates/shepherd-obs" }
+shepherd-placeholder = { path = "crates/shepherd-placeholder" }
+shepherd-plugin = { path = "crates/shepherd-plugin" }
+shepherd-proto = { path = "crates/shepherd-proto" }
+shepherd-rules = { path = "crates/shepherd-rules" }
+shepherd-scan = { path = "crates/shepherd-scan" }
+shepherd-secrets = { path = "crates/shepherd-secrets" }
+shepherd-storage = { path = "crates/shepherd-storage" }
+shepherd-tier = { path = "crates/shepherd-tier" }
+shepherd-watch = { path = "crates/shepherd-watch" }
+
+# Third-party.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+debug = 1
