@@ -157,12 +157,12 @@ pub fn evaluate_discard(
     }
 }
 
-/// Whether a discard hold blocks a job class.
+/// Whether a discard hold blocks a job class, ignoring target scope.
 ///
-/// §4.10.5 names the blocked classes as "destroy/discard". §4.4's `JobClass`
-/// has **no `Discard` variant** — the discard branch is the remote side of the
-/// `destroy` class, not a class of its own — so this matches `Destroy` and
-/// says so rather than inventing a twelfth class to make the prose literal.
+/// Thin on purpose: [`crate::breaker::HoldScope::blocks`] is the real answer
+/// and is target-scoped. This exists for callers that have already established
+/// they are looking at the held target, and both now take the catalog's
+/// [`JobClass`] so there is one vocabulary rather than two.
 pub fn hold_blocks(class: JobClass) -> bool {
     matches!(class, JobClass::Destroy)
 }

@@ -283,31 +283,33 @@ fn a_hold_blocks_only_destructive_classes_and_only_its_own_target() {
         target: TargetId::new(1),
     };
 
-    assert!(hold.blocks("destroy", TargetId::new(1)));
-    assert!(hold.blocks("discard", TargetId::new(1)));
+    // Typed, not string-matched: a renamed variant is now a compile error here
+    // rather than a hold that silently stops blocking the class it was written
+    // to block.
+    assert!(hold.blocks(JobClass::Destroy, TargetId::new(1)));
 
     // Every other job class continues — a hold is not a pause button for the
     // product.
     for class in [
-        "scan",
-        "hash",
-        "extract",
-        "tag",
-        "embed",
-        "upload",
-        "verify",
-        "restore",
-        "replicate",
-        "scrub",
+        JobClass::Scan,
+        JobClass::Hash,
+        JobClass::Extract,
+        JobClass::Tag,
+        JobClass::Embed,
+        JobClass::Upload,
+        JobClass::Verify,
+        JobClass::Restore,
+        JobClass::Replicate,
+        JobClass::Scrub,
     ] {
         assert!(
             !hold.blocks(class, TargetId::new(1)),
-            "{class} must keep running under a discard hold"
+            "{class:?} must keep running under a discard hold"
         );
     }
 
     // And another target is unaffected.
-    assert!(!hold.blocks("discard", TargetId::new(2)));
+    assert!(!hold.blocks(JobClass::Destroy, TargetId::new(2)));
 }
 
 #[test]

@@ -35,6 +35,7 @@
 //! [`EpisodeState::Confirmed`].
 
 use serde::{Deserialize, Serialize};
+use shepherd_catalog::job_repo::JobClass;
 use shepherd_core::{Blake3Hash, FileId, RootId, TargetId, Timestamp};
 
 /// Default rolling window: 24 hours.
@@ -130,8 +131,19 @@ impl HoldScope {
     ///
     /// Scan, hash, extract, tag, embed, upload, verify, restore, replicate and
     /// scrub all continue — a hold is not a pause button for the product.
-    pub fn blocks(&self, class: &str, target: TargetId) -> bool {
-        self.target == target && matches!(class, "destroy" | "discard")
+    ///
+    /// Takes the catalog's [`JobClass`] rather than a `&str`. An earlier version
+    /// string-matched `"destroy" | "discard"`, which is a second vocabulary that
+    /// can drift from the enum §4.4 actually defines: renaming a variant would
+    /// still compile and would silently stop blocking the class it was meant to
+    /// block. Same defect shape as two crates re-deriving an `atime` predicate.
+    ///
+    /// §4.10.5 names the blocked classes as "destroy/discard", but `JobClass`
+    /// has **no `Discard` variant** — discard is the remote side of `destroy`,
+    /// which is why PM-2 routes it through the same intent + audit apparatus
+    /// rather than treating it as a separate operation.
+    pub fn blocks(&self, class: JobClass, target: TargetId) -> bool {
+        self.target == target && matches!(class, JobClass::Destroy)
     }
 }
 
