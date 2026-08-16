@@ -22,5 +22,11 @@ path = "src/main.rs"
 shepherd-core.workspace = true
 shepherd-proto.workspace = true
 
+# For the offline `doctor` path: the OQ-F lingering probe lives in obs so the
+# daemon, the doctor method and this client share one implementation instead of
+# three. Deliberately NOT a dependency on shepherd-daemon, which would drag
+# rusqlite and a bundled SQLite into a CLI that needs neither.
+shepherd-obs.workspace = true
+
 clap = { workspace = true }
 serde_json = { workspace = true }

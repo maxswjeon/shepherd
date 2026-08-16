@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
+use shepherd_proto::response::{CheckStatus, DoctorCheck, DoctorResult, DoctorSource};
 use shepherd_proto::{CliEnvelope, CliError, ErrorCode, MethodKind, PROTO_VERSION};
 
 const EXIT_OK: u8 = 0;
@@ -92,7 +93,99 @@ fn run(matches: &ArgMatches) -> Result<serde_json::Value, Failure> {
         .get_one::<u64>("timeout")
         .map_or(client::DEFAULT_TIMEOUT, |s| Duration::from_secs(*s));
 
-    client::call(socket, timeout, kind.name(), params).map_err(|e| {
+    match client::call(socket, timeout, kind.name(), params) {
+        Ok(data) => Ok(data),
+        // `doctor` is the one method that must answer when the daemon is
+        // unreachable — see `offline_doctor`.
+        Err(client::ClientError::NotRunning { detail }) if kind == MethodKind::Doctor => {
+            Ok(offline_doctor(&detail))
+        }
+        Err(e) => Err(rpc_failure(&e)),
+    }
+}
+
+/// Answer `doctor` from the client when no daemon is listening.
+///
+/// The §9 Phase 1 gate exercises a seatless VM on which the daemon **correctly
+/// does not start** — lingering is disabled and OQ-F forbids Shepherd from
+/// enabling it — and requires `shepctl doctor` to report that state anyway. So
+/// the one thing a client cannot do here is fail with "daemon unreachable":
+/// the daemon being down is the condition being diagnosed, not an obstacle to
+/// diagnosing it.
+///
+/// The result is marked [`DoctorSource::OfflineClient`], because a clean
+/// offline result is a much weaker statement than a clean online one — it only
+/// covers what a client process can see — and a reader has to be able to tell
+/// them apart.
+///
+/// Exit status is 0. A warning is not a failure; if it were, the pressure to
+/// get a green doctor would become pressure to enable lingering on the user's
+/// behalf, which is the decision OQ-F records against.
+fn offline_doctor(unreachable_detail: &str) -> serde_json::Value {
+    let user = shepherd_obs::lingering::current_user();
+    let state = shepherd_obs::lingering::probe(&user);
+
+    let mut checks = vec![
+        // Shared with the daemon and with `shepherdd doctor`: one
+        // implementation of the OQ-F wording, three callers.
+        to_wire(shepherd_obs::lingering::check(
+            &state,
+            shepherd_obs::lingering::looks_seated(),
+            &user,
+        )),
+        DoctorCheck {
+            name: "daemon".into(),
+            status: CheckStatus::Warn,
+            detail: Some(unreachable_detail.to_string()),
+            remediation: Some("shepherdd run".into()),
+        },
+    ];
+    checks.push(DoctorCheck {
+        name: "checks not run".into(),
+        status: CheckStatus::NotApplicable,
+        detail: Some(
+            "the catalog, the job queue and the IPC socket are only inspectable by a running \
+             daemon. Start it and re-run to see those."
+                .into(),
+        ),
+        remediation: None,
+    });
+
+    let result = DoctorResult {
+        clean: !checks.iter().any(|c| c.status == CheckStatus::Fail),
+        checks,
+        source: DoctorSource::OfflineClient,
+    };
+    serde_json::to_value(result).unwrap_or(serde_json::Value::Null)
+}
+
+/// `shepherd_obs::doctor::Check` -> the wire type.
+///
+/// Duplicated from the daemon's `state::convert` on purpose: importing
+/// `shepherd-daemon` here would drag `rusqlite` and a bundled SQLite into a CLI
+/// that needs neither, and would make `shepctl` unbuildable anywhere the daemon
+/// is not. Fifteen lines of mapping is the cheaper coupling.
+fn to_wire(c: shepherd_obs::doctor::Check) -> DoctorCheck {
+    use shepherd_obs::doctor::CheckStatus as S;
+    let (status, detail, remediation) = match c.status {
+        S::Ok => (CheckStatus::Ok, None, None),
+        S::Warn {
+            detail,
+            remediation,
+        } => (CheckStatus::Warn, Some(detail), remediation),
+        S::Fail { detail } => (CheckStatus::Fail, Some(detail), None),
+        S::NotApplicable { reason } => (CheckStatus::NotApplicable, Some(reason), None),
+    };
+    DoctorCheck {
+        name: c.name,
+        status,
+        detail,
+        remediation,
+    }
+}
+
+fn rpc_failure(e: &client::ClientError) -> Failure {
+    {
         let exit = match &e {
             client::ClientError::NotRunning { .. } => EXIT_UNREACHABLE,
             client::ClientError::Unsupported(_) => EXIT_NOT_IMPLEMENTED,
@@ -102,10 +195,10 @@ fn run(matches: &ArgMatches) -> Result<serde_json::Value, Failure> {
             _ => EXIT_DAEMON_ERROR,
         };
         Failure {
-            error: client::to_cli_error(&e),
+            error: client::to_cli_error(e),
             exit,
         }
-    })
+    }
 }
 
 fn emit(envelope: &CliEnvelope, json: bool) {

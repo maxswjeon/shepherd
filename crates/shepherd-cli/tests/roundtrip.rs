@@ -348,3 +348,107 @@ fn a_usage_error_never_reaches_the_socket() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("vaporize"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// The offline `doctor` path
+// ---------------------------------------------------------------------------
+
+/// **The §9 gate's seatless-VM shape, at the CLI.**
+///
+/// The gate row exercises a VM where lingering is disabled, so the daemon
+/// correctly never starts, and requires `shepctl doctor` to report that anyway.
+/// The daemon being down is the condition being diagnosed — answering
+/// "daemon unreachable" and exiting 3 would be the tool refusing to do the one
+/// job the gate asks of it.
+#[test]
+fn shepctl_doctor_answers_with_no_daemon_running() {
+    let output = Command::new(env!("CARGO_BIN_EXE_shepctl"))
+        .args([
+            "--socket",
+            "/tmp/shepctl-doctor-no-daemon-4242.sock",
+            "doctor",
+            "--json",
+        ])
+        .output()
+        .expect("run shepctl doctor");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a warning is not a failure; exiting non-zero here would make a green \
+         doctor depend on enabling lingering (OQ-F). stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let env = envelope(&output);
+    assert_eq!(env["ok"], serde_json::json!(true));
+    let data = &env["data"];
+
+    // The distinction a reader must be able to make: this is a weaker
+    // statement than a daemon-produced one.
+    assert_eq!(
+        data["source"],
+        serde_json::json!("offline_client"),
+        "an offline result must not masquerade as a daemon result"
+    );
+
+    let checks = data["checks"].as_array().expect("checks array");
+    let lingering = checks
+        .iter()
+        .find(|c| c["name"] == serde_json::json!("systemd lingering"))
+        .expect("the lingering check must run without a daemon — the gate's whole point");
+    assert_ne!(
+        lingering["status"],
+        serde_json::json!("fail"),
+        "OQ-F makes lingering-off correct behaviour, not a fault"
+    );
+
+    let daemon = checks
+        .iter()
+        .find(|c| c["name"] == serde_json::json!("daemon"))
+        .expect("it must say the daemon is not running");
+    assert_eq!(daemon["status"], serde_json::json!("warn"));
+    assert!(
+        daemon["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("shepctl-doctor-no-daemon-4242.sock"),
+        "the unreachable detail must name the socket it tried: {daemon}"
+    );
+
+    // And it must be honest about what it could not check.
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["status"] == serde_json::json!("not_applicable")),
+        "an offline run must say which checks it could not perform: {data}"
+    );
+}
+
+/// Every other method still fails loudly when the daemon is down. The offline
+/// path is `doctor`'s alone; a `status` that invented an answer would be worse
+/// than one that says it cannot reach the daemon.
+#[test]
+fn only_doctor_has_an_offline_path() {
+    for args in [
+        vec!["status", "--json"],
+        vec!["root", "list", "--json"],
+        vec!["search", "q", "--json"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shepctl"))
+            .args(["--socket", "/tmp/shepctl-no-daemon-4242.sock"])
+            .args(&args)
+            .output()
+            .expect("run shepctl");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{args:?} must report the daemon unreachable"
+        );
+        let env = envelope(&output);
+        assert_eq!(
+            env["error"]["code"],
+            serde_json::json!("daemon_unreachable")
+        );
+    }
+}
