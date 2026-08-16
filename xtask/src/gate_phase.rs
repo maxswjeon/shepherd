@@ -61,8 +61,19 @@ struct Entry {
     owning_gate: String,
     #[serde(default)]
     evidence: Vec<Evidence>,
-    /// Set when an AC is knowingly unbacked. It still FAILS the gate; this only
-    /// changes the message from "nobody wrote evidence" to "here is why not".
+    /// A remaining gap that keeps this AC red **regardless of whether its
+    /// evidence passed**.
+    ///
+    /// This is what lets the gate say "here is what IS proven, and here is what
+    /// is still missing" instead of choosing between a bare NO EVIDENCE and a
+    /// green it has not earned. AC-2 is the case that forced it: the durable
+    /// store and cross-process resume are genuinely proven, on a 51-byte body,
+    /// while §9 demands a 50 GB artifact. Citing the passing tests without this
+    /// field would turn the gate green without the thing it exists to check
+    /// having happened.
+    ///
+    /// It is deliberately a hard override rather than a warning. An AC that can
+    /// be argued green while a stated gap stands is an AC that will be.
     #[serde(default)]
     evidence_missing: Option<String>,
 }
@@ -139,7 +150,18 @@ pub struct AcResult {
 
 impl AcResult {
     fn ok(&self) -> bool {
-        !self.outcomes.is_empty() && self.outcomes.iter().all(|(_, o)| o.ok())
+        // A stated gap overrides passing evidence. See `Entry::evidence_missing`.
+        self.missing_reason.is_none()
+            && !self.outcomes.is_empty()
+            && self.outcomes.iter().all(|(_, o)| o.ok())
+    }
+
+    /// Evidence that ran and passed, while the AC as a whole stays red on a
+    /// stated gap. Reported so the partial result is visible rather than buried.
+    fn is_partial(&self) -> bool {
+        self.missing_reason.is_some()
+            && !self.outcomes.is_empty()
+            && self.outcomes.iter().all(|(_, o)| o.ok())
     }
 }
 
@@ -160,7 +182,13 @@ impl PhaseReport {
 
         let mut total_tests = 0u32;
         for r in &self.results {
-            let status = if r.ok() { "PASS" } else { "FAIL" };
+            let status = if r.ok() {
+                "PASS"
+            } else if r.is_partial() {
+                "PARTIAL"
+            } else {
+                "FAIL"
+            };
             let _ = writeln!(s, "[{status}] {}", r.id);
             if r.outcomes.is_empty() {
                 let why = r.missing_reason.as_deref().unwrap_or(
@@ -179,11 +207,15 @@ impl PhaseReport {
                     let _ = writeln!(s, "             proves: {}", e.proves);
                 }
             }
+            if let Some(why) = &r.missing_reason {
+                let _ = writeln!(s, "         STILL MISSING — {why}");
+            }
         }
 
         let _ = writeln!(s, "{}", "=".repeat(78));
         let failed: Vec<&AcResult> = self.results.iter().filter(|r| !r.ok()).collect();
         let unbacked = failed.iter().filter(|r| r.outcomes.is_empty()).count();
+        let partial = failed.iter().filter(|r| r.is_partial()).count();
         if failed.is_empty() {
             let _ = writeln!(
                 s,
@@ -194,10 +226,12 @@ impl PhaseReport {
         } else {
             let _ = writeln!(
                 s,
-                "RESULT: FAIL — {} of {} criteria unmet ({} with no evidence at all): {}",
+                "RESULT: FAIL — {} of {} criteria unmet ({} with no evidence at all, {} \
+                 partial: evidence passed but a stated gap remains): {}",
                 failed.len(),
                 self.results.len(),
                 unbacked,
+                partial,
                 failed
                     .iter()
                     .map(|r| r.id.as_str())

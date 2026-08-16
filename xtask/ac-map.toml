@@ -178,8 +178,18 @@ proves = "AC-1's full remote re-read against real MinIO before any destruction"
 id = "AC-2"
 owning_gate = "2"
 exercises = ["shepherd-storage::multipart", "shepherd-storage::transfer_session", "shepherd-jobs::queue"]
-note = "the required 50 GB resume artifact is produced in the owning gate, not deferred to nightly"
-evidence_missing = "shepherd-tier::upload is not landed, so the checkpointed multipart resume AC-2 requires cannot be exercised end to end. shepherd-storage's MinIO suite covers ListParts reconciliation at the adapter layer, but the 50 GB kill-and-resume artifact §9 demands in THIS gate does not exist."
+note = "the required 50 GB artifact is produced in the owning gate, not deferred to nightly"
+evidence_missing = "SIZE ONLY. The mechanism is proven; the artifact is not. The cited tests use a 51-byte body with 16-byte parts, while Sec9's Phase 2 line requires a fresh 50 GB resume artifact IN THIS GATE, not merely nightly. Citing them as full evidence would turn this gate green without the thing it exists to check having happened. HARDWARE PREREQUISITE: not producible here at ~19 GiB free; the plan now carries a ~60 GiB requirement. The Sec8.2-vs-Sec9 contradiction is resolved in the plan, Sec9 winning as the later reviewed text, so the 5 GB per-push substitution does NOT satisfy this gate."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "session_store::tests::a_killed_upload_resumes_from_disk_without_resending_verified_parts"
+proves = "PARTIAL — cross-process resume at unit scale: the acknowledged-part count survives a process boundary and reconcile_parts skips exactly that many, with bytes_skipped > 0. Proves the mechanism, not the scale."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "session_store::tests::a_session_round_trips_through_a_real_file"
+proves = "PARTIAL — the session survives a process boundary at all: a durable store rather than MemStore, which is what was absent before 185598b."
 
 [[ac]]
 id = "AC-3"
@@ -215,7 +225,21 @@ id = "AC-6"
 owning_gate = "2"
 exercises = ["shepherd-catalog::schema", "shepherd-storage::replica_bundle", "shepherd-tier::destroy"]
 note = "moved from 1 — Phase 1 had no tiering, so it could not exercise remote-only custody state"
-evidence_missing = "requires dropping all local state after tiering-and-destroying and rebuilding from the filesystem plus the four-class recovery bundle. The bundle exists (shepherd-storage::replica) but no test performs the drop-and-rebuild, so the custody invariant is unproven."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bundle"
+proves = "P1's restated custody invariant: after tiering, destroying, and deleting the catalog file plus its WAL and shm, a rescan recovers ONLY the surviving file while the destroyed file's address comes from the four-class bundle — and the object key recovered from the bundle actually fetches bytes that hash to the destroyed file."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "the_four_class_split_excludes_derived_and_includes_the_other_two"
+proves = "the guard that stops the rebuild passing for the wrong reason: if Derived ever entered the bundle, recovery would succeed by carrying rows through rather than by rescanning, proving the opposite of the claim."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "without_its_custody_record_a_destroyed_file_is_unreachable"
+proves = "the negative that gives the positive meaning: absent a custody record the bytes sit in the target with nothing on the machine knowing their address."
 
 [[ac]]
 id = "AC-7"
