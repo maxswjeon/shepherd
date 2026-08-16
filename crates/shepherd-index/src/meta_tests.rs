@@ -525,7 +525,10 @@ fn the_production_index_meets_the_50ms_bar_at_10m_entries() {
                      the latency below would be measuring an index that does not work"
                 );
             } else {
-                assert!(m.ids.is_empty(), "round {round}: `{q}` should match nothing");
+                assert!(
+                    m.ids.is_empty(),
+                    "round {round}: `{q}` should match nothing"
+                );
             }
         }
     }
