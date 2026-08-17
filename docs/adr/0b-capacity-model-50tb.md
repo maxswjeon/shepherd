@@ -344,9 +344,23 @@ Both defects share the shape every other one in this spike has: **every
 observable signal was green and the work behind it was absent.** `9f241ef` was
 caught by reading the code; the checksum-mode defect survived a code review that
 caught the first one and was caught only by pointing the probe at a real server
-and comparing two HEADs. Verification end to end is confirmed on the real-S3
-path: request the checksum at upload, receive it at HEAD, carry it into
-`VerifiedLocation`.
+and comparing two HEADs.
+
+**The end-to-end chain, with each link marked by how it is actually known** —
+because "confirmed end to end" is the kind of summary this section exists to
+distrust:
+
+| link | status |
+|---|---|
+| upload requests `FULL_OBJECT` and S3 stores it | `[M]` measured on real S3 |
+| HEAD returns it and the adapter surfaces it as `whole_object: true` | `[M]` measured on real S3 |
+| `verify_upload` carries it into `VerifiedLocation` | **inspected, not measured** — `verify.rs`'s two-line filter was read, not exercised against S3 |
+
+The third link is the one `9f241ef` already broke once. Its only unit test pins
+the `None` case, so **no test would fail today if it were re-broken for a
+provider that does return a checksum.** Closing that needs either a fake that can
+return one, or `verify_upload` in the live probe; it is cheap and it is not done
+here.
 
 **This does not become a cheap path to gating destruction.** A provider-computed
 CRC detects bit rot; it is worthless against a provider that is wrong about its
