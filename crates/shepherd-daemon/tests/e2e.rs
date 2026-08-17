@@ -1158,3 +1158,658 @@ fn a_scan_publishes_progress_events_ending_in_done() {
         "sequence numbers must be strictly increasing: {seqs:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M1's functional leg at a million files
+// ---------------------------------------------------------------------------
+//
+// §9's Phase 1 row asks for M1 twice, and the two halves are deliberately
+// decoupled:
+//
+//   * the **scale** half is `shepherd-bench`'s 10M-row injected catalog, where
+//     no filesystem is involved so that the < 50 ms p95 measures the index;
+//   * the **functional** half is this test: the whole pipeline — `root add`,
+//     `scan start`, `search` — over a real tree of a million real files.
+//
+// Everything above this line runs at nine files, which proves the wiring and
+// nothing about six orders of magnitude more of it. This is the test that says
+// whether the walker, the deny-list, the symlink guard, the batched catalog
+// writer and the arena rebuild still agree at 1M.
+//
+// # `#[ignore]`, and why the corpus is not generated here
+//
+// The corpus is ~100 GB of inodes' worth of metadata operations and lives
+// wherever the operator has room — on this project's bench machine, a NAS. A
+// test that generated it would be a test that takes an hour and cannot run
+// twice. So the corpus is built once:
+//
+//     shepherd-bench gen-files --dest <dir> --files 1000000
+//     SHEPHERD_M1_CORPUS=<dir> cargo test -p shepherd-daemon --release \
+//         --test e2e -- --ignored --nocapture million
+//
+// and this test refuses to run rather than inventing a smaller one. A 100k-file
+// run reported as if it were the 1M requirement is precisely the defect class
+// the corpus is shaped to catch.
+//
+// # What this test does NOT measure
+//
+// **Scan throughput is not the M1 scale bar.** The rate printed at the end is a
+// property of the filesystem the corpus happens to sit on; over NFS every
+// `stat` is a network round trip. It is reported labelled, as a fact about the
+// run, and it must never be quoted against `< 50 ms p95`.
+
+/// The corpus size §9's Phase 1 row names for M1's functional leg. Not a
+/// tunable: the 10M-file corpus is Phase 0d and the 10M-*row* injected catalog
+/// is this milestone's separate scale leg.
+const M1_REQUIRED_FILES: u64 = 1_000_000;
+
+/// How long the scan may report no progress before the run is called stuck.
+///
+/// Generous on purpose, and it is a *stall* budget rather than a deadline.
+/// `shepherd_scan::walk` returns the entire `Vec<FileStat>` before the executor
+/// upserts anything, so `files_seen` is pinned at zero for the whole walk —
+/// which over a network filesystem is a million round trips. A wall-clock
+/// deadline would fail a scan that was working perfectly.
+const SCAN_STALL_BUDGET: Duration = Duration::from_secs(1_800);
+
+/// Ground truth, as written by `shepherd-bench gen-files`.
+struct Corpus {
+    dir: PathBuf,
+    m: serde_json::Value,
+}
+
+impl Corpus {
+    /// `None` when the operator has not pointed at a corpus, which is the
+    /// normal case in CI.
+    fn from_env() -> Option<Corpus> {
+        let dir = PathBuf::from(std::env::var_os("SHEPHERD_M1_CORPUS")?);
+        let text = std::fs::read_to_string(dir.join("manifest.json")).unwrap_or_else(|e| {
+            panic!(
+                "SHEPHERD_M1_CORPUS={} has no readable manifest.json: {e}. \
+                 Generate it with `shepherd-bench gen-files --dest {} --files 1000000`.",
+                dir.display(),
+                dir.display()
+            )
+        });
+        let m: serde_json::Value = serde_json::from_str(&text).expect("manifest.json is JSON");
+        Some(Corpus { dir, m })
+    }
+
+    fn root(&self) -> &str {
+        self.m["root"].as_str().expect("manifest.root")
+    }
+
+    fn n(&self, key: &str) -> u64 {
+        self.m[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("manifest has no numeric `{key}`"))
+    }
+
+    fn needles(&self) -> Vec<(String, u64, String)> {
+        self.m["needles"]
+            .as_array()
+            .expect("manifest.needles")
+            .iter()
+            .map(|n| {
+                (
+                    n["query"].as_str().unwrap().to_string(),
+                    n["expect"].as_u64().unwrap(),
+                    n["note"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn absent(&self) -> Vec<(String, String)> {
+        self.m["absent"]
+            .as_array()
+            .expect("manifest.absent")
+            .iter()
+            .map(|a| {
+                (
+                    a["query"].as_str().unwrap().to_string(),
+                    a["why"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn samples(&self) -> Vec<(String, u64)> {
+        self.m["samples"]
+            .as_array()
+            .expect("manifest.samples")
+            .iter()
+            .map(|s| {
+                (
+                    s["rel_path"].as_str().unwrap().to_string(),
+                    s["size"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Peak and current resident size of another process, from `/proc`.
+///
+/// The daemon is a child process, so its memory cannot be read from
+/// `/proc/self`. `VmHWM` is the high-water mark and never falls, which is the
+/// number the `Vec<FileStat>` ceiling documented in `scan_exec.rs` shows up in.
+fn proc_kb(pid: u32, key: &str) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Samples the WAL's size for as long as it is held.
+///
+/// E-4 asks for the write-ahead log to be shown **bounded across a scan**, not
+/// merely for a checkpointing connection to exist. A single reading at the end
+/// cannot distinguish a WAL that stayed small from one that grew to gigabytes
+/// and was checkpointed a second before the test looked.
+struct WalSampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Vec<(f64, u64)>>>,
+}
+
+impl WalSampler {
+    fn start(wal: PathBuf) -> WalSampler {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let t0 = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let n = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+                out.push((t0.elapsed().as_secs_f64(), n));
+                std::thread::sleep(Duration::from_millis(1_000));
+            }
+            out
+        });
+        WalSampler {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> Vec<(f64, u64)> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle.take().map(|h| h.join().unwrap()).unwrap()
+    }
+}
+
+/// Wait for a scan whose duration is not known in advance.
+///
+/// `wait_for_scan`'s thirty seconds is right for nine files and wrong for a
+/// million, and the failure it produces — "the scan never finished" — would be
+/// a lie about a scan that was progressing perfectly well. So the deadline here
+/// is on *progress*: the scan may take as long as it likes provided
+/// `files_seen` keeps moving.
+fn wait_for_scan_with_progress(c: &mut Client, root_id: i64, stall: Duration) -> serde_json::Value {
+    let mut last_seen = 0u64;
+    let mut last_move = Instant::now();
+    let mut last = serde_json::Value::Null;
+    let started = Instant::now();
+    loop {
+        let state = c.call("scan.status", serde_json::json!({"root_id": root_id}));
+        if let Some(scan) = state["scans"].as_array().and_then(|a| a.first()) {
+            last = scan.clone();
+            let seen = scan["files_seen"].as_u64().unwrap_or(0);
+            if seen != last_seen {
+                last_seen = seen;
+                last_move = Instant::now();
+                eprintln!(
+                    "[m1] {seen} files catalogued after {:.0}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            if scan["running"] == serde_json::json!(false) && !scan["finished_at"].is_null() {
+                return last;
+            }
+            if let Some(err) = scan["last_error"].as_str() {
+                panic!("the scan failed: {err}\n{scan}");
+            }
+        }
+        assert!(
+            last_move.elapsed() < stall,
+            "the scan made no progress for {:?} (stuck at {last_seen} files). \
+             This is a stall, not a slow filesystem: last status {last}",
+            stall
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// One search, with the page large enough that `total` is exact.
+///
+/// `total` is capped at `offset + limit` by the dispatcher, so asking for fewer
+/// hits than exist turns an over-count into a silent pass: a needle that should
+/// match 1265 files and actually matches 40000 would answer `1265` to a query
+/// with `limit: 1265`. Every count assertion here therefore asks for headroom
+/// and additionally requires `degraded` to be null, which is the dispatcher's
+/// own statement that the number is a total rather than a floor.
+fn count_exact(c: &mut Client, query: &str, expect: u64) {
+    let limit = (expect * 2).max(64) + 64;
+    let r = c.call(
+        "search",
+        serde_json::json!({"query": query, "limit": limit}),
+    );
+    assert_eq!(
+        r["total"],
+        serde_json::json!(expect),
+        "`{query}` should match exactly {expect} files"
+    );
+    assert_eq!(
+        r["degraded"],
+        serde_json::Value::Null,
+        "`{query}` was answered with headroom, so its total must not be a floor: {}",
+        r["degraded"]
+    );
+    assert_eq!(
+        r["hits"].as_array().unwrap().len() as u64,
+        expect,
+        "`{query}` reported {expect} but returned a different number of hits"
+    );
+}
+
+#[test]
+#[ignore = "needs SHEPHERD_M1_CORPUS; see the module comment above"]
+fn the_m1_demo_holds_at_a_million_files() {
+    let Some(corpus) = Corpus::from_env() else {
+        panic!(
+            "SHEPHERD_M1_CORPUS is not set. This test asserts §9 Phase 1's M1 \
+             functional leg over a 1M-file corpus and will not substitute a \
+             smaller one: build it with `shepherd-bench gen-files --dest <dir> \
+             --files 1000000` and point SHEPHERD_M1_CORPUS at <dir>."
+        );
+    };
+    let expected_seen = corpus.n("expected_seen");
+    let expected_bytes = corpus.n("expected_bytes");
+
+    // §9 asks for a million. A smaller corpus is a legitimate thing to run —
+    // the mutation checks that prove these assertions can fail are done at ten
+    // thousand, because deleting a needle and regenerating is seconds there and
+    // twenty minutes at full scale — but it is NOT the requirement, and a run
+    // that quietly used 100k and reported it as M1 is exactly the defect this
+    // whole fixture is shaped against. So a short run must say why, in the same
+    // shape `shepherd-bench` already uses for `--rows`, and the reason travels
+    // into the evidence file.
+    let small_run_reason = std::env::var("SHEPHERD_M1_SMALL_RUN_REASON").ok();
+    if expected_seen < M1_REQUIRED_FILES {
+        let why = small_run_reason.clone().unwrap_or_else(|| {
+            panic!(
+                "this corpus holds {expected_seen} files and §9 Phase 1 requires \
+                 {M1_REQUIRED_FILES}. Refusing to run: a reduced corpus reported as \
+                 M1 is the claim this test exists to prevent. If the small run is \
+                 deliberate, set SHEPHERD_M1_SMALL_RUN_REASON to why, and the \
+                 reason will be stamped into the result."
+            )
+        });
+        eprintln!("[m1] *** REDUCED SCALE: {expected_seen} files, not {M1_REQUIRED_FILES}. {why}");
+    }
+    eprintln!(
+        "[m1] corpus {} — {expected_seen} files, {} dirs, {:.1} MiB of bodies",
+        corpus.dir.display(),
+        corpus.n("dirs_created"),
+        expected_bytes as f64 / 1048576.0
+    );
+
+    let d = Daemon::start("million");
+    let pid = d.child.id();
+    let mut c = d.connect();
+
+    // --- the empty-catalog control, before the root exists ---------------
+    //
+    // Run first and over every needle, not just one. An index that answered
+    // from somewhere other than this daemon's catalog — a stale file, another
+    // test's state directory — would show up here and nowhere else.
+    for (query, expect, _) in corpus.needles() {
+        assert!(expect > 0, "manifest needle `{query}` expects nothing");
+        let r = c.call("search", serde_json::json!({"query": query}));
+        assert_eq!(
+            r["total"],
+            serde_json::json!(0),
+            "an empty catalog cannot contain `{query}`: {r}"
+        );
+    }
+
+    // --- scan ------------------------------------------------------------
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": corpus.root(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+
+    let wal_path = d.dir.join("catalog.db-wal");
+    let wal = WalSampler::start(wal_path.clone());
+    let t0 = Instant::now();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    let scan = wait_for_scan_with_progress(&mut c, root_id, SCAN_STALL_BUDGET);
+    let scan_secs = t0.elapsed().as_secs_f64();
+    let wal_samples = wal.finish();
+
+    let hwm_kb = proc_kb(pid, "VmHWM:");
+    let rss_kb = proc_kb(pid, "VmRSS:");
+
+    // --- E-4: the write-ahead log is bounded across the scan ---------------
+    //
+    // §9 asks for the WAL to be shown **bounded across a scan**, and an
+    // escalation was open on it because what existed was a checkpointing
+    // connection — the mechanism — rather than evidence that it holds. A
+    // reading taken after the scan proves nothing either: a WAL that grew to
+    // half a gigabyte and was checkpointed one second before the test looked
+    // is indistinguishable from one that never grew. Hence the sampler, and
+    // hence the assertion on its **maximum**, not its last value.
+    //
+    // The ceiling is deliberately far above what was measured (7.96 MiB at
+    // 1M files, flat from t+60s while eight hundred thousand more rows
+    // landed). It is not a tuning target and must not be tightened toward the
+    // observed figure: what it has to catch is the WAL tracking the corpus
+    // instead of the checkpoint interval, and an uncheckpointed 1M-row scan
+    // would put roughly the whole 440 MB catalog through it.
+    let wal_max = wal_samples.iter().map(|(_, n)| *n).max().unwrap_or(0);
+    const WAL_CEILING_BYTES: u64 = 64 * 1024 * 1024;
+    assert!(
+        wal_max > 0,
+        "the WAL was never observed at a non-zero size, so this check watched \
+         the wrong path and would pass however large the log grew"
+    );
+    assert!(
+        wal_max < WAL_CEILING_BYTES,
+        "the WAL peaked at {:.1} MiB during a scan of {expected_seen} files. \
+         A WAL that scales with the corpus rather than with the checkpoint \
+         interval is the E-4 failure: it is unbounded disk growth on a scan \
+         that §9 sizes at 50 TB.",
+        wal_max as f64 / 1048576.0
+    );
+
+    // --- the counts the whole test rests on ------------------------------
+    assert!(scan["last_error"].is_null(), "the scan failed: {scan}");
+    assert_eq!(
+        scan["files_seen"],
+        serde_json::json!(expected_seen),
+        "the walker and the generator disagree on how many files exist. \
+         The generator wrote {expected_seen} catalogable files plus deny-listed \
+         and off-root traps; a LARGER number here means a guard let a trap \
+         through, a smaller one means the walk missed part of the tree: {scan}"
+    );
+    assert_eq!(
+        scan["bytes_seen"],
+        serde_json::json!(expected_bytes),
+        "the file count matched but the byte total did not, so the walk saw the \
+         right number of the wrong files: {scan}"
+    );
+    let status = c.call("status", serde_json::json!({}));
+    assert_eq!(
+        status["files_catalogued"],
+        serde_json::json!(expected_seen),
+        "the walk saw {expected_seen} files but the catalog holds a different \
+         number — a batch was lost between the walker and the writer: {status}"
+    );
+
+    // --- every needle class, by exact count ------------------------------
+    for (query, expect, note) in corpus.needles() {
+        eprintln!("[m1] search {query:?} -> expect {expect} ({note})");
+        count_exact(&mut c, &query, expect);
+    }
+
+    // --- and every case whose right answer is zero -----------------------
+    //
+    // Paired with the needles deliberately. A search that returned everything
+    // would pass none of these, and a search that returned nothing would pass
+    // all of them and none of the ones above.
+    for (query, why) in corpus.absent() {
+        let r = c.call("search", serde_json::json!({"query": query, "limit": 64}));
+        assert_eq!(
+            r["total"],
+            serde_json::json!(0),
+            "`{query}` must match nothing — {why}: {r}"
+        );
+    }
+
+    // --- path scope, at scale ---------------------------------------------
+    //
+    // The same token, once with the separator and once without. `zzpathfrag`
+    // appears in thousands of directory names and in no filename, so a name
+    // query that returned the path count would be a scope check that had
+    // quietly stopped applying.
+    let frag = corpus
+        .needles()
+        .into_iter()
+        .find(|(q, _, _)| q == "zzpathfrag/")
+        .expect("the manifest must carry a path-fragment needle");
+    // Scaled to the corpus, so the same floor means the same thing at ten
+    // thousand files and at a million.
+    let discriminating = (expected_seen / 1000).max(8);
+    assert!(
+        frag.1 >= discriminating,
+        "the path needle landed {} times in a {expected_seen}-file corpus; \
+         below {discriminating} the count stops discriminating",
+        frag.1
+    );
+    count_exact(&mut c, "zzpathfrag/", frag.1);
+    let unscoped = c.call("search", serde_json::json!({"query": "zzpathfrag"}));
+    assert_eq!(
+        unscoped["total"],
+        serde_json::json!(0),
+        "a name-scoped query reached directory components: {unscoped}"
+    );
+
+    // --- case folding is a fold, not a coincidence ------------------------
+    let lower = corpus.n("case_lower_files");
+    let upper = corpus.n("case_upper_files");
+    assert!(lower > 0 && upper > 0 && lower != upper);
+    for q in ["zzcasemix", "ZZCASEMIX", "ZzCaseMix"] {
+        let r = c.call("search", serde_json::json!({"query": q, "limit": 8192}));
+        assert_eq!(
+            r["total"],
+            serde_json::json!(lower + upper),
+            "`{q}` must fold to both halves ({lower} lowercase + {upper} \
+             uppercase); returning either half alone is a case-SENSITIVE \
+             match: {r}"
+        );
+    }
+
+    // --- filters narrow the same result set -------------------------------
+    let ext = corpus
+        .needles()
+        .into_iter()
+        .find(|(q, _, _)| q == ".zzx")
+        .expect("the manifest must carry an extension needle");
+    let filtered = c.call(
+        "search",
+        serde_json::json!({"query": ".zzx", "filters": {"ext": ["zzx"]}, "limit": 8192}),
+    );
+    assert_eq!(
+        filtered["total"],
+        serde_json::json!(ext.1),
+        "every .zzx file has extension zzx: {}",
+        filtered["degraded"]
+    );
+    let wrong_ext = c.call(
+        "search",
+        serde_json::json!({"query": ".zzx", "filters": {"ext": ["pdf"]}, "limit": 8192}),
+    );
+    assert_eq!(
+        wrong_ext["total"],
+        serde_json::json!(0),
+        "no .zzx file has extension pdf: {wrong_ext}"
+    );
+    let by_state = c.call(
+        "search",
+        serde_json::json!({"query": ".zzx", "filters": {"state": "remote"}, "limit": 8192}),
+    );
+    assert_eq!(
+        by_state["total"],
+        serde_json::json!(0),
+        "nothing is tiered at Phase 1: {by_state}"
+    );
+
+    // --- paging over a needle with thousands of hits ----------------------
+    //
+    // At nine files a page boundary is a formality. Over a class with thousands
+    // of members, a rank map that lost its ordering shows up as a repeated or
+    // skipped row.
+    let (page_query, page_total, _) = corpus
+        .needles()
+        .into_iter()
+        .max_by_key(|(_, n, _)| *n)
+        .unwrap();
+    assert!(
+        page_total >= discriminating,
+        "the largest needle ({page_total}) is too small to page over"
+    );
+    // Three pages that together cover at most three quarters of the class, so
+    // the last page is never the short one.
+    let per = (page_total / 4).clamp(1, 500);
+    let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for page in 0..3u64 {
+        let r = c.call(
+            "search",
+            serde_json::json!({"query": page_query, "limit": per, "offset": page * per}),
+        );
+        let ids: Vec<i64> = r["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["file_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids.len() as u64, per, "page {page} came back short: {r}");
+        for id in ids {
+            assert!(
+                seen_ids.insert(id),
+                "file_id {id} appeared on two pages of `{page_query}`"
+            );
+        }
+    }
+    assert_eq!(seen_ids.len() as u64, 3 * per);
+
+    // --- hydration: the row, not just the name ----------------------------
+    //
+    // Sizes matter here beyond tidiness. Two of the samples are symlinks whose
+    // recorded size is the length of their *target string*; a walker that used
+    // `metadata` instead of `symlink_metadata` would report the target file's
+    // size for one and fail outright on the dangling one.
+    for (rel, size) in corpus.samples() {
+        let name = rel.rsplit('/').next().unwrap().to_string();
+        let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name);
+        let r = c.call("search", serde_json::json!({"query": stem, "limit": 16}));
+        assert_eq!(
+            r["total"],
+            serde_json::json!(1),
+            "`{stem}` names exactly one file in the corpus: {r}"
+        );
+        let hit = &r["hits"][0];
+        assert_eq!(hit["rel_path"], serde_json::json!(rel), "{hit}");
+        assert_eq!(
+            hit["size"],
+            serde_json::json!(size),
+            "the catalog's size for {rel} is not the one on disk: {hit}"
+        );
+        assert_eq!(hit["root_id"], serde_json::json!(root_id));
+        assert_eq!(hit["state"], serde_json::json!("local"));
+        assert!(hit["file_id"].as_i64().unwrap() > 0);
+        assert!(
+            hit["blake3"].is_null(),
+            "Phase 1 never hashes during a scan"
+        );
+    }
+
+    // --- doctor reports the real entry count ------------------------------
+    let doc = c.call("doctor", serde_json::json!({}));
+    let index_check = doc["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == serde_json::json!("metadata index"))
+        .expect("doctor must report on the metadata index");
+    assert_eq!(index_check["status"], serde_json::json!("ok"));
+    let detail = index_check["detail"].as_str().unwrap().to_string();
+    assert!(
+        detail.contains(&format!("{expected_seen} entries")),
+        "doctor must report the real entry count, not a health colour: {detail}"
+    );
+
+    // --- rescan: the same tree twice is the same catalog ------------------
+    //
+    // `upsert_file` is ON CONFLICT DO UPDATE, so a second scan is supposed to
+    // converge rather than duplicate. At nine files that is trivially true; at a
+    // million, a norm_key collision or a lost uniqueness constraint would show
+    // up as a catalog that grew.
+    let t1 = Instant::now();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    let scan2 = wait_for_scan_with_progress(&mut c, root_id, SCAN_STALL_BUDGET);
+    let rescan_secs = t1.elapsed().as_secs_f64();
+    assert!(scan2["last_error"].is_null(), "the rescan failed: {scan2}");
+    assert_eq!(
+        scan2["files_seen"],
+        serde_json::json!(expected_seen),
+        "the second walk saw a different tree: {scan2}"
+    );
+    let status2 = c.call("status", serde_json::json!({}));
+    assert_eq!(
+        status2["files_catalogued"],
+        serde_json::json!(expected_seen),
+        "rescanning an unchanged tree changed the catalog's row count — the \
+         upsert is inserting where it should be updating: {status2}"
+    );
+    for (query, expect, _) in corpus.needles() {
+        count_exact(&mut c, &query, expect);
+    }
+
+    // --- what the run measured --------------------------------------------
+    //
+    // Printed, never asserted. None of these is an acceptance criterion for M1:
+    // the scan rate is a property of the filesystem under the corpus, and the
+    // scale bar is the injected-catalog bench, on purpose.
+    let wal_final = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    let db_bytes = std::fs::metadata(d.dir.join("catalog.db"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let report = serde_json::json!({
+        "corpus": corpus.dir.display().to_string(),
+        "files_catalogued": expected_seen,
+        "bytes_catalogued": expected_bytes,
+        "scan_seconds": scan_secs,
+        "scan_files_per_sec": expected_seen as f64 / scan_secs,
+        "rescan_seconds": rescan_secs,
+        "scan_rate_caveat":
+            "a property of the filesystem holding the corpus, NOT the M1 scale \
+             bar; the scale leg is shepherd-bench's injected 10M-row catalog",
+        "daemon_vmhwm_bytes": hwm_kb * 1024,
+        "daemon_vmrss_after_scan_bytes": rss_kb * 1024,
+        "catalog_db_bytes": db_bytes,
+        "wal_max_bytes": wal_max,
+        "wal_final_bytes": wal_final,
+        "wal_samples": wal_samples
+            .iter()
+            .map(|(t, n)| serde_json::json!([t, n]))
+            .collect::<Vec<_>>(),
+        "index_detail": detail,
+        "m1_required_files": M1_REQUIRED_FILES,
+        "small_run_reason": small_run_reason,
+    });
+    eprintln!(
+        "[m1] scan {:.1}s ({:.0} files/s over the corpus filesystem — NOT the \
+         scale bar), rescan {:.1}s, daemon VmHWM {:.0} MiB, VmRSS {:.0} MiB, \
+         catalog.db {:.0} MiB, WAL max {:.1} MiB / final {:.1} MiB, index: {detail}",
+        scan_secs,
+        expected_seen as f64 / scan_secs,
+        rescan_secs,
+        hwm_kb as f64 / 1024.0,
+        rss_kb as f64 / 1024.0,
+        db_bytes as f64 / 1048576.0,
+        wal_max as f64 / 1048576.0,
+        wal_final as f64 / 1048576.0,
+    );
+    if let Some(out) = std::env::var_os("SHEPHERD_M1_REPORT") {
+        std::fs::write(&out, serde_json::to_string_pretty(&report).unwrap())
+            .unwrap_or_else(|e| panic!("writing the report to {out:?}: {e}"));
+        eprintln!("[m1] evidence written to {out:?}");
+    }
+}
