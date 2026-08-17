@@ -1,7 +1,10 @@
 # T2b — the 50 TB capacity model
 
 **Status:** complete for the five components §9's Phase 0a/0b gate names.
-**Date:** 2026-08-16
+**Date:** 2026-08-16, revised 2026-08-17 — §3's scrub-cost verdict is now
+conditional on one upload-time setting, measured against real AWS S3 (§3a), and
+the earlier `MinIO — none returned` row is **retracted** as a defect in our own
+client rather than a provider limitation (§3a, §3c).
 **Gate:** §9 Phase 0a/0b — "DB growth, checkpoint size, scrub request/egress
 cost, restart time, and transfer duration each have a fail bound rather than
 being *measured-or-extrapolated*."
@@ -141,11 +144,21 @@ bucket is **60.3% of all bytes**. So:
 Per 90-day cycle, sole-copy half of the corpus: **5,000,000 HEADs** and
 **100,000 full GETs totalling 15.08 TB** `[X]`.
 
+> **§3a now measures the premise of that sentence and finds it false on S3.**
+> Real S3 *does* publish a whole-object checksum for multipart objects, so the
+> 100,000 full GETs become HEADs and the egress term goes to zero. The row below
+> is retained unchanged because it remains the correct price for a corpus
+> uploaded **without** whole-object checksums requested — which is still the
+> default (`multipart_checksum: None`) and cannot be retrofitted without
+> re-uploading. Read the two S3 rows as the two configurations, not as an old
+> number and a new one.
+
 Prices are `[X]` — external, current as of 2026-08 and sourced below.
 
 | target | requests / 90d | egress / 90d | cost / 90d | **cost / month** |
 |---|---|---|---|---|
-| **AWS S3 Standard** | 5.1M × $0.0004/1k = $2.04 | 15.08 TB @ tiered $0.09→$0.085 = **$1,322** | $1,324 | **≈ $441** |
+| **AWS S3 Standard**, no whole-object checksum | 5.1M × $0.0004/1k = $2.04 | 15.08 TB @ tiered $0.09→$0.085 = **$1,322** | $1,324 | **≈ $441** |
+| **AWS S3 Standard**, whole-object checksum requested at upload `[M]` | 5.1M × $0.0004/1k = $2.04 | **$0.00** — every object verifies by HEAD | $2.04 | **≈ $0.68** |
 | **Cloudflare R2** | 5.1M Class B @ $0.36/M = $1.84 | **$0.00** (no egress charge, any volume) | $1.84 | **≈ $0.61** |
 | **Backblaze B2** | Class B free | within free allowance (3× stored = 75 TB/mo vs 5 TB/mo needed) | $0.00 | **$0.00** |
 | **SMB / NFS NAS** | n/a | no checksum at all ⇒ **100% full read**, 25 TB/90d = 278 GB/day ≈ **3.2 MB/s sustained** | no provider cost | **$0.00**, but constant LAN + disk load |
@@ -156,13 +169,18 @@ that this model and §PM-2 are computing the same thing.
 | | |
 |---|---|
 | **Reject threshold** | **projected scrub cost > $25/month** — the default ceiling `shepctl target cost --explain` enforces before scrub may be enabled |
-| **Verdict** | **AWS S3 Standard FAILS by ~18×.** R2, B2 and NAS pass with enormous margin. |
+| **Verdict** | **Determined by one upload-time setting, now measured rather than assumed.** S3 Standard **FAILS by ~18× ($441/mo)** for a corpus uploaded without whole-object checksums, and **PASSES with 37× margin ($0.68/mo)** for one uploaded with them `[M]`. R2, B2 and NAS pass with enormous margin either way. |
 
 **This is the capacity model's headline result and it is a design finding, not a
 number.** PM-2 already says "the gate fails where the projection exceeds the
 user's cost ceiling rather than silently widening the interval". Measured against
-a real distribution, that gate **fires on the most common S3 configuration**. The
-consequences, none of which are mine to choose:
+a real distribution, that gate **fires on the most common S3 configuration** —
+because the *default* configuration is still the expensive one. What §3a changes
+is that the cheap configuration is now known to exist on S3 rather than hoped
+for, which moves this from an unavoidable cost to **a registration-time decision
+that is irreversible per object**. The consequences, none of which are mine to
+choose — (1) and (2) now apply only to the **default** configuration, and (3) is
+what changes that:
 
 1. sole-copy custody on S3 Standard at this scale cannot have a 90-day
    full-verification SLO at a hobbyist cost ceiling;
@@ -170,15 +188,22 @@ consequences, none of which are mine to choose:
    objects, so a policy that verifies large multipart objects on a longer cycle
    than small ones would cut it by orders of magnitude at a stated loss of
    assurance;
-3. **enabling S3 multipart checksums (whole-object) at upload time would move the
-   large bucket onto the cheap HEAD path entirely**, and is the change most worth
-   investigating before accepting (1) or (2). It is a Phase 2 upload-path
-   decision, not a scrub-path one.
+3. **enabling S3 multipart checksums (whole-object) at upload time moves the
+   large bucket onto the cheap HEAD path entirely.** This was written as the
+   change "most worth investigating before accepting (1) or (2)"; §3a has now
+   investigated it against real S3 and it works `[M]`, which retires (1) and (2)
+   for any corpus uploaded with it. It remains a Phase 2 upload-path decision,
+   not a scrub-path one, and that is now the whole difficulty: it must be taken
+   **before the first object is uploaded**.
 
-### 3a. Response 3 is now built — and unverified on the provider this model prices
+### 3a. Response 3 is built, and now measured against real S3
 
-**The verdict above is unchanged.** This subsection exists so the mitigation is
-not mistaken for a fix already banked.
+**Settled on 2026-08-17 against a real AWS account** (`025383730468`,
+`ap-northeast-2`, a throwaway bucket created and destroyed for the run). The
+previous revision of this subsection recorded the question as a Phase 6
+prerequisite and predicted that pointing the probe at a real endpoint would
+settle it in one run. It did — and it also overturned the emulator result that
+motivated the caution.
 
 `ChecksumType::FULL_OBJECT` on `CreateMultipartUpload` is **implemented**
 (`8766be2`, worker-4). Only CRC32 / CRC32C / CRC64NVME support `FULL_OBJECT`;
@@ -186,45 +211,142 @@ the SHA algorithms are composite-only for multipart, which is the same
 digest-of-digests problem that makes the ETag untrustworthy to begin with — so
 the choice of algorithm is not free.
 
-Its payoff is **per-provider**, and the only provider it has been exercised
-against is an emulator:
+**What the server actually returned.** A 10,485,837-byte object uploaded as a
+genuine 3-part multipart with `x-amz-checksum-type: FULL_OBJECT` and CRC64NVME,
+then HEADed twice:
+
+```text
+HEAD, x-amz-checksum-mode unset:
+    etag: "7ef4e974a603f6db7b86925a6bafbb2e-3"
+
+HEAD, x-amz-checksum-mode: ENABLED:
+    etag: "7ef4e974a603f6db7b86925a6bafbb2e-3"
+    x-amz-checksum-crc64nvme: CnmyweQWB7U=
+    x-amz-checksum-type: FULL_OBJECT
+
+GetObjectAttributes:
+    Checksum: {ChecksumCRC64NVME: CnmyweQWB7U=, ChecksumType: FULL_OBJECT}
+    ObjectParts: {TotalPartsCount: 3}
+```
 
 | provider | whole-object checksum on HEAD | |
 |---|---|---|
-| MinIO | **none returned — scrub must still read multipart objects in full** | `[M]` |
-| AWS S3 | **unknown** | — |
-| Cloudflare R2 | unknown | — |
-| Backblaze B2 | unknown | — |
+| **AWS S3** | **CRC64NVME, `ChecksumType: FULL_OBJECT` — multipart objects verify by HEAD** | `[M]` |
+| **MinIO** | **CRC64NVME, `FULL_OBJECT`; byte-identical value to S3's for the same content** | `[M]` |
+| Cloudflare R2 | unknown — **no credentials; not guessed** | — |
+| Backblaze B2 | unknown — **no credentials; not guessed** | — |
 
-**MinIO's behaviour does not predict S3's**, and emulator-versus-real-service
-divergence is exactly the class of difference this would be. There is no AWS
-account on this machine, so the question is a **Phase 6 prerequisite**, not
-something Phase 0b can close. The probe test reports what the server actually
-returned rather than asserting an expected outcome, so pointing it at a real
-endpoint settles it in one run.
+**The earlier `MinIO — none returned` row was an instrument defect, not a
+provider difference.** S3 omits every `x-amz-checksum-*` response field unless
+the request carries `x-amz-checksum-mode: ENABLED`, and `S3Adapter::head` never
+sent it. Both servers had been storing the checksum correctly all along; the
+read path could not see it. Re-measured after the one-line fix, MinIO and S3
+agree exactly — **there was never any emulator-versus-real-service divergence to
+be cautious about.** The caution was still correct: it prevented the model from
+being revised in the *wrong* direction on bad evidence.
 
-Therefore: **§3's $441/month FAIL stands as written.** If S3 does return a
-whole-object checksum, the 100,000 full GETs collapse into HEADs and the figure
-falls by roughly three orders of magnitude. That is a large enough swing that it
-must be measured rather than assumed, and the model is not revised down on the
-strength of an emulator that reported the opposite.
+That defect is worth naming precisely, because it is the third instance of this
+spike's recurring shape and the only one that fails toward *expense* rather than
+toward false assurance: a missing request header made a working provider feature
+look absent, and the conclusion it invited — "this provider does not support
+whole-object checksums" — would have been recorded as a measured fact and priced
+at $441/month forever. **A false negative about a capability is as expensive as
+a false positive about integrity, and much harder to notice, because nothing
+ever fails.**
 
-**A near-miss inside the mitigation, worth recording next to the price.** The
-checksum was being requested at upload and then **dropped at verify** — the
-`VerifiedLocation` did not carry it through to `remote_object.checksum_kind`
-(fixed in `9f241ef`). Had it shipped, every step would have succeeded: the
-upload works, the provider computes the checksum, `verify_upload` returns `Ok`.
-Nothing would have failed anywhere. The only value scrub compares against on
-every later pass would simply have been discarded, and **the entire upload-time
-decision priced above would have bought nothing.**
+Therefore: **§3's verdict is now conditional rather than a flat FAIL.** With
+whole-object checksums requested at upload, the 100,000 full GETs collapse into
+HEADs, egress goes to zero, and the figure falls from **$441/month to
+$0.68/month — a factor of 649**, close to the three orders of magnitude the
+previous revision predicted. Two things keep this from being a free win:
+
+1. **`multipart_checksum` still defaults to `None`** (`s3.rs`), deliberately, so
+   that a provider which rejects the parameter does not fail every multipart
+   upload. The cheap path is therefore **opt-in and not what a target gets by
+   default.**
+2. **It cannot be retrofitted.** A corpus already uploaded without it keeps the
+   $441/month price until every multipart object is re-uploaded. This is a
+   decision that must be taken at target registration, before the first upload —
+   which is what `s3.rs`'s own doc comment already demands, and is now backed by
+   a measured 649× rather than by an argument.
+
+**This does not become a cheap path to gating destruction.** A provider-computed
+CRC detects bit rot; it is worthless against a provider that is wrong about its
+own bytes, and it is not BLAKE3. It addresses scrub *cost* only. §4.10's
+attestation requirements are untouched by it, and the assurance framing above is
+unchanged.
+
+### 3b. The composite-ETag trap is closed, and that was checked rather than assumed
+
+Trusting a digest-of-digests as if it were a content hash would be a
+**correctness** defect in scrub, not merely a cost one, so the dangerous
+direction was measured too. A deliberately COMPOSITE multipart object on the same
+real bucket returns:
+
+```text
+x-amz-checksum-crc32: 72M33w==-2      <- note the "-2": a digest-of-digests
+x-amz-checksum-type:  COMPOSITE
+```
+
+That value can never equal a CRC32 of the bytes. Two independent guards stop it
+from being treated as though it could:
+
+- `s3.rs` sets `ObjectChecksum::whole_object` from
+  `checksum_type() == FULL_OBJECT`, so the COMPOSITE value above is carried as
+  `whole_object: false`;
+- `verify.rs` applies `.filter(|c| c.whole_object)` before it reaches
+  `VerifiedLocation`, so only a genuinely whole-object value is ever persisted
+  for scrub to compare against.
+
+**The failure direction is safe.** A provider that returns a checksum with no
+`ChecksumType` at all also lands on `whole_object: false` and is dropped, which
+costs a full read that was not strictly necessary but never mistakes a composite
+digest for a content hash. Single-part objects were checked separately and do
+report `ChecksumType: FULL_OBJECT` `[M]`, so the common case is not
+false-negatived.
+
+No scrub code exists yet — nothing writes `remote_object.checksum_kind` — so
+this records that the trap is closed **before** the consumer that could fall into
+it is written, rather than after.
+
+**Filling in R2 and B2 needs no code change.** The probe reads
+`SHEPHERD_S3_BUCKET` / `SHEPHERD_S3_ENDPOINT` / `SHEPHERD_S3_REGION`, so any
+S3-compatible endpoint settles its own row in one run. They are left `unknown`
+above because guessing them is exactly what produced the `[M]` that had to be
+retracted.
+
+### 3c. Two defects, one shape — and the second one was predicted here
+
+**The near-miss recorded at upload.** The checksum was being requested at upload
+and then **dropped at verify** — the `VerifiedLocation` did not carry it through
+to `remote_object.checksum_kind` (fixed in `9f241ef`). Had it shipped, every step
+would have succeeded: the upload works, the provider computes the checksum,
+`verify_upload` returns `Ok`. Nothing would have failed anywhere. The only value
+scrub compares against on every later pass would simply have been discarded, and
+**the entire upload-time decision priced above would have bought nothing.**
 
 That is a defect whose symptom is a **cost** — it shows up in a bill, not in a
-log line. Worse than the money: scrub would have gone on reading multipart
-objects in full forever, and someone would eventually have concluded that
-whole-object checksums "don't work on this provider" and retired a working
-mechanism on false evidence. It is the same shape as every other defect this
-spike caught, in its most expensive form yet: **every observable signal was
-green and the work behind it was absent.**
+log line. Worse than the money, as the previous revision put it:
+
+> scrub would have gone on reading multipart objects in full forever, and
+> someone would eventually have concluded that whole-object checksums "don't
+> work on this provider" and retired a working mechanism on false evidence.
+
+**That sentence was written as a hypothetical, and it had already happened.** The
+missing `x-amz-checksum-mode` header (§3a) produced exactly that outcome one
+paragraph away: a working mechanism, a green upload path, and a table in this
+document recording `MinIO — none returned` as a **measured** fact. The prediction
+and the instance are separated by about thirty lines of the same file, which is
+the strongest argument available for why this class gets checked by measurement
+and not by reading.
+
+Both defects share the shape every other one in this spike has: **every
+observable signal was green and the work behind it was absent.** `9f241ef` was
+caught by reading the code; the checksum-mode defect survived a code review that
+caught the first one and was caught only by pointing the probe at a real server
+and comparing two HEADs. Verification end to end is confirmed on the real-S3
+path: request the checksum at upload, receive it at HEAD, carry it into
+`VerifiedLocation`.
 
 **This does not become a cheap path to gating destruction.** A provider-computed
 CRC detects bit rot; it is worthless against a provider that is wrong about its
@@ -320,9 +442,22 @@ quoted past its evidence.
   against the real schema would convert §1 and §2 from `[X]` to `[M]` cheaply and
   should be done at the Phase 1 gate.
 - **Provider prices are external and current as of 2026-08.** Egress pricing is
-  the term most likely to move.
-- **Nothing here measures a real provider.** §9 confines Phase 0 to local
-  emulators; the real-provider leg is Phase 6.
+  the term most likely to move. Note that the measured S3 configuration in §3a
+  has **no egress term at all**, so it is insensitive to exactly the price most
+  likely to change — the $441/month row remains fully exposed to it.
+- **One real provider is now measured; the rest are not.** §9 confines Phase 0
+  to local emulators, and the real-provider leg is Phase 6 — but the §3a probe
+  has been run against a real AWS S3 bucket, so that one row is `[M]` on the
+  service itself rather than on an emulator. **Cloudflare R2 and Backblaze B2
+  remain `unknown` and must not be assumed to follow S3**, which is precisely
+  the mistake the retracted MinIO row embodied, in the opposite direction.
+  Either can be settled without a code change by pointing the probe at it.
+- **A capability measured through our own client is only as good as the
+  client.** §3a's first result was a false negative caused by a header
+  `S3Adapter::head` failed to send, and it was recorded as `[M]` for a day. Any
+  future `[M]` of the form "provider X does not support Y" should be read as
+  "our client did not observe Y", and confirmed against a second instrument
+  before it is priced. §3a's raw-header capture exists for that reason.
 
 ---
 
