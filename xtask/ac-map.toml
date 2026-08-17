@@ -244,8 +244,14 @@ proves = "AC-1's full remote re-read against real MinIO before any destruction"
 id = "AC-2"
 owning_gate = "2"
 exercises = ["shepherd-storage::multipart", "shepherd-storage::transfer_session", "shepherd-jobs::queue"]
-note = "the required 50 GB artifact is produced in the owning gate, not deferred to nightly"
-evidence_missing = "SIZE ONLY. The mechanism is proven; the artifact is not. The cited tests use a 51-byte body with 16-byte parts, while Sec9's Phase 2 line requires a fresh 50 GB resume artifact IN THIS GATE, not merely nightly. Citing them as full evidence would turn this gate green without the thing it exists to check having happened. HARDWARE PREREQUISITE: not producible here at ~19 GiB free; the plan now carries a ~60 GiB requirement. The Sec8.2-vs-Sec9 contradiction is resolved in the plan, Sec9 winning as the later reviewed text, so the 5 GB per-push substitution does NOT satisfy this gate."
+note = "the required 50 GB artifact is produced in the owning gate, not deferred to nightly — and as of the third evidence row below, it is. `evidence_missing` said SIZE ONLY and named a hardware prerequisite; the object and MinIO's erasure parity now live on external storage (tests/docker-compose.nas.yml) and the artifact is produced. COST OF THIS GATE: the AC-2 row genuinely uploads 50 000 000 000 B, so running `gate --phase 2` takes ~50 minutes and needs ~150 GB of scratch. That is Sec9's requirement, not a choice, but it is not a seconds-long command any more."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "a_fifty_gb_upload_killed_mid_flight_resumes_without_resending_verified_parts"
+ignored = true
+requires_env = "SHEPHERD_MINIO_ENDPOINT"
+proves = "THE SIZE — the gap that kept this AC red. A real 50 000 000 000 B object goes to real MinIO as 746 parts of 67 108 864 B (deliberately NOT DEFAULT_PART_SIZE, so a part size that never reached PartPlan::new would show up as 2 981 parts instead); the uploading PROCESS is SIGKILLed mid-transfer, and the wait status is asserted to be signal 9 with no exit code, so the boundary is a real process death rather than a dropped in-process handle; a third process then opens its own database and its own client and resumes. Everything is asserted as a QUANTITY against a literal: at least 186 parts are durably acknowledged before the kill, bytes_skipped equals acked x part_size exactly, parts_sent equals 746 minus the acknowledged count, bytes_uploaded + bytes_skipped equals the whole object, the acknowledged set is the contiguous full-size prefix, and resolved_ambiguous_completion is false (a fresh per-run key prefix is what makes that assertable). The committed object is then re-read end to end BY THE PARENT and hashed, because the driver deciding it verified itself is not the same fact. Three negative controls perturb the REAL reconciliation inputs — this run's durable checkpoints against this MinIO's own ListParts — and show the skip collapsing by exactly the responsible amount: an empty provider listing skips 0 B, one wrong ETag and one wrong length each cost exactly one part. Observed 2026-08-17: 12 482 248 704 B (12.5 GB, 25.0 percent) skipped, 560 parts sent where a from-scratch run sends 746, BLAKE3 matched on a full independent re-read. NOT covered: a second from-scratch 50 GB traversal is not run, so a defect making a fresh run send MORE parts than the plan is invisible here; m2_e2e covers that shape at 12 MiB."
 
 [[ac.evidence]]
 package = "shepherd-tier"
@@ -341,11 +347,41 @@ proves = "a deny-listed tree is pruned before any rule sees it"
 id = "AC-9"
 owning_gate = "2"
 exercises = ["shepherd-scan::ignore", "shepherd-tier::plan"]
+evidence_missing = """
+THE MATCHER IS PROVEN; THE USER CANNOT REACH IT. AC-9 is `**User** \
+.gitignore-style ignore patterns are honored on both scan and tier`, and the \
+word `User` is the spec's. The cited tests below pass honestly and prove that \
+the matcher honours the patterns it is HANDED. Nothing hands it any.
+
+`scan_root.ignore_patterns_json` is declared once (schema.rs:38, `NOT NULL \
+DEFAULT '[]'`) and SELECTed once (scan_exec.rs:225). **There is no INSERT and \
+no UPDATE of that column anywhere in the tree**, and `RootAddRequest` carries \
+exactly three fields — `path`, `stub_mode`, `hosted_optin`. So every scan that \
+has ever run used `'[]'`, and no client can make it anything else.
+
+This is unreachability WITHOUT A REFUSAL. Nothing answers \
+`MethodNotImplemented`, nothing errors, nothing is marked TODO — a column is \
+read and never written, so the feature simply never happens. \
+`xtask gate --audit`'s reachability scan cannot see it: that check reads \
+refusals in `dispatch.rs`, and there is no refusal here to read.
+
+**This gap cannot be closed by writing a test.** It needs a producer for the \
+column — a proto change, since the request type has no field for it — which is \
+feature work with a version implication and is not this row's to schedule. \
+Recorded so the gate stops reporting green over a capability with no path to \
+it.
+
+Secondary, about citation rather than about a defect: both cited tests are \
+scan-side. AC-9 says `on both scan and tier`, and the tier half currently rests \
+on the planner consuming the scan's output rather than on any cited test — \
+unlike AC-8, which cites `each_negative_is_excluded_for_its_own_stated_reason` \
+for exactly that leg.\
+"""
 
 [[ac.evidence]]
 package = "shepherd-scan"
 test = "ignore::tests::the_parent_aware_form_refuses_a_file_under_an_excluded_directory"
-proves = "gitignore semantics incl. the parent-exclusion rule"
+proves = "PARTIAL — gitignore semantics incl. the parent-exclusion rule, over patterns supplied by the test. Proves the matcher, not that a user's patterns reach it"
 
 [[ac.evidence]]
 package = "shepherd-scan"
@@ -1015,21 +1051,14 @@ splitting Phase 0's gate per lane.\
 id = "G-1-M1-FUNC"
 owning_gate = "1"
 exercises = ["shepherd-daemon", "shepherd-scan::walk", "shepherd-catalog::file_repo", "shepherd-index::meta", "shepherd-cli"]
-note = "§9 M1 leg 1: `functional pipeline over the 1M on-disk corpus`"
-evidence_missing = """
-SCALE ONLY, AND THE GAP IS FIVE ORDERS OF MAGNITUDE. The pipeline is proven \
-end to end — a real daemon over a real socket, a real walk, a real catalog, a \
-real index, and the real `shepctl` binary — at NINE files. §9 demands the same \
-line over a 1M-file on-disk corpus. Everything the cited tests assert about \
-correctness is untouched by the difference; everything that only appears at \
-scale (walk throughput, catalog write pressure across a long scan, index build \
-memory, WAL growth across the full scan per E-4) is unproven, and the failures \
-that live there are exactly the ones a nine-file run cannot see.
+note = "§9 M1 leg 1: `functional pipeline over the 1M on-disk corpus`. Nothing load-bearing here — `note` is not rendered by `gate --phase`; the removal of this guard's former stated gap is recorded in the 1M row's `proves` line instead."
 
-The corpus is being built on the NAS by another worker rather than duplicated \
-here. When a recorded run over it exists, this row cites it and the gap closes; \
-until then the mechanism is proven and the milestone is not.\
-"""
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "the_m1_demo_holds_at_a_million_files"
+ignored = true
+requires_env = "SHEPHERD_M1_CORPUS"
+proves = "§9's M1 functional leg at the size §9 names: `root add && scan start && search` over 1,000,000 real files on a real filesystem. files_seen and files_catalogued are BOTH exactly 1,000,000, and unchanged by a rescan — so the scan neither drops nor duplicates at scale, which a nine-file run cannot distinguish. The search needles are asserted against a committed manifest with expected counts including needles that must return ZERO, so a matcher that returned everything fails rather than passes. A smaller run is possible only by setting SHEPHERD_M1_SMALL_RUN_REASON, which forces the reason to be recorded rather than inferred — the same discipline as shepherd-bench's scaled_run_reason. Cited with requires_env because absent the corpus this cannot be produced, and absent evidence fails rather than skips. GAP REMOVED, NOT REWORDED: this guard previously carried `SCALE ONLY, AND THE GAP IS FIVE ORDERS OF MAGNITUDE` with a largest run of NINE files. §9 asked for the 1M corpus and the 1M corpus ran, so no delta remains to state — and a gap kept past its evidence is a gate failing for a reason that no longer exists, which is as wrong as passing for one that never did. COST: this row plus G-1-M1-PERF make `gate --phase 1` a SCHEDULED command — a 1M-file scan and a 10M index build in --release. Budget a window; do not run it into someone else's"
 
 [[guard.evidence]]
 package = "shepherd-daemon"
@@ -1297,23 +1326,46 @@ owning_gate = "1"
 exercises = ["shepherd-catalog::schema"]
 note = "§9: `dedicated PASSIVE-checkpoint connection`; E-4 sharpens it to WAL bounded across the full 10M scan"
 evidence_missing = """
-NOTHING ASSERTS THIS. No evidence is cited because none exists, and citing the \
-single-writer tests would be citing a test that constructs the checkpoint \
-connection and then asserts row counts. `checkpoint_loop` — which opens its \
-own connection and issues `PRAGMA wal_checkpoint(PASSIVE)` — has no test; no \
-test in the workspace mentions wal_checkpoint or PASSIVE at all; and no test \
-asserts the checkpoint connection is separate from the writer's, which is the \
-whole content of the clause (a PASSIVE checkpoint on the writer's own \
-connection is a different mechanism with different blocking behaviour).
+THE BOUND IS NOW MEASURED; THE MECHANISM STILL IS NOT, AND THE SCALE IS 1M NOT \
+10M. This row previously cited nothing at all. E-4 demanded the harder half — \
+`Phase 1's gate must show WAL bounded across the full 10M scan, not merely \
+that a checkpoint connection exists` — and the row below now measures a bound \
+rather than an existence, which is the distinction E-4 called `this project's \
+recurring defect in its purest form`. Two things remain.
 
-E-4 in open-questions.md sharpens this and is worth quoting, because it names \
-the failure directly: `Phase 1's gate must show WAL bounded across the full \
-10M scan, not merely that a checkpoint connection exists. Flagged so the Phase \
-1 gate is written to assert the bound rather than the mechanism — the \
-difference between those two is this project's recurring defect in its purest \
-form.` E-4 is an OPEN escalation. It is also not in §9's Phase 1 row, so \
-without this note the sharper requirement would sit outside the gate entirely.\
+(i) SCALE. The bound is asserted across a 1,000,000-file scan, peaking at 7.96 \
+MiB against a 64 MiB ceiling. E-4 says the FULL 10M scan. Ten times the rows \
+is exactly where an unbounded WAL would first become visible, so the remaining \
+distance is the part that matters.
+
+(ii) THE MECHANISM IS STILL UNTESTED. §9's clause is `single-writer actor, \
+DEDICATED PASSIVE-checkpoint connection`, and no test asserts the checkpoint \
+connection is separate from the writer's. `checkpoint_loop` — which opens its \
+own connection and issues `PRAGMA wal_checkpoint(PASSIVE)` — has no direct \
+test, and no test in the workspace names wal_checkpoint or PASSIVE. A bounded \
+WAL is strong evidence that SOMETHING is checkpointing; it does not establish \
+that it is a dedicated connection, and a PASSIVE checkpoint on the writer's own \
+connection is a different mechanism with different blocking behaviour.
+
+WHAT THE MISSING TEST SHOULD ASSERT, stated because the obvious attempt is the \
+wrong one: do NOT close this by grepping for `wal_checkpoint` or by counting \
+checkpoint calls. The call can be present, be issued, and the WAL still grow \
+without bound — that is a mechanism grep standing in for an outcome, which is \
+this project's recurring defect. `dedicated` is a STRUCTURAL property: assert \
+that the connection issuing the checkpoint is a DISTINCT connection from the \
+writer's. That is small, honest, and different from both what exists and from \
+the grep.
+
+So: the outcome E-4 cared about is now measured at a tenth of the scale it \
+named, and the structural claim §9 makes is still uncited.\
 """
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "the_m1_demo_holds_at_a_million_files"
+ignored = true
+requires_env = "SHEPHERD_M1_CORPUS"
+proves = "PARTIAL — the WAL BOUND rather than the checkpoint mechanism, which is the half E-4 asked for. The WAL is SAMPLED throughout a 1,000,000-file scan and asserted on the MAXIMUM of the series, not on a final reading — the distinction that makes it evidence, since a WAL that grew unboundedly and was checkpointed once at the end would satisfy a closing measurement and fail the property. Observed peak 7.96 MiB against a 64 MiB ceiling, flat while the remaining rows landed"
 
 [[guard]]
 id = "G-1-INSTALL-LINUX"

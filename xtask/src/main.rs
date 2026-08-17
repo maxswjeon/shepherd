@@ -91,6 +91,20 @@ usage: cargo xtask <command>
         phase's §9 row that nothing in the map claims. `<id>` accepts the
         compound ids §9 uses (`0ab`, `0cd`) via the map's [alias] table.
 
+        SCHEDULE THESE TWO; they are not casual commands, and neither says so
+        until you are already inside it:
+          --phase 1   a 1M-file scan plus a 10M index build in --release.
+                      Needs $SHEPHERD_M1_CORPUS and FAILS without it.
+          --phase 2   a real 50 GB upload against MinIO, 45+ minutes.
+                      Needs $SHEPHERD_MINIO_ENDPOINT and FAILS without it.
+                      IT GOES SILENT FOR ~32 MINUTES during the resume leg —
+                      it has NOT hung. Killing it there destroys a 53-minute
+                      run and the failure looks environmental. Check
+                      /proc/<pid>/io for progress instead of the output.
+        Both hold the build-directory lock across many `cargo test` runs, so a
+        concurrent build turns one evidence row into CouldNotRun and costs the
+        whole run. See .omc/handoffs/shared-worktree-hazards.md §2.
+
   claim-ledger [--plan <path>] [--escalations <path>] [--json] [--require-escalation]
         §9 rule 5: ledger of every [V]/[U] evidence tag in the plan, with
         untagged evidence cells treated as [U].
