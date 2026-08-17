@@ -456,11 +456,55 @@ rather than a broad quality gap.
 
 ### 7.5 Decision, and the escalation
 
+> **SUPERSEDED 2026-08-17 by the user's decision on the escalation below.**
+> **f16 is the default. All three precisions are user-configurable.** The
+> measurements in this document are unchanged and were what the decision was made
+> on — only the default moves. See §7.5a.
+
+*Original spike recommendation, kept because the escalation it raised is what
+changed it:*
+
 > **i8 is confirmed as the default**, on the plan's own criteria. It passes the
 > 300 ms bar by 21× warm and 14× cold, and at **5.33 GB** it is the only
 > precision comfortably inside AC-46's 4–16 GB band. **f16 is a viable fallback**
 > at 9.17 GB, also inside the band. **f32 is excluded**, at 16.84 GB against a
 > 16 GB ceiling — as R-4 predicted, now measured.
+
+### 7.5a The decision as taken — f16 default, precision configurable
+
+The escalation asked whether *identity* or *quality* is the criterion. The answer
+taken is that **it does not have to be settled once for everyone**: f16 ships as
+the default, and i8 and f32 are both selectable.
+
+| precision | index @10M | + name arena (0.70 GB) | **total RSS** | AC-46 4–16 GB | warm p95 | cold p95 | recall @ ef=200 |
+|---|---|---|---|---|---|---|---|
+| i8 | 5.33 GB | 6.03 | **6.03 GB** | inside | 10.25 ms | 14.21 ms | 0.778 |
+| **f16 — DEFAULT** | 9.17 GB | 9.87 | **9.87 GB** | inside | 10.69 ms | 42.48 ms | 0.988 |
+| f32 | 16.84 GB | 17.54 | **17.54 GB** | **BREACHES** | *(2M only)* | *(2M only)* | 1.000 |
+
+Two consequences the spike did not have to carry and Phase 5 does:
+
+**1. f32 is offerable and does not fit at 10M — so the guard is mandatory.**
+17.54 GB against a 16 GB ceiling. Offering the option is right (the ceiling is
+*configured*, and a smaller corpus or a larger machine changes the sum), but
+Phase 5 **must project RSS from the real corpus size and the selected precision
+and refuse an over-budget combination, naming both numbers.** Accepting a setting
+that cannot fit is how AC-46 becomes a value nothing enforces. The precedent is
+this spike's own disk guard, which refused f32 at 10M with `25.0 GiB free, needs
+15.6 + 12.0 reserve` — and was obeyed rather than lowered.
+
+**2. The cold-p95 margin shrinks by 3× and is now the number to watch.** f16's
+cold p95 is **42.48 ms against i8's 14.21 ms**. Both clear the 300 ms bar, but
+§4.6's 15–25 ms query-embedding budget is excluded from both figures (see the
+`embedding_cost_excluded_note` in `bench-baseline.json`), so f16 cold lands near
+**67 ms all-in**. The margin drops from ~21× to ~4.5×. That is still comfortable
+and it is no longer the kind of margin that absorbs a surprise, which matters
+because embedding cost is the one component Phase 5 adds and Phase 0b could not
+measure.
+
+**Not affected:** every measurement above, the tiebreak that selected the arena,
+and f32's exclusion *as a default*. f32 remains outside the ceiling at 10M; what
+changed is that a user may choose it anyway, under a guard.
 
 **Escalated, not decided here:** i8's id-recall at the benched configuration is
 **0.778**, below the 0.90 sanity floor, while its retrieval *quality* is
