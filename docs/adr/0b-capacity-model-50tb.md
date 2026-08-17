@@ -274,7 +274,16 @@ over HEAD. Against MinIO it reports no `ChecksumType`, `whole_object` would
 derive as `false`, the checksum would be dropped, and multipart objects would go
 back to full reads — **reproducing this exact section's retracted finding
 through a different API.** If scrub ever moves off `HeadObject`, that derivation
-has to be re-measured, not carried over.
+has to be **re-measured, not carried over.**
+
+**How that failure would present, since recognising it is the hard part.** It
+would surface as a *cost regression* — scrub slowly getting more expensive — and
+it would read as a *provider limitation*: "MinIO doesn't return a whole-object
+checksum." Nothing errors, no test fails, and the explanation is plausible
+enough to be written down. **That combination is exactly how the first instance
+survived long enough to be priced at $441/month and deferred to Phase 6.** A
+capability that appears to disappear when the API changed is a client bug until
+proven otherwise.
 
 That defect is worth naming precisely, because it is the third instance of this
 spike's recurring shape and the only one that fails toward *expense* rather than
