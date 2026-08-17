@@ -1,0 +1,92 @@
+# Move MinIO's four drives onto large external storage. **Overlay only.**
+#
+# ---------------------------------------------------------------------------
+# WHY THIS FILE EXISTS
+# ---------------------------------------------------------------------------
+# AC-2's gate leg needs a **fresh 50 GB resume artifact in the Phase 2 gate**
+# (§9), and §2196 records the hardware prerequisite that blocked it: the object,
+# plus MinIO's erasure parity, does not fit on the development box's local disk.
+# This overlay points the four drives at a filesystem that is large enough,
+# without changing anything else about the deployment.
+#
+#   SHEPHERD_MINIO_DATA_ROOT=/path/to/big/disk \
+#   docker compose -f tests/docker-compose.yml -f tests/docker-compose.nas.yml \
+#     up -d --wait
+#
+# Same project name, same container, same `127.0.0.1:9000`, same credentials,
+# same two buckets. Every existing command in `tests/docker-compose.yml` and in
+# the test suites keeps working unchanged; only where the bytes land differs.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS FILE DELIBERATELY DOES **NOT** TOUCH
+# ---------------------------------------------------------------------------
+# The base file's `command: server /data1 /data2 /data3 /data4` is not
+# overridden, and that is the point rather than an omission.
+#
+# MinIO supports versioning only on an **erasure-coded** backend, and the base
+# file spends a long comment explaining that four drives in one container is the
+# smallest erasure set — because a single-drive deployment is exactly where
+# `mc version enable` can fail while leaving the bucket silently unversioned,
+# which would land the suite on attestation mechanism B while its name said A.
+# Collapsing to one big drive here would have re-introduced that failure through
+# the back door, in a file whose stated job is "just move the storage".
+#
+# **Verified on the NFS backend this was written for**, rather than assumed:
+#
+#   4 drives online, 0 drives offline, EC:2
+#   Erasure stripe size 4, Erasure sets 1
+#   s/…-versioned versioning is enabled
+#
+# The base file's `createbuckets` init container re-asserts the versioning half
+# of that on every `up`, and exits non-zero if it does not take — so a future
+# storage move that *does* break erasure coding fails `--wait` loudly instead of
+# quietly downgrading the attestation mechanism.
+#
+# ---------------------------------------------------------------------------
+# TWO THINGS THAT BIT, RECORDED SO THEY ARE NOT RE-BROKEN
+# ---------------------------------------------------------------------------
+#  1. `SHEPHERD_MINIO_DATA_ROOT` is `:?` — **required, with no default**. A
+#     default would let a forgotten variable bind-mount some incidental
+#     directory and fill it with 100 GB of erasure-coded parity, which is a
+#     mistake best made impossible rather than documented.
+#  2. `user:` is set, and the four directories must **already exist** and be
+#     owned by that uid. Docker creates a missing bind-mount source as **root**,
+#     and on a root-squashed NFS export a root-owned drive directory makes
+#     MinIO's drive init fail. Pre-creating them as your own uid is what avoids
+#     both halves of that.
+#
+#         mkdir -p "$SHEPHERD_MINIO_DATA_ROOT"/data{1,2,3,4}
+#
+# ---------------------------------------------------------------------------
+# WHAT `down -v` DOES NOW — CHECKED, NOT ASSUMED
+# ---------------------------------------------------------------------------
+# The four mounts below are merged **by target path**, so they replace the base
+# file's four named volumes rather than joining them, and Compose then prunes
+# the now-unreferenced `data1..data4` declarations from the merged config
+# entirely. Read off `docker compose … config` rather than reasoned about:
+#
+#   $ … config | grep -c '^volumes:'      # base + overlay
+#   0
+#   $ docker compose -f tests/docker-compose.yml config | grep -c '^volumes:'
+#   1
+#
+# The consequence is worth stating plainly, because it inverts a habit: with
+# this overlay in force there is no named volume left for `down -v` to delete,
+# so **`down -v` no longer discards the data**. The base file's promise that
+# "every run starts from an empty deployment" is not inherited here. Cleaning up
+# a large artifact is an `mc rm` (or removing the directories), and a suite that
+# relied on `down -v` for isolation must not silently rely on it here.
+
+services:
+  minio:
+    # Files land owned by this uid, so the artifact can be cleaned up afterwards
+    # without root — see note 2 above.
+    user: "${SHEPHERD_MINIO_UID:-1000}:${SHEPHERD_MINIO_GID:-1000}"
+    # Merged by mount target, so these four replace the base file's four named
+    # volumes at the same four paths. `docker inspect` is the check that it
+    # took; see `.omc/artifacts/` for the captured output.
+    volumes:
+      - ${SHEPHERD_MINIO_DATA_ROOT:?set SHEPHERD_MINIO_DATA_ROOT to a directory with room for the object PLUS its erasure parity (EC:2 doubles it)}/data1:/data1
+      - ${SHEPHERD_MINIO_DATA_ROOT:?see above}/data2:/data2
+      - ${SHEPHERD_MINIO_DATA_ROOT:?see above}/data3:/data3
+      - ${SHEPHERD_MINIO_DATA_ROOT:?see above}/data4:/data4
