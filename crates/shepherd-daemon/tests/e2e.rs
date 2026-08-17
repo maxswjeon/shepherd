@@ -1816,6 +1816,41 @@ fn the_m1_demo_holds_at_a_million_files() {
         serde_json::json!(0),
         "no .zzx file has extension pdf: {wrong_ext}"
     );
+    // The `state` filter, and an honest account of what this pair can and
+    // cannot show.
+    //
+    // `remote -> 0` on its own is a check that CANNOT FAIL. `file.state` is
+    // written by nothing in the tree — `upsert_file`'s INSERT names twelve
+    // columns and `state` is not among them, and neither `UPDATE file`
+    // statement touches it — so every row holds the schema default `'local'`
+    // and this query would answer 0 with the filter entirely broken. It was
+    // written as if it proved the filter worked; it did not.
+    //
+    // Pairing it with `local -> everything` is what makes the two together
+    // discriminating:
+    //
+    //   filter ignored altogether  ->  local = 773, remote = 773   (fails below)
+    //   filter matches nothing     ->  local = 0                   (fails below)
+    //   filter applied correctly   ->  local = 773, remote = 0     (passes)
+    //
+    // What the pair still cannot show is that the filter selects the RIGHT
+    // rows, because the catalog contains exactly one distinct value. That is
+    // not a gap in the test — it is a property of the catalog, and it is the
+    // second witness to it: `state` having no producer is also why
+    // `count_custody_rows`'s `WHERE state IN ('stub','remote')` returns 0 by
+    // construction, which is a safety refusal that cannot fire. Whoever makes
+    // tiering real must write `state`, and when they do, this assertion starts
+    // discriminating on data instead of on plumbing.
+    let by_state = c.call(
+        "search",
+        serde_json::json!({"query": ".zzx", "filters": {"state": "local"}, "limit": 8192}),
+    );
+    assert_eq!(
+        by_state["total"],
+        serde_json::json!(ext.1),
+        "every catalogued file is `local` at Phase 1, so the state filter must \
+         narrow to all of them rather than to none: {by_state}"
+    );
     let by_state = c.call(
         "search",
         serde_json::json!({"query": ".zzx", "filters": {"state": "remote"}, "limit": 8192}),
@@ -1823,7 +1858,9 @@ fn the_m1_demo_holds_at_a_million_files() {
     assert_eq!(
         by_state["total"],
         serde_json::json!(0),
-        "nothing is tiered at Phase 1: {by_state}"
+        "nothing is tiered at Phase 1, so no row is `remote` — this establishes \
+         that `state` is uniformly `local`, NOT that the filter discriminates: \
+         {by_state}"
     );
 
     // --- paging over a needle with thousands of hits ----------------------
