@@ -165,7 +165,7 @@ impl Report {
             .collect();
         phases.sort_unstable();
         phases.dedup();
-        for p in phases {
+        for p in &phases {
             let mine = self.for_phase(p);
             let _ = writeln!(
                 s,
@@ -180,12 +180,49 @@ impl Report {
         for v in &self.violations {
             let _ = writeln!(s, "  ✗ {v}");
         }
+
+        // A banner, not a count among counts.
+        //
+        // This step does not fail: the daemon surface is unscheduled feature
+        // work, and a CI that is red for months over something nobody can act
+        // on today is the never-green-gate condition — everyone learns to read
+        // past the colour and the next real failure hides behind it. The cost
+        // of not failing is that this has to carry its weight in TEXT, which is
+        // the one thing a reader skips. Hence the shape.
+        if !self.refusals.is_empty() {
+            let _ = writeln!(s, "{}", "!".repeat(72));
+            let _ = writeln!(
+                s,
+                "!! {} of {} PROTOCOL METHODS ARE NOT SERVED BY THE DAEMON.",
+                self.unserved_methods(),
+                self.methods.len()
+            );
+            for p in &phases {
+                let n = self.for_phase(p).len();
+                let _ = writeln!(
+                    s,
+                    "!! {n} refusal(s) name PHASE {p} as their owner — that phase's libraries \
+                     can pass\n!! every test they have while nothing a user types reaches them."
+                );
+            }
+            let _ = writeln!(
+                s,
+                "!! This step PASSES. It is not a verdict that the product works — it is a \
+                 count.\n!! `xtask gate --phase <id>` FAILS on these; read this banner as \
+                 \"unreachable\",\n!! never as \"clean\"."
+            );
+            let _ = writeln!(s, "{}", "!".repeat(72));
+        }
+
         let _ = writeln!(
             s,
             "NOTE: reported here, FATAL in `gate --phase <id>` for the phase a refusal names. \
              This reads what dispatch.rs says, not what the daemon does: a method wired to a \
-             stub reads as served. The live form — start a daemon, call every method in the \
-             inventory — belongs with the daemon's e2e suite."
+             stub reads as served — the false-GREEN direction, and the reason \
+             `every_registry_method_is_probed_and_exactly_the_recorded_ones_are_refused` in \
+             shepherd-daemon's e2e suite probes all {} methods over the real IPC surface and \
+             asserts the refused set by identity.",
+            self.methods.len()
         );
         s
     }

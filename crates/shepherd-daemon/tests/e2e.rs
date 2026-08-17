@@ -422,36 +422,212 @@ fn scan_start_enqueues_a_job_and_scan_status_reports_it() {
 }
 
 /// The Phase 1/Phase 2 seam, over a real socket.
-#[test]
-fn unserved_methods_answer_with_a_distinct_code() {
-    let d = Daemon::start("notimpl");
-    let mut c = d.connect();
-    for (method, params) in [
-        // `search` is NOT in this list any more: T7's metadata index landed and
-        // the daemon serves it. `search_finds_scanned_files_and_misses_absent_ones`
-        // is what replaced this row — if that test is ever deleted, put the row
-        // back rather than leaving the method unowned by any test.
-        ("target.list", serde_json::json!({})),
-        ("rule.list", serde_json::json!({})),
-        (
-            "tier.run",
-            serde_json::json!({"plan_id": "p", "candidate_set_hash": "ab"}),
+/// Params that reach each method's **handler**, so the probe below measures
+/// whether a method is served rather than whether its payload parsed.
+///
+/// The distinction is the whole test. A refused method still deserializes its
+/// request before the handler refuses it, so a probe sending `{}` to
+/// `tier.run` gets `InvalidParams` — and a probe that treated that as "not a
+/// refusal" would classify an unserved method as served. That is a false
+/// green, and false greens are what this file exists to prevent.
+///
+/// Values are deliberately ones that do not need setup: ids that will not
+/// exist, a path that will not exist. A served method answering `NotFound` has
+/// been *reached*, which is what is being measured.
+///
+/// Exhaustive by construction: an unhandled method panics naming itself, so
+/// adding a method to the registry fails here until someone decides how to
+/// probe it. A `_ => json!({})` arm would have made this list rot silently.
+fn probe_params(method: &str) -> serde_json::Value {
+    match method {
+        "root.add" => serde_json::json!({
+            // `delete`, not `dehydrate`: dehydrate is refused on Linux, and a
+            // refusal is still "reached", but using the mode with its own
+            // refusal test would make this probe depend on that one's verdict.
+            "path": "/nonexistent/shepherd-reachability-probe",
+            "stub_mode": "delete",
+        }),
+        "root.list" => serde_json::json!({}),
+        "root.remove" => serde_json::json!({"root_id": 999_999}),
+        "scan.start" => serde_json::json!({}),
+        "scan.status" => serde_json::json!({}),
+        "search" => serde_json::json!({"query": "probe"}),
+        "status" => serde_json::json!({}),
+        "target.add" => serde_json::json!({"name": "probe", "adapter": "s3"}),
+        "target.list" => serde_json::json!({}),
+        "target.test" => serde_json::json!({"target_id": 999_999}),
+        "rule.list" => serde_json::json!({}),
+        "rule.preview" => serde_json::json!({"rule_id": 999_999}),
+        "tier.plan" => serde_json::json!({"rule_id": 999_999, "target_id": 999_999}),
+        "tier.run" => serde_json::json!({"plan_id": "probe", "candidate_set_hash": "ab"}),
+        "restore" => serde_json::json!({"file_id": 999_999}),
+        "doctor" => serde_json::json!({}),
+        "events.subscribe" => serde_json::json!({}),
+        other => panic!(
+            "`{other}` is in the method registry and this probe does not know how to call it. \
+             Add params that reach its handler — not `{{}}`, unless its request has no required \
+             fields. Until then the reachability probe covers {} of the registry, and a probe \
+             that silently skipped a method would report a smaller, cleaner, wrong answer",
+            shepherd_proto::MethodKind::ALL.len() - 1
         ),
-        ("restore", serde_json::json!({"file_id": 1})),
-    ] {
-        let err = c.call_err(method, params);
-        assert_eq!(
-            err.kind(),
-            Some(shepherd_proto::ErrorCode::MethodNotImplemented),
-            "{method} answered {:?}",
-            err.kind()
-        );
-        assert!(
-            err.message.contains("Phase") || err.message.contains("T7"),
-            "an unserved method should say when it lands: {}",
-            err.message
-        );
     }
+}
+
+/// **Every method in the registry, called over the real IPC surface, and the
+/// refused set asserted by identity.**
+///
+/// This replaces a hand-kept list of four methods that asserted only that those
+/// four refuse. Two things that list could not do, and this does:
+///
+/// * It covered four of the eight unserved methods. `target.add`,
+///   `target.test`, `rule.preview` and `tier.plan` were refused by the daemon
+///   and named by no test at all.
+/// * A method that **stopped** being served would not have failed it. That is
+///   the direction that produces a false green: a regression unwiring a method
+///   from the daemon reads as no change, because the list only knew about
+///   methods someone had thought to add to it.
+///
+/// The set is derived from `MethodKind::ALL` rather than typed out, so the
+/// registry is the authority here exactly as it is in `codegen` and in
+/// `xtask`'s static scan. `xtask gate --audit` reads the same fact out of
+/// `dispatch.rs`'s source; this reads it out of the daemon's actual answers,
+/// which is the only version that catches a method wired to a stub.
+///
+/// **When this fails because a method started being served, that is the good
+/// failure**: move it out of `UNSERVED` and Phase 2 gets closer to reachable.
+#[test]
+fn every_registry_method_is_probed_and_exactly_the_recorded_ones_are_refused() {
+    use shepherd_proto::{ErrorCode, MethodKind};
+    use std::collections::BTreeSet;
+
+    /// The refusals `dispatch.rs` records today, all naming Phase 2.
+    /// `search.filters.path_glob` is a capability rather than a method and is
+    /// asserted separately below.
+    const UNSERVED: &[&str] = &[
+        "restore",
+        "rule.list",
+        "rule.preview",
+        "target.add",
+        "target.list",
+        "target.test",
+        "tier.plan",
+        "tier.run",
+    ];
+
+    let d = Daemon::start("reachability");
+
+    let mut refused: BTreeSet<&str> = BTreeSet::new();
+    let mut reached: BTreeSet<&str> = BTreeSet::new();
+
+    for kind in MethodKind::ALL {
+        let name = kind.name();
+        // A fresh connection per method. `events.subscribe` puts its connection
+        // into a streaming state, so a shared connection would have the next
+        // method's reply read an event frame instead — a cross-talk failure
+        // that would look like the method misbehaving.
+        let mut c = d.connect();
+        let frame = c.raw(name, probe_params(name));
+        let parsed: RpcResponse = serde_json::from_value(frame.clone())
+            .unwrap_or_else(|e| panic!("{name}: {e}\n{frame}"));
+
+        match parsed.outcome() {
+            Ok(_) => {
+                reached.insert(name);
+            }
+            Err(e) => {
+                // Two error codes mean the probe itself is broken, and both
+                // would otherwise silently classify an unserved method as
+                // served. They are assertions, not classifications.
+                assert_ne!(
+                    e.kind(),
+                    Some(ErrorCode::InvalidParams),
+                    "{name}: the probe's params did not deserialize, so this call never reached \
+                     the handler and says nothing about whether the method is served. Fix \
+                     `probe_params`; do not let it count as reached. ({})",
+                    e.message
+                );
+                assert_ne!(
+                    e.kind(),
+                    Some(ErrorCode::MethodNotFound),
+                    "{name}: the daemon does not know this method at the negotiated protocol \
+                     version, so this probe is measuring a surface the client cannot see"
+                );
+                if e.kind() == Some(ErrorCode::MethodNotImplemented) {
+                    assert!(
+                        e.message.contains("Phase"),
+                        "{name} is refused without saying when it lands: {}. A refusal that \
+                         names its owning phase is a promise; one that does not is a permanent \
+                         hole, and `xtask gate --phase` cannot attribute it to any gate",
+                        e.message
+                    );
+                    refused.insert(name);
+                } else {
+                    reached.insert(name);
+                }
+            }
+        }
+    }
+
+    // The count assertion. Everything above is per-method; this is what makes
+    // the whole set a fact rather than a sample.
+    assert_eq!(
+        refused.len() + reached.len(),
+        MethodKind::ALL.len(),
+        "{} of {} registry methods were classified — a probe that skipped one would report a \
+         cleaner answer over a smaller set",
+        refused.len() + reached.len(),
+        MethodKind::ALL.len()
+    );
+    let recorded: BTreeSet<&str> = UNSERVED.iter().copied().collect();
+    assert_eq!(
+        refused, recorded,
+        "the set of methods the daemon refuses is not the recorded one.\n  refused now: {:?}\
+         \n  recorded:    {:?}\nIf a method started being served, delete it from UNSERVED — that \
+         is the good direction. If one stopped, something unwired it from the daemon and no \
+         per-AC test would have noticed.",
+        refused, recorded
+    );
+    assert!(
+        !reached.is_empty() && !refused.is_empty(),
+        "both sets must be non-empty or the probe measured nothing"
+    );
+}
+
+/// A capability refused **inside a served method** is unreachable too.
+///
+/// `search` answers normally and refuses its `path_glob` filter, naming Phase
+/// 2. Nothing method-level sees this: `search` is served, its tests pass, and a
+/// user asking for a glob gets `MethodNotImplemented`. It is the ninth Phase-2
+/// refusal, and the one a method-granularity check passes cleanly.
+#[test]
+fn a_capability_refused_inside_a_served_method_is_still_unreachable() {
+    let d = Daemon::start("reachability-cap");
+    let mut c = d.connect();
+
+    // The control: without the filter, search is served. Without this the test
+    // below would also pass against a daemon that had stopped serving `search`
+    // altogether, which is a different and worse fact.
+    let ok = c.raw("search", serde_json::json!({"query": "probe"}));
+    let ok: RpcResponse = serde_json::from_value(ok).unwrap();
+    assert!(ok.outcome().is_ok(), "search itself must be served");
+
+    let err = c.call_err(
+        "search",
+        serde_json::json!({"query": "probe", "filters": {"path_glob": "*.rs"}}),
+    );
+    assert_eq!(
+        err.kind(),
+        Some(shepherd_proto::ErrorCode::MethodNotImplemented),
+        "the glob filter is refused, not silently ignored — a silently dropped filter would \
+         return MORE results than the user asked for, which is the failure shape a destructive \
+         rule cannot afford: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("Phase 2"),
+        "the refusal must name its owning phase: {}",
+        err.message
+    );
 }
 
 // ---------------------------------------------------------------------------
