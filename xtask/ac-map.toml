@@ -715,13 +715,87 @@ note = "amended to session start (OQ-F); Windows startup task needs the Phase 3 
 id = "AC-60"
 owning_gate = "8"
 exercises = ["ui", "shepherd-cli", "shepherd-daemon"]
-note = "named in the Phase 8 gate now — iteration 1's appendix claimed it, the gate did not"
+note = """
+named in the Phase 8 gate now — iteration 1's appendix claimed it, the gate did \
+not. Evidence recorded at Phase 1 though it will not RUN until Phase 8: the \
+daemon-side legs are already tested and the mapping is cheap to make once, by \
+someone who has just read all twenty-three of shepherd-daemon's e2e tests, and \
+expensive to reconstruct six phases later by someone who has not. Sec8.2 maps \
+the handshake territory here explicitly.\
+"""
+evidence_missing = """
+THE UI HALF CANNOT EXIST YET, AND NOTHING EXERCISES CONCURRENCY. AC-60 is `CLI \
+and UI observe identical state; concurrent mutations serialize` and neither \
+clause is fully proven. (i) There is no UI until Phase 8, so what is proven is \
+that TWO IPC CLIENTS observe identical state — a weaker and different claim, \
+since both speak the same protocol through the same code path while the UI is \
+a separate client. (ii) `two_clients_are_served_concurrently` performs ONE \
+mutation and reads it back; nothing anywhere drives concurrent mutations, so \
+`serialize` rests on `shepherd-catalog`'s single-writer actor (G-1-WRITER) \
+rather than on any test of this AC.
+
+Stated now rather than discovered at Phase 8: without this, the cited tests \
+would all pass and the gate would report AC-60 green over a UI that does not \
+exist — which is the vacuous pass this map exists to refuse, and adding \
+evidence without adding this note is exactly how it would have been \
+introduced.\
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "two_clients_are_served_concurrently"
+proves = "PARTIAL — two independent connections observe the same catalog: client A adds a root, and client B's `root.list` sees exactly one. The daemon-side half of `observe identical state`, over a real socket. It is ONE mutation read back, not concurrent mutation, and both clients are IPC clients rather than a CLI and a UI"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "roots_can_be_added_listed_and_removed"
+proves = "PARTIAL — the mutation surface a second observer would be observing actually works: add, list and remove round-trip through the daemon. Cited because state that cannot change cannot be observed to change identically, and because `root.remove` was until now exercised by a passing test that no AC or guard named"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "the_daemon_handshakes_and_reports_status"
+proves = "PARTIAL — the handshake completes and `status` returns a real answer rather than a stub. §8.2 maps `version handshake accept/reject` to AC-60/61; this is the accept leg, and it was the only test covering `status` that nothing cited"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "shepctl_drives_a_real_daemon_end_to_end"
+proves = "PARTIAL — the CLI half of `CLI and UI`: the real `shepctl` binary drives a real daemon over a real socket, so the client side of the parity claim is a shipped binary rather than an in-process shortcut"
 
 [[ac]]
 id = "AC-61"
 owning_gate = "8"
 exercises = ["ui", "shepherd-cli", "shepherd-daemon"]
-note = "same defect as AC-60"
+note = "same defect as AC-60; evidence recorded early for the same reason"
+evidence_missing = """
+THREE OF THE FOUR THINGS THE ERROR MUST NAME ARE UNASSERTED. AC-61 requires \
+that with the daemon down the error names **the socket path, the registration \
+state, and the start command**, with a **stable exit code**. The cited test \
+asserts that `shepherdd doctor` runs with no daemon listening, that its output \
+mentions the lingering check and the word `daemon`, and that it exits \
+successfully. It does NOT assert that the socket path appears, nor the \
+registration state, nor the start command — and `exits successfully` is one \
+observation of an exit code, not a demonstration that the code is stable \
+across invocations.
+
+So what is proven is `the daemon being down is a warning rather than a crash`. \
+What AC-61 asks for is `the message tells the user what to do about it`, and \
+that is three assertions away.\
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "shepherdd_doctor_works_with_no_daemon_running"
+proves = "PARTIAL — with SHEPHERD_SOCKET pointed at a path nothing listens on, `shepherdd doctor` still runs, still reports the lingering check, mentions the daemon, and exits 0. Proves daemon-down is a warning and not a crash; proves nothing about the three things §9 requires the message to name"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_major_version_mismatch_is_rejected_with_both_versions_named"
+proves = "PARTIAL — the adjacent failure mode, and the property AC-61 is really about: a rejection whose message names BOTH versions rather than saying `incompatible`. §8.2 maps handshake accept/reject to AC-60/61. This is skew rather than daemon-down, so it is evidence for the message-quality clause and not for the daemon-down clause"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_connection_that_skips_the_handshake_is_refused"
+proves = "PARTIAL — the reject leg of §8.2's handshake row: a client that never said hello is refused rather than served, so the protocol's precondition is enforced rather than assumed"
 
 [[ac]]
 id = "AC-62"

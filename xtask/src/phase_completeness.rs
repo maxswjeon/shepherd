@@ -765,7 +765,14 @@ impl Report {
              What this check still cannot catch: whether the evidence behind a claimed clause is \
              strong enough to be worth the claim, and whether a quote captures its clause's \
              meaning. Both stay human review properties; `--show-clauses` prints the split so the \
-             splitter itself is auditable."
+             splitter itself is auditable.\n\nHOW TO READ THIS ALONGSIDE `gate --phase`: the two \
+             are independent instruments over the same phase, and they are most useful when \
+             compared rather than read separately. A future phase should show UNENCODED clauses \
+             here AND `NO EVIDENCE` there — 53 of 65 ACs carry no evidence today, all of them in \
+             phases 3-9, and that agreement is the healthy state. **The day they disagree is the \
+             interesting one.** Evidence without a clause means the map demands something §9 does \
+             not; a clause encoded with no evidence behind it means the reverse. Each points \
+             somewhere different, and neither shows up while you read one number at a time."
         );
         s
     }
