@@ -1541,3 +1541,43 @@ gate = "6"
 ac = "AC-35"
 owned_by = "8"
 quote = "**AC-35 transport leg only**"
+
+# --- One clause of Phase 5, recorded early because its producer was deleted ---
+#
+# Not a reconciliation of Phase 5's row — the other five clauses stay UNENCODED,
+# and encoding a future phase's row from outside is still the wrong shape. This
+# single `unencoded` exists because the fact it records is losable: it is
+# knowable NOW and would otherwise be discovered by whoever encodes Phase 5,
+# months from now, as a missing harness with no explanation.
+#
+# Worth being precise about what the checker did and did not do here. It did NOT
+# detect this — a human did. The general form ("a gate whose stated evidence has
+# no machinery left to produce it") is already caught for anything CITED: delete
+# a module and its cited tests vanish, which `gate --phase` reports as
+# MatchedNothing, loudly and by name. What has no mechanical trace is a
+# capability removed before anything cited it, which is exactly this case:
+# `shepherd-bench` still exists, so a machinery-existence check would pass, and
+# no row in this file names the harness that went.
+
+[[phase]]
+gate = "5"
+
+[[phase.requirement]]
+quote = "Bench re-run on the real `fixtures/corpus-10m`, warm **and cold-cache**"
+unencoded = """
+THE HARNESS THAT WOULD PRODUCE THIS WAS DELETED. `ccbc26d` removed \
+shepherd-bench's `meta_bench.rs` and the three metadata candidates with it — \
+correctly, since two were eliminated spike code — but the winning candidate's \
+bench went with them. So the numbers in `bench-baseline.json` for \
+`meta_bench_arena_*` CANNOT be regenerated from this tree by any command, and \
+§9's Phase 5 demand for a warm-and-cold re-run has nothing left to run.
+
+Only the vector leg is reproducible. When Phase 5 encodes this clause the \
+metadata bench has to come back pointed at `shepherd-index` rather than at a \
+private copy of the arena — which is the better arrangement anyway, since a \
+bench against a private copy measures the copy.
+
+Recorded here rather than left for Phase 5 to rediscover: G-0B-BARS asserts a \
+recording this tree can no longer re-measure, and that is worth knowing while \
+someone still remembers why.\
+"""
