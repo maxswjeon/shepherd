@@ -431,8 +431,9 @@ pub fn run(
     // §9's row for this phase, reconciled against the map. Not optional: the
     // criteria below are a claim ABOUT that row, and checking them without it
     // is what returned PASS over a proper subset of Phase 1.
+    let table_path = root.join(crate::phase_completeness::TABLE_PATH);
     let (uncovered, stated_gaps, scope_note, coverage_error) =
-        match crate::phase_completeness::run(map_path, plan_path) {
+        match crate::phase_completeness::run(map_path, plan_path, &table_path) {
             Ok(report) => {
                 let cov = phases.iter().find_map(|p| report.for_phase(p));
                 match cov {

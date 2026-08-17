@@ -172,6 +172,206 @@ pub struct PlanRow {
     pub clauses: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// §9's table as a tracked artifact
+// ---------------------------------------------------------------------------
+//
+// The plan is gitignored (`/.omc/`), so for one commit this whole check could
+// not run in CI: the specification it reconciles against was invisible there.
+// A reconciliation that only runs where someone remembers to run it degrades
+// into the thing that opened the original gap.
+//
+// So §9's table is generated into `xtask/section9-gate-table.json`, tracked,
+// and the reconciliation reads THAT. Three consequences, in order of how much
+// they matter:
+//
+//   1. CI reconciles against a committed file, so the check runs everywhere.
+//   2. A §9 edit becomes a reviewable diff instead of an invisible change to an
+//      ignored file — a gain independent of CI.
+//   3. The artifact can now silently diverge from the plan, which would have CI
+//      reconciling against a stale copy while reporting green. That is this
+//      session's defect rebuilt inside its own fix, so it is the thing the
+//      drift check below exists to prevent, and drift is FATAL.
+
+/// The generated artifact's path, relative to the workspace root.
+pub const TABLE_PATH: &str = "xtask/section9-gate-table.json";
+
+/// Whether the committed table still matches §9.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Drift {
+    /// The plan was present and the artifact matches it.
+    Verified,
+    /// The plan is not in this checkout, so the artifact could not be compared
+    /// to its source. **Not** a pass — an unknown.
+    NotVerified { why: String },
+    /// The artifact disagrees with §9. Fatal.
+    Drifted { detail: String },
+}
+
+/// Render §9's rows as the tracked artifact.
+///
+/// Pretty-printed with a trailing newline, like `codegen`'s outputs and for the
+/// same reason: the check compares bytes, and a missing trailing newline is the
+/// classic way a generated file appears to drift the moment an editor touches
+/// it. Clauses are deliberately NOT stored — they are derived by
+/// [`split_clauses`] at read time, so the splitter has one definition and
+/// improving it does not require regenerating an artifact.
+pub fn render_table(rows: &[PlanRow]) -> String {
+    let doc = serde_json::json!({
+        "x-shepherd": {
+            "generator": "cargo xtask gate --regen-table",
+            "source": ".omc/plans/shepherd-consensus-plan.md, §9's gate table",
+            "warning": "GENERATED FILE — edit §9 in the plan and re-run `cargo xtask gate \
+                        --regen-table`. `gate --audit` FAILS when this disagrees with the plan.",
+            "why_tracked": "the plan is gitignored (/.omc/), so without this artifact the §9 \
+                            reconciliation cannot run in CI at all",
+        },
+        "row_count": rows.len(),
+        "rows": rows.iter().map(|r| serde_json::json!({
+            "label": r.label,
+            "command": r.command,
+            "gate_id": r.gate_id,
+            "evidence": r.evidence,
+        })).collect::<Vec<_>>(),
+    });
+    let mut s = serde_json::to_string_pretty(&doc).unwrap_or_default();
+    s.push('\n');
+    s
+}
+
+/// Parse the tracked artifact back into rows.
+pub fn parse_table(text: &str) -> Result<Vec<PlanRow>, String> {
+    let doc: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("{TABLE_PATH} is not JSON: {e}"))?;
+    let rows = doc["rows"]
+        .as_array()
+        .ok_or_else(|| format!("{TABLE_PATH} has no `rows` array"))?;
+    // The artifact states its own count, so a truncated or half-written file is
+    // a loud failure rather than a smaller table everything agrees with.
+    if let Some(n) = doc["row_count"].as_u64()
+        && n as usize != rows.len()
+    {
+        return Err(format!(
+            "{TABLE_PATH} declares row_count = {n} but lists {} rows — the artifact disagrees \
+             with itself",
+            rows.len()
+        ));
+    }
+    if rows.is_empty() {
+        return Err(format!(
+            "{TABLE_PATH} lists NO rows, so every phase would reconcile against nothing"
+        ));
+    }
+    rows.iter()
+        .map(|r| {
+            let get = |k: &str| -> Result<String, String> {
+                r[k].as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("a row in {TABLE_PATH} has no `{k}`"))
+            };
+            let evidence = get("evidence")?;
+            Ok(PlanRow {
+                label: get("label")?,
+                command: get("command")?,
+                gate_id: get("gate_id")?,
+                clauses: split_clauses(&evidence),
+                evidence,
+            })
+        })
+        .collect()
+}
+
+/// Load the rows the reconciliation runs against, and say whether they are
+/// still known to match §9.
+///
+/// The two cases the caller must not conflate, and the reason they are one
+/// function: **absent** is the CI case and must not fail, **different** is the
+/// local case and must. They are the same code path unless separated
+/// deliberately, and conflating them would either break every CI run or hide
+/// every stale artifact.
+pub fn load_rows(plan_path: &Path, table_path: &Path) -> Result<(Vec<PlanRow>, Drift), String> {
+    let on_disk = std::fs::read_to_string(table_path).map_err(|e| {
+        format!(
+            "cannot read {}: {e}. This artifact IS the specification outside a checkout with \
+             the plan; without it there is nothing to reconcile. Regenerate it with `cargo \
+             xtask gate --regen-table` from a checkout that has the plan",
+            table_path.display()
+        )
+    })?;
+    let rows = parse_table(&on_disk)?;
+
+    let Ok(plan) = std::fs::read_to_string(plan_path) else {
+        return Ok((
+            rows,
+            Drift::NotVerified {
+                why: format!(
+                    "{} is not in this checkout, so the committed table could not be compared \
+                     to its source. The reconciliation below still ran — against the artifact. \
+                     Read this as \"the table was not re-derived\", never as \"the table is \
+                     current\"",
+                    plan_path.display()
+                ),
+            },
+        ));
+    };
+
+    let regenerated = render_table(&parse_gate_table(&plan)?);
+    if regenerated == on_disk {
+        return Ok((rows, Drift::Verified));
+    }
+    let (line, disk, from_plan) = crate::codegen::first_difference(&on_disk, &regenerated);
+    // `first_difference` is line-based, and this artifact puts a whole §9 row
+    // on one JSON line — so the raw form prints two thousand identical
+    // characters twice and buries the one word that changed. Narrowing to a
+    // window around the actual divergence is what keeps its promise that "the
+    // CI log itself is sufficient in the common case of a single changed
+    // field"; without it the reader goes to a diff tool anyway, which is the
+    // failure that helper exists to prevent.
+    let (disk, from_plan) = narrow(&disk, &from_plan);
+    Ok((
+        // Deliberately the DISK rows, not the regenerated ones: reconciling
+        // against the freshly-parsed plan here would make the local run pass
+        // while CI reconciled against the stale artifact — the two would
+        // disagree and only one of them would say so.
+        rows,
+        Drift::Drifted {
+            detail: format!(
+                "§9 and {TABLE_PATH} disagree, first at line {line}:\n    on disk:    {disk}\n \
+                 \x20  from §9:   {from_plan}\nCI reconciles against the artifact, so until this is \
+                 regenerated CI is checking a stale copy of the specification and reporting on \
+                 it as though it were current. Run `cargo xtask gate --regen-table`"
+            ),
+        },
+    ))
+}
+
+/// A readable window around the first character where two long lines diverge.
+///
+/// Returns both sides trimmed to the same window, with `…` marking what was
+/// cut, so a one-word change in a two-thousand-character §9 row reads as a
+/// one-word change.
+fn narrow(a: &str, b: &str) -> (String, String) {
+    const WINDOW: usize = 70;
+    let ac: Vec<char> = a.chars().collect();
+    let bc: Vec<char> = b.chars().collect();
+    let at = ac
+        .iter()
+        .zip(bc.iter())
+        .position(|(x, y)| x != y)
+        .unwrap_or_else(|| ac.len().min(bc.len()));
+    let cut = |v: &[char]| -> String {
+        let start = at.saturating_sub(WINDOW);
+        let end = (at + WINDOW).min(v.len());
+        format!(
+            "{}{}{}",
+            if start > 0 { "…" } else { "" },
+            v[start..end].iter().collect::<String>(),
+            if end < v.len() { "…" } else { "" }
+        )
+    };
+    (cut(&ac), cut(&bc))
+}
+
 /// Pull §9's gate table out of the plan.
 ///
 /// Returns an error rather than an empty vector when the table cannot be
@@ -450,6 +650,8 @@ pub struct Report {
     pub coverage: Vec<PhaseCoverage>,
     pub row_count: usize,
     pub phase_count: usize,
+    /// Whether the table this reconciled against is still known to match §9.
+    pub drift: Drift,
 }
 
 impl Report {
@@ -521,6 +723,23 @@ impl Report {
         }
 
         let _ = writeln!(s, "{}", "-".repeat(72));
+        match &self.drift {
+            Drift::Verified => {
+                let _ = writeln!(
+                    s,
+                    "SOURCE: {TABLE_PATH} re-derived from §9 and matches it byte for byte."
+                );
+            }
+            Drift::NotVerified { why } => {
+                let _ = writeln!(s, "SOURCE: NOT RE-DERIVED — {why}");
+            }
+            Drift::Drifted { .. } => {
+                let _ = writeln!(
+                    s,
+                    "SOURCE: STALE — the committed table no longer matches §9 (see below)."
+                );
+            }
+        }
         for v in &self.violations {
             let _ = writeln!(s, "  ✗ {v}");
         }
@@ -571,23 +790,21 @@ impl Report {
     }
 }
 
-pub fn run(map_path: &Path, plan_path: &Path) -> Result<Report, String> {
+pub fn run(map_path: &Path, plan_path: &Path, table_path: &Path) -> Result<Report, String> {
     let map_text = std::fs::read_to_string(map_path)
         .map_err(|e| format!("cannot read {}: {e}", map_path.display()))?;
     let map: AcMap = toml::from_str(&map_text)
         .map_err(|e| format!("cannot parse {}: {e}", map_path.display()))?;
-    // Absent evidence fails; it never skips. A missing plan makes this check
-    // unable to run, which is not the same as it having passed.
-    let plan_text = std::fs::read_to_string(plan_path).map_err(|e| {
-        format!(
-            "cannot read the plan at {}: {e}. §9's table IS the specification this reconciles \
-             against; without it there is nothing to check and a pass would be over nothing",
-            plan_path.display()
-        )
-    })?;
 
-    let rows = parse_gate_table(&plan_text)?;
-    Ok(reconcile(&map, &rows))
+    let (rows, drift) = load_rows(plan_path, table_path)?;
+    let mut report = reconcile(&map, &rows);
+    // Drift is a structural violation: reconciling correctly against the wrong
+    // text is not a pass.
+    if let Drift::Drifted { detail } = &drift {
+        report.violations.push(detail.clone());
+    }
+    report.drift = drift;
+    Ok(report)
 }
 
 fn reconcile(map: &AcMap, rows: &[PlanRow]) -> Report {
@@ -856,6 +1073,11 @@ fn reconcile(map: &AcMap, rows: &[PlanRow]) -> Report {
         coverage,
         row_count: rows.len(),
         phase_count: map.phase_order.len(),
+        // `run` overwrites this; `reconcile` is given rows and has no view of
+        // where they came from.
+        drift: Drift::NotVerified {
+            why: "reconcile() was called directly, without a source comparison".into(),
+        },
     }
 }
 
@@ -1151,6 +1373,118 @@ mod tests {
         assert!(ids.contains("AC-54"), "got {ids:?}");
         assert!(ids.contains("AC-13"));
         assert!(ids.contains("AC-9"));
+    }
+
+    /// **The reconciliation, against the committed artifact — so it runs
+    /// WITHOUT the plan.**
+    ///
+    /// This is the test the whole tracked-artifact change exists for. It used
+    /// to need the plan, which is gitignored, so in CI it took the documented
+    /// skip and the map was reconciled against nothing on every platform. Now
+    /// it reads `section9-gate-table.json` and runs everywhere.
+    #[test]
+    fn the_committed_map_reconciles_against_the_committed_table() {
+        let table = std::fs::read_to_string(repo().join(TABLE_PATH))
+            .expect("section9-gate-table.json is tracked, unlike the plan");
+        let rows = parse_table(&table).expect("the artifact parses");
+        let map: AcMap = toml::from_str(MAP).unwrap();
+        let report = reconcile(&map, &rows);
+        assert!(
+            report.violations.is_empty(),
+            "structural violations against the committed §9 table:\n  {}",
+            report.violations.join("\n  ")
+        );
+        assert_eq!(rows.len(), 11, "§9 has eleven gate rows");
+    }
+
+    /// Generation is deterministic, so a diff in the artifact means §9 changed
+    /// rather than the generator wobbling — the property `codegen` asserts for
+    /// the same reason.
+    #[test]
+    fn table_generation_is_deterministic_and_round_trips() {
+        let table = std::fs::read_to_string(repo().join(TABLE_PATH)).unwrap();
+        let rows = parse_table(&table).unwrap();
+        assert_eq!(
+            render_table(&rows),
+            table,
+            "regenerating from the parsed artifact must reproduce it byte for byte"
+        );
+        assert!(
+            table.ends_with('\n'),
+            "a missing trailing newline is how a generated file appears to drift the moment an editor touches it"
+        );
+    }
+
+    /// **The failure this artifact introduces, and the reason it is fatal.** A
+    /// tracked copy of the specification can silently diverge from it, which
+    /// would have CI reconciling a stale §9 while reporting green — this
+    /// project's defect rebuilt inside its own fix.
+    #[test]
+    fn a_table_that_disagrees_with_the_plan_is_a_fatal_drift_not_a_warning() {
+        let plan = plan_or_bail!();
+        let real = render_table(&parse_gate_table(&plan).unwrap());
+        let stale = real.replacen("Workspace CI green", "Workspace CI amber", 1);
+        assert_ne!(stale, real, "the fixture must actually differ");
+
+        let dir = std::env::temp_dir().join(format!("shep-drift-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan_file = dir.join("plan.md");
+        let table_file = dir.join("table.json");
+        std::fs::write(&plan_file, &plan).unwrap();
+        std::fs::write(&table_file, &stale).unwrap();
+
+        let (_, drift) = load_rows(&plan_file, &table_file).unwrap();
+        match drift {
+            Drift::Drifted { detail } => {
+                assert!(detail.contains("stale copy"), "{detail}");
+                assert!(
+                    detail.contains("regen-table"),
+                    "it must name the fix: {detail}"
+                );
+            }
+            other => panic!("a divergent table must be Drifted, got {other:?}"),
+        }
+
+        // And the same call with the matching table verifies rather than drifts.
+        std::fs::write(&table_file, &real).unwrap();
+        let (_, ok) = load_rows(&plan_file, &table_file).unwrap();
+        assert_eq!(ok, Drift::Verified, "an identical table must verify");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Absent is the CI case and must NOT fail; different is the local case and
+    /// must. They are one code path unless separated deliberately, so the
+    /// separation is asserted.
+    #[test]
+    fn an_absent_plan_is_unverified_rather_than_drifted() {
+        let table = std::fs::read_to_string(repo().join(TABLE_PATH)).unwrap();
+        let dir = std::env::temp_dir().join(format!("shep-absent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let table_file = dir.join("table.json");
+        std::fs::write(&table_file, &table).unwrap();
+
+        let (rows, drift) = load_rows(&dir.join("no-such-plan.md"), &table_file).unwrap();
+        assert_eq!(rows.len(), 11, "the rows still load — this is the point");
+        match drift {
+            Drift::NotVerified { why } => assert!(why.contains("never as"), "{why}"),
+            other => panic!("an absent plan must be NotVerified, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A truncated or half-written artifact must be loud, not a smaller table
+    /// that everything downstream silently agrees with.
+    #[test]
+    fn an_artifact_that_disagrees_with_its_own_row_count_is_refused() {
+        let err = parse_table(r#"{"row_count": 9, "rows": [{"label":"1","command":"c","gate_id":"1","evidence":"e"}]}"#)
+            .expect_err("must refuse");
+        assert!(err.contains("disagrees with itself"), "{err}");
+        let empty = parse_table(r#"{"row_count": 0, "rows": []}"#).expect_err("must refuse");
+        assert!(empty.contains("reconcile against nothing"), "{empty}");
+    }
+
+    fn repo() -> std::path::PathBuf {
+        crate::evidence_artifacts::repo_root()
     }
 
     /// **The end-to-end assertion, against the real map and the real plan.**

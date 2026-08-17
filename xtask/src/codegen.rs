@@ -506,7 +506,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 /// A bare "these files differ" on a 200-line schema sends the reader to a diff
 /// tool; naming the line makes the CI log itself sufficient in the common case
 /// of a single changed field.
-fn first_difference(on_disk: &str, generated: &str) -> (usize, String, String) {
+pub(crate) fn first_difference(on_disk: &str, generated: &str) -> (usize, String, String) {
     let mut a = on_disk.lines();
     let mut b = generated.lines();
     let mut n = 0usize;

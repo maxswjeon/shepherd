@@ -149,6 +149,30 @@ fn cmd_gate(root: &Path, args: &[String]) -> Result<ExitCode, String> {
     let plan_path = flag_value(args, "--plan")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join(".omc/plans/shepherd-consensus-plan.md"));
+    let table_path = root.join(phase_completeness::TABLE_PATH);
+
+    // Regenerating §9's tracked table is the one mutating gate operation, so it
+    // is an explicit verb rather than a side effect of auditing. `gate --audit`
+    // that silently rewrote the artifact it checks could never report drift.
+    if args.iter().any(|a| a == "--regen-table") {
+        let plan = std::fs::read_to_string(&plan_path).map_err(|e| {
+            format!(
+                "cannot read the plan at {}: {e}. Regenerating requires a checkout that has it",
+                plan_path.display()
+            )
+        })?;
+        let rows = phase_completeness::parse_gate_table(&plan)?;
+        let rendered = phase_completeness::render_table(&rows);
+        std::fs::write(&table_path, &rendered)
+            .map_err(|e| format!("cannot write {}: {e}", table_path.display()))?;
+        println!(
+            "wrote {} — {} §9 gate rows, {} bytes",
+            table_path.display(),
+            rows.len(),
+            rendered.len()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
 
     // §9 names Phase 9's gate `xtask gate --release`, not `--phase 9`. Both
     // forms reach the same place; a command §9 names that this binary does not
@@ -181,22 +205,13 @@ fn cmd_gate(root: &Path, args: &[String]) -> Result<ExitCode, String> {
     // problem it was written to fix, and `gate --audit` is already required in
     // CI.
     //
-    // But the plan is **not committed** — `.gitignore` excludes all of
-    // `/.omc/` — so a CI checkout cannot see §9 at all. That is the same
-    // constraint that keeps `claim-ledger` out of CI, and it leaves three
-    // options, all bad: fail every CI run over a file-location policy, skip
-    // silently, or say so. This says so, loudly, and does not count as a pass.
-    // Wherever the plan IS present — every developer machine, and every
-    // `gate --phase` invocation, which fails outright without it — the
-    // reconciliation runs.
-    //
-    // The real fix is a decision about where the specification lives, and that
-    // is not this file's to make.
-    let completeness = if plan_path.exists() {
-        Some(phase_completeness::run(&map_path, &plan_path)?)
-    } else {
-        None
-    };
+    // This used to be unable to run there at all: the plan is gitignored, so a
+    // CI checkout could not see §9. It now reconciles against the tracked
+    // `xtask/section9-gate-table.json`, generated from §9 by
+    // `gate --regen-table`, and reports whether that artifact is still known to
+    // match its source. Absent plan (CI) is NOT a failure; a drifted artifact
+    // (local) is.
+    let completeness = phase_completeness::run(&map_path, &plan_path, &table_path)?;
 
     // Reachability reads only committed files, so unlike the completeness
     // check it works in CI. It is REPORTED here and fatal in `gate --phase`:
@@ -204,55 +219,30 @@ fn cmd_gate(root: &Path, args: &[String]) -> Result<ExitCode, String> {
     // the map's structure, and `--audit` is the map's check.
     let reach = reachability::run(root)?;
 
-    let not_run = format!(
-        "cargo xtask gate --audit — §9 phase-completeness reconciliation\n\
-         {}\n\
-         NOT RUN — {} is not present in this checkout.\n\
-         This is NOT a pass. §9's gate table is the specification this reconciles against, and\n\
-         the plan is gitignored (`/.omc/`), so no CI checkout can see it — the same reason\n\
-         `xtask claim-ledger` is not a CI step. The check runs wherever the plan is: on every\n\
-         developer machine, and inside `xtask gate --phase <id>`, which FAILS rather than\n\
-         reports when the plan is missing.\n\
-         Nothing here has been checked. Read this line as \"unknown\", never as \"clean\".\n",
-        "=".repeat(72),
-        plan_path.display()
-    );
-
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ownership": serde_json::from_str::<serde_json::Value>(&audit.to_json())
                     .unwrap_or(serde_json::Value::Null),
-                "completeness": match &completeness {
-                    Some(c) => c.to_json(),
-                    None => serde_json::json!({
-                        "ran": false,
-                        "why": "the plan is not in this checkout; /.omc/ is gitignored",
-                    }),
-                },
+                "completeness": completeness.to_json(),
                 "reachability": reach.to_json(),
-                "pass": !audit.failed() && !completeness.as_ref().is_some_and(|c| c.failed()),
+                "pass": !audit.failed() && !completeness.failed(),
             }))
             .unwrap_or_default()
         );
     } else {
         print!("{}", audit.render());
         println!();
-        match &completeness {
-            Some(c) => print!("{}", c.render(show_clauses)),
-            None => print!("{not_run}"),
-        }
+        print!("{}", completeness.render(show_clauses));
         println!();
         print!("{}", reach.render());
     }
-    Ok(
-        if audit.failed() || completeness.as_ref().is_some_and(|c| c.failed()) {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        },
-    )
+    Ok(if audit.failed() || completeness.failed() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn cmd_claim_ledger(root: &Path, args: &[String]) -> Result<ExitCode, String> {
