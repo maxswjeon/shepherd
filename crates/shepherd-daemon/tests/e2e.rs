@@ -503,10 +503,31 @@ fn every_registry_method_is_probed_and_exactly_the_recorded_ones_are_refused() {
     /// The refusals `dispatch.rs` records today, all naming Phase 2.
     /// `search.filters.path_glob` is a capability rather than a method and is
     /// asserted separately below.
+    ///
+    /// **`target.add` carries an ordering constraint, and this is the only place
+    /// anyone is forced to read it.** `S3Config::multipart_checksum` defaults to
+    /// `None` and **nothing outside a test ever sets it** — so today every S3
+    /// upload requests no whole-object checksum, and `s3.rs`'s own doc says the
+    /// value must be probed *at registration* because a checksum not requested
+    /// at upload **cannot be retrofitted without re-uploading the object**.
+    ///
+    /// That is harmless only because `target.add` is refused: with no way to
+    /// register a target there are no objects to strand. **Serving `target.add`
+    /// before a producer for `multipart_checksum` exists would permanently fix
+    /// every object written through it into the no-checksum configuration** —
+    /// measured at ADR 0b §3 as **$441/month against $0.68** on a 50 TB corpus,
+    /// per object, irreversible.
+    ///
+    /// So: whoever deletes `"target.add"` from this list owes a probe first.
+    /// The design is settled and recorded in open-questions E-5 — probe at
+    /// registration, adopt the first of CRC64NVME → CRC32C → CRC32 that
+    /// round-trips, and record the outcome **with the evidence** rather than as
+    /// a boolean, because a false negative here is silent and permanent.
     const UNSERVED: &[&str] = &[
         "restore",
         "rule.list",
         "rule.preview",
+        // See the ordering constraint above before serving this one.
         "target.add",
         "target.list",
         "target.test",
@@ -584,7 +605,14 @@ fn every_registry_method_is_probed_and_exactly_the_recorded_ones_are_refused() {
         "the set of methods the daemon refuses is not the recorded one.\n  refused now: {:?}\
          \n  recorded:    {:?}\nIf a method started being served, delete it from UNSERVED — that \
          is the good direction. If one stopped, something unwired it from the daemon and no \
-         per-AC test would have noticed.",
+         per-AC test would have noticed.\n\
+         \nIF THE CHANGE IS `target.add`, READ THIS FIRST: serving it requires a producer for \
+         `S3Config::multipart_checksum`, which today is `None` everywhere outside a test. A \
+         checksum not requested at upload cannot be retrofitted without re-uploading, so every \
+         object written through an unprobed target is permanently in the no-checksum \
+         configuration — $441/month against $0.68 on 50 TB (ADR 0b §3). Probe at registration, \
+         adopt the first of CRC64NVME -> CRC32C -> CRC32 that round-trips, and record the outcome \
+         with its evidence rather than as a boolean. See open-questions E-5.",
         refused, recorded
     );
     assert!(
