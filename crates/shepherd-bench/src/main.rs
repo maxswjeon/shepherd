@@ -34,6 +34,7 @@
 //! not describe.
 
 mod ann_bench;
+mod gen_files;
 mod generate;
 
 use std::fmt::Write as _;
@@ -557,6 +558,10 @@ COMMANDS:
   machine                  Print the probed machine record as JSON.
   gen-trace                Write the committed query trace from the contract seed.
   gen-catalog              Generate the SQLite catalog fixture (contract rows).
+  gen-files                Materialise a corpus of real files on disk, with a
+                           ground-truth manifest. This is M1's FUNCTIONAL leg;
+                           it measures no latency and its scan rate is a property
+                           of the filesystem it ran on, never of the index.
   capacity                 Measure the 50 TB model's DB/WAL/checkpoint primitives.
   build-ann    <precision> Build usearch shards: f32 | f16 | i8
   bench-ann    <precision> Benchmark one usearch precision.
@@ -571,6 +576,18 @@ GLOBAL OPTIONS:
   --scaled-run-reason <s>  Why this run is not the contract scale. Recorded in
                            the output so a scaled number can never be read as a
                            contract-scale number.
+
+gen-files OPTIONS:
+  --dest     <dir>         Where to write <dest>/root, <dest>/outside and
+                           <dest>/manifest.json. Required: a million files never
+                           land somewhere implicit.
+  --files    <n>           How many files the scan must catalogue. The traps
+                           (deny-listed and off-root files) are written on top
+                           of this, so `files_seen` should equal it exactly.
+  --seed     <n>           Default: 20260816, the contract's fixture seed.
+  --threads  <n>           Writer threads. Default 8 — enough to hide network
+                           latency on a shared NAS, few enough not to monopolise
+                           it.
 ";
 
 pub struct Args {
@@ -582,6 +599,11 @@ pub struct Args {
     pub cache: String,
     pub rows_override: Option<u64>,
     pub scaled_run_reason: Option<String>,
+    // --- gen-files only ---------------------------------------------------
+    pub dest: Option<PathBuf>,
+    pub files: Option<u64>,
+    pub seed: Option<u64>,
+    pub threads: Option<usize>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -598,6 +620,10 @@ fn parse_args() -> Result<Args, String> {
         cache: "warm".into(),
         rows_override: None,
         scaled_run_reason: None,
+        dest: None,
+        files: None,
+        seed: None,
+        threads: None,
     };
     let mut i = 1;
     while i < argv.len() {
@@ -621,6 +647,28 @@ fn parse_args() -> Result<Args, String> {
                 )
             }
             "--scaled-run-reason" => a.scaled_run_reason = Some(take("--scaled-run-reason")?),
+            "--dest" => a.dest = Some(PathBuf::from(take("--dest")?)),
+            "--files" => {
+                a.files = Some(
+                    take("--files")?
+                        .parse()
+                        .map_err(|e| format!("--files: {e}"))?,
+                )
+            }
+            "--seed" => {
+                a.seed = Some(
+                    take("--seed")?
+                        .parse()
+                        .map_err(|e| format!("--seed: {e}"))?,
+                )
+            }
+            "--threads" => {
+                a.threads = Some(
+                    take("--threads")?
+                        .parse()
+                        .map_err(|e| format!("--threads: {e}"))?,
+                )
+            }
             other if other.starts_with("--") => return Err(format!("unknown flag {other}")),
             other => a.target = Some(other.to_string()),
         }
@@ -667,6 +715,7 @@ fn run() -> Result<(), String> {
         }
         "gen-trace" => generate::gen_trace(&args),
         "gen-catalog" => generate::gen_catalog(&args),
+        "gen-files" => gen_files::gen_files(&args),
         "capacity" => generate::capacity(&args),
         "build-ann" => ann_bench::build(&args),
         "bench-ann" => ann_bench::bench(&args),
