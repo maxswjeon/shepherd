@@ -44,6 +44,62 @@ fn endpoint() -> String {
     std::env::var("SHEPHERD_MINIO_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string())
 }
 
+/// Where the whole-object-checksum probe runs.
+///
+/// Defaults to the compose-file MinIO like every other test here. Setting
+/// `SHEPHERD_S3_BUCKET` aims the same probe at a real service instead, because
+/// the capacity model's claim is that **one run against a real endpoint settles
+/// the question** — which is only true if the test can actually be aimed:
+///
+/// ```text
+/// SHEPHERD_S3_BUCKET=shepherd-probe-xxxxxxxx SHEPHERD_S3_REGION=ap-northeast-2 \
+///   cargo test -p shepherd-storage --test minio -- --ignored --nocapture \
+///   whole_object_checksums_on_multipart_are_probed_not_assumed
+/// ```
+///
+/// Credentials come from the ambient chain there rather than the compose file's
+/// fixed pair, and path style follows the endpoint: real S3 serves virtual-host
+/// buckets, every self-hosted compatible needs path style. Setting
+/// `SHEPHERD_S3_ENDPOINT` as well points it at R2, B2 or any other
+/// S3-compatible, which is how the remaining `unknown` rows in the provider
+/// table get filled in without a code change.
+fn probe_target() -> (S3Config, String) {
+    match std::env::var("SHEPHERD_S3_BUCKET") {
+        Ok(bucket) if !bucket.is_empty() => {
+            let region =
+                std::env::var("SHEPHERD_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+            let endpoint_url = std::env::var("SHEPHERD_S3_ENDPOINT")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let label = match &endpoint_url {
+                Some(u) => format!("{u} (bucket {bucket})"),
+                None => format!("AWS S3 {region} (bucket {bucket})"),
+            };
+            (
+                S3Config {
+                    bucket,
+                    force_path_style: endpoint_url.is_some(),
+                    endpoint_url,
+                    region: Some(region),
+                    // The ambient chain: `~/.aws`, the environment, or an
+                    // instance role. Never the compose file's fixed pair.
+                    credentials: None,
+                    multipart_checksum: None,
+                },
+                label,
+            )
+        }
+        _ => {
+            let mut cfg = S3Config::minio(PLAIN_BUCKET, endpoint());
+            cfg.credentials = Some(StaticCredentials {
+                access_key_id: "shepherdtest".into(),
+                secret_access_key: "shepherdtest".into(),
+            });
+            (cfg, format!("MinIO at {}", endpoint()))
+        }
+    }
+}
+
 async fn adapter(bucket: &str) -> S3Adapter {
     let mut cfg = S3Config::minio(bucket, endpoint());
     cfg.credentials = Some(StaticCredentials {
@@ -347,19 +403,22 @@ async fn a_versioned_bucket_pins_an_immutable_version_id() {
 /// actually does, because that is the finding — and asserts only the invariant
 /// that must hold either way: a composite checksum is never presented as a
 /// whole-object one.
+///
+/// It names the provider it actually reached and the key it wrote, so the raw
+/// server fields can be pulled independently. A probe that reports a negative
+/// without saying where it was pointed is indistinguishable from one that never
+/// left the emulator.
 #[tokio::test]
-#[ignore = "requires MinIO"]
+#[ignore = "requires MinIO, or SHEPHERD_S3_BUCKET for a real endpoint"]
 async fn whole_object_checksums_on_multipart_are_probed_not_assumed() {
-    let mut cfg = S3Config::minio(PLAIN_BUCKET, endpoint());
-    cfg.credentials = Some(StaticCredentials {
-        access_key_id: "shepherdtest".into(),
-        secret_access_key: "shepherdtest".into(),
-    });
+    let (mut cfg, provider) = probe_target();
     cfg.multipart_checksum = Some(shepherd_storage::adapter::ChecksumAlgorithm::Crc64Nvme);
     let a = S3Adapter::new(cfg).await.expect("adapter");
 
     let content = body((2 * PART + 77) as usize, 9);
     let key = key_for(&content, "crc64");
+    println!("FINDING: probing {provider}");
+    println!("FINDING: key={}", key.as_str());
     let plan = PartPlan::new(content.len() as u64, a.capabilities(), PART).expect("plan");
     assert_eq!(plan.part_count, 3, "must genuinely be a multipart upload");
 
@@ -367,7 +426,7 @@ async fn whole_object_checksums_on_multipart_are_probed_not_assumed() {
         Ok(u) => u,
         Err(e) => {
             println!(
-                "FINDING: MinIO rejected CreateMultipartUpload with FULL_OBJECT CRC64NVME: {e}"
+                "FINDING: {provider} rejected CreateMultipartUpload with FULL_OBJECT CRC64NVME: {e}"
             );
             println!("FINDING: scrub must read multipart objects back in full on this provider.");
             return;
@@ -398,7 +457,7 @@ async fn whole_object_checksums_on_multipart_are_probed_not_assumed() {
     match &meta.whole_object_checksum {
         Some(c) => {
             println!(
-                "FINDING: MinIO returned a checksum on HEAD: algorithm={} whole_object={} value={}",
+                "FINDING: {provider} returned a checksum on HEAD: algorithm={} whole_object={} value={}",
                 c.algorithm.as_str(),
                 c.whole_object,
                 c.value
@@ -409,7 +468,7 @@ async fn whole_object_checksums_on_multipart_are_probed_not_assumed() {
             );
         }
         None => println!(
-            "FINDING: MinIO returned NO whole-object checksum on HEAD — \
+            "FINDING: {provider} returned NO whole-object checksum on HEAD — \
              scrub must read multipart objects back in full on this provider."
         ),
     }

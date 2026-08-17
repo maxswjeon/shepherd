@@ -548,6 +548,23 @@ impl StorageAdapter for S3Adapter {
             .head_object()
             .bucket(&self.bucket)
             .key(key.as_str())
+            // S3 omits every `x-amz-checksum-*` response field unless the
+            // request opts in, so without this an object that *does* carry a
+            // whole-object checksum reports none. Measured against a real
+            // bucket, one multipart object, two HEADs:
+            //
+            //   mode unset   -> etag only
+            //   mode ENABLED -> x-amz-checksum-crc64nvme: CnmyweQWB7U=
+            //                   x-amz-checksum-type: FULL_OBJECT
+            //
+            // This was the whole of the negative result the capacity model
+            // recorded against multipart checksums: the upload path had been
+            // storing them correctly all along and the read path could not see
+            // them. Costs nothing — HEAD is priced the same either way — and
+            // omitting it sends scrub to re-read every multipart object in
+            // full, which is the expensive answer reached from a header we
+            // simply failed to send.
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
             .send()
             .await
         {
