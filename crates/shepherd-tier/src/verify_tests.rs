@@ -2,6 +2,7 @@
 
 use super::*;
 use bytes::Bytes;
+use shepherd_storage::adapter::ChecksumAlgorithm;
 use shepherd_storage::testing::MemAdapter;
 
 fn hash_of(b: &[u8]) -> Blake3Hash {
@@ -143,6 +144,78 @@ async fn the_whole_object_checksum_is_captured_rather_than_dropped() {
     );
     // The field exists so `remote_object.checksum_kind` can be written from it.
     let _: Option<ObjectChecksum> = v.whole_object_checksum;
+}
+
+/// Helper for the two `Some` branches, which had no coverage at all until the
+/// adapter's checksum became settable.
+async fn verify_with_checksum(c: ObjectChecksum) -> Option<ObjectChecksum> {
+    let a = MemAdapter::content_addressed();
+    a.put_raw(&key(), Bytes::from_static(BODY));
+    a.set_whole_object_checksum(Some(c));
+    verify_upload(
+        &a,
+        &key(),
+        hash_of(BODY),
+        BODY.len() as u64,
+        TargetId::new(1),
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect("verify")
+    .whole_object_checksum
+}
+
+#[tokio::test]
+async fn a_genuine_whole_object_checksum_survives_verification() {
+    // The value scrub compares against on every later pass WITHOUT egress. It
+    // is measured on real S3 and MinIO alike (ADR 0b §3a), and `9f241ef` is
+    // proof this link gets dropped: it was already broken once, silently,
+    // because every step still returned Ok.
+    let got = verify_with_checksum(ObjectChecksum {
+        algorithm: ChecksumAlgorithm::Crc64Nvme,
+        value: "CnmyweQWB7U=".into(),
+        whole_object: true,
+    })
+    .await;
+
+    assert_eq!(
+        got,
+        Some(ObjectChecksum {
+            algorithm: ChecksumAlgorithm::Crc64Nvme,
+            value: "CnmyweQWB7U=".into(),
+            whole_object: true,
+        }),
+        "a whole-object checksum must reach VerifiedLocation intact — dropping it \
+         costs nothing observable and silently returns scrub to full reads"
+    );
+}
+
+#[tokio::test]
+async fn a_composite_checksum_is_dropped_rather_than_persisted_as_a_content_hash() {
+    // **The safety branch.** Real S3 returns exactly this for a multipart
+    // object uploaded without ChecksumType FULL_OBJECT — measured, ADR 0b §3b:
+    //
+    //     x-amz-checksum-crc32: 72M33w==-2
+    //     x-amz-checksum-type:  COMPOSITE
+    //
+    // The trailing `-2` is the part count: it is a digest-of-digests and can
+    // never equal a CRC32 of the bytes. Persisting it as though it were a
+    // content hash is a CORRECTNESS defect in scrub, not a cost one — every
+    // multipart object would compare unequal forever, so scrub would either
+    // alarm on all of them or, worse, have its comparison "fixed" by someone
+    // who concluded the checksum was unreliable.
+    let got = verify_with_checksum(ObjectChecksum {
+        algorithm: ChecksumAlgorithm::Crc32,
+        value: "72M33w==-2".into(),
+        whole_object: false,
+    })
+    .await;
+
+    assert_eq!(
+        got, None,
+        "a COMPOSITE digest-of-digests must never be persisted as a content hash; \
+         the honest answer is None, which sends scrub to a full read"
+    );
 }
 
 #[tokio::test]

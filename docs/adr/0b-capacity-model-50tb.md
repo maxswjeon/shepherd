@@ -385,13 +385,30 @@ distrust:
 |---|---|
 | upload requests `FULL_OBJECT` and S3 stores it | `[M]` measured on real S3 |
 | HEAD returns it and the adapter surfaces it as `whole_object: true` | `[M]` measured on real S3 |
-| `verify_upload` carries it into `VerifiedLocation` | **inspected, not measured** — `verify.rs`'s two-line filter was read, not exercised against S3 |
+| `verify_upload` carries it into `VerifiedLocation`, and drops a COMPOSITE one | `[M]` covered under `cargo test`, mutation-verified |
 
-The third link is the one `9f241ef` already broke once. Its only unit test pins
-the `None` case, so **no test would fail today if it were re-broken for a
-provider that does return a checksum.** Closing that needs either a fake that can
-return one, or `verify_upload` in the live probe; it is cheap and it is not done
-here.
+The third link was **inspected rather than measured** in the first revision of
+this section, and closing it was worth doing rather than noting. `MemAdapter`
+hardcoded `whole_object_checksum: None`, so both `Some` arms of `verify.rs`'s
+filter had **no coverage at all** — including the one that rejects a composite
+digest. `9f241ef` is proof that link gets broken: it was broken once already, and
+found by inspection then too.
+
+The checksum is now settable on the fake and all three branches run under a plain
+`cargo test`. Mutation-verified, because a passing test proves nothing until it
+has been seen to fail:
+
+| mutation applied to `verify.rs` | caught by |
+|---|---|
+| drop `.filter(|c| c.whole_object)` — persist a composite as a content hash | `a_composite_checksum_is_dropped_rather_than_persisted_as_a_content_hash` |
+| replace with `None` — reproduce the `9f241ef` regression exactly | `a_genuine_whole_object_checksum_survives_verification` |
+
+**The pre-existing test passed under both mutations**, which is the measurement
+that matters here: it pinned only the `None` case, so the coverage that existed
+would not have caught the regression that had already happened once. The
+composite branch uses the literal value real S3 returned, `72M33w==-2`, so the
+guard is exercised against the shape the provider actually produces rather than
+an invented one.
 
 **This does not become a cheap path to gating destruction.** A provider-computed
 CRC detects bit rot; it is worthless against a provider that is wrong about its

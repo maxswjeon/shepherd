@@ -22,8 +22,8 @@ use shepherd_core::{Blake3Hash, JobId, ObjectKey, ObjectVersion, Timestamp};
 
 use crate::adapter::{
     AdapterCapabilities, AttestationMode, ByteRange, ControlKey, CreatePrecondition, CreateReceipt,
-    IncompleteUpload, ListPage, ListVisibility, ObjectMeta, OpaqueToken, PartReceipt,
-    StorageAdapter, StorageError, StorageResult, VersionGuard,
+    IncompleteUpload, ListPage, ListVisibility, ObjectChecksum, ObjectMeta, OpaqueToken,
+    PartReceipt, StorageAdapter, StorageError, StorageResult, VersionGuard,
 };
 use crate::transfer_session::{
     SourceFingerprint, SourceReader, TransferSession, TransferSessionStore,
@@ -67,6 +67,15 @@ struct Inner {
     /// on what was actually deleted rather than inferring it from absence —
     /// absence is also what a never-created object looks like.
     deleted: Vec<String>,
+    /// What `head` reports as the provider's whole-object checksum.
+    ///
+    /// `None` by default, modelling a provider that offers none. Settable
+    /// because the two `Some` shapes are the ones that carry risk and they were
+    /// unreachable while this was hardcoded: a genuine whole-object value must
+    /// be **carried through** to `VerifiedLocation`, and a COMPOSITE
+    /// digest-of-digests must be **dropped**. The second is a safety guard, and
+    /// an untested safety guard is a comment.
+    whole_object_checksum: Option<ObjectChecksum>,
 }
 
 /// An in-memory `StorageAdapter`.
@@ -109,6 +118,16 @@ impl MemAdapter {
 
     pub fn set_faults(&self, f: Faults) {
         self.lock().faults = f;
+    }
+
+    /// Model a provider that returns a whole-object checksum from `head`.
+    ///
+    /// Pass a value with `whole_object: false` to model the COMPOSITE case —
+    /// real S3 returns exactly that for a multipart object uploaded without
+    /// `ChecksumType: FULL_OBJECT`, as `72M33w==-2`, where the trailing part
+    /// count makes it visibly a digest-of-digests.
+    pub fn set_whole_object_checksum(&self, c: Option<ObjectChecksum>) {
+        self.lock().whole_object_checksum = c;
     }
 
     pub fn aborts(&self) -> Vec<String> {
@@ -400,9 +419,9 @@ impl StorageAdapter for MemAdapter {
             size: b.len() as u64,
             version: v.clone(),
             etag: Some(OpaqueToken::new("head-etag")),
-            // The in-memory adapter models no provider checksum: the scrub
-            // fallback path is what it exercises.
-            whole_object_checksum: None,
+            // `None` unless a test set one, which models a provider offering
+            // no checksum and exercises the scrub fallback path.
+            whole_object_checksum: inner.whole_object_checksum.clone(),
         }))
     }
 
