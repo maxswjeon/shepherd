@@ -245,6 +245,37 @@ agree exactly — **there was never any emulator-versus-real-service divergence 
 be cautious about.** The caution was still correct: it prevented the model from
 being revised in the *wrong* direction on bad evidence.
 
+**Side by side, raw wire headers, same test binary, same 10,485,837-byte
+content** — MinIO on the four-drive erasure set with NAS-backed storage, so the
+emulator is a realistic deployment rather than a straw man:
+
+| | AWS S3 `ap-northeast-2` | MinIO `RELEASE.2025-04-22` |
+|---|---|---|
+| `etag` | `"7ef4e974…bafbb2e-3"` | `"7ef4e974…bafbb2e-3"` |
+| HEAD, mode unset | etag only | etag only |
+| HEAD, `mode: ENABLED` | `x-amz-checksum-crc64nvme: CnmyweQWB7U=`<br>`x-amz-checksum-type: FULL_OBJECT` | `x-amz-checksum-crc64nvme: CnmyweQWB7U=`<br>`x-amz-checksum-type: FULL_OBJECT` |
+
+**Identical, down to the checksum value and the ETag.** The claim this document
+made — *"MinIO's behaviour does not predict S3's"* — is **not supported on the
+path Shepherd uses**, and the evidence for it was our own missing header.
+
+**There is one real divergence, and it is not on that path.** On
+`GetObjectAttributes` — which Shepherd does *not* call — the two disagree:
+
+```text
+AWS S3 : Checksum: {ChecksumCRC64NVME: CnmyweQWB7U=, ChecksumType: FULL_OBJECT}
+MinIO  : Checksum: {ChecksumCRC64NVME: CnmyweQWB7U=}          <- no ChecksumType
+```
+
+Harmless today, and worth writing down precisely because it is a **loaded trap
+for the obvious future optimisation**: `GetObjectAttributes` also returns the
+per-part checksum list, so a scrub implementation would be tempted to prefer it
+over HEAD. Against MinIO it reports no `ChecksumType`, `whole_object` would
+derive as `false`, the checksum would be dropped, and multipart objects would go
+back to full reads — **reproducing this exact section's retracted finding
+through a different API.** If scrub ever moves off `HeadObject`, that derivation
+has to be re-measured, not carried over.
+
 That defect is worth naming precisely, because it is the third instance of this
 spike's recurring shape and the only one that fails toward *expense* rather than
 toward false assurance: a missing request header made a working provider feature
