@@ -14,3 +14,4 @@ pub mod evidence_artifacts;
 pub mod gate_audit;
 pub mod gate_phase;
 pub mod phase_completeness;
+pub mod reachability;

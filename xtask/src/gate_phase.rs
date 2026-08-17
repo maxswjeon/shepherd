@@ -222,6 +222,13 @@ pub struct PhaseReport {
     /// Why coverage could not be established, when it could not. Never a skip:
     /// this fails the gate.
     pub coverage_error: Option<String>,
+    /// The daemon-reachability line for this phase, and whether it fails.
+    ///
+    /// A phase can land every library it owns, test them, and wire none of them
+    /// to anything a user can invoke. Phase 2 did: eleven of twelve criteria
+    /// PASS while `tier.run` answers `MethodNotImplemented`. Per-AC evidence
+    /// cannot see that, because each AC is true.
+    pub reachability: Option<(String, bool)>,
 }
 
 impl PhaseReport {
@@ -230,6 +237,10 @@ impl PhaseReport {
             || !self.uncovered.is_empty()
             || !self.stated_gaps.is_empty()
             || self.coverage_error.is_some()
+            || self
+                .reachability
+                .as_ref()
+                .is_some_and(|(_, failed)| *failed)
     }
 
     pub fn render(&self) -> String {
@@ -309,6 +320,10 @@ impl PhaseReport {
                  instead of passing over the part of §9 nobody wrote down."
             );
         }
+        if let Some((line, _)) = &self.reachability {
+            let _ = writeln!(s, "{}", "-".repeat(78));
+            let _ = writeln!(s, "{line}");
+        }
         let _ = writeln!(s, "{}", "=".repeat(78));
 
         let failed: Vec<&AcResult> = self.results.iter().filter(|r| !r.ok()).collect();
@@ -318,10 +333,23 @@ impl PhaseReport {
             let _ = writeln!(
                 s,
                 "RESULT: {} — {} acceptance criteria asserted by {} test(s) that actually ran",
-                if self.failed() {
-                    "FAIL (criteria green, §9 row NOT covered)"
-                } else {
-                    "PASS"
+                match (
+                    self.failed(),
+                    self.reachability.as_ref().is_some_and(|(_, f)| *f),
+                ) {
+                    (false, _) => "PASS".to_string(),
+                    // Naming which of the two it is, because "every criterion
+                    // passed" and "the phase is done" failing apart is the
+                    // whole point of these sections existing.
+                    (true, true) => format!(
+                        "FAIL (every criterion green — the phase is NOT REACHABLE{})",
+                        if self.uncovered.is_empty() && self.stated_gaps.is_empty() {
+                            ""
+                        } else {
+                            ", and its §9 row is not covered"
+                        }
+                    ),
+                    (true, false) => "FAIL (criteria green, §9 row NOT covered)".to_string(),
                 },
                 self.results.len(),
                 total_tests
@@ -478,6 +506,30 @@ pub fn run(
         });
     }
 
+    // Reachability is per-phase and derived from two committed files, so it
+    // needs neither the plan nor the map. A phase that owns no refusal still
+    // gets the line, because "no refusal names this phase" is a weaker
+    // statement than "this phase is reachable" and the difference is worth
+    // printing every time.
+    let reachability = match crate::reachability::run(root) {
+        Ok(r) => {
+            let failed = phases.iter().any(|p| r.failed_for(p));
+            let line = phases
+                .iter()
+                .map(|p| r.phase_line(p))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some((line, failed))
+        }
+        Err(e) => Some((
+            format!(
+                "REACHABILITY: COULD NOT BE ESTABLISHED — {e}\n  This fails the gate. Absent \
+                 evidence fails; it never skips."
+            ),
+            true,
+        )),
+    };
+
     Ok(PhaseReport {
         phase: phase.to_string(),
         results,
@@ -485,6 +537,7 @@ pub fn run(
         stated_gaps,
         scope_note,
         coverage_error,
+        reachability,
     })
 }
 
@@ -755,6 +808,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             stated_gaps: vec![],
             scope_note: None,
             coverage_error: None,
+            reachability: None,
         }
     }
 
@@ -777,6 +831,36 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             !out.contains("RESULT: PASS"),
             "a gate that fails must not print PASS anywhere in its verdict: {out}"
         );
+    }
+
+    /// **The Phase 2 defect, as a unit test.** Every criterion passes, the §9
+    /// row is fully covered, and the phase still fails — because its own daemon
+    /// answers `MethodNotImplemented` for the work it delivered. This is the
+    /// case per-AC evidence structurally cannot see: each AC is true.
+    #[test]
+    fn a_gate_with_green_criteria_and_a_covered_row_still_fails_when_nothing_is_reachable() {
+        let mut r = passing_report();
+        assert!(!r.failed(), "the control");
+        r.reachability = Some((
+            "REACHABILITY: 9 of the daemon's 17 protocol methods/capabilities are REFUSED"
+                .to_string(),
+            true,
+        ));
+        assert!(r.failed(), "an unreachable phase must fail its gate");
+        let out = r.render();
+        assert!(out.contains("NOT REACHABLE"), "{out}");
+        assert!(!out.contains("RESULT: PASS"), "{out}");
+    }
+
+    /// And a reported-but-not-failing reachability line must not fail the gate,
+    /// or every phase with no recorded refusal would go red for the absence of
+    /// a fact rather than the presence of one.
+    #[test]
+    fn a_reachability_line_that_does_not_fail_leaves_the_gate_alone() {
+        let mut r = passing_report();
+        r.reachability = Some(("REACHABILITY: no method … is refused".to_string(), false));
+        assert!(!r.failed());
+        assert!(r.render().contains("RESULT: PASS"));
     }
 
     /// A stated gap is honest, not satisfied. It fails for the same reason

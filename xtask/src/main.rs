@@ -20,7 +20,9 @@
 //! documentation of the same kind as an evidence artifact, and a stale one
 //! reads as current — so it is corrected here rather than left to be believed.)*
 
-use xtask::{check_deps, claim_ledger, codegen, gate_audit, gate_phase, phase_completeness};
+use xtask::{
+    check_deps, claim_ledger, codegen, gate_audit, gate_phase, phase_completeness, reachability,
+};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -196,6 +198,12 @@ fn cmd_gate(root: &Path, args: &[String]) -> Result<ExitCode, String> {
         None
     };
 
+    // Reachability reads only committed files, so unlike the completeness
+    // check it works in CI. It is REPORTED here and fatal in `gate --phase`:
+    // an unserved method is a statement about a phase's readiness, not about
+    // the map's structure, and `--audit` is the map's check.
+    let reach = reachability::run(root)?;
+
     let not_run = format!(
         "cargo xtask gate --audit — §9 phase-completeness reconciliation\n\
          {}\n\
@@ -223,6 +231,7 @@ fn cmd_gate(root: &Path, args: &[String]) -> Result<ExitCode, String> {
                         "why": "the plan is not in this checkout; /.omc/ is gitignored",
                     }),
                 },
+                "reachability": reach.to_json(),
                 "pass": !audit.failed() && !completeness.as_ref().is_some_and(|c| c.failed()),
             }))
             .unwrap_or_default()
@@ -234,6 +243,8 @@ fn cmd_gate(root: &Path, args: &[String]) -> Result<ExitCode, String> {
             Some(c) => print!("{}", c.render(show_clauses)),
             None => print!("{not_run}"),
         }
+        println!();
+        print!("{}", reach.render());
     }
     Ok(
         if audit.failed() || completeness.as_ref().is_some_and(|c| c.failed()) {
