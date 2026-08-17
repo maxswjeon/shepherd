@@ -53,6 +53,10 @@ struct AcMap {
     ac: Vec<Entry>,
     #[serde(default)]
     guard: Vec<Entry>,
+    /// §9's compound gate ids (`0ab`) over the map's atomic phases (`0a`,
+    /// `0b`). See [`resolve_phase`].
+    #[serde(default)]
+    alias: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,8 +90,21 @@ pub struct Evidence {
     /// Exact test name, passed with `--exact`.
     pub test: String,
     /// `true` for `#[ignore]`d tests, which need `--ignored`.
+    ///
+    /// §9 rule 1 forbids a gate being *satisfied by* a skipped or ignored test.
+    /// Naming one here is the opposite of skipping it: the gate runs it
+    /// explicitly and asserts its count, which is the only way an expensive
+    /// measurement can back a gate at all.
     #[serde(default)]
     pub ignored: bool,
+    /// `true` for evidence that is only meaningful in `--release`.
+    ///
+    /// Added for the 10M metadata bar, whose test *panics* under
+    /// `debug_assertions` rather than report a debug-build number as if it
+    /// meant something. Without this the gate would run it in debug and record
+    /// a FAIL that says nothing about the index.
+    #[serde(default)]
+    pub release: bool,
     /// Environment variable this evidence needs. Absent variable => the check
     /// FAILS naming it, rather than skipping.
     #[serde(default)]
@@ -188,17 +205,40 @@ impl AcResult {
 pub struct PhaseReport {
     pub phase: String,
     pub results: Vec<AcResult>,
+    /// Clauses of this phase's §9 row that **nothing in `ac-map.toml` claims**.
+    ///
+    /// The Phase 1 defect in one field: the gate reported PASS over the two ACs
+    /// it had been given while §9's row asked for eight more things, and it had
+    /// no way to know. Each entry here fails the gate on its own, separately
+    /// from the AC tally, because "the criteria I was given all pass" and "the
+    /// phase is done" are different claims and only the second one is what a
+    /// gate is read as saying.
+    pub uncovered: Vec<String>,
+    /// Clauses claimed only by a stated gap — accounted for, not carried.
+    pub stated_gaps: Vec<String>,
+    /// Set when the requested phase is one constituent of a larger §9 gate, so
+    /// a pass here cannot be read as closing that gate.
+    pub scope_note: Option<String>,
+    /// Why coverage could not be established, when it could not. Never a skip:
+    /// this fails the gate.
+    pub coverage_error: Option<String>,
 }
 
 impl PhaseReport {
     pub fn failed(&self) -> bool {
         self.results.iter().any(|r| !r.ok())
+            || !self.uncovered.is_empty()
+            || !self.stated_gaps.is_empty()
+            || self.coverage_error.is_some()
     }
 
     pub fn render(&self) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "cargo xtask gate --phase {} — §9 phase gate", self.phase);
         let _ = writeln!(s, "{}", "=".repeat(78));
+        if let Some(note) = &self.scope_note {
+            let _ = writeln!(s, "{note}\n");
+        }
 
         let mut total_tests = 0u32;
         for r in &self.results {
@@ -233,13 +273,56 @@ impl PhaseReport {
         }
 
         let _ = writeln!(s, "{}", "=".repeat(78));
+
+        // §9 coverage, printed as its own section: "every criterion I was given
+        // passed" and "§9's row for this phase is satisfied" are different
+        // claims, and collapsing them is the defect this section exists for.
+        if let Some(err) = &self.coverage_error {
+            let _ = writeln!(
+                s,
+                "§9 COVERAGE: COULD NOT BE ESTABLISHED — {err}\n  This fails the gate. A gate \
+                 that cannot read the specification it gates against has not checked it."
+            );
+        } else if self.uncovered.is_empty() && self.stated_gaps.is_empty() {
+            let _ = writeln!(
+                s,
+                "§9 COVERAGE: every clause of this phase's §9 row is claimed by a row in \
+                 ac-map.toml."
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "§9 COVERAGE: {} clause(s) of this phase's §9 row are NOT carried:",
+                self.uncovered.len() + self.stated_gaps.len()
+            );
+            for c in &self.stated_gaps {
+                let _ = writeln!(s, "  [STATED GAP] {c}");
+            }
+            for c in &self.uncovered {
+                let _ = writeln!(s, "  [UNENCODED ] {c}");
+            }
+            let _ = writeln!(
+                s,
+                "  An UNENCODED clause is a §9 demand that ac-map.toml does not ask for, so no \
+                 verdict above speaks to it. A STATED GAP is a demand encoded honestly as \
+                 unmet. Both fail the gate: this is how a phase reports being under-specified \
+                 instead of passing over the part of §9 nobody wrote down."
+            );
+        }
+        let _ = writeln!(s, "{}", "=".repeat(78));
+
         let failed: Vec<&AcResult> = self.results.iter().filter(|r| !r.ok()).collect();
         let unbacked = failed.iter().filter(|r| r.outcomes.is_empty()).count();
         let partial = failed.iter().filter(|r| r.is_partial()).count();
         if failed.is_empty() {
             let _ = writeln!(
                 s,
-                "RESULT: PASS — {} acceptance criteria asserted by {} test(s) that actually ran",
+                "RESULT: {} — {} acceptance criteria asserted by {} test(s) that actually ran",
+                if self.failed() {
+                    "FAIL (criteria green, §9 row NOT covered)"
+                } else {
+                    "PASS"
+                },
                 self.results.len(),
                 total_tests
             );
@@ -273,11 +356,32 @@ impl PhaseReport {
 // Running
 // ---------------------------------------------------------------------------
 
-pub fn run(root: &Path, map_path: &Path, phase: &str) -> Result<PhaseReport, String> {
+/// Which map phases a requested gate id covers.
+///
+/// §9 names `xtask gate --phase 0ab`; the map keeps `0a` and `0b` separate
+/// because `gate --audit`'s owned-no-earlier-than invariant needs a total order
+/// and `0ab` has no position in one. The join is declared in the map's
+/// `[alias]` table rather than guessed from the string, so `--phase 0ab` runs
+/// exactly the phases someone wrote down.
+fn resolve_phase(map: &AcMap, requested: &str) -> Vec<String> {
+    match map.alias.get(requested) {
+        Some(list) => list.clone(),
+        None => vec![requested.to_string()],
+    }
+}
+
+pub fn run(
+    root: &Path,
+    map_path: &Path,
+    plan_path: &Path,
+    phase: &str,
+) -> Result<PhaseReport, String> {
     let text = std::fs::read_to_string(map_path)
         .map_err(|e| format!("cannot read {}: {e}", map_path.display()))?;
     let map: AcMap =
         toml::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", map_path.display()))?;
+
+    let phases = resolve_phase(&map, phase);
 
     // The owned set comes from the map, never from a list in this file, so an
     // AC cannot be dropped from the gate by being forgotten here.
@@ -285,7 +389,7 @@ pub fn run(root: &Path, map_path: &Path, phase: &str) -> Result<PhaseReport, Str
         .ac
         .iter()
         .chain(map.guard.iter())
-        .filter(|e| e.owning_gate == phase)
+        .filter(|e| phases.contains(&e.owning_gate))
         .collect();
 
     if owned.is_empty() {
@@ -296,14 +400,67 @@ pub fn run(root: &Path, map_path: &Path, phase: &str) -> Result<PhaseReport, Str
         ));
     }
 
+    // §9's row for this phase, reconciled against the map. Not optional: the
+    // criteria below are a claim ABOUT that row, and checking them without it
+    // is what returned PASS over a proper subset of Phase 1.
+    let (uncovered, stated_gaps, scope_note, coverage_error) =
+        match crate::phase_completeness::run(map_path, plan_path) {
+            Ok(report) => {
+                let cov = phases.iter().find_map(|p| report.for_phase(p));
+                match cov {
+                    Some(cov) => {
+                        let note = (cov.phases.len() > phases.len()).then(|| {
+                            format!(
+                                "PARTIAL SCOPE — `{phase}` is {} of the {} phases gated by §9's \
+                                 `{}`. Whatever this run reports, it does NOT close that gate; \
+                                 the other phase(s) ({}) are not asserted here.",
+                                phases.len(),
+                                cov.phases.len(),
+                                cov.command,
+                                cov.phases
+                                    .iter()
+                                    .filter(|p| !phases.contains(p))
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        });
+                        (
+                            cov.unclaimed()
+                                .iter()
+                                .map(|c| truncate(&c.clause, 150))
+                                .collect(),
+                            cov.clauses
+                                .iter()
+                                .filter(|c| !c.carried() && c.claimed())
+                                .map(|c| truncate(&c.clause, 150))
+                                .collect(),
+                            note,
+                            None,
+                        )
+                    }
+                    None => (
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Some(format!(
+                            "no §9 gate row covers phase `{phase}`, so there is no specification \
+                             to check these criteria against"
+                        )),
+                    ),
+                }
+            }
+            Err(e) => (Vec::new(), Vec::new(), None, Some(e)),
+        };
+
     let mut results = Vec::new();
     // One test binary can back several ACs; run each distinct check once.
-    let mut cache: BTreeMap<(String, String, bool), CheckOutcome> = BTreeMap::new();
+    let mut cache: BTreeMap<(String, String, bool, bool), CheckOutcome> = BTreeMap::new();
 
     for entry in owned {
         let mut outcomes = Vec::new();
         for ev in &entry.evidence {
-            let key = (ev.package.clone(), ev.test.clone(), ev.ignored);
+            let key = (ev.package.clone(), ev.test.clone(), ev.ignored, ev.release);
             let outcome = match cache.get(&key) {
                 Some(o) => clone_outcome(o),
                 None => {
@@ -324,7 +481,21 @@ pub fn run(root: &Path, map_path: &Path, phase: &str) -> Result<PhaseReport, Str
     Ok(PhaseReport {
         phase: phase.to_string(),
         results,
+        uncovered,
+        stated_gaps,
+        scope_note,
+        coverage_error,
     })
+}
+
+/// Keep a clause readable in a report without letting one sentence of §9 take
+/// eight lines.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(n).collect();
+    format!("{head}…")
 }
 
 fn clone_outcome(o: &CheckOutcome) -> CheckOutcome {
@@ -350,8 +521,11 @@ fn run_evidence(root: &Path, ev: &Evidence) -> CheckOutcome {
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(cargo);
-    cmd.current_dir(root)
-        .args(["test", "-p", &ev.package, "--", &ev.test, "--exact"]);
+    cmd.current_dir(root).args(["test", "-p", &ev.package]);
+    if ev.release {
+        cmd.arg("--release");
+    }
+    cmd.args(["--", &ev.test, "--exact"]);
     if ev.ignored {
         cmd.arg("--ignored");
     }
@@ -559,6 +733,72 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         assert!(o.label().contains("not run"));
     }
 
+    fn passing_report() -> PhaseReport {
+        PhaseReport {
+            phase: "1".into(),
+            results: vec![AcResult {
+                id: "AC-13".into(),
+                outcomes: vec![(
+                    Evidence {
+                        package: "p".into(),
+                        test: "t".into(),
+                        ignored: false,
+                        release: false,
+                        requires_env: None,
+                        proves: String::new(),
+                    },
+                    CheckOutcome::Passed { count: 1 },
+                )],
+                missing_reason: None,
+            }],
+            uncovered: vec![],
+            stated_gaps: vec![],
+            scope_note: None,
+            coverage_error: None,
+        }
+    }
+
+    /// **The Phase 1 defect, as a unit test.** Every criterion the gate was
+    /// given passes — and the phase is not done, because §9's row asks for
+    /// things nothing in the map claims. The gate must fail, and must not
+    /// print PASS while doing it.
+    #[test]
+    fn a_gate_whose_every_criterion_passes_still_fails_on_a_clause_nothing_claims() {
+        let mut r = passing_report();
+        assert!(
+            !r.failed(),
+            "the control: with the row covered, this passes"
+        );
+        r.uncovered = vec!["`atime_mode` detection correct on all three platforms.".into()];
+        assert!(r.failed(), "an unclaimed §9 clause must fail the gate");
+        let out = r.render();
+        assert!(out.contains("UNENCODED"), "{out}");
+        assert!(
+            !out.contains("RESULT: PASS"),
+            "a gate that fails must not print PASS anywhere in its verdict: {out}"
+        );
+    }
+
+    /// A stated gap is honest, not satisfied. It fails for the same reason
+    /// `evidence_missing` overrides passing evidence one level down.
+    #[test]
+    fn a_clause_claimed_only_by_a_stated_gap_fails_too() {
+        let mut r = passing_report();
+        r.stated_gaps = vec!["the 1M on-disk corpus".into()];
+        assert!(r.failed());
+        assert!(r.render().contains("STATED GAP"));
+    }
+
+    /// If the specification cannot be read, the gate has not checked it.
+    /// "Could not determine" is not a pass here either.
+    #[test]
+    fn coverage_that_could_not_be_established_fails_rather_than_skipping() {
+        let mut r = passing_report();
+        r.coverage_error = Some("cannot read the plan".into());
+        assert!(r.failed());
+        assert!(r.render().contains("COULD NOT BE ESTABLISHED"));
+    }
+
     /// An AC with no evidence declared must FAIL, not pass vacuously.
     #[test]
     fn an_ac_with_no_evidence_does_not_pass() {
@@ -576,6 +816,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             package: "p".into(),
             test: "t".into(),
             ignored: false,
+            release: false,
             requires_env: None,
             proves: String::new(),
         };

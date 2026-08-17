@@ -10,5 +10,7 @@
 pub mod check_deps;
 pub mod claim_ledger;
 pub mod codegen;
+pub mod evidence_artifacts;
 pub mod gate_audit;
 pub mod gate_phase;
+pub mod phase_completeness;

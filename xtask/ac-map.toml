@@ -26,47 +26,61 @@ phase_order = ["0a", "0b", "0c", "0d", "1", "2", "3", "4", "5", "6", "7", "8", "
 expected_ac_count = 65
 
 # ---------------------------------------------------------------------------
-# KNOWN GAP — `gate --phase 1` PASSES while Phase 1 is NOT done.
+# CLOSED — `gate --phase 1` PASSED while Phase 1 was NOT done.
 # ---------------------------------------------------------------------------
 #
-# Only TWO ACs carry `owning_gate = "1"` (AC-13, AC-56). Both are now backed by
-# evidence that runs, so the gate reports PASS. §9's Phase 1 row demands
-# considerably more, and none of it is encoded here as a phase-1-owned AC:
+# Kept because the shape of the defect is worth more than the fix. Only TWO ACs
+# carried `owning_gate = "1"` (AC-13, AC-56); both were properly backed by
+# evidence that ran, so `gate --phase 1` reported PASS. §9's Phase 1 row demands
+# ten further things — both M1 legs, AC-54's CI check, the identity layer,
+# `atime_mode` on three platforms, the job-queue core, catalog write discipline,
+# and daemon installation on Linux and macOS — and **none of them was encoded
+# here, so the gate could not ask for them.** Nothing lied. The gate answered
+# the question it was given, and the question was a proper subset of §9's.
 #
-#   * M1 both legs — the functional pipeline over a 1M-file ON-DISK corpus, and
-#     the < 50 ms p95 over a 10M-row injected catalog. The index leg is measured
-#     (14.66 ms p95 at 10M, 0dab668) but is an #[ignore]d bench, not gate
-#     evidence; the functional leg's largest run is the daemon e2e at NINE
-#     entries.
-#   * AC-54's `CLI == registered_methods` running in CI from this phase.
-#   * The identity layer: content-addressed keys collision-free under a
-#     case/normalisation fuzz corpus, and `fs_id` stable across a simulated
-#     remount.
-#   * `atime_mode` detection correct on all three platforms.
-#   * Job-queue core: kill-and-resume of a checkpointed job. (A test exists —
-#     `kill_and_resume_of_a_checkpointed_job` — it is simply not cited here.)
-#   * Catalog write discipline: single-writer actor and dedicated PASSIVE
-#     checkpoint connection. (Tests exist —
-#     `concurrent_writers_over_one_file_serialize` and the contention pair in
-#     `session_store_tests.rs` — also not cited here.)
-#   * Daemon installation on Linux (systemd user unit, lingering checked and
-#     warned, never forced) and macOS (LaunchAgent).
+# This was the vacuous pass `gate --audit`'s own closing NOTE says it cannot
+# catch: it detects owned-too-early only, and "an AC owned late enough to
+# compile but too early to be non-trivial" was left as a human review property.
+# The limit was reached in practice, at Phase 1.
 #
-# **This is the vacuous pass `gate --audit` states it cannot catch.** Its own
-# closing NOTE says it detects owned-too-early only, and that "an AC owned late
-# enough to compile but too early to be non-trivial" stays a human review
-# property. That limit has now been reached in practice, at Phase 1.
+# WHAT CHANGED
 #
-# So: a PASS from `gate --phase 1` currently means "AC-13 and AC-56 hold", NOT
-# "Phase 1 is done". Several of the missing items ALREADY HAVE PASSING TESTS and
-# need only citing; others (the 1M corpus, the three-platform atime check, the
-# macOS LaunchAgent) need machinery or hardware this run did not have.
+# 1. Every clause of §9's Phase 1 row is now encoded — as `[[guard]]` rows
+#    (§9's prose demands carry no AC number, and the numbered AC-1..AC-65 set is
+#    fixed by the Appendix, which `gate --audit` enforces exactly-once) and as
+#    `[[phase]]` requirement rows that quote §9 verbatim.
+# 2. `xtask/src/phase_completeness.rs` reconciles this file against §9's gate
+#    table on every `gate --audit`, and `gate --phase <id>` now FAILS on any
+#    clause of its own §9 row that nothing here claims. A phase can no longer
+#    be under-specified silently: it can only be under-specified loudly.
+# 3. Phase 0 had no gate at all — §9 names `gate --phase 0ab`, which matched no
+#    id here, so `--phase 0a` exited 2. The `[alias]` table below joins §9's
+#    compound gate ids to this file's atomic phases, and 0a/0b/0c/0d now own
+#    guards. Several are RED, which is the correct report.
 #
-# The structural fix is a phase-completeness check that reconciles this file
-# against §9's per-phase rows, so a phase cannot be under-specified silently.
-# Deliberately NOT added in the same pass that discovered the gap — a checker
-# written by the person whose omission it is auditing, at the end of a run, is
-# how the next vacuous pass gets built.
+# The result is that `gate --phase 1` is now RED and says why. That is the
+# outcome: a gate that reports the phase unfinished is worth more than one that
+# reports it finished on a subset nobody chose deliberately.
+
+# ---------------------------------------------------------------------------
+# [alias] — §9's gate command ids -> the phases in `phase_order` they cover.
+# ---------------------------------------------------------------------------
+#
+# §9's table names `xtask gate --phase 0ab`, `--phase 0cd` and, for Phase 9,
+# `xtask gate --release`. None of the three matched an id here, so three of §9's
+# eleven gate commands could not be run at all — and the two Phase-0 ones failed
+# with "no acceptance criteria are owned by phase `0a`", which is the gate
+# correctly refusing to report a vacuous pass over an empty set. That refusal is
+# how this was found.
+#
+# The join lives here rather than in `phase_order` because `gate --audit`'s
+# owned-no-earlier-than invariant needs a TOTAL ORDER over phases, and `0ab` has
+# no position in one: it is not after `0a` and not before `0b`, it *is* both.
+# Aliasing keeps the ordering exact and makes every command §9 names runnable.
+[alias]
+"0ab" = ["0a", "0b"]
+"0cd" = ["0c", "0d"]
+"release" = ["9"]
 
 # ---------------------------------------------------------------------------
 # [machinery] — key -> the phase whose §6 creates-list produces it.
@@ -79,6 +93,15 @@ expected_ac_count = 65
 "xtask::claim_ledger" = "0a"
 "xtask::gate_audit" = "0a"
 "ci" = "0a"
+# Landed later than 0a but attributed to it: §6's 0a creates-list is the
+# verification-tooling lane ("xtask/ — specifically the deliverables §9 recast
+# those claims as"), and these are that lane. Attributing them to the phase that
+# happened to write them would make every Phase-0 guard citing them
+# owned-too-early, which would be the audit reporting a filing decision as an
+# ordering defect.
+"xtask::gate_phase" = "0a"
+"xtask::phase_completeness" = "0a"
+"xtask::evidence_artifacts" = "0a"
 
 # Phase 0b
 "shepherd-bench" = "0b"
@@ -768,3 +791,753 @@ id = "PM-3"
 owning_gate = "4"
 exercises = ["shepherd-watch::overflow", "shepherd-watch::cursor"]
 note = "journal-overflow resync gating; scrub and watcher guards"
+
+# ---------------------------------------------------------------------------
+# Phase 0 guards — the gate §9 names and this file did not have.
+# ---------------------------------------------------------------------------
+#
+# §9's Phase 0 rows demand artifacts and decisions, not numbered ACs, so they
+# are guards: "release-blocking but not numbered spec ACs", audited by the same
+# invariant and excluded from the AC-1..AC-65 completeness check. Inventing
+# AC-66 for them would break that check and misrepresent the Appendix, which
+# fixes the AC set at 65.
+
+[[guard]]
+id = "G-0A-CI"
+owning_gate = "0a"
+exercises = ["ci"]
+note = "§9: `Workspace CI green on all three platforms`"
+evidence_missing = """
+DECLARED, NOT GREEN. The three-platform matrix is declared in ci.yml and the \
+cited test asserts it is still declared — an edit dropping windows-latest or \
+macos-latest fails here. Whether a RUN was green on those platforms is a \
+property of a CI run, not of this repository, and no test in a repository can \
+assert it. .omc/artifacts/phase-0a/verification.md records plainly that no \
+Windows or macOS leg has ever executed. So what is proven is the matrix; what \
+§9 asks for is the result, and the honest gap is the difference.\
+"""
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::ci_declares_all_three_platforms"
+proves = "the CI matrix still names ubuntu-latest, windows-latest and macos-latest — a silent narrowing to Linux-only would otherwise leave the §9 clause reading as satisfied"
+
+[[guard]]
+id = "G-0B-BARS"
+owning_gate = "0b"
+exercises = ["shepherd-bench", "xtask::evidence_artifacts"]
+note = """
+§9: `bench-baseline.json with metadata p95, vector p95 and index RSS at 10M \
+within bars`. The bars were met, so §9's alternative closure path — a written \
+escalation carrying the user's recorded renegotiation decision — was not \
+needed for THIS clause. On what a gate can and cannot assert about a recorded \
+decision, see G-0B-CAPACITY.\
+"""
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::the_recorded_metadata_p95_clears_the_precommitted_bar_in_both_cache_states"
+proves = "the recorded metadata p95 (23.48 ms cold, 22.20 ms warm) clears the bar that bench-contract.toml FIXED BEFORE THE RUN, in both cache states, over the contract's row count — and the bar in the artifact is checked against the bar in the contract, so moving one to fit the other fails here rather than passing quietly"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::the_adr_names_the_only_candidate_that_actually_passed"
+proves = "the written index decision is backed by its own evidence: exactly one candidate clears the bar in both cache states, which is what makes the ADR's claim of `no tie to break` true, and the ADR names that candidate. A re-measure that promoted another candidate would fail here instead of leaving the ADR asserting a superseded conclusion"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::every_ann_cell_that_ran_at_full_scale_fits_the_ac46_band"
+proves = "every ANN cell measured at the contract's full vector count sits inside AC-46's 4-16 GiB band and under the 300 ms bar, and a cell that ran at reduced scale must carry a recorded reason rather than pass as though it had not. Includes a count assertion: a filter matching no cells would satisfy every other line in the test"
+
+[[guard]]
+id = "G-0B-CONTRACT"
+owning_gate = "0b"
+exercises = ["shepherd-bench", "xtask::evidence_artifacts"]
+note = "§9: the precommitted numeric workload contract, fixed BEFORE 0b runs"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::the_recorded_run_matches_the_precommitted_workload_contract"
+proves = "the run that produced the numbers used the concurrency, run count, per-run query count and background ingest the contract fixed. A p95 measured with one idle client is a different number wearing the same name, and this is what stops it being reported as the same one"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::the_contract_still_scores_every_axis_the_tiebreak_rule_names"
+proves = "the tiebreak rule still scores all five axes, including the three (persistence, crash-consistency, cold-start rebuild) added because latency-and-RSS alone would have selected differently. Losing them would let the decision be re-derived on the two axes it was corrected away from"
+
+[[guard]]
+id = "G-0B-CAPACITY"
+owning_gate = "0b"
+exercises = ["shepherd-bench"]
+note = "§9: the 50 TB capacity model's explicit reject thresholds"
+evidence_missing = """
+A THRESHOLD IS BREACHED AND ITS ESCALATION IS OPEN. §9 requires each axis of \
+the capacity model — DB growth, checkpoint size, scrub request/egress cost, \
+restart time, transfer duration — to carry a fail bound rather than being \
+measured-or-extrapolated. Scrub cost BREACHES its bound: E-3 records $441/mo \
+on S3 Standard against a $25 threshold, ~18x over, and it is an OPEN user \
+decision in .omc/plans/open-questions.md, not a resolved one. §9's Phase 0 row \
+permits closure by `a written escalation carrying the user's recorded \
+renegotiation decision`, and E-3 is written but NOT decided.
+
+ON WHAT A GATE CAN ASSERT ABOUT A RECORDED DECISION, since §9 makes one a \
+closure path: it can assert that a decision exists, that it is well-formed, \
+and that the numbers it cites agree with the artifact it claims to be about — \
+all three fail loudly on a stale or unbacked record. It CANNOT assert that the \
+user made it. Provenance of consent is not a property of a file, and a test \
+that read `- [x] RESOLVED by the user` would be asserting the presence of a \
+string any editor can type. So this row states the gap rather than encoding a \
+check that would read as proof of a decision while proving only that someone \
+wrote one down.\
+"""
+
+[[guard]]
+id = "G-0C-SPIKES"
+owning_gate = "0c"
+exercises = ["spikes/windows-syncroot", "spikes/macos-fileprovider"]
+note = "§9's 0c/0d row: Windows sync-root hydration from a separate process; the macOS spike on BOTH OQ-A mechanisms; CFAPI trash/undelete"
+evidence_missing = """
+HARDWARE, AND NO SPIKE HAS RUN. `spikes/` does not exist in the tree. Both \
+legs need hardware this machine is not: a Windows box with a signed sparse \
+package (or a documented sparse failure plus full-MSIX success), and a Mac \
+running a notarized File Provider extension. No substitute measurement is \
+available and none is claimed. The row exists so that `xtask gate --phase \
+0cd` — a command §9 names — RUNS and reports this, rather than exiting 2 with \
+`no acceptance criteria are owned by phase 0c`, which is indistinguishable \
+from a typo in the phase id.\
+"""
+
+[[guard]]
+id = "G-0D-PROCUREMENT"
+owning_gate = "0d"
+exercises = ["fixtures/corpus-10m", "signing-identities"]
+note = "§9's 0c/0d row: signing identities present and test-signed; fixtures/corpus-10m staged; the signing inventory artifact"
+evidence_missing = """
+USER-SUPPLIED AND NOT SUPPLIED. Apple Developer Program membership, the \
+Windows code-signing certificate and MSIX publisher identity, and the three \
+physical machines are recorded in open-questions.md as outstanding \
+prerequisites with multi-day-to-multi-week lead times. `fixtures/corpus-10m` \
+is not staged. These gate Phases 3, 6 and 9 and explicitly NOT Phase 1, so \
+this row being red does not block M1 — which is the whole point of §9 \
+splitting Phase 0's gate per lane.\
+"""
+
+# ---------------------------------------------------------------------------
+# Phase 1 guards — §9's Phase 1 row, clause by clause.
+# ---------------------------------------------------------------------------
+#
+# Guards rather than ACs for the same reason as Phase 0's: §9's Phase 1 row
+# demands eight things that carry no AC number, and the numbered set is fixed at
+# AC-1..AC-65 by the Appendix. Each row below quotes the clause it answers, and
+# `[[phase]]` at the foot of this file ties them to §9's text verbatim so the
+# tie cannot rot silently.
+#
+# Several are PARTIAL: evidence that genuinely runs, plus a stated gap that
+# keeps the row red. That is AC-2's pattern and it is the honest shape for this
+# phase — the mechanisms are largely built and the SCALES and PLATFORMS §9 names
+# are not reachable from this machine.
+
+[[guard]]
+id = "G-1-M1-FUNC"
+owning_gate = "1"
+exercises = ["shepherd-daemon", "shepherd-scan::walk", "shepherd-catalog::file_repo", "shepherd-index::meta", "shepherd-cli"]
+note = "§9 M1 leg 1: `functional pipeline over the 1M on-disk corpus`"
+evidence_missing = """
+SCALE ONLY, AND THE GAP IS FIVE ORDERS OF MAGNITUDE. The pipeline is proven \
+end to end — a real daemon over a real socket, a real walk, a real catalog, a \
+real index, and the real `shepctl` binary — at NINE files. §9 demands the same \
+line over a 1M-file on-disk corpus. Everything the cited tests assert about \
+correctness is untouched by the difference; everything that only appears at \
+scale (walk throughput, catalog write pressure across a long scan, index build \
+memory, WAL growth across the full scan per E-4) is unproven, and the failures \
+that live there are exactly the ones a nine-file run cannot see.
+
+The corpus is being built on the NAS by another worker rather than duplicated \
+here. When a recorded run over it exists, this row cites it and the gap closes; \
+until then the mechanism is proven and the milestone is not.\
+"""
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "search_finds_scanned_files_and_misses_absent_ones"
+proves = "PARTIAL — the M1 demo line's shape at nine entries: scan populates the catalog, search returns the files that match and NOT the ones that do not, and the daemon's own doctor reports the same entry count. The miss half is what stops a matcher that returns everything satisfying the hit half"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "shepctl_drives_a_real_daemon_end_to_end"
+proves = "PARTIAL — the demo runs through the real `shepctl` binary over a real socket, not through an in-process shortcut, so the CLI path §9's demo line names is the path exercised"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "a_scan_walks_the_root_and_the_files_land_in_the_catalog"
+proves = "PARTIAL — the walk's output is asserted against the catalog's row count rather than against the walker's own report"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "scanning_twice_converges_rather_than_duplicating"
+proves = "PARTIAL — rescanning converges; the failure this guards (a second scan doubling the catalog) is one that only shows up once a scan is repeated, which a single-run demo would never do"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "shepctl_search_returns_json_a_script_can_read"
+proves = "PARTIAL — the `--json` half of the demo line: the output is machine-readable, which is what makes the demo assertable rather than eyeballed"
+
+[[guard]]
+id = "G-1-M1-PERF"
+owning_gate = "1"
+exercises = ["shepherd-index::meta", "shepherd-bench"]
+note = "§9 M1 leg 2: `< 50 ms p95 over a 10M-row injected catalog`"
+evidence_missing = """
+THE INDEX, NOT THE PIPELINE. The cited test builds a real 10M-entry index and \
+asserts p95 < 50 ms — a genuine bar, failed rather than printed, in-process. \
+What §9 asks for at this phase is that bar over a 10M-row catalog INJECTED BY \
+shepherd-bench and queried through the daemon, which is a different \
+measurement: four concurrent clients against a live daemon under background \
+ingest, per bench-contract.toml. Phase 0b measured exactly that and recorded \
+23.48 ms cold / 22.20 ms warm (G-0B-BARS asserts it), but that is a Phase 0b \
+artifact re-read, not a Phase 1 run, and §9 rule 3 has the metadata bar \
+re-measured FROM Phase 1.
+
+So: the data structure meets the bar today, on this machine, at 10M. The \
+sentence §9 wrote — the same bar through the daemon on an injected catalog — \
+has no run behind it at Phase 1.\
+"""
+
+[[guard.evidence]]
+package = "shepherd-index"
+test = "meta::tests::the_production_index_meets_the_50ms_bar_at_10m_entries"
+ignored = true
+release = true
+proves = "PARTIAL — 10M entries, 200 queries over ten as-you-type patterns, `assert!(p95 < 50.0)`. It also asserts hits for the queries that should hit and NO hits for the four that should not, which is the guard that stops a p95 measured over an index that matches nothing. Cited with `ignored` and `release` because it refuses to run in debug rather than report a meaningless number — running it explicitly is the opposite of §9 rule 1's skipped test"
+
+[[guard]]
+id = "G-1-IDENTITY-KEY"
+owning_gate = "1"
+exercises = ["shepherd-catalog::identity"]
+note = "§9: `content-addressed keys collision-free under a case/normalization fuzz corpus`"
+evidence_missing = """
+EXAMPLES, NOT A CORPUS. Every normalisation and case rule §4.9 states is \
+proven — but by ONE hand-chosen pair each: one NFC/NFD spelling of `café`, one \
+`Dir/Report.TXT` against `dir/report.txt`. §9 says `fuzz corpus`, and there is \
+no proptest, quickcheck, arbitrary or cargo-fuzz dependency anywhere in this \
+workspace, so no input has ever been tried that a human did not choose. The \
+class of defect a corpus finds is precisely the one examples cannot: a \
+composition (a Turkish dotless i under case folding, a combining sequence with \
+more than one mark, a normalisation that changes length) that nobody thought \
+to write down.
+
+Stated rather than papered over with a generated-input test written by the \
+same hand that chose the examples: that would explore the same shapes with \
+more values, which is not what a fuzz corpus is for.\
+"""
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::nfd_and_nfc_fold_to_one_norm_key"
+proves = "PARTIAL — the two Unicode spellings of one path converge on one norm_key under both Nfc and Nfd policy, so a file does not acquire two catalog identities by how its name was typed"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::preserve_keeps_the_two_spellings_apart"
+proves = "the negative that gives the fold meaning: under Preserve the same two spellings must NOT collapse. Without this, an implementation that folded everything unconditionally would satisfy the row above while destroying the distinction on filesystems that keep it"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::case_folding_follows_the_root_policy"
+proves = "PARTIAL — case folding is driven by the per-root probed policy, asserted in both directions: distinct under Sensitive, equal under Insensitive"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::separators_are_unified"
+proves = "a backslash and a forward slash yield one key, so the same file does not get two identities across platforms"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::path_never_enters_the_key"
+proves = "the content-addressed half: the key is a function of the hash alone, so two identical files at different paths share one object and a rename cannot orphan one"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::key_layout_fans_out_on_the_hash"
+proves = "the emitted key has the documented two-level fan-out, which is what stops one flat prefix holding every object on a target that lists lexicographically"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::probe_detects_this_filesystem_and_cleans_up_after_itself"
+proves = "the policy is PROBED on a real filesystem rather than assumed, and the probe leaves nothing behind — an assumed policy is how a case-insensitive root gets case-sensitive keys"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::probe_on_a_missing_root_assumes_rather_than_failing"
+proves = "and when it cannot probe it says so (`assumed == true`) instead of reporting a detected answer it did not detect"
+
+[[guard]]
+id = "G-1-IDENTITY-FSID"
+owning_gate = "1"
+exercises = ["shepherd-catalog::volume"]
+note = "§9: `fs_id stable across a simulated remount`"
+evidence_missing = """
+NO REMOUNT IS SIMULATED, AND fs_id ITSELF IS UNTESTED. This is the weakest row \
+in Phase 1 and it should be read as red rather than partial. `fs_id()` and \
+`volume_id()` have no direct test; nothing in the workspace remounts anything, \
+changes a mount point, or varies st_dev. The cited tests prove the mountinfo \
+PARSER and the longest-prefix mount resolution — the inputs fs_id is computed \
+from — which is genuinely load-bearing (a parser that mis-attributed a path to \
+`/` would make fs_id wrong for every file under a nested mount) but is not the \
+property §9 names.
+
+Writing the missing test is small and belongs to whoever owns volume.rs: mount \
+a fixture at two different mount points and assert one fs_id. It is not \
+written here because a test authored alongside the gate that grades it, by \
+someone who has not read why volume_id is derived the way it is, is how a \
+tautology gets committed with a confident name.\
+"""
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::tests::mountinfo_parses_past_the_variable_optional_fields"
+proves = "PARTIAL — /proc/self/mountinfo's variable optional-field section is parsed correctly, including the CIFS line that has none. A parser that miscounted fields here would read the wrong column as the device and give every file the wrong volume"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::tests::the_longest_matching_mount_point_governs"
+proves = "PARTIAL — a path under a nested mount resolves to that mount and not to `/`, which is the resolution fs_id depends on"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::tests::a_mount_point_prefix_must_end_at_a_separator"
+proves = "`/tmpfoo/x` does not resolve to `/tmp` — the substring-is-not-a-component defect, in the mount table this time"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::tests::octal_escapes_are_decoded"
+proves = "a mount point containing a space round-trips, so a real user's external drive does not silently resolve to the wrong volume"
+
+[[guard]]
+id = "G-1-ATIME"
+owning_gate = "1"
+exercises = ["shepherd-catalog::atime", "shepherd-rules::match"]
+note = "§9: `atime_mode detection correct on all three platforms`"
+evidence_missing = """
+ONE PLATFORM, AND NOT THE DETECTOR. §9 says all three. What is proven is the \
+Linux mount-option CLASSIFIER — noatime beats relatime, lazytime does not \
+change file atime fidelity, a substring is not an option — and the rule-level \
+consequences that classification drives. What is NOT proven: `atime::detect()` \
+itself, which reads /proc/self/mountinfo and has no test at all; and macOS and \
+Windows, which today return Unknown and are covered by nothing. Unknown is the \
+fail-closed answer, so an untested platform degrades safely rather than \
+dangerously — destructive age rules are refused on Unknown, which IS asserted \
+— but `correct on all three platforms` is not what that says.\
+"""
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::explicit_noatime_disables"
+proves = "PARTIAL (Linux) — noatime classifies as Disabled, and wins when it appears alongside relatime"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::relatime_is_explicit_or_the_default"
+proves = "PARTIAL (Linux) — relatime is detected when stated AND assumed when unstated, which is the case that matters because it is the kernel default and the one an implementation is most likely to miss"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::a_substring_is_not_an_option"
+proves = "`some_noatime_lookalike` does not disable atime — the same substring-versus-token defect the deny-list carries, in the mount options"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::the_stricter_classification_wins_when_mount_and_superblock_disagree"
+proves = "when two sources disagree the STRICTER answer wins, so a disagreement cannot resolve in favour of trusting atime"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::destructive_age_rules_are_rejected_on_disabled_and_unknown"
+proves = "§4.12's actual safety property: Unknown is treated like Disabled, so an undetected platform refuses destructive age rules rather than silently trusting a timestamp nothing verified"
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_destructive_atime_rule_is_rejected_on_a_disabled_root"
+proves = "the rejection is enforced where it matters — Matcher::compile refuses, so the rule cannot exist rather than being filtered later"
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::the_age_signal_follows_the_documented_fallback_order"
+proves = "the fallback order is asserted rather than assumed: observed access, then atime only when Reliable, then mtime — so a preview can disclose which signal drove a match"
+
+[[guard]]
+id = "G-1-JOBS"
+owning_gate = "1"
+exercises = ["shepherd-jobs::queue", "shepherd-jobs::worker"]
+note = "§9: `Job-queue core: kill-and-resume of a checkpointed job`"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "worker::tests::kill_and_resume_of_a_checkpointed_job"
+proves = "the §9 clause exactly: a job checkpoints, the actor is dropped with the row left Running, and a second run recovers it, hands the executor back the SAME checkpoint payload, and completes — with attempts == 2, so the resume is visible as a resume rather than as a fresh job. Over a real file-backed database, not a memory store"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "queue::tests::recovery_requeues_a_non_destructive_job_with_its_checkpoint"
+proves = "the checkpoint survives the crash boundary at the queue layer too, so the resume above is a property of the store rather than of the worker that happened to hold it"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "queue::tests::recovery_quarantines_an_interrupted_destroy_instead_of_requeueing_it"
+proves = "the negative that makes resume safe: an interrupted DESTROY is quarantined, never replayed. Abort-forward-never. Without this row, `resume everything` would satisfy the positive one and re-run the only irreversible operation in the product"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "queue::tests::recovery_handles_a_mixed_batch_and_is_idempotent"
+proves = "recovery run twice does not resurrect what it already handled — a crash during recovery is a real state and this is the one that says what happens in it"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "queue::tests::recovery_clears_any_backoff_the_crash_interrupted"
+proves = "a job that was backing off when the process died is claimable after recovery rather than waiting out a timer that no longer has anything counting it"
+
+[[guard]]
+id = "G-1-WRITER"
+owning_gate = "1"
+exercises = ["shepherd-catalog::schema", "shepherd-catalog::file_repo"]
+note = "§9: `Catalog write discipline: single-writer actor`"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "writer::tests::concurrent_writers_over_one_file_serialize"
+proves = "eight threads and two hundred inserts through one actor over a file-backed WAL database land two hundred rows. The assertion is the COUNT: a lost row is the signature of two threads reaching the connection, which is the defect the single-writer rule exists to prevent, and it is invisible to an assertion that only checks the writes returned Ok"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "writer::tests::shutdown_drains_what_was_already_submitted"
+proves = "the writes are durable rather than merely acknowledged: the database is REOPENED and re-counted, so an actor that dropped its queue on shutdown fails here"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "writer::tests::a_handle_that_outlives_its_actor_reports_gone"
+proves = "a handle whose actor is gone reports it instead of blocking forever — the failure mode that turns a dead writer into a hung daemon"
+
+[[guard]]
+id = "G-1-CHECKPOINT"
+owning_gate = "1"
+exercises = ["shepherd-catalog::schema"]
+note = "§9: `dedicated PASSIVE-checkpoint connection`; E-4 sharpens it to WAL bounded across the full 10M scan"
+evidence_missing = """
+NOTHING ASSERTS THIS. No evidence is cited because none exists, and citing the \
+single-writer tests would be citing a test that constructs the checkpoint \
+connection and then asserts row counts. `checkpoint_loop` — which opens its \
+own connection and issues `PRAGMA wal_checkpoint(PASSIVE)` — has no test; no \
+test in the workspace mentions wal_checkpoint or PASSIVE at all; and no test \
+asserts the checkpoint connection is separate from the writer's, which is the \
+whole content of the clause (a PASSIVE checkpoint on the writer's own \
+connection is a different mechanism with different blocking behaviour).
+
+E-4 in open-questions.md sharpens this and is worth quoting, because it names \
+the failure directly: `Phase 1's gate must show WAL bounded across the full \
+10M scan, not merely that a checkpoint connection exists. Flagged so the Phase \
+1 gate is written to assert the bound rather than the mechanism — the \
+difference between those two is this project's recurring defect in its purest \
+form.` E-4 is an OPEN escalation. It is also not in §9's Phase 1 row, so \
+without this note the sharper requirement would sit outside the gate entirely.\
+"""
+
+[[guard]]
+id = "G-1-INSTALL-LINUX"
+owning_gate = "1"
+exercises = ["shepherd-daemon::service", "shepherd-obs"]
+note = "§9: `Daemon installs on Linux (systemd user unit; lingering checked and warned, never forced — OQ-F)`"
+evidence_missing = """
+THE UNIT IS PROVEN; INSTALLING IT IS NOT. Everything about WHAT gets installed \
+is asserted — the unit's contents, and the lingering policy in unusual depth. \
+What no test touches is `systemd::install()` itself: writing the unit file to \
+the user unit directory and invoking `systemctl --user daemon-reload` and \
+`enable`. §9's verb is `installs`. The gap is narrow and real: a unit whose \
+text is perfect and whose install path writes to the wrong directory satisfies \
+every row cited below.\
+"""
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::the_unit_starts_the_daemon_in_run_mode"
+proves = "PARTIAL — the generated unit runs the daemon in `run` mode and is wired to default.target, so it starts at session start (AC-59's OQ-F amendment) rather than at boot"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::the_unit_restarts_on_failure_only"
+proves = "Restart=on-failure and NOT Restart=always — asserted in both directions, because `always` would fight a user who stopped the daemon deliberately"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::the_unit_never_mentions_lingering"
+proves = "the unit does not touch lingering at all, which is the never-forced half of OQ-F expressed where it could most easily be violated"
+
+[[guard.evidence]]
+package = "shepherd-obs"
+test = "lingering::tests::the_remediation_names_the_command_but_nothing_runs_it"
+proves = "the strongest row here: the test greps its OWN SOURCE via include_str! and fails if any line both constructs a Command and mentions enable-linger, then asserts the only subprocess invoked is the read-only `show-user` query. OQ-F says check and warn, never force; this asserts the absence of the forcing code rather than the presence of a warning"
+
+[[guard.evidence]]
+package = "shepherd-obs"
+test = "lingering::tests::a_headless_disabled_node_warns_and_says_it_is_expected"
+proves = "the warning states the consequence plainly — the daemon will NOT start when logged out, this is expected behaviour, and Shepherd will not change the setting — which is the product decision OQ-F records, asserted rather than assumed"
+
+[[guard.evidence]]
+package = "shepherd-obs"
+test = "lingering::tests::unparseable_output_is_unknown_not_assumed_enabled"
+proves = "garbage from loginctl reads as Unknown, never as enabled. Assuming enabled is the failure that would silently drop the warning on exactly the machines that need it"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "nothing_the_daemon_runs_enables_lingering"
+proves = "end to end, over a real daemon: the lingering state before and after running the daemon plus doctor plus status is identical. The never-forced clause proven by observation rather than by code inspection"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "doctor_reports_the_lingering_check_and_never_changes_it"
+proves = "the check is always present in doctor's output and never reports `fail` — a warning, surfaced, as OQ-F requires, rather than a blocker or a silence"
+
+[[guard]]
+id = "G-1-INSTALL-MACOS"
+owning_gate = "1"
+exercises = ["shepherd-daemon::service"]
+note = "§9: `and macOS (LaunchAgent)`"
+evidence_missing = """
+HARDWARE. The plist's TEXT is proven, on Linux, by string assertions over the \
+generator. Whether launchd accepts it, whether `launchctl bootstrap` loads it, \
+and whether the agent actually starts at login are properties of a Mac, and \
+there is no Mac here. §9's verb is again `installs`, and a plist that is \
+well-formed and rejected by launchd passes every row cited below.
+
+This cannot be closed by any test written on this machine. It closes on macOS \
+hardware, at which point the same rows plus a real `launchctl` round trip \
+replace this note.\
+"""
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::launchd::tests::the_plist_is_well_formed_and_starts_the_daemon_in_run_mode"
+proves = "PARTIAL — the emitted plist is XML with balanced dict/array tags, carries the executable path and the `run` argument, and names the label. Well-formedness asserted structurally rather than by eye"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::launchd::tests::the_plist_does_not_fight_the_user"
+proves = "RunAtLoad is present and KeepAlive is ABSENT — the macOS form of restart-on-failure-only, asserted in both directions for the same reason"
+
+[[guard]]
+id = "G-1-CLI-REGISTRY"
+owning_gate = "1"
+exercises = ["shepherd-cli", "shepherd-proto", "xtask::codegen", "ci"]
+note = """
+§9: `AC-54's CLI == registered_methods check runs in CI from this phase (the \
+inventory test stays at Phase 8)`. AC-54 itself is owned at Phase 8 and is \
+declared as a [[phase.leg]] on the Phase 1 row; this guard carries only the \
+leg §9 puts here, which is that the check RUNS IN CI from Phase 1.\
+"""
+
+[[guard.evidence]]
+package = "shepherd-cli"
+test = "tests::ac54_cli_equals_registered_methods"
+proves = "the parity itself: every leaf command path the CLI builds and every cli_path in MethodKind::ALL form the same set, asserted as a bijection in both directions with no exemption list — so a CLI verb with no method, or a method with no verb, fails"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::ci_runs_the_ac54_cli_equals_registry_check_with_a_count_guard"
+proves = "the part of the clause that is about CI rather than about the test: ci.yml names that test AND asserts `1 passed` on its output. Running the test locally proves the test passes; §9's clause is that CI runs it, and only reading the workflow can say so. The count guard matters because `cargo test --exact` on a renamed test exits 0 having run nothing"
+
+[[guard.evidence]]
+package = "shepherd-proto"
+test = "method::tests::no_cli_path_is_a_prefix_of_another"
+proves = "the registry cannot describe a CLI tree that clap could not represent — the constraint that makes the bijection above achievable rather than aspirational"
+
+[[guard.evidence]]
+package = "shepherd-proto"
+test = "method::tests::names_and_cli_paths_are_unique"
+proves = "no two methods share a name or a CLI path, so the set equality above cannot be satisfied by a collision"
+
+# ---------------------------------------------------------------------------
+# [[phase]] — §9's gate rows, clause by clause.
+# ---------------------------------------------------------------------------
+#
+# Consumed by `xtask/src/phase_completeness.rs`, which runs on every
+# `gate --audit` and reconciles this file against §9's table. The rules it
+# enforces, and what each one is for:
+#
+#   * `quote` must appear VERBATIM in the row, inside a single clause. Editing
+#     §9 therefore breaks the check loudly instead of leaving an encoding that
+#     still reads as current. A quote that spans two clauses is rejected, so one
+#     quote cannot claim two demands.
+#   * `covered_by` ids must exist and be owned by a phase THIS gate runs, so a
+#     clause cannot be carried by something the gate never executes.
+#   * `unencoded` states that nothing carries the clause. It keeps the demand
+#     visible and the gate red. It is the honest answer, not a waiver.
+#   * `rationale` marks a clause that demands no evidence — scope, reasoning,
+#     or an explicit deferral. The most abusable field here, which is why it
+#     requires the quote, prints in `--show-clauses`, is counted separately
+#     rather than folded into "carried", and must say why in writing.
+#
+# `gate --phase <id>` FAILS on any clause of its row that is unencoded or
+# stated-gap. Under-specifying a phase is still possible; doing it quietly is
+# not.
+#
+# ROWS 2..9 ARE DELIBERATELY NOT ENCODED HERE. Their clauses report as
+# UNENCODED, which is accurate — no one has reconciled them — and it keeps this
+# change to the phases it is about. Encoding a future phase's row from the
+# outside is how a requirement gets recorded as someone imagined it rather than
+# as its owner reads it. The AC-level reconciliation below covers every row.
+
+[[phase]]
+gate = "0ab"
+
+[[phase.requirement]]
+quote = "with metadata p95, vector p95 and index RSS at 10M"
+covered_by = ["G-0B-BARS"]
+
+[[phase.requirement]]
+quote = "precommitted numeric workload contract"
+covered_by = ["G-0B-CONTRACT"]
+
+[[phase.requirement]]
+quote = "carries explicit reject thresholds too"
+covered_by = ["G-0B-CAPACITY"]
+
+[[phase.requirement]]
+quote = "Workspace CI green on all three platforms."
+covered_by = ["G-0A-CI"]
+
+[[phase.requirement]]
+quote = "LIST-consistency confirmed against the local emulators only"
+unencoded = """
+NOTHING CARRIES THIS, AND IT CANNOT BE CARRIED FROM PHASE 0. No test asserts \
+LIST pagination or visibility against MinIO, Azurite, Samba or NFS. \
+tests/docker-compose.yml is committed; nothing reads it. The reason it is \
+stated rather than encoded is structural and worth a plan correction: the \
+machinery this clause exercises (shepherd-storage::s3, ::azure, ::nas) is \
+created in Phases 2 and 6, so ANY row owning it at Phase 0 would be rejected \
+by `gate --audit` as owned-too-early — the same unsatisfiable-gate class §9's \
+own row text says it removed real-provider LIST evidence to avoid. The \
+emulator leg has the identical shape one phase down.\
+"""
+
+[[phase.requirement]]
+quote = "Iteration 2 put real-provider LIST evidence on this gate"
+rationale = "records why an earlier iteration's requirement was removed from this gate. It demands nothing of Phase 0; the demand it describes now sits on Phase 6, where the adapters exist."
+
+[[phase.requirement]]
+quote = "Spike sources are **preserved as non-production fixtures**, not deleted"
+unencoded = """
+`spikes/` does not exist in the tree, so there is nothing preserved and \
+nothing deleted. Correctly a 0c concern: the spike sources are 0c's output, \
+and this clause sits in the 0a/0b row. Reported rather than filed against 0c \
+on my own authority — where a clause of §9 belongs is the plan's call, not the \
+gate's.\
+"""
+
+[[phase.leg]]
+ac = "AC-46"
+owned_by = "5"
+quote = "supported AC-46 ceiling range: 4–16 GB"
+
+[[phase]]
+gate = "1"
+
+[[phase.requirement]]
+quote = "functional pipeline over the 1M on-disk corpus"
+covered_by = ["G-1-M1-FUNC"]
+
+[[phase.requirement]]
+quote = "< 50 ms p95 over a 10M-row injected catalog"
+covered_by = ["G-1-M1-PERF"]
+
+[[phase.requirement]]
+quote = "matcher over all seven predicate kinds"
+covered_by = ["AC-13"]
+
+[[phase.requirement]]
+quote = "**AC-56** schema stability."
+covered_by = ["AC-56"]
+
+[[phase.requirement]]
+quote = "check runs in CI from this phase"
+covered_by = ["G-1-CLI-REGISTRY"]
+
+[[phase.requirement]]
+quote = "content-addressed keys collision-free under a case/normalization fuzz corpus"
+covered_by = ["G-1-IDENTITY-KEY"]
+
+[[phase.requirement]]
+quote = "stable across a simulated remount"
+covered_by = ["G-1-IDENTITY-FSID"]
+
+[[phase.requirement]]
+quote = "detection correct on all three platforms"
+covered_by = ["G-1-ATIME"]
+
+[[phase.requirement]]
+quote = "kill-and-resume of a checkpointed job"
+covered_by = ["G-1-JOBS"]
+
+[[phase.requirement]]
+quote = "single-writer actor"
+covered_by = ["G-1-WRITER"]
+
+[[phase.requirement]]
+quote = "dedicated PASSIVE-checkpoint connection"
+covered_by = ["G-1-CHECKPOINT"]
+
+[[phase.requirement]]
+quote = "Daemon installs on **Linux"
+covered_by = ["G-1-INSTALL-LINUX"]
+
+[[phase.requirement]]
+quote = "and macOS (LaunchAgent)"
+covered_by = ["G-1-INSTALL-MACOS"]
+
+[[phase.requirement]]
+quote = "Windows startup task defers to Phase 3 with package identity"
+rationale = "an explicit deferral: it states what Phase 1 does NOT have to do. The Windows startup task needs the package identity Phase 3 creates, and AC-59 is owned at Phase 4."
+
+[[phase.leg]]
+ac = "AC-54"
+owned_by = "8"
+quote = "the inventory test stays at Phase 8"
+
+# --- Rows 2..9: AC reconciliation only. -------------------------------------
+#
+# No requirement rows (see the note above), but the leg declarations are
+# required for every row, because the AC check runs over all of §9. Each quotes
+# the sentence in which §9 names an AC it does not own — the "exactly one gate
+# may claim a complete AC; earlier gates name the leg" rule, made checkable.
+
+[[phase]]
+gate = "2"
+
+[[phase.leg]]
+ac = "AC-3"
+owned_by = "3"
+quote = "**AC-3, AC-4 and AC-10 mock legs only**"
+
+[[phase.leg]]
+ac = "AC-4"
+owned_by = "3"
+quote = "AC-4 is deliberately absent from this list"
+
+[[phase.leg]]
+ac = "AC-10"
+owned_by = "3"
+quote = "final ownership of all three is Phase 3"
+
+[[phase]]
+gate = "4"
+
+[[phase.leg]]
+ac = "AC-37"
+owned_by = "6"
+quote = "**AC-37 governor leg only**"
+
+[[phase]]
+gate = "6"
+
+[[phase.leg]]
+ac = "AC-35"
+owned_by = "8"
+quote = "**AC-35 transport leg only**"
