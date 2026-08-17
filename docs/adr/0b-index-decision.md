@@ -367,7 +367,12 @@ not only here.
 
 ### 7.2 RAM — AC-46, and R-4 re-measured
 
-| precision | measured | B/vector | 10M projection | plan's `[U]` estimate | AC-46 4–16 GB |
+> **⚠ This table's last column is a category error — see the correction in §7.5a.** The figures are
+> **on-disk index size**, and AC-46 constrains **RAM**. §7.3 below measures the quantity AC-46 names
+> and finds it flat at ~1.95 GiB across precisions. Read this table as "how big the index gets",
+> which is a real and separate constraint, not as "does it fit AC-46".
+
+| precision | measured | B/vector | 10M projection | plan's `[U]` estimate | ~~AC-46 4–16 GB~~ *(see §7.5a)* |
 |---|---|---|---|---|---|
 | **i8** | 4.96 GiB @ 10M `[M]` | 532 | **5.33 GB** | ~6.3 GB | **inside** |
 | **f16** | 8.54 GiB @ 10M `[M]` | 916 | **9.17 GB** | ~10 GB | **inside** |
@@ -476,11 +481,51 @@ The escalation asked whether *identity* or *quality* is the criterion. The answe
 taken is that **it does not have to be settled once for everyone**: f16 ships as
 the default, and i8 and f32 are both selectable.
 
-| precision | index @10M | + name arena (0.70 GB) | **total RSS** | AC-46 4–16 GB | warm p95 | cold p95 | recall @ ef=200 |
-|---|---|---|---|---|---|---|---|
-| i8 | 5.33 GB | 6.03 | **6.03 GB** | inside | 10.25 ms | 14.21 ms | 0.778 |
-| **f16 — DEFAULT** | 9.17 GB | 9.87 | **9.87 GB** | inside | 10.69 ms | 42.48 ms | 0.988 |
-| f32 | 16.84 GB | 17.54 | **17.54 GB** | **BREACHES** | *(2M only)* | *(2M only)* | 1.000 |
+| precision | **index size @10M** | **measured RSS @10M** | + name arena | warm p95 | cold p95 | recall @ ef=200 |
+|---|---|---|---|---|---|---|
+| i8 | 5.33 GB | **1.97 GiB** | ~2.6 GiB | 10.25 ms | 14.21 ms | 0.778 |
+| **f16 — DEFAULT** | 9.17 GB | **1.95 GiB** | ~2.6 GiB | 10.69 ms | 42.48 ms | 0.988 |
+| f32 | 16.84 GB | *(not measured at 10M)* | — | *(2M only)* | *(2M only)* | 1.000 |
+
+> ### ⚠ Correction — §7.2 compared the wrong quantity against AC-46, and §7.5 inherited it
+>
+> **AC-46 is a RAM ceiling.** The spec reads *"Index RAM stays within the configured ceiling at 10M
+> files"*; the plan's §9 row reads *"Index RSS under sustained load ≤ configured ceiling (peak RSS)"*;
+> and `bench-contract.toml` defines the scored axis as *"peak VmHWM of a freshly-spawned bench
+> process"*. All three agree: **resident memory.**
+>
+> **§7.2's table compares the 10M projection of *index size* against that band** — 5.33 / 9.17 / 16.84
+> GB — and concludes f32 is "at/over the ceiling". Those are on-disk index bytes, not RSS. §7.3, two
+> paragraphs later, measures the quantity AC-46 actually names and finds something different:
+> **resident set stays flat at ~1.95 GiB while the index nearly doubles** (i8 1.97 of 4.96 GiB, f16
+> 1.95 of 8.54 GiB). §7.3 even calls that flatness *"the property the whole AC-46 ceiling argument
+> depends on"* — correctly — while §7.2's table proceeds as if index size were the constrained
+> quantity. **The two sections disagree with each other and the wrong one drove the verdict.**
+>
+> Found by `worker-gate` while encoding Phase 0b's bars as gate evidence, because a gate has to name
+> the quantity it asserts and the two documents named different ones.
+>
+> **What changes:**
+>
+> - **On AC-46's own axis, precision does not discriminate.** i8 and f16 are 1.97 vs 1.95 GiB —
+>   indistinguishable, and both sit *below* even the 4 GiB low end of the contract's assumed ceiling
+>   range. `view()` mmap is why: resident memory is navigation structures plus a bounded hot-page
+>   budget, and neither scales with vector width.
+> - **f32 is not excluded by AC-46.** Its exclusion is real but rests on **index size**, not RAM — and
+>   the guard that actually refused f32 at 10M during this spike was a **disk** guard (`25.0 GiB free,
+>   needs 15.6 + 12.0 reserve`), which was the correct instrument all along.
+> - **f32's RSS at 10M was never measured**, because the disk guard refused the run. Nothing here
+>   licenses an assumption that it would also land near 1.95 GiB; the graph is precision-independent
+>   but the hot-page budget need not be.
+>
+> **What does not change:** every measurement, the tiebreak that selected the arena, the latency
+> figures, the recall figures, and the decision that f16 is the default with all three selectable. The
+> numbers were right; the column they were compared against was wrong.
+>
+> **What Phase 5 must build is therefore a *disk*-and-index-size guard, not the projected-RSS guard
+> previously recorded here** — plus a genuine RSS assertion at 10M for whichever precision is
+> selected, since AC-46 remains unasserted at scale for f32 and is asserted only incidentally for the
+> other two.
 
 Two consequences the spike did not have to carry and Phase 5 does:
 
