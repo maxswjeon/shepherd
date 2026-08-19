@@ -1041,47 +1041,43 @@ owning_gate = "0b"
 exercises = ["shepherd-bench"]
 note = "§9: the 50 TB capacity model's explicit reject thresholds"
 evidence_missing = """
-THE BREACH IS REAL, THE REMEDY IS DEMONSTRATED, AND THE BLOCKER IS NOW A NAMED \
-ARCHITECTURE DECISION RATHER THAN MISSING EVIDENCE. This row previously read \
-`a threshold is breached and its escalation is open`. The escalation is no \
-longer the open part.
+THE PRODUCER LANDED; THE CONSUMER IS PHASE 2. This row previously said the \
+remedy was demonstrated but had no caller, and named the blocker as an \
+architecture decision nobody had made. The user made it, `target.add` is \
+served, and the position is now materially better and still not closed.
 
-E-3 SETTLED and inverted: the cause was our own client, not the provider. \
-`S3Adapter::head` never sent `x-amz-checksum-mode: ENABLED`, and S3 omits every \
-`x-amz-checksum-*` field unless the request opts in. Real S3 and MinIO both \
-return a whole-object checksum on multipart objects; there was never any \
-emulator-versus-real divergence. Fixed in 680c0fa.
+WHAT CHANGED. `Session::target_add` calls `probe_multipart_checksum` BEFORE \
+inserting the `target` row and persists the adopted algorithm with its \
+per-algorithm evidence to `config_json`. The irreversible decision is therefore \
+made, correctly, at the only moment it can be made — a checksum not requested \
+at upload cannot be retrofitted without re-uploading the object. `Err(_)` \
+refuses and writes no row, so `we could not tell` is never persisted as `it \
+supports nothing`.
 
-BOTH COST ROWS STAND, and that is the whole difficulty. No whole-object \
-checksum is $441/mo — 18x the $25 bound. Checksum requested at upload is \
-$0.68/mo — 37x under. 649x between them. `multipart_checksum` defaults to \
-`None` and CANNOT BE RETROFITTED WITHOUT RE-UPLOADING EVERY OBJECT, so $441 \
-remains correct for a default-config corpus and the axis stays breached until \
-the DEFAULT changes.
+WHY THE AXIS STILL FAILS ITS BOUND. Nothing reads `config_json` back into an \
+`S3Config` for an actual upload. The storage layer is ready — \
+`s3.rs:312`, `:354` and `:449` all consume `multipart_checksum` — but the only \
+production construction of an `S3Config` is `to_s3_config` at \
+`dispatch.rs:555`, inside `target_add`, for the probe itself. The upload path \
+is Phase 2. So an object written today still goes without a whole-object \
+checksum, and $441/mo against a $25 bound remains correct for it.
 
-WHY THE DEFAULT HAS NOT CHANGED. E-5's producer — probe at registration, adopt \
-the first of CRC64NVME, CRC32C, CRC32 that round-trips — is BUILT and proven \
-against a live endpoint: one genuinely two-part ~10 MiB upload per algorithm \
-through the real multipart path, verdict read from HEAD rather than \
-GetObjectAttributes, recording per-algorithm evidence rather than a boolean. It \
-has NO PRODUCTION CALLER, because the only place it can be called is \
-`target.add`, which is refused. Serving `target.add` requires an async runtime \
-in `shepherd-daemon`, which today contains zero `async` and zero `tokio` and \
-has no edge to `shepherd-storage`; nothing parses `TargetAddRequest::config` \
-and nothing resolves `credentials_ref`. THAT IS A PHASE 2 ARCHITECTURE \
-DECISION FOR THE USER, not an implementation gap, and wiring a probe onto a \
-half-served `target.add` would relocate this project's own defect class from \
-declared-with-no-producer to producer-with-no-consumer.
+THE SEAM IS LEFT AND TESTED so the future consumer cannot drift: \
+`S3TargetConfig::parse_stored` and `to_s3_config` round-trip through ONE struct \
+with `deny_unknown_fields`, unit-tested in both directions, specifically so \
+Phase 2 does not write a second parser that disagrees with the writer.
 
-So the honest state is: the axis fails its bound under the default \
-configuration; the fix is specified, implemented and demonstrated; and \
-adopting it is blocked on a decision nobody has made. §9's closure path — `a \
-written escalation carrying the user's recorded renegotiation decision` — is \
-still available and still unexercised. The gate can assert a decision exists, \
-is well-formed, and cites numbers that agree with its artifact. It cannot \
-assert the user made it: provenance of consent is not a property of a file, \
-and a test reading `- [x] RESOLVED` would prove only that someone typed a \
-string.
+WHAT REMAINS IS SMALL AND NAMED, which it was not before: hydrate the stored \
+config on the upload path. No decision is outstanding, no probe is missing, no \
+architecture question is open. And the cost of the delay is currently ZERO — \
+the $441 figure applies to objects uploaded WITHOUT the checksum, and no \
+objects exist yet. That will stop being true the moment the first real upload \
+happens, which is the deadline this row is really tracking.
+
+§9's closure path — `a written escalation carrying the user's recorded \
+renegotiation decision` — remains available and remains unexercised, and is now \
+the LESS attractive option: the axis is on track to pass by measurement rather \
+than by renegotiation.
 """
 
 [[guard]]
