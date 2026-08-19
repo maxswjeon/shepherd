@@ -428,15 +428,27 @@ mod remount_tests {
         }
 
         fn attach(&self) -> String {
-            let out = sudo("/usr/sbin/losetup", &["--find", "--show", &self.img.to_string_lossy()]);
+            let out = sudo(
+                "/usr/sbin/losetup",
+                &["--find", "--show", &self.img.to_string_lossy()],
+            );
             let dev = out.trim().to_string();
-            assert!(dev.starts_with("/dev/loop"), "unexpected losetup output {out:?}");
+            assert!(
+                dev.starts_with("/dev/loop"),
+                "unexpected losetup output {out:?}"
+            );
             // udev needs a moment to publish /dev/disk/by-uuid, which
             // `volume_id` resolves the source through.
             for _ in 0..50 {
-                if std::path::Path::new("/dev/disk/by-uuid").read_dir().into_iter().flatten().flatten().any(|e| {
-                    std::fs::canonicalize(e.path()).ok() == std::fs::canonicalize(&dev).ok()
-                }) {
+                if std::path::Path::new("/dev/disk/by-uuid")
+                    .read_dir()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|e| {
+                        std::fs::canonicalize(e.path()).ok() == std::fs::canonicalize(&dev).ok()
+                    })
+                {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -447,7 +459,11 @@ mod remount_tests {
         fn mount(&self, name: &str) -> PathBuf {
             let mp = self.dir.join(name);
             std::fs::create_dir_all(&mp).expect("create mount point");
-            let dev = self.loop_dev.borrow().clone().expect("a loop device is attached");
+            let dev = self
+                .loop_dev
+                .borrow()
+                .clone()
+                .expect("a loop device is attached");
             sudo("/usr/bin/mount", &[&dev, &mp.to_string_lossy()]);
             // The test writes as an unprivileged user into a filesystem whose
             // root is owned by root.
