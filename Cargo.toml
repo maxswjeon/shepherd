@@ -182,6 +182,26 @@ memchr = "2"
 # path: OQ-J's residual must be EXERCISED, not assumed away, and a held mmap is
 # the case `rename()` cannot invalidate. Never ships.
 memmap2 = "0.9"
+
+# DEV-ONLY, `shepherd-catalog`. §9 asks for the §4.9 identity rules to hold
+# under a `case/normalization fuzz corpus`, and a corpus is not a longer list of
+# examples: the defect it exists to find is a COMPOSITION nobody thought to
+# write down. Every §4.9 rule was previously proven by one hand-chosen pair each
+# — one NFC/NFD spelling of `café`, one `Dir/Report.TXT` — so no input had ever
+# been tried that the author of the assertion had not also chosen. Generated
+# inputs are the only way to break that circle.
+#
+# `proptest` over `quickcheck` for one reason that matters here: shrinking on
+# Unicode. A failure found at a 40-codepoint string with four combining marks is
+# useless as a bug report until it is reduced to the two codepoints that
+# actually disagree, and proptest shrinks `String` and `Vec<char>` structurally
+# where quickcheck largely does not. Its `prop_oneof!` also lets uniform
+# `any::<String>()` sampling be mixed with dense sampling of the families that
+# are known to be hazardous (dotted/dotless i, Kelvin sign, final sigma,
+# Hangul), which uniform sampling alone would essentially never generate.
+#
+# Never ships: `[dev-dependencies]` only.
+proptest = "1.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 

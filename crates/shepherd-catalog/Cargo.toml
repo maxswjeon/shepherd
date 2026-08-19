@@ -18,3 +18,16 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+# §9's `case/normalization fuzz corpus` for §4.9 identity. See the justification
+# in the root manifest: the examples in `identity.rs` were each chosen by the
+# same hand that wrote the assertion they satisfy, so only generated input can
+# find the composition nobody enumerated.
+proptest = { workspace = true }
+
+# §4.12 macOS atime fidelity: `statfs(2)`'s `f_flags` carries `MNT_NOATIME`, and
+# neither the syscall nor the flag is in std. Scoped to macOS because the Linux
+# side reads `/proc/self/mountinfo` and needs no FFI at all.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
