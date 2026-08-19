@@ -222,7 +222,22 @@ impl Drop for Corpus {
 /// nothing about walking or matching. See [`tier_plan_for`] for the planning
 /// step itself.
 fn select_candidates(corpus: &Corpus, now: Timestamp) -> Vec<FileStat> {
-    let ignores = IgnoreSet::new(&corpus.dir, &["*.tmp".to_string()]).unwrap();
+    select_candidates_ignoring(corpus, now, &["*.tmp".to_string()])
+}
+
+/// The same selection, with the user ignore patterns supplied by the caller.
+///
+/// Split out for AC-9's tier leg. The `*.tmp` list the default passes has never
+/// been load-bearing — this corpus contains no `.tmp` file, so that pattern
+/// excludes nothing and the whole selection would behave identically with an
+/// empty set. See `a_user_ignore_pattern_excludes_a_file_the_rule_would_tier`,
+/// which supplies a pattern that actually hits.
+fn select_candidates_ignoring(
+    corpus: &Corpus,
+    now: Timestamp,
+    patterns: &[String],
+) -> Vec<FileStat> {
+    let ignores = IgnoreSet::new(&corpus.dir, patterns).unwrap();
     let out = walk(
         RootId::new(1),
         &corpus.dir,
@@ -293,7 +308,13 @@ fn select_candidates(corpus: &Corpus, now: Timestamp) -> Vec<FileStat> {
 /// §4.9 mistake (path-derived keys) reproduced inside the test that exists to
 /// catch it.
 fn tier_plan_for(corpus: &Corpus, now: Timestamp, prefix: &str) -> TierPlan {
-    let selected: Vec<SelectedFile> = select_candidates(corpus, now)
+    plan_over(corpus, now, prefix, &["*.tmp".to_string()])
+}
+
+/// The same planning step over a caller-supplied ignore list. See
+/// [`select_candidates_ignoring`].
+fn plan_over(corpus: &Corpus, now: Timestamp, prefix: &str, patterns: &[String]) -> TierPlan {
+    let selected: Vec<SelectedFile> = select_candidates_ignoring(corpus, now, patterns)
         .into_iter()
         .enumerate()
         .map(|(i, f)| {
@@ -666,6 +687,79 @@ fn the_dry_run_selects_exactly_one_candidate_out_of_five() {
     assert!(
         !k.contains("shoot") && !k.contains("Photos"),
         "no part of the local path may appear in the key: {k}"
+    );
+}
+
+/// **AC-9's tier leg**: a user ignore pattern removes a file the tiering rule
+/// would otherwise have selected.
+///
+/// AC-9 reads "ignore patterns are honored on both scan and tier". The scan
+/// leg is cited to `shepherd-scan`'s walker; this is the other one, and it was
+/// missing. `shepherd-tier` has no `IgnoreSet` of its own — it honours ignores
+/// by consuming what the walk produced — so the only way to prove the tier leg
+/// is to show a file disappearing from a **tier plan**, not from a walk.
+///
+/// Both directions are asserted on the same file, which is the point. An
+/// "excluded.raw is not in the plan" assertion on its own passes just as
+/// happily when the rule never matched it, when the size floor rejected it, or
+/// when the walk crashed — so the first half proves the file IS a candidate
+/// with no pattern in force, and only then does the second half attribute its
+/// disappearance to the pattern.
+#[test]
+fn a_user_ignore_pattern_excludes_a_file_the_rule_would_tier() {
+    let corpus = Corpus::new("ac9-tier");
+    let now = Timestamp::from_nanos(1_000_000_000_000);
+
+    // A second file that satisfies every positive condition `select_candidates`
+    // applies: `.raw`, directly under `Photos/<year>/`, and over the 1 MiB
+    // floor. Nothing but an ignore pattern can remove it.
+    std::fs::write(
+        corpus.dir.join("Photos/2024/scratch.raw"),
+        body(2 * 1024 * 1024, 11),
+    )
+    .unwrap();
+
+    // 1. With no user patterns, the rule genuinely selects it.
+    let without = select_candidates_ignoring(&corpus, now, &[]);
+    let paths = |v: &[FileStat]| v.iter().map(|f| f.rel_path.clone()).collect::<Vec<_>>();
+    assert!(
+        paths(&without).contains(&"Photos/2024/scratch.raw".to_string()),
+        "the fixture is wrong if the rule does not pick this file up: {:?}",
+        paths(&without)
+    );
+    assert!(
+        paths(&without).contains(&"Photos/2024/shoot.raw".to_string()),
+        "{:?}",
+        paths(&without)
+    );
+
+    // 2. With the user's pattern, it is gone — and the sibling is not.
+    let with = select_candidates_ignoring(&corpus, now, &["scratch.raw".to_string()]);
+    assert!(
+        !paths(&with).contains(&"Photos/2024/scratch.raw".to_string()),
+        "the user's ignore pattern did not reach tier selection: {:?}",
+        paths(&with)
+    );
+    assert!(
+        paths(&with).contains(&"Photos/2024/shoot.raw".to_string()),
+        "the pattern excluded more than it named — a rule that matched nothing \
+         would pass the assertion above: {:?}",
+        paths(&with)
+    );
+
+    // 3. And it is absent from the real plan, not merely from the selection.
+    // `plan_tier` is what turns selections into work items; a file excluded by
+    // the selection but re-admitted by the planner would still be uploaded.
+    let ignored_plan = plan_over(&corpus, now, "ac9-with", &["scratch.raw".to_string()]);
+    assert_eq!(ignored_plan.items.len(), 1, "{:?}", ignored_plan.items);
+    let open_plan = plan_over(&corpus, now, "ac9-without", &[]);
+    assert_eq!(
+        open_plan.items.len(),
+        2,
+        "the paired non-zero: with no pattern the planner must produce TWO items, \
+         or the assertion above is satisfied by a planner that produces one \
+         regardless: {:?}",
+        open_plan.items
     );
 }
 

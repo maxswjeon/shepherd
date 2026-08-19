@@ -138,6 +138,22 @@ impl Client {
         serde_json::from_str(&buf).unwrap_or_else(|e| panic!("not JSON: {e}\n{buf}"))
     }
 
+    /// Widen the socket read timeout for a corpus that is not nine files.
+    ///
+    /// The twenty seconds in `connect_as` is sized for a daemon holding a
+    /// handful of rows. At M1 scale a single `search` can ask the dispatcher to
+    /// hydrate tens of thousands of rows and serialise several megabytes of
+    /// JSON before the first byte comes back, and the response is built whole
+    /// rather than streamed — so the client's first `read` waits out the entire
+    /// server-side cost. A timeout tuned to the small tests turns that into
+    /// "the daemon closed the connection", which is a false red about a daemon
+    /// that was working. This does not relax any deadline that means anything:
+    /// scan progress is still bounded by `SCAN_STALL_BUDGET`.
+    fn set_read_timeout(&mut self, t: Duration) {
+        self.writer.set_read_timeout(Some(t)).unwrap();
+        self.reader.get_ref().set_read_timeout(Some(t)).unwrap();
+    }
+
     /// Call and require success.
     fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let frame = self.raw(method, params);
@@ -505,24 +521,37 @@ fn every_registry_method_is_probed_and_exactly_the_recorded_ones_are_refused() {
     /// asserted separately below.
     ///
     /// **`target.add` carries an ordering constraint, and this is the only place
-    /// anyone is forced to read it.** `S3Config::multipart_checksum` defaults to
-    /// `None` and **nothing outside a test ever sets it** — so today every S3
-    /// upload requests no whole-object checksum, and `s3.rs`'s own doc says the
-    /// value must be probed *at registration* because a checksum not requested
-    /// at upload **cannot be retrofitted without re-uploading the object**.
+    /// anyone is forced to read it.** `S3Config::multipart_checksum` decides
+    /// whether an S3 upload requests a **whole-object** checksum, and `s3.rs`'s
+    /// own doc says the value must be probed *at registration* because a
+    /// checksum not requested at upload **cannot be retrofitted without
+    /// re-uploading the object**. Serving `target.add` without probing would
+    /// permanently fix every object written through that target into the
+    /// no-checksum configuration — measured at ADR 0b §3 as **$441/month
+    /// against $0.68** on a 50 TB corpus, 649x, per object, irreversible.
     ///
-    /// That is harmless only because `target.add` is refused: with no way to
-    /// register a target there are no objects to strand. **Serving `target.add`
-    /// before a producer for `multipart_checksum` exists would permanently fix
-    /// every object written through it into the no-checksum configuration** —
-    /// measured at ADR 0b §3 as **$441/month against $0.68** on a 50 TB corpus,
-    /// per object, irreversible.
+    /// That has been harmless only because `target.add` is refused: with no way
+    /// to register a target there are no objects to strand.
     ///
-    /// So: whoever deletes `"target.add"` from this list owes a probe first.
-    /// The design is settled and recorded in open-questions E-5 — probe at
-    /// registration, adopt the first of CRC64NVME → CRC32C → CRC32 that
-    /// round-trips, and record the outcome **with the evidence** rather than as
-    /// a boolean, because a false negative here is silent and permanent.
+    /// **The producer now exists** — `shepherd_storage::s3::probe_multipart_checksum`
+    /// (E-5's settled design: probe at registration, adopt the first of
+    /// CRC64NVME → CRC32C → CRC32 that round-trips, record the outcome **with
+    /// its evidence** rather than as a boolean). So the constraint is no longer
+    /// "a probe must be written" but "the probe must be CALLED":
+    ///
+    /// > Whoever deletes `"target.add"` from this list owes a call to
+    /// > `probe_multipart_checksum` on the registration path, and must persist
+    /// > its `ChecksumProbe` — including the per-algorithm reasons behind a
+    /// > negative. `Ok(adopted: None)` is a legitimate provider answer;
+    /// > `Err(_)` means the provider was never reached and must fail the
+    /// > registration rather than be stored as "supports nothing", because a
+    /// > false negative there is silent, permanent and indistinguishable from a
+    /// > real measurement.
+    ///
+    /// Serving it also needs a Phase-2 registration path that does not exist:
+    /// `shepherd-daemon` has no `tokio` runtime and no `shepherd-storage` edge,
+    /// and nothing parses `TargetAddRequest::config` or resolves
+    /// `credentials_ref`. That is why this row still stands.
     const UNSERVED: &[&str] = &[
         "restore",
         "rule.list",
@@ -606,13 +635,15 @@ fn every_registry_method_is_probed_and_exactly_the_recorded_ones_are_refused() {
          \n  recorded:    {:?}\nIf a method started being served, delete it from UNSERVED — that \
          is the good direction. If one stopped, something unwired it from the daemon and no \
          per-AC test would have noticed.\n\
-         \nIF THE CHANGE IS `target.add`, READ THIS FIRST: serving it requires a producer for \
-         `S3Config::multipart_checksum`, which today is `None` everywhere outside a test. A \
-         checksum not requested at upload cannot be retrofitted without re-uploading, so every \
-         object written through an unprobed target is permanently in the no-checksum \
-         configuration — $441/month against $0.68 on 50 TB (ADR 0b §3). Probe at registration, \
-         adopt the first of CRC64NVME -> CRC32C -> CRC32 that round-trips, and record the outcome \
-         with its evidence rather than as a boolean. See open-questions E-5.",
+         \nIF THE CHANGE IS `target.add`, READ THIS FIRST: serving it requires the registration \
+         path to CALL `shepherd_storage::s3::probe_multipart_checksum` and persist the \
+         `ChecksumProbe` it returns. A checksum not requested at upload cannot be retrofitted \
+         without re-uploading, so every object written through an unprobed target is permanently \
+         in the no-checksum configuration — $441/month against $0.68 on 50 TB, 649x (ADR 0b §3). \
+         The probe adopts the first of CRC64NVME -> CRC32C -> CRC32 that round-trips and records \
+         per-algorithm evidence rather than a boolean. `Ok(adopted: None)` is a real provider \
+         answer and is safe; `Err(_)` means the provider was never reached and MUST fail the \
+         registration, never be stored as `unsupported`. See open-questions E-5.",
         refused, recorded
     );
     assert!(
@@ -1154,33 +1185,149 @@ fn shepctl_drives_a_real_daemon_end_to_end() {
 /// The gate exercises this on a VM with lingering disabled, where the daemon
 /// legitimately never starts. What is proven here is the half that does not
 /// need a special VM: with nothing listening, the checks still run and still
-/// report lingering.
+/// report lingering — and, per AC-61, the message names the three things a
+/// user needs in order to act: the socket path actually tried, the service
+/// registration state (naming the real unit-file location, not a hardcoded
+/// word), and the exact command to start the daemon — plus a stable, specific
+/// exit code.
+///
+/// `HOME` and `XDG_CONFIG_HOME` are pinned to an empty directory under `dir`
+/// so the registration state is deterministic regardless of whatever is
+/// actually installed on the machine running this test — otherwise a dev box
+/// with a real `shepherd.service` would flip both the text and the
+/// remediation command and this test would go flaky.
 #[test]
 fn shepherdd_doctor_works_with_no_daemon_running() {
     let dir = std::env::temp_dir().join(format!("shepherdd-e2e-offline-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let home = dir.join("home");
+    let config = home.join(".config");
+    std::fs::create_dir_all(&config).unwrap();
+    let socket = dir.join("nothing.sock");
+    // The exact path `shepherd-daemon::service::systemd::unit_path()` would
+    // resolve given `XDG_CONFIG_HOME=config` — computed independently here
+    // from the documented env-var contract, not by calling that function,
+    // so this assertion cannot pass by tautology.
+    let unit_path = config.join("systemd/user/shepherd.service");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_shepherdd"))
-        .arg("doctor")
-        .env("SHEPHERD_STATE_DIR", &dir)
-        .env("SHEPHERD_SOCKET", dir.join("nothing.sock"))
-        .output()
-        .expect("run shepherdd doctor");
+    let run_doctor = || {
+        Command::new(env!("CARGO_BIN_EXE_shepherdd"))
+            .arg("doctor")
+            .env("SHEPHERD_STATE_DIR", &dir)
+            .env("SHEPHERD_SOCKET", &socket)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .output()
+            .expect("run shepherdd doctor")
+    };
+
+    let out = run_doctor();
     let text = String::from_utf8_lossy(&out.stdout);
 
     assert!(
         text.contains("systemd lingering"),
         "the lingering check must run without a daemon: {text}"
     );
+
+    // AC-61, 1 of 3: the socket path actually tried — not just the word
+    // "daemon", which is the substring trap the AC calls out by name.
     assert!(
-        text.contains("daemon"),
-        "it must report that no daemon is listening: {text}"
+        text.contains(socket.to_str().unwrap()),
+        "the message must name the exact socket path it tried: {text}"
+    );
+    // AC-61, 2 of 3: the registration state, naming the real unit-file
+    // location this process would use.
+    // `shepherdd_doctor_reports_the_daemon_as_registered_when_a_unit_file_exists`
+    // proves this same line flips to "registered" once that file exists,
+    // which is what makes this a load-bearing check rather than fixed text.
+    assert!(
+        text.contains(unit_path.to_str().unwrap()) && text.contains("not registered"),
+        "the message must name the real unit path and say it is unregistered: {text}"
+    );
+    // AC-61, 3 of 3: a start command a user could paste.
+    assert!(
+        text.contains("shepherdd run"),
+        "an unregistered daemon's remediation must be the foreground command: {text}"
+    );
+
+    // AC-61's "stable exit code": one observation of `success()` proves
+    // nothing about stability, and would still pass if the code silently
+    // changed from 0 to some other success-ish value. Two identical
+    // invocations must return the same, specific code, and that code must
+    // differ from a genuine failure's — otherwise the code carries no
+    // information about which case the user is in.
+    let code = out.status.code();
+    assert_eq!(
+        code,
+        Some(0),
+        "daemon-down is a warning, not a failure: {text}"
+    );
+    assert_eq!(
+        code,
+        run_doctor().status.code(),
+        "the exit code must be stable across invocations of the same condition"
+    );
+
+    let failure = Command::new(env!("CARGO_BIN_EXE_shepherdd"))
+        .arg("doctor")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .output()
+        .expect("run shepherdd doctor with no environment");
+    assert_eq!(
+        failure.status.code(),
+        Some(1),
+        "an actual failure (no state directory can be resolved) must exit differently \
+         from daemon-down: {}",
+        String::from_utf8_lossy(&failure.stdout)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The registration line in `shepherdd doctor`'s daemon-down message is
+/// load-bearing: it names whichever service unit actually exists on disk,
+/// not a fixed string that would say "not registered" even with a unit file
+/// sitting right there. Linux-only because it targets the systemd unit path;
+/// `shepherdd_doctor_works_with_no_daemon_running` covers the unregistered
+/// case, which is portable.
+///
+/// The expected path is built by hand from the same env-var contract the
+/// unregistered test uses, not by calling `service::systemd::unit_path()` —
+/// asserting against the output of the function under test would make this
+/// pass even if that function's own path computation were wrong.
+#[cfg(target_os = "linux")]
+#[test]
+fn shepherdd_doctor_reports_the_daemon_as_registered_when_a_unit_file_exists() {
+    let dir = std::env::temp_dir().join(format!("shepherdd-e2e-registered-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let home = dir.join("home");
+    let config = home.join(".config");
+    let unit_dir = config.join("systemd/user");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    let unit_path = unit_dir.join("shepherd.service");
+    std::fs::write(&unit_path, "[Unit]\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_shepherdd"))
+        .arg("doctor")
+        .env("SHEPHERD_STATE_DIR", &dir)
+        .env("SHEPHERD_SOCKET", dir.join("nothing.sock"))
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .expect("run shepherdd doctor");
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        text.contains(unit_path.to_str().unwrap()) && text.contains("registered:"),
+        "a unit file on disk must flip the check to registered, naming its real path: {text}"
     );
     assert!(
-        out.status.success(),
-        "no daemon running is a warning, not a failure: {text}"
+        text.contains("systemctl --user start shepherd"),
+        "a registered service must be started through systemctl, not `shepherdd run`: {text}"
     );
+
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1589,6 +1736,20 @@ fn wait_for_scan_with_progress(c: &mut Client, root_id: i64, stall: Duration) ->
     }
 }
 
+/// The page size a count assertion must ask for to be allowed to fail.
+///
+/// **A literal `limit` is a scale bug, not a style choice.** For an unfiltered
+/// query the dispatcher hands the index `offset + limit` candidates and counts
+/// what comes back, so `total` is *capped by the page size*: a class with
+/// 18,000 members queried with `limit: 8192` answers `8192`, and an assertion
+/// comparing that to 8192 would pass while the index returned less than half
+/// the corpus. Every count assertion therefore derives its page from the number
+/// the manifest says to expect, so the same line means the same thing at ten
+/// thousand files and at ten million.
+fn headroom(expect: u64) -> u64 {
+    (expect * 2).max(64) + 64
+}
+
 /// One search, with the page large enough that `total` is exact.
 ///
 /// `total` is capped at `offset + limit` by the dispatcher, so asking for fewer
@@ -1598,7 +1759,7 @@ fn wait_for_scan_with_progress(c: &mut Client, root_id: i64, stall: Duration) ->
 /// and additionally requires `degraded` to be null, which is the dispatcher's
 /// own statement that the number is a total rather than a floor.
 fn count_exact(c: &mut Client, query: &str, expect: u64) {
-    let limit = (expect * 2).max(64) + 64;
+    let limit = headroom(expect);
     let r = c.call(
         "search",
         serde_json::json!({"query": query, "limit": limit}),
@@ -1666,6 +1827,7 @@ fn the_m1_demo_holds_at_a_million_files() {
     let d = Daemon::start("million");
     let pid = d.child.id();
     let mut c = d.connect();
+    c.set_read_timeout(Duration::from_secs(120));
 
     // --- the empty-catalog control, before the root exists ---------------
     //
@@ -1809,7 +1971,10 @@ fn the_m1_demo_holds_at_a_million_files() {
     let upper = corpus.n("case_upper_files");
     assert!(lower > 0 && upper > 0 && lower != upper);
     for q in ["zzcasemix", "ZZCASEMIX", "ZzCaseMix"] {
-        let r = c.call("search", serde_json::json!({"query": q, "limit": 8192}));
+        let r = c.call(
+            "search",
+            serde_json::json!({"query": q, "limit": headroom(lower + upper)}),
+        );
         assert_eq!(
             r["total"],
             serde_json::json!(lower + upper),
@@ -1827,7 +1992,7 @@ fn the_m1_demo_holds_at_a_million_files() {
         .expect("the manifest must carry an extension needle");
     let filtered = c.call(
         "search",
-        serde_json::json!({"query": ".zzx", "filters": {"ext": ["zzx"]}, "limit": 8192}),
+        serde_json::json!({"query": ".zzx", "filters": {"ext": ["zzx"]}, "limit": headroom(ext.1)}),
     );
     assert_eq!(
         filtered["total"],
@@ -1837,7 +2002,7 @@ fn the_m1_demo_holds_at_a_million_files() {
     );
     let wrong_ext = c.call(
         "search",
-        serde_json::json!({"query": ".zzx", "filters": {"ext": ["pdf"]}, "limit": 8192}),
+        serde_json::json!({"query": ".zzx", "filters": {"ext": ["pdf"]}, "limit": headroom(ext.1)}),
     );
     assert_eq!(
         wrong_ext["total"],
@@ -1847,12 +2012,12 @@ fn the_m1_demo_holds_at_a_million_files() {
     // The `state` filter, and an honest account of what this pair can and
     // cannot show.
     //
-    // `remote -> 0` on its own is a check that CANNOT FAIL. `file.state` is
-    // written by nothing in the tree — `upsert_file`'s INSERT names twelve
-    // columns and `state` is not among them, and neither `UPDATE file`
-    // statement touches it — so every row holds the schema default `'local'`
-    // and this query would answer 0 with the filter entirely broken. It was
-    // written as if it proved the filter worked; it did not.
+    // `remote -> 0` on its own is a check that CANNOT FAIL. Every row in this
+    // catalog holds `'local'`: `upsert_file` writes exactly that on insert and
+    // deliberately leaves the column alone on re-scan, and **no code path in
+    // the tree ever writes `'stub'` or `'remote'`**, because tiering is Phase
+    // 2/3 work. So this query would answer 0 with the filter entirely broken.
+    // It was written as if it proved the filter worked; it did not.
     //
     // Pairing it with `local -> everything` is what makes the two together
     // discriminating:
@@ -1865,13 +2030,16 @@ fn the_m1_demo_holds_at_a_million_files() {
     // rows, because the catalog contains exactly one distinct value. That is
     // not a gap in the test — it is a property of the catalog, and it is the
     // second witness to it: `state` having no producer is also why
-    // `count_custody_rows`'s `WHERE state IN ('stub','remote')` returns 0 by
-    // construction, which is a safety refusal that cannot fire. Whoever makes
+    // `count_custody_rows`'s `WHERE state IN ('stub','remote')` returns 0 here,
+    // which is a safety refusal this corpus cannot make fire. That the refusal
+    // is *able* to fire is established away from the corpus, in
+    // `dispatch::tests::the_custody_count_is_zero_before_tiering_and_non_zero_after`,
+    // which drives the same function to a non-zero answer. Whoever makes
     // tiering real must write `state`, and when they do, this assertion starts
     // discriminating on data instead of on plumbing.
     let by_state = c.call(
         "search",
-        serde_json::json!({"query": ".zzx", "filters": {"state": "local"}, "limit": 8192}),
+        serde_json::json!({"query": ".zzx", "filters": {"state": "local"}, "limit": headroom(ext.1)}),
     );
     assert_eq!(
         by_state["total"],
@@ -1881,7 +2049,7 @@ fn the_m1_demo_holds_at_a_million_files() {
     );
     let by_state = c.call(
         "search",
-        serde_json::json!({"query": ".zzx", "filters": {"state": "remote"}, "limit": 8192}),
+        serde_json::json!({"query": ".zzx", "filters": {"state": "remote"}, "limit": headroom(ext.1)}),
     );
     assert_eq!(
         by_state["total"],
@@ -2053,4 +2221,248 @@ fn the_m1_demo_holds_at_a_million_files() {
             .unwrap_or_else(|e| panic!("writing the report to {out:?}: {e}"));
         eprintln!("[m1] evidence written to {out:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// AC-9 (`**User**` ignore patterns) and the `hosted_optin` consent flag —
+// the two fields `root.add` accepted and then dropped.
+// ---------------------------------------------------------------------------
+
+/// **AC-9's scan leg, end to end from a client's request.**
+///
+/// `shepherd-scan`'s own tests prove the matcher honours the patterns it is
+/// handed, and they always did. What no test covered — because until proto 1.2
+/// it could not be written — is that a pattern a *user* supplies reaches that
+/// matcher: `scan_root.ignore_patterns_json` was read by `scan_exec` and
+/// written by nothing, so every scan that had ever run used `'[]'`.
+///
+/// **Both directions on the same file, deliberately.** A test asserting only
+/// that `secrets/` is absent from the catalog passes just as well when the scan
+/// found nothing at all, when the walk crashed, or when the root was empty —
+/// which is this project's recurring defect in its purest form. So the same
+/// daemon scans the same tree twice: once with no patterns, where every file
+/// must be present, and once with them, where exactly the named ones must be
+/// gone and the rest must remain.
+#[test]
+fn a_user_supplied_ignore_pattern_reaches_the_scan_and_excludes_only_what_it_names() {
+    let d = Daemon::start("ac9-ignore");
+    let mut c = d.connect();
+
+    let layout = |root: &Path| {
+        write_file(root, "keep/report.txt", "aaaa");
+        write_file(root, "build/artifact.o", "bb");
+        write_file(root, "notes.tmp", "c");
+        write_file(root, "notes.md", "dd");
+    };
+
+    // 1. No patterns: all four files land. This is the control, and it is what
+    //    makes the exclusions below attributable.
+    let open = d.dir.join("corpus-ac9-open");
+    layout(&open);
+    let open_id = c.call(
+        "root.add",
+        serde_json::json!({"path": open.to_str().unwrap(), "stub_mode": "delete"}),
+    )["root"]["root_id"]
+        .as_i64()
+        .unwrap();
+    c.call("scan.start", serde_json::json!({"root_id": open_id}));
+    let open_scan = wait_for_scan(&mut c, open_id);
+    assert_eq!(
+        open_scan["files_seen"],
+        serde_json::json!(4),
+        "the control must see every file, or the comparison below proves nothing: {open_scan}"
+    );
+
+    // 2. The same tree, with the user's patterns.
+    let filtered = d.dir.join("corpus-ac9-filtered");
+    layout(&filtered);
+    let added = c.call(
+        "root.add",
+        serde_json::json!({
+            "path": filtered.to_str().unwrap(),
+            "stub_mode": "delete",
+            "ignore_patterns": ["build/", "*.tmp"],
+        }),
+    );
+    let filtered_id = added["root"]["root_id"].as_i64().unwrap();
+
+    // The daemon STORED them. Echoed from the catalog by `root.list`, not from
+    // the request — the additive rule means a daemon that ignored the field
+    // would answer this request identically otherwise.
+    assert_eq!(
+        added["root"]["ignore_patterns"],
+        serde_json::json!(["build/", "*.tmp"]),
+        "root.add must echo the patterns it stored: {added}"
+    );
+
+    c.call("scan.start", serde_json::json!({"root_id": filtered_id}));
+    let scan = wait_for_scan(&mut c, filtered_id);
+    assert!(scan["last_error"].is_null(), "{scan}");
+    assert_eq!(
+        scan["files_seen"],
+        serde_json::json!(2),
+        "`build/` and `*.tmp` must exclude exactly two of the four files: {scan}"
+    );
+
+    // And it is the RIGHT two, by name. A count alone is satisfied by any
+    // pattern that happens to exclude two files.
+    let mut hits = |needle: &str| -> Vec<String> {
+        let r = c.call(
+            "search",
+            serde_json::json!({"query": needle, "filters": {"root_id": filtered_id}}),
+        );
+        r["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["path"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    assert!(
+        hits("artifact").is_empty(),
+        "`build/` did not exclude the directory: {:?}",
+        hits("artifact")
+    );
+    assert!(
+        hits("notes.tmp").is_empty(),
+        "`*.tmp` did not exclude the file: {:?}",
+        hits("notes.tmp")
+    );
+    // The paired non-zero on the same mechanism: a search that returned nothing
+    // for everything would satisfy both assertions above.
+    assert_eq!(hits("report").len(), 1, "{:?}", hits("report"));
+    assert_eq!(hits("notes.md").len(), 1, "{:?}", hits("notes.md"));
+}
+
+/// An ignore pattern that cannot compile is refused at registration, and the
+/// root is not created.
+///
+/// The backstop in `scan_exec` fails the scan *job*, which is correct but
+/// arrives detached from the request that caused it — by then the root exists
+/// and the user has a registration that can never scan.
+#[test]
+fn an_uncompilable_ignore_pattern_is_refused_and_registers_nothing() {
+    let d = Daemon::start("ac9-badpattern");
+    let mut c = d.connect();
+    let root_dir = d.dir.join("corpus-ac9-bad");
+    write_file(&root_dir, "a.txt", "a");
+
+    let before = c.call("root.list", serde_json::json!({}))["roots"]
+        .as_array()
+        .unwrap()
+        .len();
+
+    // An inverted character range. Chosen by probing `GitignoreBuilder` rather
+    // than assumed: the obvious candidates (`a[b`, `***`, `a/**b`) are all
+    // ACCEPTED by the `ignore` crate, so a test built on one of those would
+    // have asserted a refusal that never happens.
+    let err = c.call_err(
+        "root.add",
+        serde_json::json!({
+            "path": root_dir.to_str().unwrap(),
+            "stub_mode": "delete",
+            "ignore_patterns": ["[z-a]"],
+        }),
+    );
+    assert_eq!(
+        err.kind(),
+        Some(shepherd_proto::ErrorCode::Invalid),
+        "{err:?}"
+    );
+    assert!(
+        err.message.contains("ignore pattern"),
+        "the refusal must name what was wrong: {}",
+        err.message
+    );
+
+    assert_eq!(
+        c.call("root.list", serde_json::json!({}))["roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        before,
+        "a refused root.add must not have registered the root"
+    );
+
+    // Paired: the same path with a VALID pattern registers, so the refusal
+    // above is attributable to the pattern and not to the path or the daemon.
+    let ok = c.call(
+        "root.add",
+        serde_json::json!({
+            "path": root_dir.to_str().unwrap(),
+            "stub_mode": "delete",
+            "ignore_patterns": ["[a-z]*.txt"],
+        }),
+    );
+    assert_eq!(
+        ok["root"]["ignore_patterns"],
+        serde_json::json!(["[a-z]*.txt"])
+    );
+}
+
+/// **`hosted_optin` is a consent flag, and the daemon was discarding it.**
+///
+/// `RootAddRequest` carried it, `roundtrip.rs` proves `shepctl` puts it on the
+/// wire, `RootSummary` reported it and `scan_root.hosted_optin` stored it — and
+/// `root_add` never passed it to `insert_root`, so the column kept its
+/// `DEFAULT 0` and every root read back as "no consent given".
+///
+/// The failure direction is why this went unnoticed: defaulting a consent flag
+/// to *denied* is the safe way to be wrong, and nothing downstream complains
+/// about consent it never received. It is still a user's explicit instruction
+/// being silently discarded, which is the direction that matters for a flag
+/// whose whole purpose is to record that the user was asked.
+///
+/// **`true` is the load-bearing case.** A test asserting only the `false`
+/// default passes unchanged against the broken code, because the broken code
+/// produced `false` for everyone.
+#[test]
+fn hosted_optin_is_stored_as_the_user_set_it_rather_than_defaulted() {
+    let d = Daemon::start("hosted-optin");
+    let mut c = d.connect();
+
+    let consented = d.dir.join("corpus-consent-yes");
+    let withheld = d.dir.join("corpus-consent-no");
+    write_file(&consented, "a.txt", "a");
+    write_file(&withheld, "b.txt", "b");
+
+    let yes = c.call(
+        "root.add",
+        serde_json::json!({
+            "path": consented.to_str().unwrap(),
+            "stub_mode": "delete",
+            "hosted_optin": true,
+        }),
+    );
+    assert_eq!(
+        yes["root"]["hosted_optin"],
+        serde_json::json!(true),
+        "the consent the user gave must survive registration: {yes}"
+    );
+
+    let no = c.call(
+        "root.add",
+        serde_json::json!({"path": withheld.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    assert_eq!(
+        no["root"]["hosted_optin"],
+        serde_json::json!(false),
+        "and consent nobody gave must not appear: {no}"
+    );
+
+    // Durable, not just echoed back out of the request that set it. `root.list`
+    // reads the column; `root.add`'s own result does too, but a handler that
+    // reflected the request would pass that one either way.
+    let listed = c.call("root.list", serde_json::json!({}));
+    let by_path = |p: &Path| -> bool {
+        listed["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["path"] == serde_json::json!(p.to_str().unwrap()))
+            .unwrap_or_else(|| panic!("{p:?} is not listed: {listed}"))["hosted_optin"]
+            == serde_json::json!(true)
+    };
+    assert!(by_path(&consented), "{listed}");
+    assert!(!by_path(&withheld), "{listed}");
 }

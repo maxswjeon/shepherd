@@ -132,6 +132,8 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
                 PathNormPolicy::Preserve,
                 AtimeMode::Relatime,
                 Some("uuid:ac6"),
+                false,
+                &[],
                 now,
             )
             .unwrap();
@@ -265,6 +267,8 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
                 PathNormPolicy::Preserve,
                 AtimeMode::Relatime,
                 Some("uuid:ac6"),
+                false,
+                &[],
                 now,
             )
             .unwrap();
