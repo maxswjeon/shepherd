@@ -157,6 +157,23 @@ impl CatalogActor {
     /// in-memory catalog needs — a second connection to `:memory:` would open a
     /// *different, empty* database, so checkpointing it would be theatre.
     pub fn start(catalog: Catalog, checkpoint_path: Option<std::path::PathBuf>) -> Self {
+        Self::start_with_interval(catalog, checkpoint_path, CHECKPOINT_INTERVAL)
+    }
+
+    /// [`CatalogActor::start`] with the checkpoint period as a parameter.
+    ///
+    /// Private, and it exists for one reason: the test that shows the
+    /// checkpoint runs on a connection the writer thread does not own has to
+    /// observe a checkpoint land inside a window during which the writer is
+    /// provably occupied, and a thirty-second window is a thirty-second test.
+    /// Nothing outside this module may choose the period — [`CHECKPOINT_INTERVAL`]
+    /// is the daemon's, and a caller that could shorten it could turn the
+    /// PASSIVE checkpoint into a busy loop against the writer.
+    fn start_with_interval(
+        catalog: Catalog,
+        checkpoint_path: Option<std::path::PathBuf>,
+        interval: Duration,
+    ) -> Self {
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -180,7 +197,7 @@ impl CatalogActor {
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("shepherd-wal-checkpoint".into())
-                .spawn(move || checkpoint_loop(&path, &stop))
+                .spawn(move || checkpoint_loop(&path, &stop, interval))
                 .expect("spawning the WAL checkpoint thread")
         });
 
@@ -220,7 +237,7 @@ impl Drop for CatalogActor {
 /// WAL that stays large for another interval, which is a performance condition,
 /// not a correctness one. Turning it into an error would take the daemon down
 /// over housekeeping.
-fn checkpoint_loop(path: &std::path::Path, stop: &AtomicBool) {
+fn checkpoint_loop(path: &std::path::Path, stop: &AtomicBool, interval: Duration) {
     let conn = match rusqlite::Connection::open(path) {
         Ok(c) => c,
         Err(e) => {
@@ -230,10 +247,10 @@ fn checkpoint_loop(path: &std::path::Path, stop: &AtomicBool) {
         }
     };
     // Sleep in short slices so shutdown is prompt without a condvar.
-    let slice = Duration::from_millis(100);
+    let slice = Duration::from_millis(100).min(interval);
     let mut waited = Duration::ZERO;
     while !stop.load(Ordering::SeqCst) {
-        if waited >= CHECKPOINT_INTERVAL {
+        if waited >= interval {
             waited = Duration::ZERO;
             if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "PASSIVE") {
                 tracing::warn!(error = %e, "PASSIVE WAL checkpoint failed");
@@ -370,6 +387,208 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, WriterError::Gone), "{err:?}");
+    }
+
+    /// **§9's `dedicated PASSIVE-checkpoint connection`, as a claim about
+    /// *which connection*, not about whether the call appears.**
+    ///
+    /// A bounded WAL is evidence that *something* checkpoints. It is not
+    /// evidence that the something is a second connection: a
+    /// `wal_checkpoint(PASSIVE)` issued on the writer's own connection bounds
+    /// the log just as well, and SQLite's built-in `wal_autocheckpoint` — which
+    /// this crate's [`PRAGMAS`](crate::PRAGMAS) never disables — bounds it
+    /// without any of our code running at all. All three produce the same
+    /// graph. They are different mechanisms with different blocking behaviour,
+    /// and §9 names one of them.
+    ///
+    /// So this does not grep for `wal_checkpoint`, and it does not count
+    /// checkpoint calls; a call that is present, is issued, and never bounds
+    /// anything would satisfy both. It measures an **outcome that only a
+    /// separate connection can produce**:
+    ///
+    /// 1. The actor's whole invariant is that exactly one thread ever holds the
+    ///    `Catalog`. Anything executed on the writer's connection therefore
+    ///    runs on the writer thread — that is what
+    ///    [`concurrent_writers_over_one_file_serialize`] establishes.
+    /// 2. The writer thread is put to sleep *inside* a closure, and a probe
+    ///    task submitted afterwards is shown not to have completed. The writer's
+    ///    connection is provably idle for the whole window.
+    /// 3. `wal_autocheckpoint` is turned off **on the writer's connection**
+    ///    (it is connection-scoped, so the checkpoint thread's own connection
+    ///    keeps its default). SQLite's automatic checkpoint fires on commit,
+    ///    and no commit happens in the window regardless.
+    /// 4. In WAL mode the main database file grows only when frames are
+    ///    backfilled into it. Growth during that window is a checkpoint that
+    ///    ran on a connection nothing on the writer thread was touching.
+    ///
+    /// And the same window with `checkpoint_path: None` is run as the control.
+    /// Without it, "the file grew" would be a number with nothing to compare it
+    /// against; with it, the difference between the two runs *is* the dedicated
+    /// connection.
+    #[test]
+    fn the_checkpoint_lands_on_a_connection_the_writer_thread_does_not_own() {
+        let dedicated = backfilled_while_the_writer_slept("dedicated", true);
+        let none = backfilled_while_the_writer_slept("no-checkpoint-thread", false);
+
+        assert!(
+            dedicated > 0,
+            "no WAL frame reached the database file while the writer thread sat \
+             inside a sleeping closure. Every checkpoint this project could be \
+             performing on the writer's own connection is impossible in that \
+             window, so a zero here means §9's `dedicated` connection is not \
+             checkpointing — whatever else is keeping the WAL small"
+        );
+        assert_eq!(
+            none, 0,
+            "the database file grew by {none} bytes during the same window with \
+             NO checkpoint thread running. Something other than the dedicated \
+             connection backfills the WAL here, so the {dedicated} bytes measured \
+             with the thread running are not attributable to it and this test \
+             proves nothing"
+        );
+    }
+
+    /// One window: block the writer thread, and report how many bytes the main
+    /// database file grew while it was blocked.
+    ///
+    /// `dedicated` chooses whether [`CatalogActor`] gets a checkpoint
+    /// connection at all, which is the only difference between the measurement
+    /// and its control.
+    fn backfilled_while_the_writer_slept(tag: &str, dedicated: bool) -> u64 {
+        /// Short enough that the window is seconds rather than the daemon's
+        /// half-minute; long enough that the checkpoint is still a timer.
+        const TICK: Duration = Duration::from_millis(250);
+        /// The window the writer thread spends asleep. Many `TICK`s, so a
+        /// missed checkpoint is a missing mechanism and not a missed deadline.
+        const WINDOW: Duration = Duration::from_secs(4);
+        /// Enough rows that backfilling them must ALLOCATE pages, which is what
+        /// makes the checkpoint visible as file *growth*. Overwriting pages the
+        /// database already has would leave its length unchanged.
+        const ROWS: usize = 20_000;
+
+        let dir = tmpdir(tag);
+        let db = dir.join("catalog.db");
+        let actor = CatalogActor::start_with_interval(
+            Catalog::open(&db).unwrap(),
+            dedicated.then(|| db.clone()),
+            TICK,
+        );
+        let w = actor.handle();
+
+        // Take SQLite's own checkpointer off the writer's connection, and
+        // CHECK that it went: `wal_autocheckpoint` defaults to 1000 pages, so
+        // left alone the writer's commits backfill their own frames and the
+        // growth this function measures would be the writer's work rather than
+        // the checkpoint thread's. `pragma_update` cannot set the pragmas that
+        // answer with a row, hence the fallback — the same shape
+        // `crate::apply_pragmas` uses.
+        let autock = w
+            .with(|cat| {
+                let c = cat.conn();
+                let _ = c
+                    .pragma_update(None, "wal_autocheckpoint", 0)
+                    .or_else(|_| c.query_row("PRAGMA wal_autocheckpoint = 0", [], |_| Ok(())));
+                c.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get::<_, i64>(0))
+                    .unwrap_or(-1)
+            })
+            .unwrap();
+        assert_eq!(
+            autock, 0,
+            "SQLite's automatic checkpoint is still armed on the writer's \
+             connection, so any backfill measured below could be the writer's own"
+        );
+
+        let occupied = Arc::new(AtomicBool::new(false));
+        let baseline = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let occupied = Arc::clone(&occupied);
+            let baseline = Arc::clone(&baseline);
+            let path = db.clone();
+            let w = w.clone();
+            std::thread::spawn(move || {
+                w.with(move |cat| {
+                    // One committed transaction. Its pages live only in the WAL:
+                    // autocheckpoint is off and this connection issues nothing
+                    // else for the rest of the window.
+                    let tx = cat.conn_mut().transaction().unwrap();
+                    {
+                        let mut st = tx
+                            .prepare(
+                                "INSERT INTO scan_root (path, stub_mode, created_at)
+                                 VALUES (?1, 'delete', 0)",
+                            )
+                            .unwrap();
+                        for i in 0..ROWS {
+                            st.execute(rusqlite::params![format!("/ck/{i}")]).unwrap();
+                        }
+                    }
+                    tx.commit().unwrap();
+                    // Taken here, on the writer thread, after the commit: every
+                    // byte counted against it arrived while this thread slept.
+                    baseline.store(
+                        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                        Ordering::SeqCst,
+                    );
+                    occupied.store(true, Ordering::SeqCst);
+                    std::thread::sleep(WINDOW);
+                    occupied.store(false, Ordering::SeqCst);
+                })
+                .expect("the blocking closure must reach the actor");
+            });
+        }
+
+        let waiting = std::time::Instant::now();
+        while !occupied.load(Ordering::SeqCst) {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(120),
+                "the blocking closure never started, so no window was ever opened"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The control for step 2: a task submitted now cannot be served until
+        // the sleeping closure returns. If it completes, the writer thread was
+        // not blocked and nothing below can be attributed to a second
+        // connection.
+        let probe_done = Arc::new(AtomicBool::new(false));
+        {
+            let probe_done = Arc::clone(&probe_done);
+            let w = w.clone();
+            std::thread::spawn(move || {
+                let _ = w.with(|_| ());
+                probe_done.store(true, Ordering::SeqCst);
+            });
+        }
+
+        let base = baseline.load(Ordering::SeqCst);
+        assert!(base > 0, "the database file was never readable");
+        let mut grew = 0;
+        let deadline = std::time::Instant::now() + WINDOW - Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            let now = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+            if now > base {
+                assert!(
+                    occupied.load(Ordering::SeqCst),
+                    "the window had already closed when the growth was seen"
+                );
+                assert!(
+                    !probe_done.load(Ordering::SeqCst),
+                    "a task submitted after the window opened completed inside \
+                     it, so the writer thread was not blocked and the growth \
+                     cannot be attributed to another connection"
+                );
+                grew = now - base;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        while occupied.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        drop(actor);
+        std::fs::remove_dir_all(&dir).ok();
+        grew
     }
 
     /// The handle must be `Send + Sync` — `shepherd-tier`'s session store needs
