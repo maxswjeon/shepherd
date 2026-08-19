@@ -16,7 +16,9 @@
 //! The response is three-part, and only the first part lives here:
 //!
 //! 1. **detect fidelity per volume** — this module, recorded in
-//!    `scan_root.atime_mode`;
+//!    `scan_root.atime_mode`. [`detect`] is read-only and safe to call
+//!    anywhere; [`detect_with_write_probe`] additionally *measures* the case
+//!    Linux's mount options cannot express, and is for `target.add` only;
 //! 2. maintain `file.last_observed_access`, a Shepherd-owned signal fed by
 //!    hydrations, restores and served opens — the column exists in the schema,
 //!    the feeding is Phase 3/4 work;
@@ -138,19 +140,25 @@ pub fn classify_mount_options(options: &str) -> AtimeMode {
     //    silently dropping a case the classifier claims to handle is worse than
     //    an arm that rarely fires — but nobody should read its presence as
     //    evidence that `Reliable` is achievable on Linux.
-    // 2. THEREFORE `AtimeMode::Reliable` IS CURRENTLY UNREACHABLE ON LINUX via
-    //    `detect()`, and `only_reliable_atime_may_feed_the_observed_access_signal`
-    //    can never be satisfied here. A genuinely strict mount is classified
-    //    `Relatime`, which REFUSES to feed `last_observed_access` and still
-    //    permits destructive age rules. That is fail-safe and imprecise, not
-    //    fail-open.
+    // 2. THEREFORE `AtimeMode::Reliable` IS UNREACHABLE FROM THIS FUNCTION ON
+    //    LINUX, and it stays that way on purpose. A genuinely strict mount is
+    //    classified `Relatime` here, which REFUSES to feed
+    //    `last_observed_access` and still permits destructive age rules. That
+    //    is fail-safe and imprecise, not fail-open.
     //
-    // The honest fix is macOS's: PROBE the no-flag case rather than infer it —
-    // backdate an atime, read, and see whether it advanced. macOS does exactly
-    // that and maps its own no-flag case to `Relatime` on the evidence. Until
-    // Linux does the same, inferring `Reliable` from an absent flag would be
+    // The honest fix is macOS's, and it has now been made: PROBE the no-flag
+    // case rather than infer it — backdate an atime, read, and see whether it
+    // advanced. See [`probe_atime_advance`], which measures the distinction
+    // this string cannot carry, and [`detect_with_write_probe`], which is its
+    // only caller and runs once at `target.add`. Measured on this machine's
+    // `/dev/shm` — a real mount whose options are silent — the probe reads
+    // `Reliable` where this function reads `Relatime`.
+    //
+    // WHAT DID NOT CHANGE: this function, and `detect()` above it, still never
+    // answer `Reliable` on Linux. Inferring it from an absent flag would be
     // deciding a destructive-rule input by assumption, which is the one
-    // direction this module must not guess in.
+    // direction this module must not guess in. `Reliable` became reachable by
+    // MEASUREMENT, and only where a write is sanctioned.
     AtimeMode::Relatime
 }
 
@@ -202,6 +210,278 @@ fn detect_linux(path: &Path) -> Option<AtimeMode> {
         classify_mount_options(&options),
         classify_mount_options(&super_options),
     ))
+}
+
+/// Whether either mount option string **names** an atime policy.
+///
+/// The kernel names `noatime` and `relatime` and names `strictatime` nowhere
+/// (measured — see [`classify_mount_options`]), so "neither string names one"
+/// is exactly the ambiguous case: either the mount really is strict, or the
+/// kernel simply had nothing to say. That is the only case
+/// [`detect_with_write_probe`] spends a file creation and ~60 ms on; when the
+/// kernel has already named a policy there is nothing to measure and the
+/// classification is taken as final.
+///
+/// Token equality, not substring containment, for the reason
+/// `a_substring_is_not_an_option` already records: `nodiratime` is not
+/// `noatime`, and `lazytime` names no atime policy at all — it defers
+/// timestamp *writeback*, not the update.
+///
+/// Pure and unconditionally compiled, so the Linux CI leg is not the only
+/// place it is exercised.
+pub fn mount_options_name_an_atime_policy(options: &str, super_options: &str) -> bool {
+    [options, super_options].iter().any(|s| {
+        s.split(',')
+            .map(str::trim)
+            .any(|o| o == "noatime" || o == "relatime")
+    })
+}
+
+/// Measure whether this volume advances `atime` on **every** read.
+///
+/// # Why a probe exists at all
+///
+/// [`classify_mount_options`] cannot answer this. The kernel records strict
+/// behaviour as the ABSENCE of any atime flag, so a genuinely strict mount and
+/// a mount the kernel said nothing about are the same string. Inferring
+/// `Reliable` from that absence would be deciding a destructive-rule input by
+/// assumption. So this measures instead, exactly as macOS does for the
+/// identical ambiguity in its `statfs` flags — see [`classify_statfs_flags`].
+///
+/// # How read #2 is made decisive
+///
+/// `relatime_need_update()` (`fs/inode.c`) updates atime if **any** of three
+/// clauses holds: `mtime >= atime`, `ctime >= atime`, or atime is a day old.
+/// The probe drives all three false before the decisive read, and *verifies it
+/// did* by reading the inode back. Once the invariant `mtime < atime && ctime <
+/// atime && atime is seconds old` holds, relatime is obliged to skip — so an
+/// advance on read #2 is `strictatime`, measured, not inferred.
+///
+/// **Establishing the invariant is the whole difficulty, and skipping it is a
+/// FALSE `Reliable`.** Backdating sets `ctime` to *now*, so on a filesystem
+/// whose timestamps are coarse the refresh read can land in the same tick as
+/// `ctime`, leaving `ctime >= atime` true and relatime still obliged to update.
+/// A first draft of this probe slept a fixed interval instead of checking, and
+/// called this machine's ext4 `relatime` volume strict. Hence the loop below
+/// reads until the inode itself shows the invariant, rather than sleeping a
+/// length guessed from a granularity it does not know.
+///
+/// # `lazytime` does not fool this
+///
+/// `lazytime` defers timestamp *writeback*, not the update. Every observation
+/// here is `fstat` on the live descriptor, which serves the in-memory inode —
+/// the same value a scan's `stat` reads on a mounted filesystem, so the probe
+/// and the consumer see one number. Measured on a loop-mounted ext4: with AND
+/// without `lazytime` the on-disk atime still read 2020 while `fstat` showed
+/// the advance, so deferred writeback is not a `lazytime` distinction and not
+/// one any mounted reader can see. The residue is that after an unclean
+/// shutdown the on-disk atime can regress by up to the dirty-expire window
+/// (~12–24 h) — stated here because it is real, not acted on, because a crash
+/// degrades `Reliable` to roughly `Relatime` for that window rather than
+/// making it unsafe.
+///
+/// # Fail-closed
+///
+/// `None` on every failure — unwritable volume, no space, an unlink that did
+/// not take, a filesystem that ignores the backdate, an invariant that could
+/// not be established. The caller
+/// keeps the mount-option classification, which is `Relatime`. The probe can
+/// only ever *reach* `Reliable` by measuring it.
+#[cfg(target_os = "linux")]
+fn probe_atime_advance(dir: &Path) -> Option<AtimeMode> {
+    use std::fs::{FileTimes, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    /// 2020-01-01T00:00:00Z — older than relatime's 24 h clause by years, so
+    /// every atime-updating policy is obliged to advance it on first read.
+    const BACKDATE_SECS: u64 = 1_577_836_800;
+    /// Long enough to cross the kernel's coarse-clock tick on any sane `HZ`.
+    const STEP: Duration = Duration::from_millis(20);
+    /// Total time the invariant loop may spend. A filesystem with 1-second
+    /// timestamps needs about a second of it; one that never gets there is
+    /// answered `Relatime`, not guessed at.
+    const BUDGET: Duration = Duration::from_secs(2);
+
+    /// The inode's `(atime, mtime, ctime)` in nanoseconds, from `fstat` on the
+    /// live descriptor — see the `lazytime` note above.
+    fn stamps(f: &std::fs::File) -> Option<(i128, i128, i128)> {
+        let m = f.metadata().ok()?;
+        let ns = |s: i64, n: i64| i128::from(s) * 1_000_000_000 + i128::from(n);
+        Some((
+            ns(m.atime(), m.atime_nsec()),
+            ns(m.mtime(), m.mtime_nsec()),
+            ns(m.ctime(), m.ctime_nsec()),
+        ))
+    }
+
+    /// One real read, which is what `touch_atime` hangs off.
+    fn read_once(f: &mut std::fs::File) -> Option<()> {
+        f.seek(SeekFrom::Start(0)).ok()?;
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).ok()?;
+        Some(())
+    }
+
+    // Unique per process AND per call, and created with `create_new` —
+    // `O_CREAT|O_EXCL`, which REFUSES to open anything already there. A fixed
+    // name opened with `O_TRUNC` would empty a user's file that happened to
+    // share the name, inside the probe whose entire job is not to damage the
+    // volume it is measuring.
+    let name = format!(
+        ".shepherd-atime-probe-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+    );
+    let path = dir.join(name);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+
+    // Unlinked immediately, then driven entirely through the descriptor. This
+    // is stronger than cleaning up on the way out the way `identity`'s
+    // `ProbeFiles` does: a `Drop` guard still leaves the file behind if the
+    // process is killed mid-probe, and this leaves nothing behind even then.
+    //
+    // The failure is NOT swallowed, and that is load-bearing rather than
+    // tidiness. Every reading below assumes the inode is unreachable by anyone
+    // else — that is what makes the measured advance attributable to this
+    // probe's own reads. A file that is still linked is reachable by name, so
+    // an unlink that failed invalidates the premise, and the probe abandons
+    // rather than measuring something it can no longer attribute.
+    std::fs::remove_file(&path).ok()?;
+
+    file.write_all(b"shepherd atime probe").ok()?;
+
+    // mtime is backdated alongside atime as belt-and-braces: it removes
+    // relatime's FIRST clause (`mtime >= atime`) outright. It is not what makes
+    // the probe correct — the invariant loop below is, and it would corner
+    // relatime just as well with mtime left at "now", since it waits on
+    // `atime > mtime` and `atime > ctime` together.
+    let backdate = UNIX_EPOCH + Duration::from_secs(BACKDATE_SECS);
+    file.set_times(
+        FileTimes::new()
+            .set_accessed(backdate)
+            .set_modified(backdate),
+    )
+    .ok()?;
+
+    // A filesystem that quietly ignored the backdate cannot be measured this
+    // way; the comparisons below would all be against a timestamp of "now".
+    let (a0, _, _) = stamps(&file)?;
+    if a0 != i128::from(BACKDATE_SECS) * 1_000_000_000 {
+        return None;
+    }
+
+    // Read #1, the refresh read, taken IMMEDIATELY — no sleep first, on
+    // purpose. On an atime of 2020 EVERY updating policy is obliged to
+    // advance: relatime because its ctime and 24 h clauses both fire,
+    // strictatime unconditionally. So no advance here is not a timing artefact
+    // — it means last-access updates are off on this volume.
+    //
+    // Reading this early also leaves the invariant BROKEN in the usual case,
+    // which is deliberate: `set_times` stamped ctime microseconds ago, the
+    // kernel's coarse clock ticks every 1–4 ms, so this read almost always
+    // lands in ctime's own tick and `ctime == atime`. That hands the real work
+    // to the loop below rather than to a sleep chosen by guesswork — and it is
+    // what makes deleting that loop a test failure instead of a silent
+    // dependence on timing that happened to hold.
+    read_once(&mut file)?;
+    let (mut a1, mut m1, mut c1) = stamps(&file)?;
+    if a1 == a0 {
+        return Some(AtimeMode::Disabled);
+    }
+
+    // Keep reading until the inode ITSELF shows relatime is cornered. Each
+    // read carries atime forward under either policy, so this terminates as
+    // soon as atime clears the `ctime` the backdate stamped — one iteration on
+    // a millisecond-granularity filesystem, about a second on a
+    // one-second-granularity one, and never on a filesystem coarser than the
+    // budget, which is answered `Relatime` rather than guessed at.
+    let start = Instant::now();
+    while !(m1 < a1 && c1 < a1) {
+        if start.elapsed() > BUDGET {
+            // Read #2 could not have been made decisive, so it will not be
+            // read as proof of anything.
+            return Some(AtimeMode::Relatime);
+        }
+        std::thread::sleep(STEP);
+        read_once(&mut file)?;
+        (a1, m1, c1) = stamps(&file)?;
+    }
+
+    // Read #2. Relatime is now obliged to skip, so an advance is strict.
+    std::thread::sleep(STEP);
+    read_once(&mut file)?;
+    let (a2, _, _) = stamps(&file)?;
+
+    // No re-check that mtime/ctime held still between the two reads. It was
+    // written, and deleted: the inode is unlinked and reachable only through
+    // this private descriptor, so no other process can move them, and an atime
+    // update does not touch ctime. It was a check that could not fail, which is
+    // the thing this module keeps refusing to ship. The premise it restated is
+    // enforced instead, at the `remove_file` above.
+    Some(if a2 > a1 {
+        AtimeMode::Reliable
+    } else {
+        AtimeMode::Relatime
+    })
+}
+
+/// [`detect`], plus a write probe on Linux when the mount options are silent.
+///
+/// This is the entry point for `target.add` and **only** for `target.add`. It
+/// creates (and immediately unlinks) one file on the volume, so it must never
+/// run during a scan, and it must not run against a volume the user has not
+/// handed to Shepherd. `root_add` already writes probe files into the same
+/// directory two lines earlier — `identity::probe_path_policies` — so the
+/// consent boundary this sits inside is one the call site already established.
+///
+/// On macOS and Windows this is [`detect`] unchanged: their detectors are
+/// already probe-backed or registry-backed, and neither has Linux's
+/// unnamed-strict ambiguity.
+///
+/// The probe is consulted **only** where `classify_mount_options` provably
+/// answered `Relatime` by default rather than by evidence — see
+/// [`mount_options_name_an_atime_policy`]. A mount the kernel described is
+/// believed, at no cost.
+pub fn detect_with_write_probe(path: &Path) -> AtimeMode {
+    #[cfg(target_os = "linux")]
+    {
+        detect_linux_probed(path).unwrap_or(AtimeMode::Unknown)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        detect(path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_probed(path: &Path) -> Option<AtimeMode> {
+    let canonical = path.canonicalize().ok()?;
+    let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let (options, super_options) =
+        crate::volume::linux_mountinfo(&text, &canonical.to_string_lossy())?;
+    let classified = stricter(
+        classify_mount_options(&options),
+        classify_mount_options(&super_options),
+    );
+    if mount_options_name_an_atime_policy(&options, &super_options) {
+        return Some(classified);
+    }
+    // `classified` is necessarily `Relatime` here — both strings were silent,
+    // so both classified by the default arm. The probe replaces it outright
+    // rather than taking `stricter` of the two: `stricter` would discard the
+    // `Reliable` this exists to reach, and the value being replaced is the one
+    // the default arm admits it did not measure.
+    Some(probe_atime_advance(&canonical).unwrap_or(classified))
 }
 
 /// `MNT_STRICTATIME` from `<sys/mount.h>`.
@@ -798,6 +1078,43 @@ mod tests {
         }
     }
 
+    /// The gate that decides whether a write probe is spent at all.
+    ///
+    /// Pure, so it runs on every platform on fixture strings — the same split
+    /// the classifier itself uses.
+    #[test]
+    fn only_a_mount_that_names_no_atime_policy_is_worth_probing() {
+        // The kernel spoke. Believe it, spend nothing.
+        assert!(mount_options_name_an_atime_policy("rw,relatime", "rw"));
+        assert!(mount_options_name_an_atime_policy("rw", "rw,noatime"));
+        assert!(mount_options_name_an_atime_policy(
+            "rw,noatime",
+            "rw,relatime"
+        ));
+
+        // The kernel said nothing: strict and unstated are the same string, and
+        // this is the only case a probe can distinguish.
+        assert!(!mount_options_name_an_atime_policy("rw", "rw"));
+        assert!(!mount_options_name_an_atime_policy(
+            "rw,inode64",
+            "rw,size=1k"
+        ));
+
+        // `nodiratime` is not `noatime` and `lazytime` is not an atime policy —
+        // neither may suppress the probe, or a strict mount carrying one would
+        // silently stay `Relatime`.
+        assert!(!mount_options_name_an_atime_policy(
+            "rw,nodiratime",
+            "rw,lazytime"
+        ));
+        // Substring containment would wrongly fire on both of the above; token
+        // equality is what keeps `a_substring_is_not_an_option` true here too.
+        assert!(!mount_options_name_an_atime_policy(
+            "rw,noatimex",
+            "rw,xrelatime"
+        ));
+    }
+
     #[test]
     fn string_forms_round_trip_with_the_schema_check_constraint() {
         for m in [
@@ -1056,5 +1373,276 @@ mod linux_tests {
             !after.may_fold_into_observed_access(),
             "Relatime must not feed last_observed_access"
         );
+    }
+
+    /// Fail-closed: a directory the probe cannot create a file in must yield
+    /// `None`, so the caller keeps the mount-option answer.
+    ///
+    /// `/proc` is not writable even by root, which is what makes it a usable
+    /// stand-in for a read-only volume without mounting one.
+    #[test]
+    fn a_volume_the_probe_cannot_write_to_answers_nothing() {
+        assert_eq!(probe_atime_advance(Path::new("/proc")), None);
+        assert_eq!(
+            probe_atime_advance(Path::new("/no/such/dir/shepherd-atime")),
+            None
+        );
+    }
+
+    /// The probe must never say `Reliable` on a mount the kernel called
+    /// `relatime` — and this runs unprivileged, on whatever `/tmp` is.
+    ///
+    /// Skipped rather than asserted if `/tmp` is not a relatime mount, because
+    /// then it is testing something else.
+    #[test]
+    fn a_relatime_mount_is_never_measured_as_reliable() {
+        let text = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        let tmp = Path::new("/tmp").canonicalize().expect("canonicalize /tmp");
+        let Some((options, super_options)) =
+            crate::volume::linux_mountinfo(&text, &tmp.to_string_lossy())
+        else {
+            return;
+        };
+        if !mount_options_name_an_atime_policy(&options, &super_options) {
+            return; // /tmp is a silent mount here; that is the other test's job.
+        }
+        if !options.split(',').any(|o| o == "relatime") {
+            return;
+        }
+        assert_ne!(
+            probe_atime_advance(&tmp),
+            Some(AtimeMode::Reliable),
+            "the probe measured a kernel-declared relatime mount as strict. \
+             Its invariant loop is not cornering relatime_need_update()"
+        );
+        assert_ne!(
+            detect_with_write_probe(Path::new("/tmp")),
+            AtimeMode::Reliable
+        );
+    }
+
+    /// The probe must not leave anything behind on the volume it measured.
+    #[test]
+    fn the_probe_leaves_no_file_behind() {
+        let dir =
+            std::env::temp_dir().join(format!("shepherd-atime-residue-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let _ = probe_atime_advance(&dir);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            left.is_empty(),
+            "probe left {left:?} on the volume it was measuring"
+        );
+    }
+
+    /// An existing file is never opened, let alone truncated.
+    ///
+    /// The probe names its file uniquely and creates it with `O_CREAT|O_EXCL`,
+    /// so there is no name a user could hold that it would clobber. A draft
+    /// that used a fixed name and `O_TRUNC` would empty this file.
+    #[test]
+    fn the_probe_cannot_truncate_a_users_file() {
+        let dir =
+            std::env::temp_dir().join(format!("shepherd-atime-noclobber-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Every plausible fixed name a probe might have chosen.
+        for name in [
+            ".shepherd-atime-probe",
+            ".shep-atime-probe",
+            ".shepherd-atime-probe-0-0",
+        ] {
+            std::fs::write(dir.join(name), b"precious").expect("seed");
+        }
+        let _ = probe_atime_advance(&dir);
+        for name in [
+            ".shepherd-atime-probe",
+            ".shep-atime-probe",
+            ".shepherd-atime-probe-0-0",
+        ] {
+            let body = std::fs::read(dir.join(name)).expect("user file still there");
+            assert_eq!(
+                body, b"precious",
+                "the probe truncated `{name}`, a file it did not create"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate must actually PREVENT the write, not merely make it redundant.
+    ///
+    /// `target.add` may only spend a write where the kernel left the question
+    /// open. On a mount that names its policy there is nothing to measure, and
+    /// the probe must not touch the volume at all — a property no assertion
+    /// about the returned `AtimeMode` can see, because probing a relatime mount
+    /// returns `Relatime` too.
+    ///
+    /// What distinguishes them is the DIRECTORY: creating and unlinking a file
+    /// inside it moves its mtime. So the observable is the mtime, not the mode.
+    #[test]
+    fn a_mount_that_already_names_its_policy_is_never_written_to() {
+        let text = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        let dir = std::env::temp_dir().join(format!("shepherd-atime-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let canonical = dir.canonicalize().expect("canonicalize");
+
+        let Some((options, super_options)) =
+            crate::volume::linux_mountinfo(&text, &canonical.to_string_lossy())
+        else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        if !mount_options_name_an_atime_policy(&options, &super_options) {
+            // The temp volume is a silent mount, so probing it is CORRECT here
+            // and there is no gate to observe. Skip rather than invert.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // Let the directory's mtime settle a tick behind, so a write during the
+        // call lands in a later one and is unambiguous.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let before = std::fs::metadata(&canonical)
+            .expect("stat dir")
+            .modified()
+            .ok();
+
+        let mode = detect_with_write_probe(&canonical);
+
+        let after = std::fs::metadata(&canonical)
+            .expect("stat dir")
+            .modified()
+            .ok();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            before, after,
+            "detect_with_write_probe created a file on a mount whose options \
+             already named its atime policy ({options:?} / {super_options:?}). \
+             target.add may only spend a write where the kernel left the \
+             question open"
+        );
+        assert_ne!(mode, AtimeMode::Unknown);
+    }
+
+    /// The load-bearing one: drive the probe across mounts whose atime policy
+    /// the test CONTROLS, and require it to change its answer.
+    ///
+    /// This is the test `detect_changes_its_answer_when_the_mount_options_change`
+    /// could not be, because `detect()` reads only the option string and a
+    /// strict mount does not appear in it. All three legs mount `tmpfs` at the
+    /// same point and differ only in the atime option, so a probe hardcoded to
+    /// any one answer fails whichever constant it is. Needs root.
+    #[test]
+    #[ignore = "needs root to mount tmpfs"]
+    fn the_probe_measures_what_the_option_string_cannot_say() {
+        let dir = std::env::temp_dir().join("shepherd-atime-probe-mount");
+        let _ = Command::new("sudo")
+            .args(["umount", "-l"])
+            .arg(&dir)
+            .output();
+        std::fs::create_dir_all(&dir).expect("mkdir probe mountpoint");
+
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("sudo")
+                    .args(["umount", "-l"])
+                    .arg(&self.0)
+                    .output();
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _guard = Cleanup(dir.clone());
+
+        let mount = |opts: &str| {
+            let st = Command::new("sudo")
+                .args(["mount", "-t", "tmpfs", "-o", opts, "shepherd-atime-probe"])
+                .arg(&dir)
+                .status()
+                .expect("run mount");
+            assert!(st.success(), "mount -o {opts} failed");
+            let st = Command::new("sudo")
+                .args(["chmod", "777"])
+                .arg(&dir)
+                .status()
+                .expect("run chmod");
+            assert!(st.success(), "chmod failed");
+        };
+        let umount = || {
+            let _ = Command::new("sudo")
+                .args(["umount", "-l"])
+                .arg(&dir)
+                .output();
+        };
+
+        // STRICT. The option string for this mount is `rw` — indistinguishable
+        // from a mount the kernel said nothing about, which is exactly why the
+        // classifier answers `Relatime` and the probe has to exist.
+        mount("strictatime");
+        let opts = std::fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|t| {
+                crate::volume::linux_mountinfo(&t, &dir.canonicalize().ok()?.to_string_lossy())
+            })
+            .expect("probe mount is in mountinfo");
+        assert!(
+            !mount_options_name_an_atime_policy(&opts.0, &opts.1),
+            "a strictatime tmpfs named an atime policy in mountinfo ({:?}). \
+             The kernel changed; the whole premise of this probe needs re-measuring",
+            opts
+        );
+        assert_eq!(
+            classify_mount_options(&opts.0),
+            AtimeMode::Relatime,
+            "the option string alone cannot see strictness — this is the gap"
+        );
+        assert_eq!(
+            probe_atime_advance(&dir),
+            Some(AtimeMode::Reliable),
+            "a strictatime tmpfs advances atime on every read; the probe did \
+             not measure it"
+        );
+        assert_eq!(
+            detect_with_write_probe(&dir),
+            AtimeMode::Reliable,
+            "the composed target.add path must carry the probe's answer through"
+        );
+        assert!(detect_with_write_probe(&dir).may_fold_into_observed_access());
+        // And the read-only detector must be unchanged by any of this.
+        assert_eq!(detect(&dir), AtimeMode::Relatime);
+        umount();
+
+        // RELATIME. Same mount point, same filesystem, one option different.
+        mount("relatime");
+        assert_eq!(
+            probe_atime_advance(&dir),
+            Some(AtimeMode::Relatime),
+            "a relatime tmpfs refreshes a stale atime once and then holds; a \
+             probe that reads this as Reliable would authorise OS atime to feed \
+             last_observed_access on a signal that only moves when already stale"
+        );
+        assert_eq!(detect_with_write_probe(&dir), AtimeMode::Relatime);
+        assert!(!detect_with_write_probe(&dir).may_fold_into_observed_access());
+        umount();
+
+        // NOATIME. The gate skips the probe here because the kernel named the
+        // policy, so `probe_atime_advance` is called directly to exercise the
+        // arm that a 2020 atime which does not move means updates are off.
+        mount("noatime");
+        assert_eq!(
+            probe_atime_advance(&dir),
+            Some(AtimeMode::Disabled),
+            "atime backdated to 2020 did not advance on read, which every \
+             updating policy is obliged to do; that is a disabled volume"
+        );
+        assert_eq!(detect_with_write_probe(&dir), AtimeMode::Disabled);
+        assert!(!detect_with_write_probe(&dir).supports_destructive_age_rule());
+        umount();
     }
 }
