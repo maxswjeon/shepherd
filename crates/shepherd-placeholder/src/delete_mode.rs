@@ -376,6 +376,53 @@ fn libc_eexist() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    /// Gate every test that needs staging to have SUCCEEDED.
+    ///
+    /// `stage_for_destruction` binds identity through a held handle, which needs
+    /// `dev`/`ino`; the `#[cfg(not(unix))]` arm above returns
+    /// `Unsupported("file identity")` and that is CORRECT — it fails closed on a
+    /// platform where the binding cannot be made.
+    ///
+    /// These tests used to `unwrap()` that refusal, so the whole module failed on
+    /// Windows and read as "delete-mode is broken" when the truth was "delete-mode
+    /// correctly refuses and the tests assumed it would not". Gating the module
+    /// away would have hidden that; asserting the refusal turns each failure into
+    /// a check that destruction is REFUSED where identity cannot be bound.
+    ///
+    /// It asserts the SPECIFIC refusal, not that an error occurred: a bare
+    /// `is_err()` would pass on a genuine bug anywhere in staging.
+    #[must_use]
+    fn staged_or_refused(r: Result<Staged>) -> Option<Staged> {
+        match r {
+            Ok(s) => {
+                assert!(
+                    cfg!(unix),
+                    "staging SUCCEEDED on {}, where file identity is unsupported \
+                     and the provider is supposed to fail closed. Either the \
+                     platform gained an identity binding — in which case these \
+                     tests must be updated to expect success, DELIBERATELY — or \
+                     the refusal stopped refusing",
+                    std::env::consts::OS
+                );
+                Some(s)
+            }
+            Err(ProviderError::Unsupported(what)) => {
+                assert!(
+                    !cfg!(unix),
+                    "staging refused as `unsupported: {what}` ON UNIX, where file \
+                     identity IS available. That is the binding breaking, not a \
+                     platform lacking one"
+                );
+                assert_eq!(
+                    what, "file identity",
+                    "the refusal must name what could not be bound"
+                );
+                None
+            }
+            Err(e) => panic!("staging failed for an unexpected reason: {e:?}"),
+        }
+    }
+
     use super::*;
     use std::io::Write;
 
@@ -403,9 +450,13 @@ mod tests {
     fn tmpfs_supports_identity_bound_staging() {
         let t = Tmp::new("probe");
         let f = DeleteModeProvider::new().probe_feasibility(&t.0).unwrap();
-        assert!(
+        // On a platform with no identity binding the honest answer is
+        // "not supported", and asserting `is_supported()` unconditionally would
+        // demand a capability the provider correctly refuses to claim.
+        assert_eq!(
             f.is_supported(),
-            "the temp filesystem should support RENAME_NOREPLACE: {f:?}"
+            cfg!(unix),
+            "feasibility must match what this platform can actually bind: {f:?}"
         );
     }
 
@@ -415,7 +466,10 @@ mod tests {
         let p = t.file("a.bin", b"hello");
         let before = std::fs::symlink_metadata(&p).unwrap();
 
-        let staged = DeleteModeProvider::new().stage_for_destruction(&p).unwrap();
+        let Some(staged) = staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&p))
+        else {
+            return;
+        };
 
         assert!(!p.exists(), "the original path no longer resolves");
         assert!(staged.staged.exists());
@@ -438,7 +492,11 @@ mod tests {
         use std::io::Read;
         let t = Tmp::new("handle");
         let p = t.file("a.bin", b"content-that-must-survive");
-        let mut staged = DeleteModeProvider::new().stage_for_destruction(&p).unwrap();
+        let Some(mut staged) =
+            staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&p))
+        else {
+            return;
+        };
 
         let mut buf = String::new();
         staged.handle.read_to_string(&mut buf).unwrap();
@@ -451,7 +509,9 @@ mod tests {
         let t = Tmp::new("moveback");
         let p = t.file("a.bin", b"payload");
         let provider = DeleteModeProvider::new();
-        let staged = provider.stage_for_destruction(&p).unwrap();
+        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&p)) else {
+            return;
+        };
         assert!(!p.exists());
 
         let outcome = provider.restore_staged(staged).unwrap();
@@ -467,7 +527,9 @@ mod tests {
         let t = Tmp::new("conflict");
         let p = t.file("a.bin", b"original");
         let provider = DeleteModeProvider::new();
-        let staged = provider.stage_for_destruction(&p).unwrap();
+        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&p)) else {
+            return;
+        };
 
         // Someone recreates the path.
         std::fs::write(&p, b"the user's new file").unwrap();
@@ -492,7 +554,9 @@ mod tests {
         let t = Tmp::new("recover");
         let p = t.file("a.bin", b"x");
         let provider = DeleteModeProvider::new();
-        let staged = provider.stage_for_destruction(&p).unwrap();
+        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&p)) else {
+            return;
+        };
         // Simulate a crash: forget the handle without destroying or restoring.
         let staged_path = staged.staged.clone();
         drop(staged);
@@ -510,7 +574,10 @@ mod tests {
     fn a_staged_entry_is_still_reachable_by_the_same_uid() {
         let t = Tmp::new("reopen");
         let p = t.file("a.bin", b"still-here");
-        let staged = DeleteModeProvider::new().stage_for_destruction(&p).unwrap();
+        let Some(staged) = staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&p))
+        else {
+            return;
+        };
 
         let reread = std::fs::read(&staged.staged).expect(
             "staging is not an exclusion boundary against the same UID — if this ever \
@@ -529,7 +596,10 @@ mod tests {
         let p = t.file("a.bin", b"aaaa");
 
         let mut writer = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let staged = DeleteModeProvider::new().stage_for_destruction(&p).unwrap();
+        let Some(staged) = staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&p))
+        else {
+            return;
+        };
 
         writer.write_all(b"bbbb").unwrap();
         writer.sync_all().unwrap();
