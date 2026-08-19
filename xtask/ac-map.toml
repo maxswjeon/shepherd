@@ -1560,42 +1560,55 @@ note = """
 §9: `single-writer actor, dedicated PASSIVE-checkpoint connection`; E-4 sharpens it to WAL bounded across the full 10M scan. Both halves are cited below. READ THEM AS TWO SEPARATE CLAIMS: the first proves the WAL is bounded, the second proves a dedicated connection checkpoints. NEITHER proves the dedicated connection is what BOUNDS the WAL — and the measurements say it does not. `crate::PRAGMAS` (lib.rs:81) sets journal_mode / foreign_keys / synchronous / busy_timeout and never disables `wal_autocheckpoint`, so SQLite's own page-count checkpoint is armed on the writer's connection throughout. (`writer.rs:489` does disable it, but that line is inside `#[cfg(test)]` — it exists so the structural test below can attribute backfill to the dedicated thread, and it is the one place it must be off for a test to be valid. Production runs with it armed.)
 """
 evidence_missing = """
-BOTH HALVES ARE NOW CITED; WHAT REMAINS IS AN ATTRIBUTION, NOT A GAP IN EITHER. \
-E-4's demand — the WAL bounded across the FULL 10M scan — is met at 10,000,000 \
-files on a sampled maximum. The structural claim §9 makes — a DEDICATED \
-connection — is met by a test that a PASSIVE checkpoint on the writer's own \
-connection fails.
+THE ATTRIBUTION IS NOW SETTLED BY EXPERIMENT, AND §9's STATED MECHANISM IS THE \
+THING IT DISPROVES. This row previously said the two cited claims were both met \
+and that what remained was an attribution — with the honest close named as \
+`disable wal_autocheckpoint in PRAGMAS and re-measure`. That was done.
 
-What no evidence establishes is that the dedicated connection is what BOUNDS \
-the log, and the run's own numbers say it is not. `crate::PRAGMAS` never \
-disables `wal_autocheckpoint`, so SQLite's default page-count checkpoint is \
-armed on the writer's connection for the whole scan. At the measured write rate \
-(4,513 MiB of catalog over a 1,882 s upsert = 2.40 MiB/s, itself a lower bound \
-on bytes entering the log) a checkpointer running only every 30 s would have to \
-let the WAL hold ~72 MiB between ticks — six times the observed 11.30 MiB, and \
-past the 64 MiB ceiling this row asserts.
+THE MEASUREMENT. Same 1,000,000-file corpus, same box, same session, same \
+binary; the ONLY difference is one pragma:
 
-A controlled re-run over the same corpus on an unloaded box wrote 14.4 % faster \
-and produced a high-water of 10.84 MiB against the loaded run's 11.30 MiB — a \
-faster writer with a SMALLER log. A checkpointer running only on a 30 s period \
-would have produced a proportionally LARGER one. The bound does not come from \
-the dedicated thread. That second reading is a post-mortem file size rather \
-than a sampled series, and it is a HIGH-WATER MARK for the same reason the \
-series has no drops: a PASSIVE checkpoint backfills and reuses the log in place, \
-`journal_size_limit` is unset, and nothing issues TRUNCATE or RESTART, so the \
-file is monotonically non-decreasing for the daemon's life. The idle run also \
-covers MORE writing than the loaded one (5,645,500 rows against 4,937,000 at the \
-same elapsed time), which makes the comparison conservative rather than merely \
-favourable — and it retires the worry that the loaded run's bound passed because \
-contention gave the checkpointer slack. The loaded figure is the more \
-conservative of the two.
+    wal_autocheckpoint ON  (production today)   WAL peak     7.9 MiB   PASS
+    wal_autocheckpoint OFF (30 s thread alone)  WAL peak 6,378.8 MiB   FAIL
 
-The WAL file cannot settle this by sampling. Because the log is reused in place \
-rather than truncated, the size series has no drops at any resolution — across \
-the whole 10M scan, ZERO. Anyone tempted to close this by looking harder at the \
-samples should stop; the honest closes are to disable `wal_autocheckpoint` in \
-PRAGMAS and re-measure, or to accept the two claims as the separate things they \
-are.\
+808x. The ceiling is 64 MiB, so the dedicated thread alone overshoots it by a \
+factor of 100 on a corpus holding 100 MB of data. The daemon really does start \
+the dedicated thread — `main.rs:91` passes `Some(paths.catalog())` to \
+`CatalogActor::start` — so this measures the 30 s connection doing its job \
+alone, not the absence of a checkpointer.
+
+WHAT THAT MEANS, AND IT IS NOT AN INTERVAL PROBLEM. The failing run's own \
+assertion names it: `a WAL that scales with the corpus rather than with the \
+checkpoint interval`. It did not plateau at one interval's writes — it grew \
+across three intervals to 6.4 GiB. A PASSIVE checkpoint cannot backfill frames \
+a reader still holds, and during a scan the index rebuild reads continuously, \
+so the PASSIVE checkpoints are repeatedly blocked and the log tracks corpus \
+size. SHORTENING THE INTERVAL DOES NOT FIX THIS: a more frequent PASSIVE \
+checkpoint is blocked just as often. What works is SQLite's own autocheckpoint, \
+which fires at a commit boundary ON THE WRITING CONNECTION, where it can \
+backfill.
+
+SO §9's CLAUSE — `single-writer actor, DEDICATED PASSIVE-checkpoint connection` \
+— DESCRIBES A MECHANISM THAT DOES NOT BOUND THE WAL, and the code is not what \
+is wrong. Production behaviour is correct and measured: 7.9 MiB at 1M, and \
+11.30 MiB loaded / 10.84 MiB idle across two full 10M scans. The dedicated \
+connection exists and demonstrably checkpoints (see the structural row below); \
+it simply is not the thing holding the bound.
+
+THIS IS A DECISION, NOT AN EVIDENCE GAP, which is why the row stays red rather \
+than closing:
+
+  (a) amend §9 to say the page-count autocheckpoint bounds the WAL and the \
+      dedicated PASSIVE connection is a supplementary backstop — matching what \
+      is measured, changing no code; or
+  (b) keep §9's mechanism as written and change the design so the dedicated \
+      connection actually bounds it, which the measurement says a shorter \
+      interval will not achieve and which would mean reimplementing, worse, \
+      something SQLite already does at the right moment.
+
+Both are the user's call. Recorded here rather than resolved because picking \
+(a) rewrites a specification clause and picking (b) rewrites a durability \
+mechanism, and a gate row is not the place either decision gets made quietly.
 """
 
 
