@@ -7,7 +7,16 @@
 //! `mtime` is not a restore in any sense the user recognises. So the contract
 //! names a floor and a disclosure rule:
 //!
-//! * **Preserved at minimum: bytes, `mtime`, and `mode`.**
+//! * **Preserved at minimum: bytes, `mtime`, and `mode`.** `mtime` is
+//!   preserved **to the resolution the target filesystem can represent**, which
+//!   is 1 ns on POSIX and 100 ns on NTFS — see `MTIME_RESOLUTION_NANOS`. That
+//!   narrowing is deliberate and was forced by measurement rather than chosen:
+//!   NTFS timestamps are FILETIME ticks, so a file tiered on Linux with a
+//!   nanosecond `mtime` cannot be restored bit-identically onto Windows by
+//!   anyone. Promising exactness there would be promising something no
+//!   implementation can deliver, which is worse than a stated limit. Any
+//!   difference the target COULD have represented and did not is still a
+//!   breach.
 //! * Captured where the provider allows: xattrs, POSIX ACLs, macOS resource
 //!   forks and Finder tags, NTFS alternate data streams.
 //! * **Anything not captured is documented as not preserved** rather than
@@ -164,6 +173,39 @@ pub enum FidelityBreach {
     },
 }
 
+/// The finest mtime this platform's filesystems can actually store, in
+/// nanoseconds.
+///
+/// **1 ns on POSIX. 100 ns on Windows**, because NTFS timestamps are FILETIME
+/// ticks and `SystemTime` is backed by the same, so a nanosecond value simply
+/// cannot be written there — `1700000000123456789` reads back as
+/// `1700000000123456700`.
+///
+/// This exists because the first native Windows CI run of this repository
+/// reported four `restore` fidelity breaches, and the test that fired says in
+/// its own comment that firing means "a real finding about the filesystem under
+/// test, not a flaky test". It was right. The finding is that a file tiered on
+/// Linux with nanosecond mtime CANNOT be restored bit-identically onto NTFS,
+/// ever, by anyone.
+///
+/// So the comparison below is against what the TARGET can represent rather than
+/// against exact equality. That is a deliberate narrowing of §4.10.6's promise
+/// and it is narrowed in the only direction that is honest: shepherd does not
+/// claim to preserve precision the storage cannot hold. It still fails on any
+/// difference the target COULD have represented and did not — which is the
+/// breach the check exists to catch, and on POSIX the behaviour is unchanged
+/// because the resolution there is 1 ns.
+const MTIME_RESOLUTION_NANOS: i64 = if cfg!(unix) { 1 } else { 100 };
+
+/// Whether a restored mtime is as faithful as the target filesystem allows.
+///
+/// Not `abs() < resolution` on a whim: a difference SMALLER than one tick is
+/// the target quantising a value it cannot hold, which is physics. A difference
+/// of one tick or more is data the target could have kept and did not.
+fn mtime_is_faithful(expected: Timestamp, actual: Timestamp) -> bool {
+    (expected.as_nanos() - actual.as_nanos()).abs() < MTIME_RESOLUTION_NANOS
+}
+
 /// Check a restore against its manifest's floor.
 ///
 /// Returns **every** breach rather than the first, so one restore report names
@@ -187,7 +229,7 @@ pub fn verify_restore(
             actual: actual.size,
         });
     }
-    if actual.mtime != c.mtime {
+    if !mtime_is_faithful(c.mtime, actual.mtime) {
         breaches.push(FidelityBreach::Mtime {
             expected: c.mtime,
             actual: actual.mtime,

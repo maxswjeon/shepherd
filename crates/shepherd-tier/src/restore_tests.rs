@@ -169,10 +169,18 @@ fn timestamps_round_trip_through_system_time_including_before_the_epoch() {
         1_700_000_000_000_000_000,
     ] {
         let ts = Timestamp::from_nanos(nanos);
-        assert_eq!(
-            from_system_time(to_system_time(ts)),
-            ts,
-            "round trip failed for {nanos}"
+        // `SystemTime` is FILETIME on Windows — 100 ns ticks — so a nanosecond
+        // value cannot survive the trip there and 1700000000123456789 comes
+        // back as ...700. That is the platform, not a defect, and it is the
+        // same limit `fidelity::MTIME_RESOLUTION_NANOS` encodes. Asserting
+        // exact equality here asserted a POSIX property as though it were
+        // universal.
+        let back = from_system_time(to_system_time(ts));
+        let slack = if cfg!(unix) { 1 } else { 100 };
+        assert!(
+            (back.as_nanos() - ts.as_nanos()).abs() < slack,
+            "round trip failed for {nanos}: got {} (slack {slack} ns)",
+            back.as_nanos()
         );
     }
 }
