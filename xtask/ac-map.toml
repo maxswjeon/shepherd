@@ -1091,10 +1091,9 @@ exercises = ["spikes/windows-syncroot", "spikes/macos-fileprovider"]
 note = "§9's 0c/0d row: Windows sync-root hydration from a separate process; the macOS spike on BOTH OQ-A mechanisms; CFAPI trash/undelete"
 evidence_missing = """
 `spikes/` NOW EXISTS AND BOTH LEGS HAVE RUN ON REAL HARDWARE. WHAT REMAINS IS \
-NOTARIZATION, WHICH IS G-0D, AND ONE REPRODUCIBILITY GAP THAT IS THIS ROW'S \
-OWN TO CARRY. This row previously read `hardware, and no spike has run` and \
-reported `no evidence at all` — both were true of the repository and false of \
-the work, which is the gap `spikes/` closes.
+NOTARIZATION AND HYDRATION, BOTH G-0D. This row previously read `hardware, and \
+no spike has run` and reported `no evidence at all` — both were true of the \
+repository and false of the work, which is the gap `spikes/` closes.
 
 WINDOWS: GREEN. Register/connect decoupling works from unpackaged executables. \
 Three distinct processes — one registered the sync root with \
@@ -1109,19 +1108,32 @@ could not have failed for the right reason; `CfGetSyncRootInfoByPath` is the \
 load-bearing one and returns 0x80070186 after unregistration. Source and \
 findings: `spikes/windows-cfapi/`.
 
-macOS: REGISTRATION COSTS NOTHING, HYDRATION IS BLOCKED, AND THE REGISTRATION \
-RESULT DOES NOT CURRENTLY REPRODUCE. No Apple certificate, no provisioning \
-profile and no notarization are needed, PROVIDED the appex is `MH_EXECUTE` with \
-`_NSExtensionMain` as entry point and carries `com.apple.security.app-sandbox`. \
-But the 2026-08-18 registration was demonstrated in a `tart` VM that was \
-destroyed without preserving its bundle, and a reconstruction — original Swift, \
-corrected build recipe, REBUILT plists — is NOT DISCOVERED on the host: `pkd` \
-never mentions it, `NSFileProviderManager.add` returns `-2014 \
-ApplicationExtensionNotFound`, while a control in the same session lists Photos \
-and both iCloud Drive providers. Build and signing ARE verified on macOS \
-26.5.2; discovery is NOT. Hydration was NEVER REACHED rather than \
-attempted-and-failed — the domain is created `user-disabled` and no extension \
-method was ever entered. Findings: `spikes/macos-fileprovider/FINDINGS.md`.
+macOS: REGISTRATION COSTS NO APPLE IDENTITY, AND THIS IS NOW REPRODUCIBLE. An \
+ad-hoc-signed `MH_EXECUTE` appex registers a File Provider domain — \
+`Signature=adhoc`, `TeamIdentifier=not set`, no certificate, no provisioning \
+profile, no notarization — verified 2026-08-19 on the HOST with SIP ENABLED \
+across four bundle IDs never used there, AND in a fresh VM reporting `0 valid \
+identities found`. The extension PROCESS LAUNCHES, which is further than any \
+earlier probe reached. Two requirements are load-bearing and neither is \
+obvious: the appex must carry `com.apple.security.application-groups` matching \
+its own `NSExtensionFileProviderDocumentGroup` exactly — omit it and `codesign` \
+is happy, `pluginkit` lists it, and only `fileproviderd` says why, once, at \
+ERROR, while the caller sees `-2014` and reads it as never-discovered — and \
+`pluginkit -a` must follow `lsregister -f` WITH NO GAP: six alternating trials \
+on identical bundles gave 0 s -> ACCEPTED x3 and 5 s -> REFUSED x3, perfect \
+separation, mechanism unexplained and labelled a guess. Source, findings and \
+the preserved working bundle: `spikes/macos-fileprovider/` and \
+`.omc/artifacts/phase-0c/`.
+
+AN EARLIER VERSION OF THIS ROW SAID THE macOS RESULT DID NOT REPRODUCE, AND \
+BLAMED THE REBUILT PLISTS OR A HOST-VERSUS-VM DIFFERENCE. Both guesses were \
+wrong, and the correction is recorded rather than quietly replaced: the \
+original probe scripts were recovered from the Mac and `vmfp.sh`'s \
+`write_plist()` generates the appex plist KEY-FOR-KEY identically to the \
+committed one, so the plists are exonerated on evidence. The real causes were \
+the two requirements above. A separate confound in the old record is now dead: \
+the original ad-hoc success had re-signed a bundle pkd already accepted under \
+an Apple Development identity, whereas the cold VM had no identities at all.
 
 THIS EVIDENCE IS PLATFORM-BOUND AND DELIBERATELY NOT GATE-EXECUTABLE. The gate \
 runs `cargo test` on Linux; Cloud Files needs the `cldflt.sys` kernel \
@@ -1130,13 +1142,14 @@ asserting these files exist and parse was REFUSED on purpose: it would pass \
 honestly while saying nothing about whether either spike works, which is this \
 repository's recurring defect one level up. §9's own text accepts a documented \
 conditional for this row — `a documented sparse failure plus full-MSIX \
-success` — and this is that. A reader should not have to run the gate and find \
-nothing ran.
+success` — and this is that.
 
-STILL RED FOR: the notarized extension §9 names (Apple Developer Program \
-membership, G-0D-PROCUREMENT, excluded by the user), and the macOS discovery \
-reproduction above, which needs a fresh VM from \
-`ghcr.io/cirruslabs/macos-tahoe-base` bisected against the committed bundle.
+STILL RED FOR: the notarized extension §9 names, and HYDRATION. Domains are \
+created `user-disabled`, and the documented headless bypass \
+(`NSFileProviderDomain.testingModes`) needs a restricted entitlement that AMFI \
+SIGKILLs under ad-hoc. So the boundary is now precise, and it is the answer to \
+the procurement question: REGISTRATION IS FREE; HYDRATION IS WHAT \
+G-0D-PROCUREMENT BUYS.
 """
 
 [[guard]]
