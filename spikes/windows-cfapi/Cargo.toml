@@ -22,6 +22,8 @@ edition = "2021"
 
 [dependencies.windows]
 version = "0.58"
+# Declares its own [workspace], so it inherits nothing from the root manifest.
+license = "AGPL-3.0-or-later"
 features = [
     "Win32_Foundation",
     "Win32_Storage_CloudFilters",

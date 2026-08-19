@@ -9,8 +9,13 @@ edition = "2024"
 # 1.141.0 and its `aws-smithy-*` transitives declare `rust-version = 1.94.1`,
 # which made the old pin and §4.5's settled SDK choice mutually unsatisfiable.
 rust-version = "1.96"
-license = "Apache-2.0"
-repository = "https://github.com/swjeon/shepherd"
+# AGPL-3.0-or-later, matching the LICENSE file at the repository root. This
+# line said `Apache-2.0` until 2026-08-19, which contradicted the licence that
+# was actually chosen — and every one of the 22 crates inherits it via
+# `license.workspace = true`, so a stale value here mislabels the whole
+# workspace, not one manifest.
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/maxswjeon/shepherd"
 publish = false
 
 # Workspace-wide lint policy.
