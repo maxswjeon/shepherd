@@ -380,7 +380,7 @@ proves = "the `and tier` leg, which had no citation at all: a file the tiering r
 
 [[ac.evidence]]
 package = "shepherd-cli"
-test = "ignore_patterns_becomes_a_repeatable_flag_carrying_an_ordered_array"
+test = "tests::ignore_patterns_becomes_a_repeatable_flag_carrying_an_ordered_array"
 proves = "the capability is reachable by a user at the outermost hop: a repeatable, order-preserving --ignore-patterns flag, omitted from the request when unset"
 
 [[ac]]
