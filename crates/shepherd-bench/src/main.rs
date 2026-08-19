@@ -34,6 +34,7 @@
 //! not describe.
 
 mod ann_bench;
+mod daemon_meta;
 mod gen_files;
 mod generate;
 
@@ -86,6 +87,33 @@ pub struct ReferenceMachine {
     /// fixture and the WAL/checkpoint figures behind the 50 TB model.
     pub sqlite_bundled: String,
     pub usearch: String,
+    /// The tantivy the eliminated candidate was measured against.
+    ///
+    /// **The dependency is gone; the record is not, and must not be.** `ccbc26d`
+    /// dropped the tantivy candidate and deleted this field along with it, but
+    /// `bench-contract.toml` is a *precommitted* artifact — it records the
+    /// provenance of measurements that were already taken, and `46b84ab` put
+    /// this line in it before those measurements ran. `bench-baseline.json`
+    /// still carries `meta_bench_tantivy_warm`/`_cold`, and the version those
+    /// numbers came from is exactly the kind of fact the contract exists to
+    /// pin. Deleting the line to match the struct would edit a measurement's
+    /// provenance after the fact, which is the failure mode the file's own
+    /// header names.
+    ///
+    /// So the field is restored rather than the contract trimmed. It is
+    /// `Option` because a future contract revision that never had a tantivy leg
+    /// should not be forced to invent one — but while the line is there, the
+    /// loader reads it instead of refusing the file.
+    ///
+    /// Refusing the file is what it did: `deny_unknown_fields` turned the
+    /// leftover line into a hard parse error, so from `ccbc26d` until this
+    /// commit **every shepherd-bench command that loads the contract was
+    /// unrunnable** — gen-trace, gen-catalog, capacity, and all three ANN legs.
+    /// `ccbc26d`'s own "Verified:" block did not catch it because the only
+    /// command it ran was `smoke`, which takes no contract. A verification that
+    /// cannot fail the way the change breaks things is the defect class this
+    /// project keeps finding, here in the harness that measures it.
+    pub tantivy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -558,6 +586,14 @@ COMMANDS:
   machine                  Print the probed machine record as JSON.
   gen-trace                Write the committed query trace from the contract seed.
   gen-catalog              Generate the SQLite catalog fixture (contract rows).
+  inject-catalog           Inject contract rows into a catalog in the REAL §4.4
+                           schema, at the path the daemon reads. Distinct from
+                           gen-catalog, which writes the Phase 0b spike table
+                           that the daemon cannot read.
+  bench-meta-daemon        §9 M1 leg 2: the metadata p95 bar measured THROUGH a
+                           live daemon over its socket, four concurrent client
+                           connections under background ingest. Needs
+                           --daemon-bin and a prior inject-catalog.
   gen-files                Materialise a corpus of real files on disk, with a
                            ground-truth manifest. This is M1's FUNCTIONAL leg;
                            it measures no latency and its scan rate is a property
@@ -576,6 +612,16 @@ GLOBAL OPTIONS:
   --scaled-run-reason <s>  Why this run is not the contract scale. Recorded in
                            the output so a scaled number can never be read as a
                            contract-scale number.
+
+bench-meta-daemon OPTIONS:
+  --daemon-bin <path>      The `shepherdd` binary to measure. Required.
+  --cores-substitution-reason <s>
+                           Permit a pin to a different CORE SET than the contract
+                           names, for the stated reason. Same core COUNT is still
+                           enforced. Recorded in the output.
+  --diagnostic-clients <n> DIAGNOSTIC ONLY. Run at n query clients instead of
+                           the contract's. Emits under a different key and marks
+                           the result supplementary; never a contract run.
 
 gen-files OPTIONS:
   --dest     <dir>         Where to write <dest>/root, <dest>/outside and
@@ -599,6 +645,27 @@ pub struct Args {
     pub cache: String,
     pub rows_override: Option<u64>,
     pub scaled_run_reason: Option<String>,
+    // --- bench-meta-daemon only -------------------------------------------
+    /// Path to the `shepherdd` binary under test. Required rather than
+    /// discovered: a harness that guesses which build it measured produces a
+    /// number nobody can re-run.
+    pub daemon_bin: Option<PathBuf>,
+    /// Override `[execution].query_clients` for a DIAGNOSTIC run.
+    ///
+    /// Never a contract run. Setting this changes the emitted key and stamps
+    /// the result object as supplementary, because the contract fixes the
+    /// client count and a run at a different one answers a different question —
+    /// `[reference_machine]`'s own language for the 32-core case is
+    /// "clearly-labelled supplementary, never the basis of a decision".
+    pub diagnostic_clients: Option<usize>,
+    /// Why this run is pinned to a different CORE SET than the contract names.
+    ///
+    /// The same discipline as `--scaled-run-reason`, for the same reason: a run
+    /// that deviates without saying why is a deviating number that can later be
+    /// read as a contract number. Required to run off `[reference_machine]
+    /// .pin_to_cores`, recorded verbatim in the result object, and it does NOT
+    /// relax the core COUNT — which is the property that clause exists to fix.
+    pub cores_substitution_reason: Option<String>,
     // --- gen-files only ---------------------------------------------------
     pub dest: Option<PathBuf>,
     pub files: Option<u64>,
@@ -620,6 +687,9 @@ fn parse_args() -> Result<Args, String> {
         cache: "warm".into(),
         rows_override: None,
         scaled_run_reason: None,
+        daemon_bin: None,
+        diagnostic_clients: None,
+        cores_substitution_reason: None,
         dest: None,
         files: None,
         seed: None,
@@ -647,6 +717,17 @@ fn parse_args() -> Result<Args, String> {
                 )
             }
             "--scaled-run-reason" => a.scaled_run_reason = Some(take("--scaled-run-reason")?),
+            "--daemon-bin" => a.daemon_bin = Some(PathBuf::from(take("--daemon-bin")?)),
+            "--cores-substitution-reason" => {
+                a.cores_substitution_reason = Some(take("--cores-substitution-reason")?)
+            }
+            "--diagnostic-clients" => {
+                a.diagnostic_clients = Some(
+                    take("--diagnostic-clients")?
+                        .parse()
+                        .map_err(|e| format!("--diagnostic-clients: {e}"))?,
+                )
+            }
             "--dest" => a.dest = Some(PathBuf::from(take("--dest")?)),
             "--files" => {
                 a.files = Some(
@@ -715,6 +796,8 @@ fn run() -> Result<(), String> {
         }
         "gen-trace" => generate::gen_trace(&args),
         "gen-catalog" => generate::gen_catalog(&args),
+        "inject-catalog" => daemon_meta::inject_catalog(&args),
+        "bench-meta-daemon" => daemon_meta::bench_daemon(&args),
         "gen-files" => gen_files::gen_files(&args),
         "capacity" => generate::capacity(&args),
         "build-ann" => ann_bench::build(&args),

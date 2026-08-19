@@ -1292,5 +1292,386 @@
     "persistence_note": "independent on-disk index with its own commit semantics",
     "rows": 10000000,
     "scaled_run_reason": null
+  },
+  "meta_daemon_bench_cold": {
+    "background_ingest_errors": 0,
+    "background_ingest_rows_per_sec_target": 2000,
+    "background_rows_ingested": 7911,
+    "background_rows_ingested_per_run": [
+      2212,
+      3399,
+      2300
+    ],
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 9.034174,
+        "p95_ms": 39.550776000000006,
+        "p99_ms": 111.703322,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 37.497751124437784,
+        "p50_ms": 22.887714,
+        "p95_ms": 82.824578,
+        "p99_ms": 146.723229,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 50.0,
+        "p50_ms": 6.2778920000000005,
+        "p95_ms": 22.981233,
+        "p99_ms": 109.606254,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "cold",
+    "client_connections": 4,
+    "contract_core_count": 8,
+    "contract_pin_to_cores": "0-7",
+    "contract_query_clients": 4,
+    "core_count": 8,
+    "cores_substitution_reason": null,
+    "daemon_cpus_allowed_list": "0-7",
+    "daemon_start_to_ready_seconds_per_run": [
+      4.666239584,
+      4.716252083,
+      4.565953966
+    ],
+    "harness_cpus_allowed_list": "0-7",
+    "loadavg_at_start": "6.56 5.04 5.21",
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.78066666666667,
+    "measured_host_idle_baseline": 0.884,
+    "measured_through": "live shepherdd over a Unix socket, client-side send->response",
+    "min_idle_fraction_required": 0.84,
+    "pass": true,
+    "pinned_core_idle_fraction_after_each_run": [
+      0.913793103448276,
+      0.9446182728410512,
+      0.8785982478097623
+    ],
+    "pinned_core_idle_fraction_before_each_run": [
+      0.8891324772940808,
+      0.9439398684622612,
+      0.9379310344827586
+    ],
+    "pinned_core_idle_sample_window_ms": 4000,
+    "post_run_settle_ms": 2000,
+    "query_clients": 4,
+    "result_limit": 50,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 41.219823000000005,
+      "drift_flagged": true,
+      "median_p50_ms": 8.159013999999999,
+      "median_p99_ms": 108.151302,
+      "run_to_run_drift_pct": 17.081148068005998,
+      "runs": [
+        {
+          "max_ms": 150.371326,
+          "mean_ms": 14.987566459000016,
+          "n": 1000,
+          "p50_ms": 8.571239,
+          "p95_ms": 41.219823000000005,
+          "p99_ms": 91.340598
+        },
+        {
+          "max_ms": 155.988327,
+          "mean_ms": 16.527325778,
+          "n": 1000,
+          "p50_ms": 8.159013999999999,
+          "p95_ms": 46.563517,
+          "p99_ms": 137.94500000000002
+        },
+        {
+          "max_ms": 448.427539,
+          "mean_ms": 15.402176963000002,
+          "n": 1000,
+          "p50_ms": 8.025312999999999,
+          "p95_ms": 39.522698000000005,
+          "p99_ms": 108.151302
+        }
+      ]
+    },
+    "supplementary_diagnostic": false,
+    "zero_hit_queries": 0
+  },
+  "meta_daemon_bench_warm": {
+    "background_ingest_errors": 0,
+    "background_ingest_rows_per_sec_target": 2000,
+    "background_rows_ingested": 11008,
+    "background_rows_ingested_per_run": [
+      1014,
+      5497,
+      4497
+    ],
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 8.906087999999999,
+        "p95_ms": 35.241438,
+        "p99_ms": 44.451071,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 37.497751124437784,
+        "p50_ms": 20.429278,
+        "p95_ms": 41.12141,
+        "p99_ms": 49.614731,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 50.0,
+        "p50_ms": 5.885761,
+        "p95_ms": 18.081389,
+        "p99_ms": 29.996925,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "warm",
+    "client_connections": 4,
+    "contract_core_count": 8,
+    "contract_pin_to_cores": "0-7",
+    "contract_query_clients": 4,
+    "core_count": 8,
+    "cores_substitution_reason": null,
+    "daemon_cpus_allowed_list": "0-7",
+    "daemon_start_to_ready_seconds_per_run": [
+      3.259018143,
+      3.308722963,
+      3.309256253
+    ],
+    "harness_cpus_allowed_list": "0-7",
+    "loadavg_at_start": "4.25 4.79 5.03",
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.78066666666667,
+    "measured_host_idle_baseline": 0.884,
+    "measured_through": "live shepherdd over a Unix socket, client-side send->response",
+    "min_idle_fraction_required": 0.84,
+    "pass": true,
+    "pinned_core_idle_fraction_after_each_run": [
+      0.9609497032177444,
+      0.9327284105131415,
+      0.9499217527386542
+    ],
+    "pinned_core_idle_fraction_before_each_run": [
+      0.9032863849765258,
+      0.9335214800878018,
+      0.9577993122850891
+    ],
+    "pinned_core_idle_sample_window_ms": 4000,
+    "post_run_settle_ms": 2000,
+    "query_clients": 4,
+    "result_limit": 50,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 33.903592,
+      "drift_flagged": true,
+      "median_p50_ms": 8.191529,
+      "median_p99_ms": 42.275424,
+      "run_to_run_drift_pct": 12.919462928883755,
+      "runs": [
+        {
+          "max_ms": 67.344685,
+          "mean_ms": 12.844213858999991,
+          "n": 1000,
+          "p50_ms": 8.191529,
+          "p95_ms": 37.606485,
+          "p99_ms": 47.272662
+        },
+        {
+          "max_ms": 51.888029,
+          "mean_ms": 11.351753640999998,
+          "n": 1000,
+          "p50_ms": 7.5558320000000005,
+          "p95_ms": 33.226323,
+          "p99_ms": 40.670223
+        },
+        {
+          "max_ms": 51.869261,
+          "mean_ms": 12.009706992999996,
+          "n": 1000,
+          "p50_ms": 8.283831000000001,
+          "p95_ms": 33.903592,
+          "p99_ms": 42.275424
+        }
+      ]
+    },
+    "supplementary_diagnostic": false,
+    "zero_hit_queries": 0
+  },
+  "meta_daemon_bench_warm__diagnostic_1c": {
+    "background_ingest_errors": 0,
+    "background_ingest_rows_per_sec_target": 2000,
+    "background_rows_ingested": 22900,
+    "background_rows_ingested_per_run": [
+      6411,
+      8094,
+      8395
+    ],
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 1.63475,
+        "p95_ms": 16.882861,
+        "p99_ms": 20.620288000000002,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 37.497751124437784,
+        "p50_ms": 12.947892000000001,
+        "p95_ms": 21.792392,
+        "p99_ms": 28.154131999999997,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 50.0,
+        "p50_ms": 1.069814,
+        "p95_ms": 2.197727,
+        "p99_ms": 13.61552,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "warm",
+    "client_connections": 1,
+    "contract_core_count": 8,
+    "contract_pin_to_cores": "0-7",
+    "contract_query_clients": 4,
+    "core_count": 8,
+    "cores_substitution_reason": null,
+    "daemon_cpus_allowed_list": "0-7",
+    "daemon_start_to_ready_seconds_per_run": [
+      3.462580589,
+      3.309174865,
+      3.258848806
+    ],
+    "harness_cpus_allowed_list": "0-7",
+    "loadavg_at_start": "4.66 4.56 4.79",
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.78066666666667,
+    "measured_host_idle_baseline": 0.884,
+    "measured_through": "live shepherdd over a Unix socket, client-side send->response",
+    "min_idle_fraction_required": 0.84,
+    "pass": true,
+    "pinned_core_idle_fraction_after_each_run": [
+      0.9525296689569019,
+      0.949874686716792,
+      0.9005006257822278
+    ],
+    "pinned_core_idle_fraction_before_each_run": [
+      0.945244055068836,
+      0.9292866082603254,
+      0.9416354556803995
+    ],
+    "pinned_core_idle_sample_window_ms": 4000,
+    "post_run_settle_ms": 2000,
+    "query_clients": 1,
+    "result_limit": 50,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 18.092405999999997,
+      "drift_flagged": false,
+      "median_p50_ms": 1.294436,
+      "median_p99_ms": 21.59109,
+      "run_to_run_drift_pct": 5.103091319087141,
+      "runs": [
+        {
+          "max_ms": 34.105006,
+          "mean_ms": 4.560653911999997,
+          "n": 1000,
+          "p50_ms": 1.294436,
+          "p95_ms": 18.068546,
+          "p99_ms": 21.422468
+        },
+        {
+          "max_ms": 28.748639,
+          "mean_ms": 4.508150222999998,
+          "n": 1000,
+          "p50_ms": 1.273616,
+          "p95_ms": 18.092405999999997,
+          "p99_ms": 21.59109
+        },
+        {
+          "max_ms": 32.264803,
+          "mean_ms": 4.707340933999999,
+          "n": 1000,
+          "p50_ms": 1.330046,
+          "p95_ms": 18.991818000000002,
+          "p99_ms": 25.58663
+        }
+      ]
+    },
+    "supplementary_diagnostic": true,
+    "zero_hit_queries": 0
   }
 }

@@ -17,6 +17,18 @@ path = "src/main.rs"
 [dependencies]
 shepherd-core.workspace = true
 
+# The injected catalog must be the schema the daemon actually reads, so it is
+# created by the product's own migrator rather than by a second spelling of the
+# DDL here, and `norm_key` is computed by the product's own function. See
+# `daemon_meta::inject_catalog`.
+shepherd-catalog.workspace = true
+
+# The wire contract for the through-daemon leg. Hand-rolled JSON frames would be
+# a private copy of the protocol, free to drift from the one the daemon speaks —
+# and a handshake that drifts fails as "connection refused", which reads as a
+# harness bug rather than as the protocol change it would be.
+shepherd-proto.workspace = true
+
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
