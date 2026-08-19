@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use shepherd_catalog::writer::CatalogActor;
+use shepherd_daemon::Paths;
 use shepherd_daemon::events::EventHub;
-use shepherd_daemon::paths::Paths;
 use shepherd_daemon::scan_exec::ScanExecutor;
 #[cfg(unix)]
 use shepherd_daemon::server;

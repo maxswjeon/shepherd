@@ -387,6 +387,32 @@ pub enum ChainStatus {
     Gap { missing: Vec<String> },
 }
 
+/// How far the *referenced segments* have actually been checked.
+///
+/// Pointer records and the bytes they publish are separate objects, and
+/// [`resolve_chain`] only ever sees the pointers. A chain can therefore be
+/// perfectly formed — unforked, gapless, every `self_blake3` correct — while
+/// the segment holding the recovery payload has been deleted or rewritten.
+/// This enum is what stops that shape from being mistaken for a verified one:
+/// custody requires [`SegmentEvidence::Verified`], and only
+/// [`verify_segments`] can produce it.
+///
+/// There is deliberately **no intermediate "the segments exist" level**. A
+/// HEAD proves existence and size, which for a compressed segment is close to
+/// no evidence at all — it cannot distinguish the right bytes from any other
+/// bytes of the same length, and the whole value of a recovery payload is that
+/// it decodes. Offering that as a custody level would invite exactly the
+/// substitution §4.10.2 refuses to make for the closing HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentEvidence {
+    /// Nothing looked. What [`resolve_chain`] and [`read_chain`] produce, since
+    /// neither fetches a segment.
+    Unchecked,
+    /// Every referenced segment was fetched and hashed to its record's
+    /// `segment_blake3`.
+    Verified,
+}
+
 /// The result of reading a chain.
 ///
 /// Returned as data rather than logged, because upper layers gate real
@@ -402,10 +428,28 @@ pub struct ChainResolution {
     /// only custody record for a file whose original is already gone.
     pub records: Vec<PointerRecord>,
     /// Records that failed validation, with the reason. Reported, never
-    /// silently skipped.
+    /// silently skipped. [`verify_segments`] appends to this too: a pointer
+    /// whose segment is gone or wrong is an invalid record, not a valid record
+    /// with a footnote.
     pub invalid: Vec<(String, String)>,
     /// The chain tip, when there is exactly one.
     pub head: Option<Blake3Hash>,
+    /// Whether the referenced segments were proven to hold the right bytes.
+    ///
+    /// Starts [`SegmentEvidence::Unchecked`] and is raised only by
+    /// [`verify_segments`]. Custody requires it, so a caller that never
+    /// verifies gets a refusal rather than a false authorisation.
+    ///
+    /// **`verify_segments` HAS NO PRODUCTION CALLER TODAY.** Nothing outside
+    /// this crate's tests raises this field, so `custody_eligible()` answers
+    /// `false` for every real chain and will keep doing so until the periodic
+    /// replica-verification pass is wired to call it. That is deliberate and
+    /// currently costs nothing — `dispatch.rs` already hardcodes
+    /// `custody_eligible: false` at registration — but it means this is a
+    /// refusal waiting to be noticed rather than a working check. Whoever
+    /// enables replica custody must wire that pass; finding it broken at that
+    /// point is the intended outcome, finding it silently permissive is not.
+    pub segments: SegmentEvidence,
 }
 
 impl ChainResolution {
@@ -428,12 +472,155 @@ impl ChainResolution {
     /// head are required. The head clause is not redundant with the record
     /// clause: `Single` with records but no lone tip means the chain closed on
     /// itself, and a replay has nowhere to start.
+    ///
+    /// **Intact pointers are not an intact bundle.** Every clause above reads
+    /// only pointer *topology*, and the pointers are separate objects from the
+    /// segments carrying the recovery payload. A chain whose segment was
+    /// deleted or rewritten satisfies all of them, so
+    /// [`SegmentEvidence::Verified`] is required as well — see
+    /// [`verify_segments`] for where that evidence comes from and what it
+    /// costs.
     pub fn custody_eligible(&self) -> bool {
         matches!(self.status, ChainStatus::Single)
             && self.invalid.is_empty()
             && !self.records.is_empty()
             && self.head.is_some()
+            && self.segments == SegmentEvidence::Verified
     }
+}
+
+/// How much of a segment is read at a time while hashing it.
+///
+/// Segments reach hundreds of megabytes (see [`verify_segments`]), so they are
+/// streamed rather than buffered — the same reason
+/// [`crate::adapter::verify_full_content`] takes a chunk size at all.
+const SEGMENT_VERIFY_CHUNK: u64 = 8 * 1024 * 1024;
+
+/// Fetch and hash every referenced segment, raising the chain's
+/// [`SegmentEvidence`] to [`SegmentEvidence::Verified`] if all of them hold the
+/// bytes their pointer claims.
+///
+/// A missing or mismatched segment is recorded in [`ChainResolution::invalid`]
+/// and the evidence stays [`SegmentEvidence::Unchecked`], so custody is refused
+/// twice over.
+///
+/// # IF YOU ARE WIRING THE DAEMON, READ THIS FIRST
+///
+/// **This function has no production caller, and until it has one every
+/// replica is custody-ineligible — permanently, and silently.** Nothing fails
+/// while that is true: [`custody_eligible`](ChainResolution::custody_eligible)
+/// simply keeps answering `false`, which is the safe direction but is also
+/// indistinguishable from a feature nobody has switched on yet. This is inert
+/// code holding a door shut, not inert code doing nothing, so no test will
+/// come and remind you.
+///
+/// What has to be wired:
+///
+/// * the periodic replica-verification / scrub pass calls this after
+///   [`read_chain`], per target — **not** the destroy path, for the cost
+///   reasons below;
+/// * its verdict is persisted to `target.custody_eligible` (§4.4). That column
+///   is what the destroy path actually reads; this function is only what
+///   entitles anyone to set it true;
+/// * on failure the column stays false and [`ChainResolution::invalid`] names
+///   the offending segment, which is the operator-facing half.
+///
+/// **This does not disable anything that currently works.** `target.add` in
+/// `shepherd-daemon` already hardcodes `custody_eligible: false` — "§4.4:
+/// registration does not confer custody" — so no production path grants
+/// custody today by any route. What changed is that the eventual enabling path
+/// now has to go through a verification that was *performed* rather than one
+/// that was assumed from intact pointers.
+///
+/// # What this costs, and why it is therefore not on the destroy path
+///
+/// This downloads the entire recovery payload. That is not a small number and
+/// pretending otherwise is how it would end up in the wrong place:
+///
+/// * a snapshot segment is a compressed copy of the catalog, and the capacity
+///   ADR measures the catalog at **854 MB at 10M files** — several hundred MB
+///   compressed;
+/// * delta segments accumulate without bound, because **v1 disables garbage
+///   collection** (D-10) — a compactor working from a stale LIST could orphan
+///   a live segment, so nothing deletes anything. The chain only grows;
+/// * at S3 egress rates that is roughly **$0.09 per GB, per verification**.
+///
+/// So the honest reading of "verify before granting custody" is not
+/// "re-download the catalog every time a file is destroyed" — that would cost
+/// more than the tiering saves and would put a multi-minute transfer inside a
+/// per-file decision. It is that **custody is an attestation, not a
+/// predicate**: `target.custody_eligible` is a persisted column (§4.4),
+/// refreshed by the periodic replica-verification pass that already budgets
+/// full reads — the same pass whose NAS configuration re-reads 25 TB every 90
+/// days, next to which a few hundred MB is noise. This function is that pass's
+/// worker.
+///
+/// The type is what keeps the two apart: [`read_chain`] cannot produce
+/// `Verified`, so no amount of reading the chain on a hot path can accidentally
+/// authorise a destruction.
+///
+/// A transport failure is propagated rather than recorded as a mismatch: "the
+/// network is down" is not evidence that a segment is bad, and turning it into
+/// one would let a flaky link mark a healthy replica permanently ineligible.
+pub async fn verify_segments(
+    adapter: &dyn StorageAdapter,
+    resolution: &mut ChainResolution,
+) -> StorageResult<()> {
+    let mut failures: Vec<(String, String)> = Vec::new();
+
+    for record in &resolution.records {
+        let name = record.key().pointer_name();
+        let key = ObjectKey::new(record.segment_key.clone());
+
+        let Some(expected) = Blake3Hash::from_hex(&record.segment_blake3) else {
+            // `validate` already rejects this, so reaching it means a record
+            // entered `records` without validating.
+            failures.push((name, "segment_blake3 is not a valid hash".into()));
+            continue;
+        };
+
+        let Some(meta) = adapter.head(&key).await? else {
+            failures.push((
+                name,
+                format!(
+                    "segment {} is absent: the pointer is intact but the recovery payload it \
+                     publishes is gone",
+                    key.as_str()
+                ),
+            ));
+            continue;
+        };
+
+        match crate::adapter::verify_full_content(
+            adapter,
+            &key,
+            expected,
+            meta.size,
+            SEGMENT_VERIFY_CHUNK,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(StorageError::ContentMismatch {
+                key: k,
+                expected: e,
+                actual: a,
+            }) => failures.push((
+                name,
+                format!("segment {k} does not hash to the value its pointer names: expected {e}, read {a}"),
+            )),
+            // Not a verdict about the segment. See the note above.
+            Err(other) => return Err(other),
+        }
+    }
+
+    if failures.is_empty() {
+        resolution.segments = SegmentEvidence::Verified;
+    } else {
+        resolution.invalid.extend(failures);
+        resolution.segments = SegmentEvidence::Unchecked;
+    }
+    Ok(())
 }
 
 /// Reconstruct the chain from a set of fetched pointer bodies.
@@ -522,6 +709,8 @@ pub fn resolve_chain(bodies: &[(String, PointerRecord)]) -> ChainResolution {
         records: valid,
         invalid,
         head,
+        // This function fetches no segment, so it has no evidence about any.
+        segments: SegmentEvidence::Unchecked,
     }
 }
 

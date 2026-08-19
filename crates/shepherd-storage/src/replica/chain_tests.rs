@@ -88,7 +88,7 @@ fn canonicalization_ignores_json_key_order() {
 }
 
 #[test]
-fn a_single_chain_resolves_and_is_custody_eligible() {
+fn a_single_chain_resolves_but_topology_alone_is_not_custody() {
     let g = rec(1, 1, "u1", None);
     let b = rec(1, 2, "u2", Some(g.self_blake3.clone()));
     let c = rec(2, 3, "u3", Some(b.self_blake3.clone()));
@@ -97,7 +97,14 @@ fn a_single_chain_resolves_and_is_custody_eligible() {
     // guarantee on SMB or NFS.
     let r = resolve_chain(&listed(&[c.clone(), g.clone(), b.clone()]));
     assert_eq!(r.status, ChainStatus::Single);
-    assert!(r.custody_eligible());
+    // Topology is clean — and that alone is deliberately not custody. Nothing
+    // here fetched a segment, so there is no evidence the recovery payload
+    // exists; see `a_verified_chain_is_custody_eligible` for the other half.
+    assert_eq!(r.segments, SegmentEvidence::Unchecked);
+    assert!(
+        !r.custody_eligible(),
+        "an unforked gapless chain is necessary for custody, not sufficient"
+    );
     assert!(r.invalid.is_empty());
     assert_eq!(
         r.records.iter().map(|x| x.seq).collect::<Vec<_>>(),
@@ -358,11 +365,21 @@ async fn a_second_publish_chains_onto_the_first() {
 
     assert_eq!(second.prev_ptr_blake3, Some(head.to_hex()));
 
-    let resolved = read_chain(&adapter).await.expect("read back");
+    let mut resolved = read_chain(&adapter).await.expect("read back");
     assert_eq!(resolved.status, ChainStatus::Single);
-    assert!(resolved.custody_eligible());
     assert_eq!(resolved.records.len(), 2);
     assert_eq!(resolved.head, Some(second.compute_self_hash().unwrap()));
+
+    // `read_chain` fetches pointer bodies only, so it cannot mint custody.
+    assert!(!resolved.custody_eligible());
+    verify_segments(&adapter, &mut resolved)
+        .await
+        .expect("both segments are present and intact");
+    assert_eq!(resolved.segments, SegmentEvidence::Verified);
+    assert!(
+        resolved.custody_eligible(),
+        "a verified two-record chain must be a usable custody authority"
+    );
 }
 
 #[tokio::test]
@@ -434,14 +451,158 @@ fn an_empty_chain_is_not_custody_eligible() {
 /// otherwise the guard above would be indistinguishable from breaking custody
 /// entirely.
 #[test]
-fn a_single_valid_record_is_still_custody_eligible() {
+fn a_single_valid_record_satisfies_every_topology_clause() {
     let g = rec(1, 1, "u1", None);
     let r = resolve_chain(&listed(std::slice::from_ref(&g)));
     assert_eq!(r.status, ChainStatus::Single);
     assert_eq!(r.records.len(), 1);
     assert_eq!(r.head, Blake3Hash::from_hex(&g.self_blake3));
     assert!(
-        r.custody_eligible(),
-        "one valid genesis record with a head is a usable custody authority"
+        r.invalid.is_empty(),
+        "one valid genesis record with a head clears every clause resolve_chain can judge"
+    );
+    // The remaining clause is not judgeable from pointers alone.
+    assert_eq!(r.segments, SegmentEvidence::Unchecked);
+}
+
+// --- segments, not just pointers -------------------------------------------
+//
+// A chain's pointers and the segments they publish are separate objects. These
+// four tests hold the two apart: intact pointers over a deleted or rewritten
+// segment must never authorize destroying the sole local catalog, and a chain
+// whose segments really are intact must still be able to.
+
+/// A chain with two records, published for real through [`ChainWriter`].
+async fn published_pair(adapter: &MemAdapter) -> (PointerRecord, PointerRecord) {
+    let alloc = FakeAllocator::at_epoch(3);
+    let writer = ChainWriter::new(adapter, &alloc, TargetId::new(1));
+    let first = writer
+        .publish(
+            SegmentKind::Delta,
+            Bytes::from_static(b"segment-one"),
+            None,
+            Blake3Hash::from_bytes([1; 32]),
+        )
+        .await
+        .expect("first");
+    let head = first.compute_self_hash().unwrap();
+    let second = writer
+        .publish(
+            SegmentKind::Delta,
+            Bytes::from_static(b"segment-two"),
+            Some(head),
+            Blake3Hash::from_bytes([2; 32]),
+        )
+        .await
+        .expect("second");
+    (first, second)
+}
+
+/// **The accepting direction.** A guard hard-wired to refuse would pass all
+/// three refusal tests below while making every replica permanently
+/// custody-ineligible — which is the failure mode that voids tiering rather
+/// than the one that loses data, and so the easier one to ship unnoticed.
+#[tokio::test]
+async fn a_verified_chain_is_custody_eligible() {
+    let adapter = MemAdapter::content_addressed();
+    let _ = published_pair(&adapter).await;
+
+    let mut resolved = read_chain(&adapter).await.expect("read");
+    verify_segments(&adapter, &mut resolved)
+        .await
+        .expect("intact segments verify");
+
+    assert_eq!(resolved.segments, SegmentEvidence::Verified);
+    assert!(resolved.invalid.is_empty(), "{:?}", resolved.invalid);
+    assert!(resolved.custody_eligible());
+}
+
+/// The finding's first half: the pointer records are intact but the object
+/// they reference was deleted.
+#[tokio::test]
+async fn a_deleted_segment_invalidates_custody() {
+    let adapter = MemAdapter::content_addressed();
+    let (first, _second) = published_pair(&adapter).await;
+    let gone = ObjectKey::new(first.segment_key.clone());
+    adapter.remove_raw(&gone);
+
+    let mut resolved = read_chain(&adapter).await.expect("read");
+    assert_eq!(
+        resolved.status,
+        ChainStatus::Single,
+        "precondition: pointer topology is still perfect — that is the whole problem"
+    );
+
+    verify_segments(&adapter, &mut resolved)
+        .await
+        .expect("a missing segment is a verdict, not a transport error");
+
+    assert_eq!(resolved.segments, SegmentEvidence::Unchecked);
+    assert_eq!(
+        resolved.invalid.len(),
+        1,
+        "the missing segment must be reported, not silently skipped: {:?}",
+        resolved.invalid
+    );
+    assert!(
+        resolved.invalid[0].1.contains(gone.as_str()),
+        "the report must name the segment: {:?}",
+        resolved.invalid[0]
+    );
+    assert!(!resolved.custody_eligible());
+}
+
+/// The finding's second half, and the one existence alone cannot catch: the
+/// segment is present, the right size, and holds different bytes.
+#[tokio::test]
+async fn a_corrupted_segment_of_the_same_size_invalidates_custody() {
+    let adapter = MemAdapter::content_addressed();
+    let (first, _second) = published_pair(&adapter).await;
+    let key = ObjectKey::new(first.segment_key.clone());
+    let original = adapter.object(&key).expect("published");
+
+    // Same length, different bytes — so a HEAD-based check would see nothing.
+    let corrupt = Bytes::from_static(b"segment-ONE");
+    assert_eq!(corrupt.len(), original.len(), "precondition: same size");
+    assert_ne!(corrupt, original);
+    adapter.put_raw(&key, corrupt);
+
+    let mut resolved = read_chain(&adapter).await.expect("read");
+    assert_eq!(resolved.status, ChainStatus::Single);
+
+    verify_segments(&adapter, &mut resolved)
+        .await
+        .expect("a hash disagreement is a verdict");
+
+    assert_eq!(resolved.segments, SegmentEvidence::Unchecked);
+    assert_eq!(resolved.invalid.len(), 1, "{:?}", resolved.invalid);
+    assert!(
+        !resolved.custody_eligible(),
+        "a same-size rewrite is exactly what a size check cannot see, which is why \
+         custody requires the hash"
+    );
+}
+
+/// Verification is not something a caller can skip by accident: the only
+/// constructor of a `ChainResolution` starts at `Unchecked`, and reading the
+/// chain — however completely — never raises it.
+#[tokio::test]
+async fn reading_the_chain_alone_never_produces_custody() {
+    let adapter = MemAdapter::content_addressed();
+    let _ = published_pair(&adapter).await;
+
+    let resolved = read_chain(&adapter).await.expect("read");
+    assert_eq!(resolved.status, ChainStatus::Single);
+    assert!(resolved.invalid.is_empty());
+    assert_eq!(resolved.records.len(), 2);
+    assert!(resolved.head.is_some());
+    assert_eq!(
+        resolved.segments,
+        SegmentEvidence::Unchecked,
+        "read_chain fetches pointer bodies only"
+    );
+    assert!(
+        !resolved.custody_eligible(),
+        "every topology clause passes and custody must still be refused"
     );
 }

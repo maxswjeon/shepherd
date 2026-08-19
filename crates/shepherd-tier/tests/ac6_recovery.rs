@@ -160,6 +160,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
             let md = std::fs::metadata(p).unwrap();
             repo.upsert_file(
                 &root,
+                // Generation is irrelevant here — this fixture never sweeps.
                 &FileStat {
                     root: root.id,
                     rel_path: rel,
@@ -169,6 +170,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
                     atime: None,
                     blake3: h,
                 },
+                1,
                 now,
             )
             .unwrap();
@@ -340,7 +342,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     {
         let mut repo = FileRepo::new(&mut cat);
         for f in &walked.files {
-            repo.upsert_file(&root, f, now).unwrap();
+            repo.upsert_file(&root, f, 1, now).unwrap();
         }
     }
 

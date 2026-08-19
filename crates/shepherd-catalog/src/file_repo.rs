@@ -261,12 +261,39 @@ impl<'a> FileRepo<'a> {
     /// revoked custody on every tiered file at the next scan and broken
     /// nothing. `a_rescan_does_not_revoke_a_tiered_rows_custody` is that pin.
     ///
+    /// # `generation`
+    ///
+    /// The scan pass this sighting belongs to, written to `last_seen_gen` on
+    /// **both** the insert and the conflict branch. It is what lets a completed
+    /// scan reconcile the rows it did *not* see: everything left below the
+    /// current generation was not found on disk. This repo stamps it here and
+    /// nowhere else, so "seen by a scan" has exactly one definition.
+    ///
+    /// **It is a counter, and it must never be a wall clock.** An `updated_at`
+    /// watermark was considered and rejected: an NTP step backwards mid-scan
+    /// would leave freshly-seen rows below the mark and sweep files that are
+    /// still on disk to `'missing'` — worse than the reconciliation gap it
+    /// would close. The caller owns the choice of source and its monotonicity;
+    /// this function's contract is only to store faithfully what it is handed,
+    /// on both paths.
+    ///
+    /// It is deliberately **not** an input to the `blake3` guard below. Every
+    /// scan bumps the generation for every file it sees, so a digest guard that
+    /// counted it as a metadata change would clear every hash in the catalog on
+    /// the first re-scan.
+    ///
     /// The reason `file.state` nonetheless only ever holds `'local'` is
     /// separate and still open: **nothing in the tree writes `'stub'` or
     /// `'remote'`**, here or anywhere else, because tiering is Phase 2/3 work.
     /// That is what makes `WHERE state IN ('stub','remote')` a filter over a
     /// single-valued column, and it is not fixed by this statement.
-    pub fn upsert_file(&mut self, root: &ScanRoot, stat: &FileStat, now: Timestamp) -> Result<()> {
+    pub fn upsert_file(
+        &mut self,
+        root: &ScanRoot,
+        stat: &FileStat,
+        generation: i64,
+        now: Timestamp,
+    ) -> Result<()> {
         if stat.root != root.id {
             return Err(CatalogError::Invalid(format!(
                 "FileStat belongs to {} but was upserted against root {}",
@@ -278,12 +305,20 @@ impl<'a> FileRepo<'a> {
         self.0.conn_mut().execute(
             "INSERT INTO file
                  (root_id, rel_path, name, ext, size, mtime, ctime, atime,
-                  norm_key, first_seen_at, blake3, state, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'local', ?10)
+                  norm_key, first_seen_at, blake3, state, last_seen_gen, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'local', ?12, ?10)
              ON CONFLICT(root_id, rel_path) DO UPDATE SET
                  name = excluded.name, ext = excluded.ext, size = excluded.size,
                  mtime = excluded.mtime, ctime = excluded.ctime, atime = excluded.atime,
                  norm_key = excluded.norm_key, updated_at = excluded.updated_at,
+                 -- last_seen_gen IS in this list, and that is the whole point
+                 -- of it. The reconciling sweep is
+                 -- `SET state='missing' WHERE last_seen_gen < :this_scan`, so a
+                 -- row stamped on INSERT and never on UPDATE keeps its
+                 -- first-ever generation and is swept as missing on the second
+                 -- scan — the catalog declaring a file gone while it is on
+                 -- disk. Both writes or neither.
+                 last_seen_gen = excluded.last_seen_gen,
                  -- first_seen_at is NEVER overwritten: §4.12 makes it the
                  -- min-age floor source where mtime is untrusted or in the
                  -- future, and a re-scan must not reset a file's apparent age.
@@ -292,7 +327,45 @@ impl<'a> FileRepo<'a> {
                  -- reason: a stub or a tiered placeholder still stats, so a
                  -- re-scan that wrote excluded.state ('local') would silently
                  -- revoke custody on every file the tierer had moved.
-                 blake3 = COALESCE(excluded.blake3, file.blake3)",
+                 --
+                 -- blake3 survives a hashless re-scan ONLY where the metadata
+                 -- that identified the hashed bytes held still. A bare COALESCE
+                 -- kept the digest unconditionally, so a row could pair the new
+                 -- size and mtime with the old bytes' hash — and since that
+                 -- hash is what names the content-addressed object, the next
+                 -- upload would put the NEW bytes under the OLD key and find
+                 -- out after the full transfer. Clearing it costs a re-hash;
+                 -- keeping it costs correctness of the object namespace.
+                 --
+                 -- ctime is in the comparison and atime is not, deliberately.
+                 -- ctime catches a write that preserved mtime (`cp -p`, rsync
+                 -- --times, `touch -r`); its false positive is a re-hash after
+                 -- a chmod, which is wasted work, not a wrong answer. atime
+                 -- moves on every READ, and a digest invalidated by reading
+                 -- would re-hash the whole corpus every time anyone opened it.
+                 --
+                 -- READ THIS BEFORE WIRING HASHING. Clearing a digest is only
+                 -- half a mechanism: something has to re-take it. Nothing does
+                 -- today — the walker emits `blake3: None` unconditionally
+                 -- (`shepherd-scan::walk`), `FileRepo::set_blake3` has no
+                 -- caller outside this module''s tests, and there is no
+                 -- selector anywhere that looks for unhashed rows. So the
+                 -- column is always NULL in a running daemon and this
+                 -- expression cannot yet clear anything real.
+                 --
+                 -- The moment hashing IS wired, the hashing job MUST select on
+                 -- `WHERE blake3 IS NULL` (or an equivalent that re-queues a
+                 -- cleared row). Wire it to scan-newly-inserted-rows only and
+                 -- every digest this expression clears is never re-taken: the
+                 -- file becomes permanently `PlanRefusal::Unhashed`, silently
+                 -- excluded from every tier plan, which is a file that never
+                 -- gets backed up and never reports why.
+                 blake3 = COALESCE(
+                     excluded.blake3,
+                     CASE WHEN excluded.size  = file.size
+                           AND excluded.mtime = file.mtime
+                           AND excluded.ctime = file.ctime
+                          THEN file.blake3 END)",
             params![
                 root.id.get(),
                 stat.rel_path,
@@ -305,6 +378,7 @@ impl<'a> FileRepo<'a> {
                 nk,
                 now.as_nanos(),
                 stat.blake3.map(|h| h.as_bytes().to_vec()),
+                generation,
             ],
         )?;
         Ok(())
@@ -432,6 +506,9 @@ fn split_name(rel_path: &str) -> (String, Option<String>) {
 mod tests {
     use super::*;
 
+    /// A scan generation for tests that are not about generations.
+    const GEN: i64 = 1;
+
     fn stat(root: RootId, rel: &str) -> FileStat {
         FileStat {
             root,
@@ -472,7 +549,7 @@ mod tests {
         let nfc = "caf\u{00e9}/notes.txt";
         let nfd = "cafe\u{0301}/notes.txt";
         FileRepo::new(&mut cat)
-            .upsert_file(&root, &stat(root.id, nfc), Timestamp::from_nanos(2))
+            .upsert_file(&root, &stat(root.id, nfc), GEN, Timestamp::from_nanos(2))
             .unwrap();
 
         let repo = FileRepo::new(&mut cat);
@@ -500,10 +577,20 @@ mod tests {
     fn first_seen_at_survives_a_rescan() {
         let (mut cat, root) = fixture();
         let mut repo = FileRepo::new(&mut cat);
-        repo.upsert_file(&root, &stat(root.id, "a.txt"), Timestamp::from_nanos(100))
-            .unwrap();
-        repo.upsert_file(&root, &stat(root.id, "a.txt"), Timestamp::from_nanos(999))
-            .unwrap();
+        repo.upsert_file(
+            &root,
+            &stat(root.id, "a.txt"),
+            GEN,
+            Timestamp::from_nanos(100),
+        )
+        .unwrap();
+        repo.upsert_file(
+            &root,
+            &stat(root.id, "a.txt"),
+            GEN,
+            Timestamp::from_nanos(999),
+        )
+        .unwrap();
         let first: i64 = cat
             .conn()
             .query_row("SELECT first_seen_at FROM file", [], |r| r.get(0))
@@ -524,7 +611,12 @@ mod tests {
     fn a_freshly_scanned_row_is_local() {
         let (mut cat, root) = fixture();
         FileRepo::new(&mut cat)
-            .upsert_file(&root, &stat(root.id, "a.txt"), Timestamp::from_nanos(1))
+            .upsert_file(
+                &root,
+                &stat(root.id, "a.txt"),
+                GEN,
+                Timestamp::from_nanos(1),
+            )
             .unwrap();
         let st: String = cat
             .conn()
@@ -545,7 +637,12 @@ mod tests {
     fn a_rescan_does_not_revoke_a_tiered_rows_custody() {
         let (mut cat, root) = fixture();
         FileRepo::new(&mut cat)
-            .upsert_file(&root, &stat(root.id, "a.txt"), Timestamp::from_nanos(1))
+            .upsert_file(
+                &root,
+                &stat(root.id, "a.txt"),
+                GEN,
+                Timestamp::from_nanos(1),
+            )
             .unwrap();
         // Stand in for the tierer, which is Phase 2/3 work. What is under test
         // is the re-scan, not who set the state.
@@ -554,7 +651,12 @@ mod tests {
             .unwrap();
 
         FileRepo::new(&mut cat)
-            .upsert_file(&root, &stat(root.id, "a.txt"), Timestamp::from_nanos(2))
+            .upsert_file(
+                &root,
+                &stat(root.id, "a.txt"),
+                GEN,
+                Timestamp::from_nanos(2),
+            )
             .unwrap();
 
         let st: String = cat
@@ -581,17 +683,269 @@ mod tests {
         let mut repo = FileRepo::new(&mut cat);
         let mut s = stat(root.id, "a.txt");
         s.blake3 = Some(Blake3Hash::from_bytes([7; 32]));
-        repo.upsert_file(&root, &s, Timestamp::from_nanos(1))
+        repo.upsert_file(&root, &s, GEN, Timestamp::from_nanos(1))
             .unwrap();
         // Hashing is its own job class, so a later metadata-only scan arrives
         // with blake3 = None. It must not clear the hash.
-        repo.upsert_file(&root, &stat(root.id, "a.txt"), Timestamp::from_nanos(2))
-            .unwrap();
+        repo.upsert_file(
+            &root,
+            &stat(root.id, "a.txt"),
+            GEN,
+            Timestamp::from_nanos(2),
+        )
+        .unwrap();
         let h: Option<Vec<u8>> = cat
             .conn()
             .query_row("SELECT blake3 FROM file", [], |r| r.get(0))
             .unwrap();
         assert_eq!(h, Some(vec![7u8; 32]));
+    }
+
+    /// The generation must advance on a RE-scan, not only on the first sight.
+    ///
+    /// `last_seen_gen` is what lets a completed scan reconcile the rows it did
+    /// not see — the sweep is `UPDATE file SET state = 'missing' WHERE
+    /// last_seen_gen < :this_scan`. So the dangerous omission is not forgetting
+    /// the column: it is stamping it on the INSERT and forgetting the
+    /// `DO UPDATE` list. A file present in every scan then keeps its
+    /// first-ever generation for ever and is swept as **missing** on the second
+    /// run — the catalog declaring the user's data gone while it sits on disk.
+    ///
+    /// That is a one-line omission with a data-shaped consequence, and it is
+    /// invisible to any test that only inserts. Hence: the same path, twice,
+    /// under two generations, asserting the value MOVED — not merely that the
+    /// column is populated.
+    #[test]
+    fn a_rescan_advances_the_generation_it_was_given() {
+        let (mut cat, root) = fixture();
+        let mut repo = FileRepo::new(&mut cat);
+        repo.upsert_file(&root, &stat(root.id, "a.txt"), 7, Timestamp::from_nanos(1))
+            .unwrap();
+        let first: i64 = cat
+            .conn()
+            .query_row("SELECT last_seen_gen FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            first, 7,
+            "the insert must stamp the generation it was given"
+        );
+
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &stat(root.id, "a.txt"), 8, Timestamp::from_nanos(2))
+            .unwrap();
+        let second: i64 = cat
+            .conn()
+            .query_row("SELECT last_seen_gen FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            second, 8,
+            "a re-scan left the row at generation {first}. The next completed \
+             scan sweeps `last_seen_gen < gen` to 'missing', so this file — \
+             which the scan just saw on disk — would be marked missing"
+        );
+    }
+
+    /// The generation and the stale-digest guard must stay independent.
+    ///
+    /// Every scan bumps the generation for every file it sees; that is the
+    /// point of it. A digest guard that treated the bump as "the metadata
+    /// changed" would therefore clear **every hash in the catalog** on the
+    /// first re-scan, turning a correctness fix into a corpus-wide re-hash.
+    ///
+    /// It is independent by construction — the `CASE` compares size, mtime and
+    /// ctime and nothing else — but "obvious from the code" is exactly what
+    /// stops being true when someone later makes the guard stricter.
+    #[test]
+    fn a_generation_bump_alone_does_not_clear_the_digest() {
+        let (mut cat, root) = fixture();
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &stat(root.id, "a.txt"), 1, Timestamp::from_nanos(1))
+            .unwrap();
+        let id: i64 = cat
+            .conn()
+            .query_row("SELECT id FROM file", [], |r| r.get(0))
+            .unwrap();
+        FileRepo::new(&mut cat)
+            .set_blake3(
+                id,
+                Blake3Hash::from_bytes([7; 32]),
+                Timestamp::from_nanos(2),
+            )
+            .unwrap();
+
+        // Identical bytes, identical metadata, next scan.
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &stat(root.id, "a.txt"), 2, Timestamp::from_nanos(3))
+            .unwrap();
+
+        let (h, seen_gen): (Option<Vec<u8>>, i64) = cat
+            .conn()
+            .query_row("SELECT blake3, last_seen_gen FROM file", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(seen_gen, 2, "the generation must still have advanced");
+        assert_eq!(
+            h,
+            Some(vec![7u8; 32]),
+            "advancing the scan generation re-hashed an unchanged file — on a \
+             50 TB corpus that is every file, every scan"
+        );
+    }
+
+    /// A digest is only valid for the bytes it was taken over.
+    ///
+    /// `COALESCE(excluded.blake3, file.blake3)` kept the old digest through a
+    /// metadata-only re-scan **unconditionally**, so a row could carry the
+    /// current size and mtime beside the hash of bytes that no longer existed.
+    /// The digest is what names the content-addressed remote object, so the
+    /// consequence is not a stale column: it is an upload of the NEW bytes
+    /// under the OLD bytes' key, discovered only after the whole transfer.
+    #[test]
+    fn a_rescan_that_saw_new_bytes_does_not_keep_the_old_digest() {
+        let (mut cat, root) = fixture();
+        let old_hash = Blake3Hash::from_bytes([7; 32]);
+        FileRepo::new(&mut cat)
+            .upsert_file(
+                &root,
+                &stat(root.id, "a.txt"),
+                GEN,
+                Timestamp::from_nanos(1),
+            )
+            .unwrap();
+        let id: i64 = cat
+            .conn()
+            .query_row("SELECT id FROM file", [], |r| r.get(0))
+            .unwrap();
+        // Hashing is its own job class (§6 Phase 1), so it lands here, not in
+        // the scan that created the row.
+        FileRepo::new(&mut cat)
+            .set_blake3(id, old_hash, Timestamp::from_nanos(2))
+            .unwrap();
+
+        // The file is rewritten. The next scan is metadata-only, as scans are:
+        // it reports the new size and mtime and carries no hash.
+        let mut changed = stat(root.id, "a.txt");
+        changed.size = 4096;
+        changed.mtime = Timestamp::from_nanos(500);
+        changed.ctime = Timestamp::from_nanos(500);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &changed, GEN, Timestamp::from_nanos(3))
+            .unwrap();
+
+        let h: Option<Vec<u8>> = cat
+            .conn()
+            .query_row("SELECT blake3 FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            h,
+            None,
+            "the row kept a digest of bytes that are gone. `plan_tier` accepts \
+             any digest it finds, so this row's next upload would be addressed \
+             {} — an object named for content it does not contain",
+            crate::identity::content_key("p", old_hash).as_str()
+        );
+        // And the rest of the row did update, so the assertion above is about
+        // the digest and not about the upsert having done nothing.
+        let size: i64 = cat
+            .conn()
+            .query_row("SELECT size FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(size, 4096, "the re-scan must still have written the row");
+    }
+
+    /// The half of the guard that mtime alone would miss.
+    ///
+    /// `rsync --times`, `cp -p` and `touch -r` all restore mtime after writing,
+    /// and a same-size edit is ordinary. Comparing only size and mtime would
+    /// call that pair unchanged and keep the old digest — the exact stale-hash
+    /// row this guard exists to prevent, reached by the commonest backup tools
+    /// in use. ctime cannot be restored by a userspace tool, which is why it is
+    /// in the comparison.
+    #[test]
+    fn a_write_that_restored_mtime_still_clears_the_digest() {
+        let (mut cat, root) = fixture();
+        FileRepo::new(&mut cat)
+            .upsert_file(
+                &root,
+                &stat(root.id, "a.txt"),
+                GEN,
+                Timestamp::from_nanos(1),
+            )
+            .unwrap();
+        let id: i64 = cat
+            .conn()
+            .query_row("SELECT id FROM file", [], |r| r.get(0))
+            .unwrap();
+        FileRepo::new(&mut cat)
+            .set_blake3(
+                id,
+                Blake3Hash::from_bytes([7; 32]),
+                Timestamp::from_nanos(2),
+            )
+            .unwrap();
+
+        // Same size, same mtime — the tool put it back. Only ctime tells.
+        let mut rewritten = stat(root.id, "a.txt");
+        rewritten.ctime = Timestamp::from_nanos(500);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &rewritten, GEN, Timestamp::from_nanos(3))
+            .unwrap();
+
+        let h: Option<Vec<u8>> = cat
+            .conn()
+            .query_row("SELECT blake3 FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            h, None,
+            "a write with a restored mtime kept its old digest — every \
+             mtime-preserving copy tool produces this row"
+        );
+    }
+
+    /// The accepting direction, and the reason the guard is not "clear on any
+    /// difference": **reading** a file changes its atime and nothing else. A
+    /// hash invalidated by a read would be re-taken on every scan of every file
+    /// anyone had opened, and hashing 50 TB is not free.
+    #[test]
+    fn a_rescan_that_saw_only_a_new_atime_keeps_the_digest() {
+        let (mut cat, root) = fixture();
+        FileRepo::new(&mut cat)
+            .upsert_file(
+                &root,
+                &stat(root.id, "a.txt"),
+                GEN,
+                Timestamp::from_nanos(1),
+            )
+            .unwrap();
+        let id: i64 = cat
+            .conn()
+            .query_row("SELECT id FROM file", [], |r| r.get(0))
+            .unwrap();
+        FileRepo::new(&mut cat)
+            .set_blake3(
+                id,
+                Blake3Hash::from_bytes([7; 32]),
+                Timestamp::from_nanos(2),
+            )
+            .unwrap();
+
+        let mut read = stat(root.id, "a.txt");
+        read.atime = Some(Timestamp::from_nanos(900));
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &read, GEN, Timestamp::from_nanos(3))
+            .unwrap();
+
+        let h: Option<Vec<u8>> = cat
+            .conn()
+            .query_row("SELECT blake3 FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            h,
+            Some(vec![7u8; 32]),
+            "an access re-hashed the file: the bytes did not change, only the \
+             record of who looked at them"
+        );
     }
 
     #[test]
@@ -641,7 +995,7 @@ mod tests {
         assert!(r.destroy_refusal().unwrap().contains("EINVAL"));
         // Still fully usable for everything that is not destruction.
         FileRepo::new(&mut cat)
-            .upsert_file(&r, &stat(r.id, "a.txt"), Timestamp::from_nanos(2))
+            .upsert_file(&r, &stat(r.id, "a.txt"), GEN, Timestamp::from_nanos(2))
             .unwrap();
         assert_eq!(
             FileRepo::new(&mut cat)
@@ -677,7 +1031,7 @@ mod tests {
     fn upserting_against_the_wrong_root_is_refused() {
         let (mut cat, root) = fixture();
         let wrong = stat(RootId::new(root.id.get() + 1), "a.txt");
-        let err = FileRepo::new(&mut cat).upsert_file(&root, &wrong, Timestamp::from_nanos(1));
+        let err = FileRepo::new(&mut cat).upsert_file(&root, &wrong, GEN, Timestamp::from_nanos(1));
         assert!(
             err.is_err(),
             "a row must not be filed under another root's policies"

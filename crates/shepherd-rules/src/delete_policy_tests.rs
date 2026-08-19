@@ -333,3 +333,130 @@ impl DiscardInputs<'_> {
         discard_permitted(&self).refusals().to_vec()
     }
 }
+
+// --- a deferral authorizes its OWN destruction and no other ----------------
+//
+// The same shape as the destroy-lock defect: two sides of a guard disagreeing
+// about what identity means. An elapsed window is only evidence about the file,
+// target and side of the system it was opened for. A lookup that returns the
+// wrong row must not be able to spend one file's elapsed window on another.
+
+fn deferral_keyed(
+    file: i64,
+    target: i64,
+    kind: DeferralKind,
+    now: &ClockReading,
+    days: u32,
+) -> Deferral {
+    Deferral::open(
+        FileId::new(file),
+        TargetId::new(target),
+        kind,
+        days,
+        now,
+        ClockProvenance::NtpSynced,
+    )
+}
+
+/// `file` is load-bearing on its own.
+#[test]
+fn an_elapsed_window_belonging_to_another_file_authorizes_nothing() {
+    let start = boot("b1", 0, 0);
+    let after = boot("b1", 15, 15);
+    // Same target, same kind, same elapsed window — only the file differs.
+    let other_file = deferral_keyed(2, 1, DeferralKind::Remote, &start, 14);
+    assert_eq!(
+        other_file.status(&after),
+        DeferralStatus::Expired,
+        "precondition: the window really has elapsed, so only identity can refuse it"
+    );
+
+    let decision = discard_permitted(&inputs(&after, Some(&other_file), Some(14)));
+    assert_eq!(
+        decision.refusals(),
+        [DiscardRefusal::DeferralForAnotherKey {
+            deferral_file: FileId::new(2),
+            deferral_target: TargetId::new(1),
+            deferral_kind: DeferralKind::Remote,
+        }],
+        "file 2's elapsed window must not destroy file 1"
+    );
+}
+
+/// `target` is load-bearing on its own — a test that only varies `file` cannot
+/// tell you this field is compared at all.
+#[test]
+fn an_elapsed_window_for_another_target_authorizes_nothing() {
+    let start = boot("b1", 0, 0);
+    let after = boot("b1", 15, 15);
+    let other_target = deferral_keyed(1, 9, DeferralKind::Remote, &start, 14);
+    assert_eq!(other_target.status(&after), DeferralStatus::Expired);
+
+    let decision = discard_permitted(&inputs(&after, Some(&other_target), Some(14)));
+    assert_eq!(
+        decision.refusals(),
+        [DiscardRefusal::DeferralForAnotherKey {
+            deferral_file: FileId::new(1),
+            deferral_target: TargetId::new(9),
+            deferral_kind: DeferralKind::Remote,
+        }],
+        "the same file on a different target is a different destruction"
+    );
+}
+
+/// `kind` is load-bearing on its own. PM-1's local unlink and PM-2's remote
+/// discard protect opposite sides of the system; an elapsed window for one is
+/// no authority over the other.
+#[test]
+fn an_elapsed_local_unlink_window_does_not_authorize_a_remote_discard() {
+    let start = boot("b1", 0, 0);
+    let after = boot("b1", 15, 15);
+    let local = deferral_keyed(1, 1, DeferralKind::Local, &start, 14);
+    assert_eq!(local.status(&after), DeferralStatus::Expired);
+
+    let decision = discard_permitted(&inputs(&after, Some(&local), Some(14)));
+    assert_eq!(
+        decision.refusals(),
+        [DiscardRefusal::DeferralForAnotherKey {
+            deferral_file: FileId::new(1),
+            deferral_target: TargetId::new(1),
+            deferral_kind: DeferralKind::Local,
+        }],
+        "a local unlink window is not a remote discard window"
+    );
+}
+
+/// The accepting direction. "Never authorize" passes all three tests above and
+/// disables the deferral window entirely.
+#[test]
+fn the_files_own_elapsed_window_still_authorizes_it() {
+    let start = boot("b1", 0, 0);
+    let after = boot("b1", 15, 15);
+    let own = deferral_keyed(1, 1, DeferralKind::Remote, &start, 14);
+    assert_eq!(
+        discard_permitted(&inputs(&after, Some(&own), Some(14))),
+        DiscardDecision::Permitted,
+        "the whole point of the window is that it can elapse"
+    );
+}
+
+/// The zero-window branch reads `cancelled_at`, which is also a status. It gets
+/// the same identity check, and for the same reason.
+#[test]
+fn a_zero_window_does_not_read_another_files_deferral_either() {
+    let start = boot("b1", 0, 0);
+    let now = boot("b1", 1, 1);
+    let mut other_file = deferral_keyed(2, 1, DeferralKind::Remote, &start, 0);
+    other_file.cancelled_at = Some(Timestamp::from_nanos(1));
+
+    let decision = discard_permitted(&inputs(&now, Some(&other_file), Some(0)));
+    assert_eq!(
+        decision.refusals(),
+        [DiscardRefusal::DeferralForAnotherKey {
+            deferral_file: FileId::new(2),
+            deferral_target: TargetId::new(1),
+            deferral_kind: DeferralKind::Remote,
+        }],
+        "another file's cancellation is not this file's cancellation, either way round"
+    );
+}

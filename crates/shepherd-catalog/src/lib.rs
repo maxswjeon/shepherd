@@ -52,6 +52,15 @@ pub enum CatalogError {
     SchemaVersion { found: i64, expected: i64 },
     #[error("{0}")]
     Invalid(String),
+    /// A state machine was asked to move a row to the state it is already in.
+    ///
+    /// Its own variant, rather than an [`CatalogError::Invariant`] with a
+    /// distinctive message, so a caller retrying after a crash can tell
+    /// "already there, nothing to do" from "that edge is illegal" by matching
+    /// on the type. Deciding that by `to_string().contains(..)` is how a
+    /// rephrased error silently turns a skip into a hard failure.
+    #[error("{0}")]
+    AlreadyInState(String),
 }
 
 pub type Result<T> = std::result::Result<T, CatalogError>;

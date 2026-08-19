@@ -94,7 +94,42 @@ impl RateWindow {
             .fold(0u32, |a, b| a.saturating_add(b))
     }
 
+    /// Test the budget and consume it **in one step**, refusing rather than
+    /// overshooting.
+    ///
+    /// This is the operation the discard path must use, and [`Self::record`] is
+    /// not. A caller that checks [`Self::count_within`] and then calls `record`
+    /// has published a window between the two in which a second episode reads
+    /// the same unused budget and also passes — so two passes that are each
+    /// under the limit jointly exceed it. That is the arithmetic evasion the
+    /// rolling window exists to stop, reintroduced one layer up.
+    ///
+    /// Atomicity here is only as wide as the `&mut` borrow, which is the whole
+    /// point: within a process the borrow checker makes concurrent charges
+    /// impossible, and across processes it is the [`RateLedger`] implementation
+    /// that must carry the same guarantee down to its storage.
+    pub fn try_charge(
+        &mut self,
+        now: Timestamp,
+        n: u32,
+        limits: &BreakerLimits,
+    ) -> Result<(), BreakerRefusal> {
+        let used = self.count_within(now, limits.window_nanos);
+        if used.saturating_add(n) > limits.max_in_window {
+            return Err(BreakerRefusal::RateWindowExhausted {
+                used,
+                limit: limits.max_in_window,
+                window_nanos: limits.window_nanos,
+            });
+        }
+        self.record(now, n);
+        Ok(())
+    }
+
     /// Record `n` discards at `now`.
+    ///
+    /// Unconditional. [`Self::try_charge`] is what the discard path calls;
+    /// this is the raw recorder underneath it and a recovery/replay hook.
     pub fn record(&mut self, now: Timestamp, n: u32) {
         match self.buckets.iter_mut().find(|b| b.bucket_start == now) {
             Some(b) => b.count = b.count.saturating_add(n),
@@ -239,7 +274,53 @@ pub enum BreakerRefusal {
         count: u32,
         limit: u32,
     },
+    /// More deletions were attempted than the episode reserved budget for.
+    ///
+    /// Reaching this means the charge and the executions have drifted apart,
+    /// so it is a refusal rather than an automatic top-up: the budget a human
+    /// confirmed is the budget, and quietly extending it at execution time
+    /// would make the reservation decorative.
+    ChargeExhausted {
+        reserved: u32,
+    },
     Cancelled,
+}
+
+/// The durable rolling window, as the discard path reaches it.
+///
+/// Implemented by whatever owns §4.4's `discard_rate_window` table. The port
+/// exists for the same reason [`crate::destroy::RemoteGate`] does: the thing
+/// that must happen lives in another crate, and the rule about *when* it
+/// happens lives here.
+///
+/// **Contract, and the whole point of the mechanism:**
+///
+/// * `charge` must test the budget and consume it **atomically** — one
+///   transaction, not a read followed by a write. Two episodes evaluating
+///   concurrently both observe the same free budget, and only the atomicity of
+///   this call decides which of them gets it.
+/// * The charge must be **durable before it returns**. A charge that is still
+///   in memory when the process dies restores exactly the budget the deletions
+///   already spent, which is the restart evasion the persisted window exists
+///   to close.
+/// * It must be called **before** the deletions it pays for, never after. A
+///   post-delete update leaves every concurrent episode reading a stale window
+///   for the whole duration of the delete.
+///
+/// [`RateWindow::try_charge`] is the reference implementation of the test-and-
+/// consume step; an implementation backed by SQLite should perform the same
+/// arithmetic inside a single immediate transaction.
+#[async_trait::async_trait]
+pub trait RateLedger: Send + Sync {
+    /// Reserve `n` discards against the persisted window for `(target, root)`.
+    async fn charge(
+        &self,
+        target: TargetId,
+        root: RootId,
+        at: Timestamp,
+        n: u32,
+        limits: &BreakerLimits,
+    ) -> Result<(), BreakerRefusal>;
 }
 
 impl Episode {

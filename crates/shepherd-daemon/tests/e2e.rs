@@ -173,6 +173,38 @@ impl Daemon {
     fn connect(&self) -> Client {
         Client::connect(&self.socket)
     }
+
+    /// A daemon told **only** where its state lives, and left to place its own
+    /// socket.
+    ///
+    /// Every other constructor here passes `SHEPHERD_SOCKET`, which means every
+    /// other test tells the client the answer too, through `--socket`. That
+    /// hides the entire question of whether the two agree. This one deliberately
+    /// does not: `Paths::resolve` with a state directory and no runtime
+    /// directory puts the socket at `$SHEPHERD_STATE_DIR/daemon.sock`, and
+    /// finding it is then the client's problem — which is what the finding is
+    /// about.
+    fn start_with_only_a_state_dir(tag: &str) -> Daemon {
+        let dir = std::env::temp_dir().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Where `Paths::resolve` will put it, stated by the test rather than
+        // read back from the daemon: if this expectation and the daemon's
+        // resolution disagree, `wait_until_listening` fails and says so.
+        let socket = dir.join("daemon.sock");
+
+        let child = Command::new(env!("CARGO_BIN_EXE_shepherdd"))
+            .arg("run")
+            .env("SHEPHERD_STATE_DIR", &dir)
+            .env_remove("SHEPHERD_SOCKET")
+            .env_remove("XDG_RUNTIME_DIR")
+            .spawn()
+            .expect("spawn shepherdd");
+
+        let d = Daemon { child, dir, socket };
+        d.wait_until_listening();
+        d
+    }
 }
 
 impl Drop for Daemon {
@@ -273,26 +305,43 @@ impl Client {
     }
 }
 
-/// Locate `shepctl`, building it if this test run did not.
+/// Locate `shepctl`, building it first.
 ///
 /// `CARGO_BIN_EXE_*` only covers binaries of *this* package, so the sibling has
 /// to be found. Building on demand rather than skipping: a test that quietly
 /// does nothing when a binary is missing is the vacuous pass this project keeps
 /// finding in its own gates.
+///
+/// # The build is unconditional, and that is the point
+///
+/// This used to return the binary as soon as one *existed*. `cargo test -p
+/// shepherd-daemon` does not rebuild a sibling package's binary, so every CLI
+/// leg in this file silently ran whatever `shepctl` happened to be left in
+/// `target/debug` — which, after any change to `shepherd-cli`, is the previous
+/// one. A CLI fix would appear to pass before it was compiled, and a CLI
+/// regression would appear to pass after it was introduced. That is a test that
+/// does not test the thing it names, which is the failure this suite exists to
+/// catch in the product.
+///
+/// `cargo build` on an up-to-date binary is a few tens of milliseconds, paid
+/// once per test binary. It is not a price worth an untrustworthy result.
 fn shepctl() -> PathBuf {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT.get_or_init(build_shepctl).clone()
+}
+
+fn build_shepctl() -> PathBuf {
     let mine = PathBuf::from(env!("CARGO_BIN_EXE_shepherdd"));
     let target_dir = mine.parent().expect("binary has a parent directory");
     let candidate = target_dir.join("shepctl");
-    if candidate.exists() {
-        return candidate;
-    }
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let out = Command::new(cargo)
         .args(["build", "-p", "shepherd-cli", "--bin", "shepctl"])
         .output()
         .expect("build shepctl");
     assert!(
-        candidate.exists(),
+        out.status.success() && candidate.exists(),
         "shepctl was not built at {}: {}",
         candidate.display(),
         String::from_utf8_lossy(&out.stderr)
@@ -1303,17 +1352,13 @@ fn a_resuming_subscription_is_answered_before_the_frames_it_replays() {
         last_seq = seq;
     }
 
-    // The exposed path, exercised as a user reaches it. `client::call` reads
-    // one frame and parses it as a response, so this is the whole finding in
-    // one exit code.
-    let out = Command::new(shepctl())
-        .arg("--socket")
-        .arg(&d.socket)
-        .args(["events", "subscribe", "--resume-from", "0", "--json"])
-        .output()
-        .expect("run shepctl");
-    let env: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("shepctl --json emits one JSON document");
+    // The exposed path, exercised as a user reaches it. `shepctl events
+    // subscribe` now follows the stream rather than returning after one frame,
+    // so it is driven as a child and read as it goes — see
+    // `shepctl_events_subscribe_renders_the_events_it_subscribed_to`, which is
+    // where the rendering itself is asserted. Here the point is narrower: the
+    // response frame must still parse as a response.
+    let (env, _events) = subscribe_until_eof(&d, &["--resume-from", "0"]);
     assert_eq!(
         env["ok"],
         serde_json::json!(true),
@@ -1323,6 +1368,148 @@ fn a_resuming_subscription_is_answered_before_the_frames_it_replays() {
     assert!(
         env["data"]["subscription_id"].as_u64().unwrap() >= 1,
         "{env}"
+    );
+}
+
+/// Run `shepctl events subscribe --json`, stop the daemon, and collect what it
+/// rendered.
+///
+/// Returns the closing envelope and the event lines that preceded it.
+///
+/// The daemon is killed on purpose: end of stream is how this command
+/// terminates, and producing it is therefore part of exercising it. `--json`
+/// makes each event exactly one line and the envelope a pretty-printed document
+/// after them, which is what lets the two be told apart here.
+fn subscribe_until_eof(d: &Daemon, extra: &[&str]) -> (serde_json::Value, Vec<serde_json::Value>) {
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(shepctl());
+    cmd.arg("--socket")
+        .arg(&d.socket)
+        .args(["events", "subscribe", "--json"])
+        .args(extra)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("run shepctl");
+
+    // Give the subscription time to be answered and its replay to arrive before
+    // the socket goes away. Without this the test would race the thing it is
+    // trying to observe, and would pass for the wrong reason on a slow host.
+    let stdout = child.stdout.take().expect("piped");
+    let reader = BufReader::new(stdout);
+    let collected = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&collected);
+    let pump = std::thread::spawn(move || {
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            sink.lock().unwrap().push(line);
+        }
+    });
+
+    // Wait until at least one event line has been rendered, or give up: the
+    // caller's assertions are what decide whether that was enough.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if collected
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.trim_start().starts_with('{') && l.contains("\"seq\""))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // End the stream the way a stopped daemon does.
+    let _ = std::process::Command::new("kill")
+        .arg(d.child.id().to_string())
+        .status();
+
+    let status = child.wait().expect("shepctl exits when the stream ends");
+    pump.join().expect("stdout pump");
+
+    let lines = collected.lock().unwrap().clone();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "end of stream is how this command ends; it is not a failure. lines: {lines:?}"
+    );
+
+    // Event lines are single-line JSON objects; the closing envelope is
+    // pretty-printed, so it is everything from the first line that is a bare `{`.
+    let mut events = Vec::new();
+    let mut envelope_from = lines.len();
+    for (i, line) in lines.iter().enumerate() {
+        if line == "{" {
+            envelope_from = i;
+            break;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            events.push(v);
+        }
+    }
+    let envelope: serde_json::Value = serde_json::from_str(&lines[envelope_from..].join("\n"))
+        .unwrap_or_else(|e| panic!("the closing envelope is not JSON ({e}): {lines:?}"));
+    (envelope, events)
+}
+
+/// `shepctl events subscribe` must actually render events.
+///
+/// This is the finding, and it is about a command that reported success while
+/// doing nothing at all. `events.subscribe` was routed through `client::call`,
+/// which reads exactly one response frame and then drops its `Connection`. The
+/// daemon's pump writes to that same socket, so it saw a closed peer
+/// immediately: neither the frames it had queued for replay nor any live event
+/// was ever written to a terminal. The command exited 0 with a subscription id
+/// and a user saw nothing, forever.
+///
+/// So what is asserted is the **events**, by content. `resume_from: 0` replays
+/// the buffer the seeding scan filled, which makes the arrival deterministic —
+/// there is no waiting on a live publisher and no sleep standing in for one.
+/// A `subscription_id` in the envelope is exactly what the broken version
+/// produced and is worth nothing on its own; `events_rendered` is cross-checked
+/// against the frames that were actually printed so the count cannot be right
+/// while the output is empty.
+#[test]
+fn shepctl_events_subscribe_renders_the_events_it_subscribed_to() {
+    let d = Daemon::start("subrender");
+    let mut c = d.connect();
+    seed_some_events(&d, &mut c, "subrender");
+    drop(c);
+
+    let (env, events) = subscribe_until_eof(&d, &["--resume-from", "0"]);
+
+    assert_eq!(env["ok"], serde_json::json!(true), "{env}");
+    assert!(
+        !events.is_empty(),
+        "the subscription rendered nothing — which is exactly what it did before, while \
+         still reporting success: {env}"
+    );
+    assert_eq!(
+        env["data"]["events_rendered"].as_u64().unwrap(),
+        events.len() as u64,
+        "the reported count must match the frames that reached stdout, or the count is a \
+         second thing that can be right while the output is empty"
+    );
+
+    // By content: these are `scan` events with monotonic sequence numbers, not
+    // merely "some JSON was printed".
+    let mut last = 0;
+    for e in &events {
+        let seq = e["seq"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("an event frame has no `seq`: {e}"));
+        assert!(seq > last, "replay went backwards: {events:?}");
+        last = seq;
+        assert_eq!(e["stream"], serde_json::json!("scan"), "{e}");
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| e["payload"]["files_seen"].is_number()),
+        "a scan progress event carries `files_seen`; without it these frames are not the \
+         events the scan published: {events:?}"
     );
 }
 
@@ -1765,6 +1952,28 @@ fn wait_for_scan(c: &mut Client, root_id: i64) -> serde_json::Value {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("the scan never finished; last status was {last}");
+}
+
+/// Wait until a scan records a failure.
+///
+/// Separate from [`wait_for_scan`] because a failed job does not stay finished:
+/// the queue retries it with backoff, so it is pending again moments after the
+/// attempt that failed. Waiting for `finished_at` on a scan that is *supposed*
+/// to fail waits for the retry schedule to run out, which is minutes.
+fn wait_for_scan_error(c: &mut Client, root_id: i64) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        let state = c.call("scan.status", serde_json::json!({"root_id": root_id}));
+        if let Some(scan) = state["scans"].as_array().and_then(|a| a.first()) {
+            last = scan.clone();
+            if !scan["last_error"].is_null() {
+                return last;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the scan never recorded a failure; last status was {last}");
 }
 
 /// **§6 Phase 1's M1 demo, minus the search leg.**
@@ -3205,5 +3414,335 @@ fn a_minio_target_adopts_the_strongest_algorithm_that_round_trips() {
         serde_json::json!("not_attempted"),
         "a provider that answered on the first algorithm must not be billed for two more 10 MiB \
          uploads: {stored}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The client has to look where the daemon actually listens
+// ---------------------------------------------------------------------------
+
+/// An unqualified `shepctl` must reach a daemon configured through
+/// `SHEPHERD_STATE_DIR`.
+///
+/// `Paths::resolve` places the socket in the configured state directory when
+/// there is no `XDG_RUNTIME_DIR` — that is §4.3's fallback and it is what a
+/// headless node, a `su` shell or a second daemon instance actually gets. The
+/// client's candidate list was written independently and knew only
+/// `$XDG_RUNTIME_DIR/shepherd/daemon.sock` and
+/// `$HOME/.local/state/shepherd/daemon.sock`, so it looked in neither of the
+/// places this daemon can be. The daemon runs, the socket exists, every command
+/// reports it unreachable.
+///
+/// `--socket` is deliberately **not** passed: handing the client the answer is
+/// exactly what every other test here does, and it is why this went unnoticed.
+///
+/// Exit status 3 is the client's "daemon unreachable", so asserting on the
+/// status rather than on stderr text pins the actual user-visible outcome.
+#[test]
+fn an_unqualified_shepctl_reaches_a_daemon_configured_by_state_dir() {
+    let d = Daemon::start_with_only_a_state_dir("clientpaths");
+    assert!(
+        d.socket.exists(),
+        "the daemon is listening at {} — the rest of this test is about whether the client \
+         looks there",
+        d.socket.display()
+    );
+
+    let out = Command::new(shepctl())
+        .args(["status", "--json"])
+        .env("SHEPHERD_STATE_DIR", &d.dir)
+        .env_remove("SHEPHERD_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .expect("run shepctl");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`shepctl status` with no --socket must reach the daemon its own environment \
+         describes; exit 3 is `daemon unreachable`.\nstderr: {stderr}"
+    );
+    let env: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("shepctl --json emits one JSON document");
+    assert_eq!(env["ok"], serde_json::json!(true), "{env}");
+    assert!(
+        env["data"]["proto_version"].is_object() || env["data"]["uptime_s"].is_number(),
+        "the reply must be a real `status` result from the daemon, not an empty success: {env}"
+    );
+}
+
+/// And the refusal still refuses.
+///
+/// A client that resolved paths by trying everything, or that reported success
+/// without connecting, would pass the test above. This one is the other
+/// direction: pointed at a state directory with no daemon in it, `shepctl` must
+/// still fail with exit 3 and name what it tried.
+#[test]
+fn shepctl_still_reports_unreachable_when_no_daemon_is_listening() {
+    let dir = std::env::temp_dir().join(format!("shepctl-nodaemon-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let out = Command::new(shepctl())
+        .args(["status", "--json"])
+        .env("SHEPHERD_STATE_DIR", &dir)
+        .env_remove("SHEPHERD_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .expect("run shepctl");
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "no daemon is listening in {}; this must be exit 3, not a success",
+        dir.display()
+    );
+    let env: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("shepctl --json emits one JSON document");
+    let hint = env["error"]["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains(&dir.join("daemon.sock").display().to_string()),
+        "AC-61 wants an error the user can act on: the path actually tried must be named. \
+         hint was: {hint}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A completed scan stamps `file.last_seen_gen` with its own job id.
+///
+/// `last_seen_gen` is the column an absence reconciliation reads
+/// (`... WHERE last_seen_gen < :this_scan` marks rows the walk did not see as
+/// `'missing'`). The catalog now writes whatever generation it is handed, and
+/// its own tests pin that. What they cannot see is the value this executor
+/// *chooses* — a constant, or a clock, or the job id — and that choice is the
+/// whole correctness of the sweep that will read it. A generation that did not
+/// advance between scans would make the next completed scan mark every file it
+/// had just seen on disk as missing.
+///
+/// So both halves are asserted: the value equals the job id that produced it,
+/// and it **moves** when the same root is scanned again.
+///
+/// The sweep itself is not implemented — nothing reads this column yet. This
+/// test is what stops the stamping from silently rotting in the meantime.
+#[test]
+fn a_scan_stamps_its_job_id_as_the_generation_and_a_rescan_advances_it() {
+    let d = Daemon::start("scangen");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-scangen");
+    write_file(&root_dir, "a.txt", "hello");
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+
+    let started = c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    let first_job = started["job_ids"][0].as_i64().expect("a scan job id");
+    scan_and_expect(&mut c, root_id, 1);
+
+    let gen_of = || -> i64 {
+        let conn = rusqlite::Connection::open_with_flags(
+            d.dir.join("catalog.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open the daemon's catalog read-only");
+        conn.query_row("SELECT MIN(last_seen_gen) FROM file", [], |r| r.get(0))
+            .expect("read last_seen_gen")
+    };
+
+    assert_eq!(
+        gen_of(),
+        first_job,
+        "the row must carry the generation of the scan that saw it, not a constant"
+    );
+
+    let restarted = c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    let second_job = restarted["job_ids"][0]
+        .as_i64()
+        .expect("a second scan job id");
+    assert!(
+        second_job > first_job,
+        "job ids must be monotonic for this to be a usable generation: {second_job} !> {first_job}"
+    );
+    scan_and_expect(&mut c, root_id, 1);
+
+    assert_eq!(
+        gen_of(),
+        second_job,
+        "a re-scan left the row at the first scan's generation. A sweep on \
+         `last_seen_gen < :this_scan` would then mark this file — which the scan just \
+         saw on disk — as missing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Absence reconciliation: a completed scan reconciles the rows it did not see
+// ---------------------------------------------------------------------------
+
+/// Every file row under `root`, as `(rel_path, state)`.
+fn rows_by_state(d: &Daemon, root_id: i64) -> Vec<(String, String)> {
+    let conn = rusqlite::Connection::open_with_flags(
+        d.dir.join("catalog.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the daemon's catalog read-only");
+    let mut stmt = conn
+        .prepare("SELECT rel_path, state FROM file WHERE root_id = ?1 ORDER BY rel_path")
+        .unwrap();
+    let rows = stmt
+        .query_map(rusqlite::params![root_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// A root that has vanished must fail the scan, not sweep the catalog away.
+///
+/// **This is the landmine under the whole finding.** `shepherd_scan::walk`
+/// reports an unreadable directory as a `Skip::Unreadable` and returns `Ok` —
+/// so a root on an unmounted volume, or one the user deleted, produces a
+/// perfectly *successful* walk of zero files. A sweep that trusted "the walk
+/// completed" would then reconcile every row under that root to `missing`,
+/// including every tiered file whose catalog row is the only address of its
+/// remote bytes.
+///
+/// `scan_exec`'s PM-3 guard does not cover this: it refuses a root the catalog
+/// already *knows* is unavailable, and nothing marks a root unavailable when it
+/// disappears underneath a running daemon.
+///
+/// So the scan must fail. Both halves are asserted — the failure, and the rows
+/// still being `'local'` — because a scan that failed *after* sweeping would
+/// report the error and still have destroyed the catalog's picture.
+#[test]
+fn a_scan_of_a_vanished_root_fails_and_reconciles_nothing() {
+    let d = Daemon::start("sweepgone");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-sweepgone");
+    write_file(&root_dir, "precious.txt", "the only copy");
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    scan_and_expect(&mut c, root_id, 1);
+
+    // The volume goes away.
+    std::fs::remove_dir_all(&root_dir).unwrap();
+
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    // Not `wait_for_scan`: that waits for a job to *finish*, and a failing scan
+    // is retried with backoff, so it is queued again before it is ever
+    // observably done. What is under test is the recorded failure, which
+    // appears as soon as the first attempt returns.
+    let scan = wait_for_scan_error(&mut c, root_id);
+    let detail = scan["last_error"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("could not be read"),
+        "a walk that could not read its own root observed nothing; reporting that as a \
+         successful scan of zero files is what turns a missing volume into a swept \
+         catalog: {scan}"
+    );
+
+    assert_eq!(
+        rows_by_state(&d, root_id),
+        vec![("precious.txt".to_string(), "local".to_string())],
+        "the root was unreadable, not empty. Every row under it must be untouched — these \
+         rows are the only address of anything that was tiered from here"
+    );
+}
+
+/// A root whose identity probe could not run must say so.
+///
+/// `identity::probe_path_policies` returns `assumed: true` when it could not
+/// create its throwaway files and fell back to platform defaults, and its doc
+/// comment says "the caller records the distinction". `root.add` took `case`
+/// and `norm` and dropped `assumed` on the floor — so a root whose case and
+/// normalization policy was **guessed** became indistinguishable, forever, from
+/// one that was measured.
+///
+/// That matters because `norm_key` is derived from those policies and watcher
+/// events match against it; §4.9's whole argument is that retrofitting identity
+/// after Phase 2 has destroyed files is the scenario probing prevents. The line
+/// directly above the call reads "Probed, never assumed" — a comment describing
+/// behaviour the code did not have.
+///
+/// The two sibling gaps in the same function — an untrustworthy atime and an
+/// absent volume id — both already push a warning. This is that pattern, applied
+/// to the third.
+///
+/// A read-only directory is how the probe is made to fail: it creates files with
+/// `create_new`, which cannot succeed under `0o555`.
+#[test]
+fn a_root_whose_identity_probe_could_not_run_is_reported_as_assumed() {
+    // The probe would succeed as root, and a test that passes because the
+    // condition never arose is worse than no test.
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "this test needs a directory it cannot write to, so it cannot run as root"
+    );
+
+    let d = Daemon::start("assumed");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-assumed");
+    std::fs::create_dir_all(&root_dir).unwrap();
+    std::fs::set_permissions(&root_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+
+    let warnings: Vec<&str> = added["warnings"]
+        .as_array()
+        .expect("root.add reports warnings")
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert!(
+        warnings.iter().any(|w| w.contains("could not probe")),
+        "the case/normalization policy was assumed, not probed, and nothing said so. \
+         `probe_path_policies` reports the distinction and this is the caller its docs \
+         name. warnings were: {warnings:?}"
+    );
+
+    // Restored so `Drop` can clean the directory up.
+    std::fs::set_permissions(&root_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// And a root that probed cleanly must NOT carry that warning.
+///
+/// Without this, "warn when assumed" is satisfiable by warning always — which
+/// would train every user to ignore the line, and is the same defect as never
+/// warning at all wearing the opposite face.
+#[test]
+fn a_root_that_probed_successfully_carries_no_assumed_warning() {
+    let d = Daemon::start("probed");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-probed");
+    write_file(&root_dir, "a.txt", "a");
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let warnings: Vec<&str> = added["warnings"]
+        .as_array()
+        .expect("root.add reports warnings")
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert!(
+        !warnings.iter().any(|w| w.contains("could not probe")),
+        "this root's probe ran; claiming its policies were assumed would make the warning \
+         meaningless: {warnings:?}"
     );
 }

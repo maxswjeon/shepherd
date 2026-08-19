@@ -28,14 +28,29 @@
 //! a changed rule into a real pass. AC-51 asks for the daemon to enforce this,
 //! and "the daemon" includes the moment it acts, not only the moment it is
 //! asked.
+//!
+//! # …and the body is not the only thing that moves
+//!
+//! The rule can hold perfectly still while the corpus does not. Files are
+//! created, deleted, retagged and touched between the dry run an operator read
+//! and the run they authorized, and a hash over the rule body cannot see any of
+//! it. So [`RunMode::Execute`] also compares the set it just matched against
+//! [`PreviewRecord::matches`], and refuses on any difference.
+//!
+//! Refuses, rather than intersecting down to the previewed set. The friendlier
+//! reading — act on the overlap — still acts on a list nobody approved in that
+//! shape, and does it quietly. The operator gets a [`MatchSetDrift`] naming
+//! what appeared, what left and what changed signal, and re-previews.
+
+use std::collections::BTreeMap;
 
 use shepherd_catalog::atime::AtimeMode;
 use shepherd_core::{FileId, FileStat, Timestamp};
 
 use crate::r#match::{MatchContext, MatchError, Matcher};
 use crate::preview::{
-    AccessSignalSource, EnableDecision, PreviewRecord, PreviewedMatch, RuleAction, RuleBody,
-    may_enable, preview_hash,
+    AccessSignalSource, EnableDecision, EnableRefusal, PreviewRecord, PreviewedMatch, RuleAction,
+    RuleBody, may_enable, preview_hash,
 };
 
 /// One file the engine may act on, with the context its predicates need.
@@ -67,6 +82,61 @@ pub struct PlannedAction {
     pub age_signal: Option<AccessSignalSource>,
 }
 
+/// One previewed match whose record no longer reads the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchDrifted {
+    pub previewed: PreviewedMatch,
+    pub current: PreviewedMatch,
+}
+
+/// How the set this pass matched differs from the set a preview enumerated.
+///
+/// Whole [`PreviewedMatch`] records are compared rather than file ids alone, so
+/// a field added to that struct joins this comparison automatically instead of
+/// having to be remembered here. That includes the signal: AC-14 makes the
+/// preview state which signal drove each match, so a match driven by a
+/// different signal is not the match that was approved.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MatchSetDrift {
+    /// Matching now, absent from the preview — files the operator never saw.
+    pub added: Vec<PreviewedMatch>,
+    /// Previewed, no longer matching.
+    pub removed: Vec<PreviewedMatch>,
+    /// Same file, different record.
+    pub changed: Vec<MatchDrifted>,
+}
+
+impl MatchSetDrift {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+/// Compare a pass's matches against the set a preview recorded.
+///
+/// Keyed by file and ordered, so the refusal an operator reads is the same on
+/// every run rather than whatever a hash map happened to iterate.
+fn drift_against(previewed: &[PreviewedMatch], current: &[PreviewedMatch]) -> MatchSetDrift {
+    let mut outstanding: BTreeMap<FileId, &PreviewedMatch> =
+        previewed.iter().map(|m| (m.file, m)).collect();
+    let mut drift = MatchSetDrift::default();
+    for c in current {
+        match outstanding.remove(&c.file) {
+            // A file id repeated inside one pass consumes its previewed entry
+            // once and lands in `added` on the second sighting. That is a
+            // caller bug either way, and it fails closed.
+            None => drift.added.push(c.clone()),
+            Some(p) if p != c => drift.changed.push(MatchDrifted {
+                previewed: p.clone(),
+                current: c.clone(),
+            }),
+            Some(_) => {}
+        }
+    }
+    drift.removed = outstanding.into_values().cloned().collect();
+    drift
+}
+
 /// Why a run refused to proceed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -79,6 +149,21 @@ pub enum EngineRefusal {
     Untrustworthy { detail: String },
     /// `Execute` without a preview, or against a stale one.
     NotEnabled { decision: EnableDecision },
+    /// The set this pass matches is not the set the preview enumerated.
+    ///
+    /// Refused rather than intersected down to the previewed set. Intersecting
+    /// looks friendlier and would still act — on a list the operator approved
+    /// in a different shape. AC-14 says the dry run enumerates *exactly* the
+    /// real run's set, and the honest answer to a corpus that moved underneath
+    /// it is a fresh preview, not a quiet subset.
+    ///
+    /// **Callers must surface this as *re-preview required*, not as an error
+    /// string.** It is a routine, expected outcome — the corpus moved, which it
+    /// does constantly — and the operator's next step is a new dry run, not a
+    /// retry and not a support ticket. A wildcard arm rendering every refusal
+    /// as "refused" compiles perfectly well and throws the `drift` away, which
+    /// is the whole content of the answer.
+    PreviewDrifted { drift: MatchSetDrift },
 }
 
 /// The result of a pass.
@@ -150,12 +235,31 @@ impl<'a> Engine<'a> {
         // Re-checked HERE, not only when the rule was enabled. A rule can be
         // enabled, edited, then run; `may_enable` guards the first of those and
         // this guards the third.
-        if mode == RunMode::Execute {
+        let previewed = if mode == RunMode::Execute {
             let decision = may_enable(self.body, preview, self.atime_mode);
             if !decision.is_permitted() {
                 return Err(EngineRefusal::NotEnabled { decision });
             }
-        }
+            // Bound here rather than reached for at the comparison below. An
+            // absent preview would otherwise compare equal to an empty match
+            // set, and "nothing drifted" is not an answer a run that was never
+            // previewed is entitled to. `may_enable` already refuses `None`;
+            // this makes that a property of this function rather than a
+            // second-hand one.
+            //
+            // Deliberately un-killable by test: deleting it leaves the suite
+            // green, because `may_enable` catches the case today. It is here
+            // against a future edit to `may_enable`, not against a bug that
+            // exists — redundant on purpose rather than dead.
+            let Some(p) = preview else {
+                return Err(EngineRefusal::NotEnabled {
+                    decision: EnableDecision::Refused(vec![EnableRefusal::NoPreview]),
+                });
+            };
+            Some(p)
+        } else {
+            None
+        };
 
         let mut matches = Vec::new();
         let mut actions = Vec::new();
@@ -186,6 +290,19 @@ impl<'a> Engine<'a> {
                     action: self.body.action.clone(),
                     age_signal: out.age_signal,
                 });
+            }
+        }
+
+        // `may_enable` proves the rule *body* is the one that was previewed. It
+        // cannot prove anything about the corpus, which moves on its own:
+        // files are created, deleted, retagged and touched between the dry run
+        // an operator read and the run they authorized. AC-14's "exactly the
+        // real run's set" is a claim about the set, so the set is compared —
+        // before any of these actions reach the caller.
+        if let Some(p) = previewed {
+            let drift = drift_against(&p.matches, &matches);
+            if !drift.is_empty() {
+                return Err(EngineRefusal::PreviewDrifted { drift });
             }
         }
 

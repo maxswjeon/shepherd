@@ -21,5 +21,6 @@ pub use bundle::{
 };
 pub use chain::{
     CATALOG_PREFIX, ChainError, ChainResolution, ChainStatus, ChainWriter, POINTER_SCHEMA_VERSION,
-    PointerRecord, RecordKey, SegmentKind, SequenceAllocator, read_chain, resolve_chain,
+    PointerRecord, RecordKey, SegmentEvidence, SegmentKind, SequenceAllocator, read_chain,
+    resolve_chain, verify_segments,
 };

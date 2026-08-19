@@ -484,7 +484,7 @@ fn a_second_connection_writing_during_a_scan_batch_gets_sqlite_busy() {
             cat.conn().execute_batch("BEGIN").expect("begin");
             for i in 0..50 {
                 FileRepo::new(&mut cat)
-                    .upsert_file(&root, &scan_stat(i), Timestamp::from_nanos(1))
+                    .upsert_file(&root, &scan_stat(i), 1, Timestamp::from_nanos(1))
                     .expect("upsert");
             }
             holding.store(true, Ordering::SeqCst);
@@ -652,6 +652,7 @@ async fn the_writer_actor_queues_a_session_save_behind_a_scan_batch_instead_of_f
                             FileRepo::new(cat).upsert_file(
                                 &root,
                                 &scan_stat(batch * PER_BATCH + i),
+                                1,
                                 Timestamp::from_nanos(1),
                             )?;
                         }

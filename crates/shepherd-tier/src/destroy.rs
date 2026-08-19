@@ -59,6 +59,11 @@ use crate::serialize::FileLocks;
 pub enum DestroyError {
     #[error("refused: {0:?}")]
     Refused(DestroyRefusal),
+    /// A blast-radius control refused — §4.10.5's breaker, not §4.10.2's
+    /// custody predicate. Kept as its own variant so the two cannot be
+    /// confused at a call site that only handles one of them.
+    #[error("breaker refused: {0:?}")]
+    Breaker(crate::breaker::BreakerRefusal),
     #[error("floor refused: {code} — {detail}")]
     Floor { code: &'static str, detail: String },
     #[error("root refuses destruction: {0}")]

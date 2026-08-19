@@ -142,6 +142,42 @@ impl Executor for ScanExecutor {
         let output = walk(rid, &path, &deny, &ignores, now())
             .map_err(|e| format!("walking {}: {e}", root.path))?;
 
+        // **An unreadable root is not an empty root, and the difference is the
+        // whole safety of the reconciliation below.**
+        //
+        // `walk` reports a directory it could not read as a `Skip::Unreadable`
+        // and returns `Ok`. So a root on an unmounted volume — or one the user
+        // deleted, or one whose permissions changed — produces a perfectly
+        // successful walk of **zero files**. Reconciling on that would mark
+        // every row under the root `'missing'`, including every tiered file
+        // whose catalog row is the only address of its remote bytes.
+        //
+        // The PM-3 check above does not cover this: it refuses a root the
+        // catalog already *knows* is unavailable, and nothing marks a root
+        // unavailable when it disappears underneath a running daemon.
+        //
+        // `dirs_visited == 0` is exactly "not even the root itself was read".
+        // Failing here rather than skipping the sweep is deliberate: a scan
+        // that could not open its own root has not scanned anything, and
+        // reporting that as success is the completion this file already warns
+        // about twice.
+        if output.dirs_visited == 0 {
+            let why = output
+                .skipped
+                .iter()
+                .find_map(|s| match s {
+                    Skip::Unreadable { path: p, detail } if *p == path => Some(detail.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "no directory under it could be read".to_string());
+            return Err(format!(
+                "root {root_id} at {} could not be read ({why}); refusing to treat an \
+                 unreadable root as an empty one — a scan that observed nothing must not \
+                 reconcile anything",
+                root.path
+            ));
+        }
+
         let skipped = summarise_skips(&output.skipped);
         tracing::info!(
             root = root_id,
@@ -156,6 +192,29 @@ impl Executor for ScanExecutor {
         let mut bytes_seen: u64 = 0;
         let mut since_progress = 0usize;
 
+        // The generation this scan stamps on every row it sees.
+        //
+        // The job id, deliberately. `last_seen_gen` only has to be **monotonic
+        // per root** for the absence sweep it exists to feed
+        // (`last_seen_gen < :this_scan`), and a job id already is: it is a
+        // SQLite `INTEGER PRIMARY KEY` allocated when the job is enqueued, so a
+        // later scan of a root always carries a larger one than any earlier
+        // scan of that root.
+        //
+        // Rejected alternatives, because both fail in the direction that marks
+        // present files missing:
+        //
+        // * a wall clock — an NTP step backwards mid-run makes a *later* scan
+        //   carry an *earlier* generation, and the next sweep then deletes the
+        //   world. `last_seen_gen` exists precisely so absence does not depend
+        //   on a clock;
+        // * a per-root counter column — the same value, plus a schema change
+        //   and a read-modify-write to keep it monotonic.
+        //
+        // NOTE: nothing sweeps on this yet. Stamping it is correct and inert on
+        // its own; the reconciliation that reads it is a separate decision.
+        let generation = ctx.id().get();
+
         for chunk in output.files.chunks(UPSERT_BATCH) {
             let batch: Vec<shepherd_core::FileStat> = chunk.to_vec();
             let root_for_batch = root.clone();
@@ -164,7 +223,7 @@ impl Executor for ScanExecutor {
             let last_path = batch.last().map(|f| f.rel_path.clone());
 
             self.writer()
-                .try_with(move |cat| upsert_batch(cat, &root_for_batch, &batch))
+                .try_with(move |cat| upsert_batch(cat, &root_for_batch, &batch, generation))
                 .map_err(|e| format!("upserting a batch of {n}: {e}"))?;
 
             files_seen += n as u64;
@@ -298,11 +357,12 @@ fn upsert_batch(
     cat: &mut Catalog,
     root: &ScanRoot,
     batch: &[shepherd_core::FileStat],
+    generation: i64,
 ) -> Result<(), CatalogError> {
     cat.conn().execute_batch("BEGIN")?;
     let stamp = now();
     for stat in batch {
-        if let Err(e) = FileRepo::new(cat).upsert_file(root, stat, stamp) {
+        if let Err(e) = FileRepo::new(cat).upsert_file(root, stat, generation, stamp) {
             let _ = cat.conn().execute_batch("ROLLBACK");
             return Err(e);
         }

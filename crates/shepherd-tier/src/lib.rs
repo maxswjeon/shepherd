@@ -28,13 +28,13 @@ pub mod verify;
 
 pub use audit::{AuditLog, AuditRecord};
 pub use breaker::{
-    BreakerLimits, BreakerRefusal, Candidate, Episode, EpisodeState, HoldScope, RateWindow,
-    candidate_set_hash,
+    BreakerLimits, BreakerRefusal, Candidate, Episode, EpisodeState, HoldScope, RateLedger,
+    RateWindow, candidate_set_hash,
 };
 pub use destroy::{LocalDestroyRequest, execute_local_destruction, execute_remote_discard};
 pub use discard::{
-    DiscardRefusals, StubPlatform, confirmation_from_operator, confirmation_from_stub,
-    evaluate_discard, execute_discard, hold_blocks,
+    DiscardCharge, DiscardRefusals, StubPlatform, confirmation_from_operator,
+    confirmation_from_stub, evaluate_discard, execute_discard, hold_blocks, reserve_discard,
 };
 pub use fidelity::{
     AttrCapture, AttrClass, CoreAttrs, FidelityBreach, FidelityManifest, RestoreTarget,

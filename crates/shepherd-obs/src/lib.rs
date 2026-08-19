@@ -17,6 +17,8 @@ pub mod doctor;
 /// systemd user-lingering detection (OQ-F): detect, warn, never modify.
 pub mod lingering;
 pub mod metrics;
+/// Where the daemon's socket and state live, and where a client looks for them.
+pub mod paths;
 pub mod tracing_setup;
 
 pub use doctor::{Check, CheckStatus, Doctor};

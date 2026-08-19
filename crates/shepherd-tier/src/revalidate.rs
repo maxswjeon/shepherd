@@ -76,10 +76,39 @@ impl Location {
     /// Whether this location can, on its own, authorise destroying the last
     /// local copy.
     fn satisfies_custody(&self, now: Timestamp, window: std::time::Duration) -> bool {
-        self.custody_eligible
+        self.state_holds_the_object()
+            && self.custody_eligible
             && self.attestation.permits_destruction()
             && self.publication_receipt_ok
             && self.verified_within(now, window)
+    }
+
+    /// Whether this location is known to hold the object **now**.
+    ///
+    /// Every other conjunct of [`Self::satisfies_custody`] is a *historical*
+    /// fact — an attestation timestamp, a receipt, a pinned version — and a
+    /// location keeps all of them when it transitions out of `Verified`. The
+    /// state is therefore the only field that distinguishes "this copy exists"
+    /// from "this copy is known to be gone", which makes it the one that must
+    /// not be omitted from a predicate authorising destruction of the sole
+    /// local copy.
+    ///
+    /// **Exhaustive, with no `_` arm, deliberately.** A `LocationState` added
+    /// later must not default into counting as custody; the compiler is what
+    /// forces the author to decide. This is the same convention the rules-side
+    /// safety predicate uses.
+    fn state_holds_the_object(&self) -> bool {
+        match self.state {
+            LocationState::Verified => true,
+            // `Pending` was never confirmed. `Lost` is known not to hold it.
+            // `LostButReplicated` is the subtle one: it says *some other*
+            // location still has the content, which is exactly why §4.10.2
+            // admits it for the ∀ clause — and says nothing whatever about
+            // this location, which is why it cannot satisfy the ∃ clause.
+            LocationState::Pending | LocationState::Lost | LocationState::LostButReplicated => {
+                false
+            }
+        }
     }
 
     fn verified_within(&self, now: Timestamp, window: std::time::Duration) -> bool {
@@ -114,15 +143,19 @@ pub enum DestroyRefusal {
 ///
 /// ```text
 /// destroy_permitted(file) =
-///       ∃ L : L.custody_eligible ∧ L.attestation ≠ none
+///       ∃ L : L.state = verified ∧ L.custody_eligible ∧ L.attestation ≠ none
 ///                                ∧ L.verified_within(window)
 ///                                ∧ L.publication_receipt_ok
 ///   AND ∀ L required by the rule : L.state ∈ {verified, lost-but-replicated}
 /// ```
 ///
-/// In words: **at least one location must be fully attested and
-/// custody-eligible**, and **every location the rule asked for must have been
-/// reached**. The two clauses do different jobs — the first says the content
+/// In words: **at least one location must currently hold the object, and be
+/// fully attested and custody-eligible**, and **every location the rule asked
+/// for must have been reached**. Note the two clauses read `state` to different
+/// standards on purpose: the ∃ clause demands `verified`, because it is
+/// asserting that *this* copy exists, while the ∀ clause also admits
+/// `lost-but-replicated`, because it is only asserting that the replication the
+/// user asked for was carried out somewhere. The two clauses do different jobs — the first says the content
 /// survives somewhere trustworthy, the second says the user's replication
 /// intent was honoured — and satisfying only one is not a partial pass, it is a
 /// refusal.
@@ -157,9 +190,13 @@ pub fn destroy_permitted<'a>(
         }
     }
 
+    // The state clause lives inside `satisfies_custody`, not here. It was once
+    // conjoined at this call site, which closed the hole for *this* caller
+    // while leaving the predicate that is named for the question answering it
+    // wrongly — so a second caller would have inherited a fail-open default.
     locations
         .iter()
-        .find(|l| l.satisfies_custody(now, window) && l.state == LocationState::Verified)
+        .find(|l| l.satisfies_custody(now, window))
         .ok_or(DestroyRefusal::NoAttestedCustodian {
             examined: locations.len(),
         })
@@ -268,6 +305,62 @@ mod tests {
     fn a_single_attested_custodian_permits_destruction() {
         let l = vec![loc(1)];
         assert!(destroy_permitted(&l, &[TargetId::new(1)], now(), WINDOW).is_ok());
+    }
+
+    /// The accepting direction, on the predicate itself. A custody check fixed
+    /// into "never eligible" would pass every refusal test below and silently
+    /// disable tiering, so the pair is load-bearing.
+    #[test]
+    fn a_verified_location_satisfies_custody() {
+        assert!(
+            loc(1).satisfies_custody(now(), WINDOW),
+            "a fully attested Verified location must still authorise destruction"
+        );
+    }
+
+    /// The ∃ clause reads `L.custody_eligible ∧ …`, and the location's *state*
+    /// is what says whether L still holds the object at all. A location that
+    /// has transitioned to `Pending`, `Lost` or `LostButReplicated` keeps its
+    /// previous attestation timestamp and receipt, so every other conjunct
+    /// still passes — the state is the only thing that distinguishes them.
+    ///
+    /// Asserted against `satisfies_custody` directly, because that is the
+    /// function whose name claims to answer the question.
+    #[test]
+    fn a_location_that_does_not_hold_the_object_never_satisfies_custody() {
+        for state in [
+            LocationState::Pending,
+            LocationState::Lost,
+            LocationState::LostButReplicated,
+        ] {
+            let mut l = loc(1);
+            l.state = state;
+            assert!(
+                !l.satisfies_custody(now(), WINDOW),
+                "{state:?} still satisfied the ∃ clause: this location is not known to hold \
+                 the object, and it would authorise destroying the sole local copy"
+            );
+        }
+    }
+
+    /// The whole-predicate view of the same fact. `destroy_permitted` must
+    /// refuse outright — not merely fail to pick this location — when the only
+    /// candidate is in a state that does not hold the object.
+    #[test]
+    fn destroy_permitted_refuses_a_custodian_that_does_not_hold_the_object() {
+        for state in [
+            LocationState::Pending,
+            LocationState::Lost,
+            LocationState::LostButReplicated,
+        ] {
+            let mut l = loc(1);
+            l.state = state;
+            assert_eq!(
+                destroy_permitted(&[l], &[], now(), WINDOW).unwrap_err(),
+                DestroyRefusal::NoAttestedCustodian { examined: 1 },
+                "{state:?} was accepted as the sole custodian"
+            );
+        }
     }
 
     /// The ∃ clause: a third-party target counts as a replica but can never

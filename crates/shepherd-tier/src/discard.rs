@@ -40,7 +40,7 @@ use shepherd_rules::delete_policy::{
 use shepherd_storage::adapter::VersionGuard;
 
 use crate::audit::AuditLog;
-use crate::breaker::{BreakerLimits, BreakerRefusal, Episode, RateWindow};
+use crate::breaker::{BreakerLimits, BreakerRefusal, Episode, RateLedger, RateWindow};
 use crate::destroy::{DestroyError, RemoteGate, execute_remote_discard};
 
 /// Translate a platform stub state into the fact the policy engine consumes.
@@ -157,6 +157,120 @@ pub fn evaluate_discard(
     }
 }
 
+/// Proof that the rolling breaker was charged for an episode's deletions.
+///
+/// **This type is the fix for "the breaker is a check with no subject".**
+/// [`evaluate_discard`] observed available budget and nothing ever consumed it,
+/// so repeated sub-threshold episodes kept reading the same unused window. The
+/// charge is now minted only by [`reserve_discard`], which persists it before
+/// returning, and [`execute_discard`] cannot be called without one — so
+/// "forgot to charge the breaker" is not a reachable state rather than a
+/// convention someone has to remember.
+///
+/// One unit is spent per object deleted, so a single reservation authorises
+/// exactly the number of deletions it paid for and not one more.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "an unspent charge has already consumed breaker budget; spend it or drop the episode"]
+pub struct DiscardCharge {
+    target: TargetId,
+    root: shepherd_core::RootId,
+    at: Timestamp,
+    reserved: u32,
+    spent: u32,
+}
+
+impl DiscardCharge {
+    pub fn target(&self) -> TargetId {
+        self.target
+    }
+
+    pub fn root(&self) -> shepherd_core::RootId {
+        self.root
+    }
+
+    /// When the charge was persisted.
+    pub fn charged_at(&self) -> Timestamp {
+        self.at
+    }
+
+    pub fn reserved(&self) -> u32 {
+        self.reserved
+    }
+
+    pub fn remaining(&self) -> u32 {
+        self.reserved.saturating_sub(self.spent)
+    }
+
+    /// Consume one unit, for one object about to be deleted.
+    ///
+    /// Called by [`execute_discard`] **before** the deletion, never after.
+    fn spend(&mut self) -> Result<(), BreakerRefusal> {
+        if self.remaining() == 0 {
+            return Err(BreakerRefusal::ChargeExhausted {
+                reserved: self.reserved,
+            });
+        }
+        self.spent += 1;
+        Ok(())
+    }
+}
+
+/// Evaluate both gates and **reserve** the breaker budget the episode needs.
+///
+/// The two steps answer different questions and only the second one is
+/// authoritative:
+///
+/// 1. [`evaluate_discard`] reports **every** refusal, because a held bulk
+///    discard is operator-facing and a list of one reason at a time is a bad
+///    conversation. Its view of the rate window is a snapshot, so it is
+///    advisory: two episodes racing each other both pass this step.
+/// 2. `ledger.charge` is the authority. It tests and consumes the budget in
+///    one durable step, so of two racing episodes exactly one gets it and the
+///    other is refused here — which is the check-then-act window the previous
+///    shape left open.
+///
+/// # Why nothing is refunded when a deletion fails
+///
+/// A failed remote deletion is **not** the same fact as a deletion that did not
+/// happen: a timeout, a dropped connection or an ambiguous provider response
+/// leaves the object's fate unknown, which is precisely why §4.4's
+/// `destroy_intent` carries an `outcome-ambiguous` state. Returning budget on
+/// error would therefore hand back capacity that may well have been spent on a
+/// real deletion, and it would do so on the one path that cannot be undone.
+///
+/// An un-refunded charge only ever makes the breaker **stricter**, and a
+/// breaker that is occasionally too conservative after an error is the correct
+/// failure direction for a blast-radius control. The budget it holds is
+/// released by the window rolling forward, which is the same mechanism that
+/// releases every other charge.
+pub async fn reserve_discard(
+    inputs: DiscardInputs<'_>,
+    episode: &Episode,
+    window: &RateWindow,
+    limits: &BreakerLimits,
+    now: Timestamp,
+    ledger: &impl RateLedger,
+) -> Result<DiscardCharge, DiscardRefusals> {
+    evaluate_discard(inputs, episode, window, limits, now)?;
+
+    let count = u32::try_from(episode.candidates.len()).unwrap_or(u32::MAX);
+    ledger
+        .charge(episode.target, episode.root, now, count, limits)
+        .await
+        .map_err(|r| DiscardRefusals {
+            policy: Vec::new(),
+            breaker: vec![r],
+        })?;
+
+    Ok(DiscardCharge {
+        target: episode.target,
+        root: episode.root,
+        at: now,
+        reserved: count,
+        spent: 0,
+    })
+}
+
 /// Whether a discard hold blocks a job class, ignoring target scope.
 ///
 /// Thin on purpose: [`crate::breaker::HoldScope::blocks`] is the real answer
@@ -180,8 +294,14 @@ const SENTINEL: TargetId = TargetId::new(0);
 /// permits `delete_object` to be *named* only inside `shepherd-storage` and
 /// `destroy.rs`, so a double implemented against the adapter trait would fail
 /// the gate. Implement `RemoteGate` instead.
+/// Takes `&mut DiscardCharge` rather than a bare go-ahead, because the charge
+/// is the only evidence that the rolling breaker was actually paid. The unit is
+/// spent **before** the deletion is authorised: charging afterwards would leave
+/// every concurrent episode reading a stale window for the duration of the
+/// delete, and charging not at all was the defect this pair of types replaced.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_discard(
+    charge: &mut DiscardCharge,
     intent: IntentId,
     remote: &impl RemoteGate,
     key: &ObjectKey,
@@ -190,6 +310,10 @@ pub async fn execute_discard(
     attestation: &str,
     now: Timestamp,
 ) -> Result<(), DestroyError> {
+    // Before the deletion, never after. The budget was already persisted by
+    // `reserve_discard`; this is the per-object draw against it.
+    charge.spend().map_err(DestroyError::Breaker)?;
+
     // One call site. PM-2's requirement is that the discard branch runs through
     // the same intent + audit apparatus as local destruction; a second path
     // here would be a second place to forget the audit record.

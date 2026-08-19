@@ -2,20 +2,26 @@
 //!
 //! # Scope, stated plainly
 //!
-//! This is a **synchronous, one-call-per-connection** client. It connects,
-//! shakes hands, sends one request, reads one response and exits — which is
-//! exactly the lifetime of a `shepctl` invocation. There is no runtime, no
-//! connection pool and no reconnect loop, because a process that lives for
-//! 40 ms needs none of them. A long-lived subscriber (the UI relay, or
-//! `shepctl events subscribe` once the daemon can serve it) needs a streaming
-//! reader on the same framing; that is task T6's, and [`Connection::read_frame`]
-//! is the piece it would reuse.
+//! This is a **synchronous** client with two shapes of exchange, and the
+//! difference between them is the whole of this module's design:
 //!
-//! **No daemon exists yet.** `shepherd-daemon` is task T6 and is still a
-//! skeleton, so nothing here has been exercised against a live socket. What *is*
-//! exercised: the framing, the handshake construction, the envelope mapping and
-//! the not-running error path, all in `tests/`. The live path is scaffolded, and
-//! this paragraph is the honest statement of that.
+//! * [`call`] — one request, one response, done. That is the lifetime of an
+//!   ordinary `shepctl` invocation, and there is no runtime, no connection pool
+//!   and no reconnect loop, because a process that lives for 40 ms needs none.
+//! * [`subscribe`] — one request, then **every frame that follows**, until the
+//!   stream ends. `events.subscribe` installs a pump on the connection it
+//!   arrived on, so a client that returns after the response closes the socket
+//!   the events were about to come down. Serving it through `call` is not a
+//!   smaller version of subscribing; it is a subscription that renders nothing.
+//!
+//! This paragraph used to say that no daemon existed and that nothing here had
+//! ever met a live socket. That has not been true since T6 landed, and leaving
+//! it standing was worse than saying nothing: it is the kind of stale caveat a
+//! reader trusts. Both paths are now exercised against a real `shepherdd` — see
+//! `shepherd-daemon`'s `tests/e2e.rs`, which drives the real `shepctl` binary
+//! over a real socket, including the subscription stream. `tests/` here still
+//! covers the parts a mock is better at: the framing, the handshake
+//! construction, the envelope mapping and the not-running error path.
 //!
 //! # Windows
 //!
@@ -81,24 +87,27 @@ impl std::fmt::Display for ClientError {
 
 /// Where the daemon listens.
 ///
-/// §4.3: `$XDG_RUNTIME_DIR/shepherd/daemon.sock`, falling back to
-/// `~/.local/state/shepherd/daemon.sock`. Both are returned so an error can name
-/// every path that was tried — AC-61 forbids an error the user cannot act on,
-/// and "connection refused" without a path is precisely that.
+/// Delegated to `shepherd_obs::paths`, which is also what the daemon binds
+/// from. That is the whole point and it is not tidiness: this function used to
+/// have its own opinion — `$XDG_RUNTIME_DIR/shepherd/daemon.sock` then
+/// `$HOME/.local/state/shepherd/daemon.sock`, and nothing else — while
+/// `Paths::resolve` also honours `SHEPHERD_SOCKET`, `SHEPHERD_STATE_DIR` and
+/// `XDG_STATE_HOME`. A daemon configured through any of those three ran
+/// normally and every unqualified `shepctl` reported it unreachable, because
+/// the client was looking in two places the daemon could not be.
+///
+/// The list is still a list, and still ordered: an error can then name every
+/// path that was tried, which AC-61 requires, and a client whose environment
+/// has skewed from the daemon's (systemd sets `XDG_RUNTIME_DIR`; an `ssh` shell
+/// often does not) still has somewhere else to look. The *first* entry is the
+/// daemon's own answer, asserted over the whole environment matrix in
+/// `shepherd_obs::paths`.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn candidate_socket_paths() -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR")
-        && !runtime.is_empty()
-    {
-        out.push(format!("{runtime}/shepherd/daemon.sock"));
-    }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-    {
-        out.push(format!("{home}/.local/state/shepherd/daemon.sock"));
-    }
-    out
+    shepherd_obs::paths::socket_candidates(&shepherd_obs::paths::Env::from_process())
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect()
 }
 
 /// The platform command that starts the daemon, named in the not-running error.
@@ -220,19 +229,50 @@ mod unix_impl {
         /// treating silence as success is how a CLI reports a tiering run that
         /// never started.
         pub fn read_frame(&mut self) -> Result<serde_json::Value, ClientError> {
+            self.read_frame_or_eof()?.ok_or_else(|| {
+                ClientError::Transport("the daemon closed the connection without answering".into())
+            })
+        }
+
+        /// Read one frame, or `None` at end of stream.
+        ///
+        /// The distinction exists for exactly one caller. For a request/response
+        /// call, EOF means the daemon hung up without answering and is a failure
+        /// — see [`Self::read_frame`], which is that call's door. For a
+        /// subscription, EOF is how the stream **ends**: the daemon stopped, or
+        /// was stopped, and the frames that arrived before that were real. Both
+        /// readings cannot live in one function, so the raw one is here and the
+        /// opinionated one wraps it.
+        pub fn read_frame_or_eof(&mut self) -> Result<Option<serde_json::Value>, ClientError> {
             let mut line = String::new();
             let n = self
                 .reader
                 .read_line(&mut line)
                 .map_err(|e| ClientError::Transport(e.to_string()))?;
             if n == 0 {
-                return Err(ClientError::Transport(
-                    "the daemon closed the connection without answering".into(),
-                ));
+                return Ok(None);
             }
-            serde_json::from_str(&line).map_err(|e| {
+            serde_json::from_str(&line).map(Some).map_err(|e| {
                 ClientError::Transport(format!("the daemon sent a frame that is not JSON: {e}"))
             })
+        }
+
+        /// Stop applying the per-call read timeout to this connection.
+        ///
+        /// A subscription is idle by design — a quiet system publishes nothing —
+        /// so the 30 s deadline that protects a request/response call from a
+        /// hung daemon would instead kill a perfectly healthy stream on its
+        /// first quiet half-minute. It stays in force for the connect, the
+        /// handshake and the subscribe response, which are the parts that can
+        /// legitimately hang, and is cleared only once the stream begins.
+        pub fn read_without_deadline(&mut self) -> Result<(), ClientError> {
+            // On the reader's own descriptor. `try_clone` is a `dup`, so the two
+            // share one socket and one `SO_RCVTIMEO`, but naming the descriptor
+            // that is actually read leaves nothing resting on that.
+            self.reader
+                .get_ref()
+                .set_read_timeout(None)
+                .map_err(|e| ClientError::Transport(e.to_string()))
         }
     }
 }
@@ -273,6 +313,14 @@ mod other_impl {
         }
 
         pub fn read_frame(&mut self) -> Result<serde_json::Value, ClientError> {
+            match self._never {}
+        }
+
+        pub fn read_frame_or_eof(&mut self) -> Result<Option<serde_json::Value>, ClientError> {
+            match self._never {}
+        }
+
+        pub fn read_without_deadline(&mut self) -> Result<(), ClientError> {
             match self._never {}
         }
     }
@@ -340,6 +388,85 @@ pub fn call(
     conn.write_frame(&encoded).map_err(&at)?;
     let reply: RpcResponse = parse_frame(conn.read_frame().map_err(&at)?).map_err(&at)?;
     reply.outcome().map_err(ClientError::Rpc)
+}
+
+/// Subscribe, then keep reading until the stream ends.
+///
+/// # Why this cannot be [`call`]
+///
+/// `call` reads one response and drops its `Connection`. For every other method
+/// that is exactly right. For `events.subscribe` it is the bug: the daemon
+/// answers the subscription, then pumps notifications down *the same socket*
+/// (see `shepherd_daemon::server::subscribe_on_connection`, which installs the
+/// pump on the connection the request arrived on). Returning after one frame
+/// closes that socket, the pump's first write fails, and the subscriber is
+/// reaped — so neither the replayed frames nor a single live event was ever
+/// rendered. The subscription "succeeded" and did nothing, which is the shape
+/// of failure this project keeps having to walk back.
+///
+/// # How it ends
+///
+/// On **end of stream** — the daemon stopped, or the connection was closed —
+/// and on **Ctrl-C**, which needs no code here because the default SIGINT
+/// disposition is what a user pressing it expects. There is deliberately no
+/// `--count` or `--for` flag: this CLI's arguments are derived from the
+/// method's request schema by construction (see `main.rs`), so a client-only
+/// argument would be the first thing to break that, and `journalctl -f` and
+/// `docker logs -f` have already established EOF-or-interrupt as what a
+/// follow command does.
+///
+/// `on_event` is handed each notification's `params` — one event frame — as it
+/// arrives, not collected and returned at the end. A subscriber that rendered
+/// nothing until the stream closed would be as useless as the one this replaces.
+///
+/// Returns the `SubscribeResult` the daemon answered with, and how many event
+/// frames were rendered.
+pub fn subscribe(
+    socket: Option<&str>,
+    timeout: Duration,
+    params: serde_json::Value,
+    mut on_event: impl FnMut(&serde_json::Value),
+) -> Result<(serde_json::Value, u64), ClientError> {
+    let mut conn = Connection::connect(socket, timeout)?;
+    let path = conn.socket().to_string();
+    let at = |e: ClientError| match e {
+        ClientError::Transport(m) => ClientError::Transport(format!("{m} (socket {path})")),
+        other => other,
+    };
+
+    conn.write_frame(&hello_frame(0)).map_err(&at)?;
+    let hello_reply: RpcResponse = parse_frame(conn.read_frame().map_err(&at)?).map_err(&at)?;
+    hello_reply.outcome().map_err(ClientError::Rpc)?;
+
+    let request = RpcRequest::new(
+        RequestId::Number(1),
+        shepherd_proto::MethodKind::EventsSubscribe.name(),
+        params,
+    );
+    let encoded = serde_json::to_value(&request)
+        .map_err(|e| ClientError::Transport(format!("cannot encode the request: {e}")))?;
+    conn.write_frame(&encoded).map_err(&at)?;
+    let reply: RpcResponse = parse_frame(conn.read_frame().map_err(&at)?).map_err(&at)?;
+    let result = reply.outcome().map_err(ClientError::Rpc)?;
+
+    // Only now: everything above can legitimately hang and is worth a deadline.
+    // Nothing below is — silence is the normal state of a subscription.
+    conn.read_without_deadline().map_err(&at)?;
+
+    let mut rendered = 0u64;
+    while let Some(frame) = conn.read_frame_or_eof().map_err(&at)? {
+        // The daemon sends notifications, which carry `method` and no `id`.
+        // Anything else on this socket is not an event and is not ours to
+        // render; skipping rather than failing keeps a future frame kind from
+        // breaking a running subscriber.
+        if frame.get("method").and_then(serde_json::Value::as_str) == Some("event")
+            && let Some(payload) = frame.get("params")
+        {
+            rendered += 1;
+            on_event(payload);
+        }
+    }
+    Ok((result, rendered))
 }
 
 fn parse_frame(value: serde_json::Value) -> Result<RpcResponse, ClientError> {

@@ -239,3 +239,182 @@ fn zero_matches_is_distinguishable_from_nothing_considered() {
     let nothing_seen = e.run(&[], RunMode::DryRun, None, now()).expect("dry");
     assert_eq!(nothing_seen.considered, 0);
 }
+
+// --- execution is bound to the previewed SET, not just the rule body -------
+//
+// `may_enable` proves the rule text has not changed. It says nothing about the
+// corpus, which moves on its own: files are created, deleted, retagged and
+// touched between the dry run an operator read and the run they authorized.
+// AC-14's "exactly the real run's set" is a claim about the set, so the set is
+// what gets compared.
+
+/// A candidate whose Shepherd-owned access signal is absent, so an `atime`
+/// predicate falls through to `atime` itself.
+fn candidate_without_observed_access(id: i64, name: &str, age_days: i64) -> Candidate {
+    Candidate {
+        last_observed_access: None,
+        ..candidate(id, name, age_days, 50_000_000)
+    }
+}
+
+#[test]
+fn a_file_that_appeared_after_the_preview_is_not_acted_on() {
+    let b = tiering();
+    let e = Engine::new(&b, AtimeMode::Reliable);
+    let previewed = e.preview(&corpus(), now()).expect("preview");
+
+    // A second old raw lands between the dry run and the run.
+    let mut later = corpus();
+    later.push(candidate(4, "Photos/older.raw", 500, 50_000_000));
+
+    match e.run(&later, RunMode::Execute, Some(&previewed), now()) {
+        Err(EngineRefusal::PreviewDrifted { drift }) => {
+            assert_eq!(
+                drift.added,
+                vec![PreviewedMatch {
+                    file: FileId::new(4),
+                    signal: AccessSignalSource::Observed,
+                }],
+                "the operator never saw file 4"
+            );
+            assert!(
+                drift.removed.is_empty() && drift.changed.is_empty(),
+                "{drift:?}"
+            );
+        }
+        other => panic!("a file the preview never enumerated must not be acted on, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_previewed_file_that_vanished_refuses_rather_than_quietly_shrinking() {
+    let b = tiering();
+    let e = Engine::new(&b, AtimeMode::Reliable);
+    let previewed = e.preview(&corpus(), now()).expect("preview");
+
+    // The matching file is gone by the time the run happens.
+    let later: Vec<Candidate> = corpus()
+        .into_iter()
+        .filter(|c| c.file != FileId::new(1))
+        .collect();
+
+    match e.run(&later, RunMode::Execute, Some(&previewed), now()) {
+        Err(EngineRefusal::PreviewDrifted { drift }) => {
+            assert_eq!(
+                drift.removed,
+                vec![PreviewedMatch {
+                    file: FileId::new(1),
+                    signal: AccessSignalSource::Observed,
+                }]
+            );
+            assert!(
+                drift.added.is_empty() && drift.changed.is_empty(),
+                "{drift:?}"
+            );
+        }
+        other => panic!("a shrunken set is still not the approved set, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_previewed_file_that_was_touched_since_no_longer_matches_and_is_refused() {
+    // The everyday case: the user opened the file after reading the dry run.
+    let b = tiering();
+    let e = Engine::new(&b, AtimeMode::Reliable);
+    let previewed = e.preview(&corpus(), now()).expect("preview");
+
+    let mut later = corpus();
+    later[0] = candidate(1, "Photos/old.raw", 1, 50_000_000);
+
+    match e.run(&later, RunMode::Execute, Some(&previewed), now()) {
+        Err(EngineRefusal::PreviewDrifted { drift }) => {
+            assert_eq!(drift.removed.len(), 1);
+            assert_eq!(drift.removed[0].file, FileId::new(1));
+        }
+        other => panic!("a file that stopped matching must not still be acted on, got {other:?}"),
+    }
+}
+
+/// AC-14 makes the preview state *which signal* drove each match. A match the
+/// operator read as Shepherd-observed and that now rests on raw `atime` is not
+/// the match they approved, even though the file id is the same.
+#[test]
+fn a_match_driven_by_a_different_signal_is_not_the_match_that_was_approved() {
+    // `older_than_days` is §4.12's fallback-order predicate: observed → atime
+    // → mtime. The signal it lands on is a property of the file, not the rule.
+    let b = tiering();
+    let e = Engine::new(&b, AtimeMode::Reliable);
+
+    let observed = vec![candidate(1, "Photos/old.raw", 400, 50_000_000)];
+    let previewed = e.preview(&observed, now()).expect("preview");
+    assert_eq!(
+        previewed.matches[0].signal,
+        AccessSignalSource::Observed,
+        "precondition: the dry run rested on the Shepherd-owned signal"
+    );
+
+    // Same file, still matching, but the observed signal is gone.
+    let fallen_back = vec![candidate_without_observed_access(1, "Photos/old.raw", 400)];
+    match e.run(&fallen_back, RunMode::Execute, Some(&previewed), now()) {
+        Err(EngineRefusal::PreviewDrifted { drift }) => {
+            assert_eq!(drift.changed.len(), 1, "{drift:?}");
+            assert_eq!(
+                drift.changed[0].previewed.signal,
+                AccessSignalSource::Observed
+            );
+            assert_eq!(drift.changed[0].current.signal, AccessSignalSource::Atime);
+        }
+        other => panic!("a match on a different signal is a different match, got {other:?}"),
+    }
+}
+
+/// The accepting direction. Without this, "refuse every execution" passes every
+/// refusal test above and the engine can never act again.
+#[test]
+fn a_corpus_that_moved_around_the_match_set_still_executes() {
+    let b = tiering();
+    let e = Engine::new(&b, AtimeMode::Reliable);
+    let previewed = e.preview(&corpus(), now()).expect("preview");
+
+    // Files added, files removed, order changed — but *the match set* is
+    // identical, and the match set is what was approved.
+    let later = vec![
+        candidate(7, "Docs/new-note.txt", 900, 10),
+        candidate(1, "Photos/old.raw", 400, 50_000_000),
+        candidate(2, "Photos/new.raw", 5, 50_000_000),
+    ];
+
+    let real = e
+        .run(&later, RunMode::Execute, Some(&previewed), now())
+        .expect("an unchanged match set must still run");
+    assert_eq!(real.actions.len(), 1);
+    assert_eq!(real.actions[0].file, FileId::new(1));
+}
+
+/// The zero-comparison trap, stated as a test: an absent preview must never
+/// read as "an empty previewed set, and nothing drifted from it".
+#[test]
+fn no_preview_at_all_is_distinguishable_from_a_preview_nothing_drifted_from() {
+    let b = tiering();
+    let e = Engine::new(&b, AtimeMode::Reliable);
+
+    // Nothing matches, so a drift comparison against an absent preview would
+    // compare empty with empty and wave the run through.
+    match e.run(&[], RunMode::Execute, None, now()) {
+        Err(EngineRefusal::NotEnabled { decision }) => {
+            assert_eq!(decision.refusals(), [EnableRefusal::NoPreview]);
+        }
+        other => panic!("an absent preview is not an empty one, got {other:?}"),
+    }
+
+    // A preview that really did enumerate nothing is a different answer: it
+    // exists, so the run proceeds and plans nothing.
+    let barren = [candidate(9, "Docs/a.txt", 5, 10)];
+    let previewed = e.preview(&barren, now()).expect("preview");
+    assert!(previewed.matches.is_empty(), "precondition");
+    let real = e
+        .run(&barren, RunMode::Execute, Some(&previewed), now())
+        .expect("an empty preview is a preview");
+    assert!(real.actions.is_empty());
+    assert_eq!(real.considered, 1);
+}

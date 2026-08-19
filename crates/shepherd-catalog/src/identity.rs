@@ -170,15 +170,18 @@ pub struct PathPolicies {
 
 /// Probe a root's case and normalization behaviour by creating throwaway files.
 ///
-/// §4.9 requires probing rather than assuming. The probe writes two dotfiles
+/// §4.9 requires probing rather than assuming. The probe creates two dotfiles
 /// with deliberately awkward names and observes what comes back:
 ///
-/// * **case** — write `.shepherd-probe-CASE`, then test whether
-///   `.shepherd-probe-case` resolves to it.
-/// * **normalization** — write a name containing `é` as NFC (`U+00E9`), then
+/// * **case** — create `<stem>CASE`, then test whether `<stem>case` resolves
+///   to it.
+/// * **normalization** — create a name containing `é` as NFC (`U+00E9`), then
 ///   read the directory back and see which form the filesystem reports.
 ///
-/// Both probe files are removed on every exit path, including the error ones.
+/// `<stem>` is [`ProbeFiles`]'s per-call unique prefix, and the files are
+/// created with `create_new` — see that type for why both matter. Every file
+/// this probe created is removed on every exit path, including the error ones;
+/// no file it did not create is ever touched.
 ///
 /// On a read-only root the probe cannot run. It then returns platform defaults
 /// with `assumed: true` rather than failing enrollment — a root you can only
@@ -217,7 +220,44 @@ fn platform_default_norm() -> PathNormPolicy {
 }
 
 /// RAII holder for the probe files, so no path returns without cleaning up.
+///
+/// # The names are unique, and the files are created exclusively
+///
+/// An earlier version used the FIXED names `.shepherd-probe-CASE` and
+/// `.shepherd-probe-é`, opened with `std::fs::write` — which is
+/// `O_CREAT|O_TRUNC`. A root that already held a user file under either name
+/// had it **emptied** by the open and then **unlinked** by [`Drop`]. So
+/// `root.add`, an operation whose entire job is to look at a directory, could
+/// destroy data in it.
+///
+/// Both halves of the fix are load-bearing:
+///
+/// * a per-call `stem` (`.shepherd-probe-{pid}-{nanos}-`) makes a collision
+///   with a user's file, or with a concurrent probe of the same root,
+///   effectively impossible rather than merely unlikely;
+/// * `create_new` — `O_CREAT|O_EXCL` — **refuses** to open anything already
+///   there, so even on a collision nothing is truncated. The refusal takes the
+///   same path as a read-only root: `failed`, hence `assumed: true` and
+///   platform defaults. That is a degradation, not a rejection; enrollment
+///   still succeeds, which is the behaviour `root_add` already expects.
+///
+/// **This is not a new idea in this crate — it is one this crate already had
+/// and did not apply here.** [`crate::atime::probe_atime_advance`]
+/// (`atime.rs:291`) creates its probe the same way, and the comment at
+/// `atime.rs:327` names the identical hazard in as many words: *"Unique per
+/// process AND per call, and created with `create_new` — `O_CREAT|O_EXCL`,
+/// which REFUSES to open anything already there. A fixed name opened with
+/// `O_TRUNC` would empty a user's file that happened to share the name, inside
+/// the probe whose entire job is not to damage the volume it is measuring."*
+/// Same technique, same `{pid}-{nanos}` shape, same clean-up-only-what-we-made
+/// discipline, deliberately rather than coincidentally — a second convention
+/// here would be the actual defect.
+///
+/// The stem is **decimal digits and ASCII only**, which the case probe depends
+/// on: folding `<stem>CASE` to `<stem>case` must change the deliberate tail and
+/// nothing else.
 struct ProbeFiles {
+    stem: String,
     upper: Option<std::path::PathBuf>,
     nfc: Option<std::path::PathBuf>,
     root: std::path::PathBuf,
@@ -227,30 +267,35 @@ struct ProbeFiles {
 /// `é` as a single precomposed codepoint (NFC).
 const NFC_E_ACUTE: &str = "\u{00e9}";
 
+/// Marks the normalization probe's name, so its namespace is disjoint from the
+/// case probe's by construction.
+///
+/// The previous code separated them by skipping any entry that
+/// `contains("CASE")`, which a case-*folding* filesystem defeats: it reports
+/// the file back as `case`, the skip misses, and the case probe's own name gets
+/// measured as if it were the normalization probe's.
+const NORM_TAG: &str = "n";
+
 impl ProbeFiles {
     fn new(root: &Path) -> Self {
-        let upper = root.join(".shepherd-probe-CASE");
-        let nfc = root.join(format!(".shepherd-probe-{NFC_E_ACUTE}"));
-        let mut failed = false;
-        let upper = match std::fs::write(&upper, b"") {
-            Ok(()) => Some(upper),
-            Err(_) => {
-                failed = true;
-                None
-            }
-        };
-        let nfc = match std::fs::write(&nfc, b"") {
-            Ok(()) => Some(nfc),
-            Err(_) => {
-                failed = true;
-                None
-            }
-        };
+        Self::with_stem(root, unique_stem())
+    }
+
+    /// [`ProbeFiles::new`] with the stem supplied rather than generated.
+    ///
+    /// Exists so the exclusive-create half of this type can be tested at all.
+    /// A unique stem makes a collision unreachable by construction, which is
+    /// the point — but it also means a test cannot arrange one, and an
+    /// untestable guard is one a later edit deletes without a failure.
+    fn with_stem(root: &Path, stem: String) -> Self {
+        let upper = create_exclusive(root.join(format!("{stem}CASE")));
+        let nfc = create_exclusive(root.join(format!("{stem}{NORM_TAG}{NFC_E_ACUTE}")));
         Self {
+            failed: upper.is_none() || nfc.is_none(),
+            stem,
             upper,
             nfc,
             root: root.to_path_buf(),
-            failed,
         }
     }
 
@@ -260,7 +305,7 @@ impl ProbeFiles {
 
     fn case(&self) -> Option<PathCasePolicy> {
         self.upper.as_ref()?;
-        let lower = self.root.join(".shepherd-probe-case");
+        let lower = self.root.join(format!("{}case", self.stem));
         Some(if lower.exists() {
             PathCasePolicy::Insensitive
         } else {
@@ -270,14 +315,17 @@ impl ProbeFiles {
 
     fn norm(&self) -> Option<PathNormPolicy> {
         self.nfc.as_ref()?;
+        // Matched against THIS probe's own prefix, not against
+        // `.shepherd-probe-` at large: a user's file, or a concurrent probe of
+        // the same root, must not be measured as if this probe had written it.
+        let prefix = format!("{}{NORM_TAG}", self.stem);
         let entries = std::fs::read_dir(&self.root).ok()?;
         for e in entries.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if !name.starts_with(".shepherd-probe-") || name.contains("CASE") {
+            let Some(tail) = name.strip_prefix(prefix.as_str()) else {
                 continue;
-            }
-            let tail = &name[".shepherd-probe-".len()..];
+            };
             let nfc: String = tail.nfc().collect();
             let nfd: String = tail.nfd().collect();
             // Reported in decomposed form though it was written composed: the
@@ -297,8 +345,43 @@ impl ProbeFiles {
     }
 }
 
+/// `.shepherd-probe-{pid}-{nanos}-`: unique per process AND per call.
+///
+/// A clock before the epoch costs uniqueness, not correctness — `create_new` is
+/// what makes the probe safe, and it holds whatever this suffix says.
+///
+/// Decimal digits and ASCII only, which the case probe depends on: folding
+/// `<stem>CASE` to `<stem>case` must change the deliberate tail and nothing
+/// else.
+fn unique_stem() -> String {
+    format!(
+        ".shepherd-probe-{}-{}-",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
+/// Create `path` and return it, or `None` if anything was already there.
+///
+/// `create_new` is `O_CREAT|O_EXCL`. Returning `None` rather than a path is
+/// what makes [`ProbeFiles::drop`] unlink only files this probe itself created.
+fn create_exclusive(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()
+        .map(|_| path)
+}
+
 impl Drop for ProbeFiles {
     fn drop(&mut self) {
+        // Only the `Some` paths, which are only the ones `create_exclusive`
+        // actually created. A name this probe refused to open is a name it must
+        // not delete.
         for p in [self.upper.take(), self.nfc.take()].into_iter().flatten() {
             let _ = std::fs::remove_file(p);
         }
@@ -308,6 +391,29 @@ impl Drop for ProbeFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch directory unique to this test run, so two tests (or two
+    /// concurrent runs) never share one.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "shepherd-identity-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect()
+    }
 
     /// The §4.9 collision test. Two files whose paths differ only in case get
     /// the SAME key when their content is identical, and DIFFERENT keys when
@@ -454,6 +560,107 @@ mod tests {
         let once = norm_key(s, PathCasePolicy::Insensitive, PathNormPolicy::Nfc);
         let twice = norm_key(&once, PathCasePolicy::Insensitive, PathNormPolicy::Nfc);
         assert_eq!(once, twice, "norm_key must be a fixed point of itself");
+    }
+
+    /// A user's file whose name collides with a probe must survive enrollment.
+    ///
+    /// The probe wrote **fixed** names with `std::fs::write`, which is
+    /// `O_CREAT|O_TRUNC`: a root that already held `.shepherd-probe-CASE`
+    /// had it emptied, and then `ProbeFiles::drop` unlinked it. So `root.add`
+    /// — an operation whose whole job is to *look* at a directory — could
+    /// destroy a file in it. `atime.rs`'s probe already names this hazard and
+    /// avoids it with `create_new` and a unique name; this is the same fix.
+    #[test]
+    fn a_users_file_whose_name_collides_with_a_probe_survives_enrollment() {
+        let dir = scratch_dir("collide");
+        // The two names the probe used to claim unconditionally.
+        let upper = dir.join(".shepherd-probe-CASE");
+        let accent = dir.join(format!(".shepherd-probe-{NFC_E_ACUTE}"));
+        std::fs::write(&upper, b"irreplaceable upper").unwrap();
+        std::fs::write(&accent, b"irreplaceable accent").unwrap();
+
+        let got = probe_path_policies(&dir);
+
+        // The accepting direction: colliding user files cost nothing. The fix
+        // must not be "give up whenever the root holds something probe-shaped".
+        let clean = scratch_dir("collide-control");
+        let want = probe_path_policies(&clean);
+        std::fs::remove_dir_all(&clean).ok();
+        assert!(
+            !got.assumed,
+            "a colliding user file must not disable the probe"
+        );
+        assert_eq!(
+            got, want,
+            "the measurement changed because a user file shared a probe's old name"
+        );
+
+        assert_eq!(
+            std::fs::read(&upper).ok().as_deref(),
+            Some(&b"irreplaceable upper"[..]),
+            "enrollment truncated or deleted a user file at {}",
+            upper.display()
+        );
+        assert_eq!(
+            std::fs::read(&accent).ok().as_deref(),
+            Some(&b"irreplaceable accent"[..]),
+            "enrollment truncated or deleted a user file at {}",
+            accent.display()
+        );
+        // And the probe still cleaned up after itself: the only things left
+        // are the two files that were there before it ran.
+        let mut left = dir_entries(&dir);
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                ".shepherd-probe-CASE".to_string(),
+                format!(".shepherd-probe-{NFC_E_ACUTE}"),
+            ],
+            "the probe left its own files behind"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the fix, and the one a unique name cannot demonstrate.
+    ///
+    /// The stem makes a collision unreachable in practice, so
+    /// [`a_users_file_whose_name_collides_with_a_probe_survives_enrollment`]
+    /// passes even if `create_new` is swapped back for a truncating open —
+    /// verified by mutation. This test arranges the collision the stem
+    /// prevents, and pins what happens in it: the existing bytes are refused,
+    /// not emptied, and the probe reports `failed` so the caller falls back to
+    /// platform defaults instead of a measurement it never made.
+    ///
+    /// `root_add` **degrades** on that rather than refusing — it reads
+    /// `policies.case`/`policies.norm` and registers the root regardless — so
+    /// a collision costs a probed answer, never an enrollment.
+    #[test]
+    fn a_name_collision_refuses_to_truncate_and_falls_back_to_defaults() {
+        let dir = scratch_dir("exclusive");
+        let stem = ".shepherd-probe-collide-on-purpose-";
+        let planted = dir.join(format!("{stem}CASE"));
+        std::fs::write(&planted, b"irreplaceable").unwrap();
+
+        let probe = ProbeFiles::with_stem(&dir, stem.to_string());
+        assert!(
+            probe.failed(),
+            "a probe that could not create its own file must say so, or the \
+             caller reports a platform default as if it had been measured"
+        );
+        assert_eq!(
+            probe.case(),
+            None,
+            "no case policy may be reported from a file this probe did not write"
+        );
+        drop(probe);
+
+        assert_eq!(
+            std::fs::read(&planted).ok().as_deref(),
+            Some(&b"irreplaceable"[..]),
+            "the probe truncated or deleted a file it did not create"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

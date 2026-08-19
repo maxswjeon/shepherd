@@ -36,6 +36,15 @@
 //! | 2 | usage error (clap's own convention) |
 //! | 3 | the daemon could not be reached |
 //! | 4 | the method is registered but not served here |
+//!
+//! # One command does not return promptly
+//!
+//! `events subscribe` follows its stream: it prints each event as it arrives
+//! and returns only when the daemon closes the connection (exit 0) or the user
+//! interrupts it. Every other command is one request and one response. There is
+//! deliberately no `--count` or `--for` flag to bound it — the argument tree
+//! above is derived from each method's request schema, and a client-only
+//! argument would be the first thing to break that. See `stream_events`.
 
 mod client;
 
@@ -93,6 +102,14 @@ fn run(matches: &ArgMatches) -> Result<serde_json::Value, Failure> {
         .get_one::<u64>("timeout")
         .map_or(client::DEFAULT_TIMEOUT, |s| Duration::from_secs(*s));
 
+    // `events.subscribe` is the one method whose answer is not the point. The
+    // daemon replies, then pumps notifications down the same socket; a client
+    // that returns after the reply closes the socket and renders nothing. See
+    // `client::subscribe`.
+    if kind == MethodKind::EventsSubscribe {
+        return stream_events(socket, timeout, params, matches.get_flag("json"));
+    }
+
     match client::call(socket, timeout, kind.name(), params) {
         Ok(data) => Ok(data),
         // `doctor` is the one method that must answer when the daemon is
@@ -102,6 +119,54 @@ fn run(matches: &ArgMatches) -> Result<serde_json::Value, Failure> {
         }
         Err(e) => Err(rpc_failure(&e)),
     }
+}
+
+/// Render `events subscribe` as a stream, and return once it ends.
+///
+/// # This command is long-running, and the others are not
+///
+/// Every other `shepctl` invocation is one request and one response. This one
+/// subscribes and then **follows**, printing each event as it arrives, until
+/// the daemon closes the connection or the user interrupts it. That is a
+/// deliberate behaviour change: the previous version used the same one-response
+/// path as every ordinary RPC, so it read the `SubscribeResult`, dropped the
+/// connection, and never rendered a single event — replayed or live. It
+/// reported success for a subscription that had already been reaped.
+///
+/// Events are printed as they arrive rather than accumulated, because a
+/// follow command that shows nothing until it exits is not a follow command.
+/// With `--json` each event is one compact line — NDJSON, which is what a
+/// script piping this can consume incrementally — and the ordinary envelope
+/// still closes the run. Rust's stdout is line-buffered, so a line is on the
+/// pipe as soon as it is written.
+///
+/// The returned value is the subscription itself plus the count, so
+/// `--json` consumers get a final record of what the run covered rather than
+/// having to infer it.
+fn stream_events(
+    socket: Option<&str>,
+    timeout: Duration,
+    params: serde_json::Value,
+    json: bool,
+) -> Result<serde_json::Value, Failure> {
+    let (result, rendered) = client::subscribe(socket, timeout, params, |event| {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(event).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+            );
+        } else {
+            print!("{}", render_human(event, 0));
+        }
+    })
+    .map_err(|e| rpc_failure(&e))?;
+
+    let mut summary = serde_json::Map::new();
+    if let serde_json::Value::Object(map) = result {
+        summary.extend(map);
+    }
+    summary.insert("events_rendered".into(), serde_json::json!(rendered));
+    Ok(serde_json::Value::Object(summary))
 }
 
 /// Answer `doctor` from the client when no daemon is listening.

@@ -295,6 +295,21 @@ pub enum DiscardRefusal {
     WindowConfiguredButNoDeferral {
         window_days: u32,
     },
+    /// The supplied deferral is some *other* deferral: a different file, a
+    /// different target, or the local-unlink side rather than the remote
+    /// discard side.
+    ///
+    /// Reported before its status is read at all. An elapsed window belonging
+    /// to one file says nothing whatsoever about another file, and a lookup
+    /// that returns the wrong row must not be able to authorize a destruction
+    /// on the strength of it. The offending record's own identity is carried
+    /// here because that, not this file's identity, is what names the wiring
+    /// mistake.
+    DeferralForAnotherKey {
+        deferral_file: FileId,
+        deferral_target: TargetId,
+        deferral_kind: DeferralKind,
+    },
     DeferralStillRunning {
         remaining_nanos: i64,
     },
@@ -330,6 +345,25 @@ impl DiscardDecision {
     }
 }
 
+/// Whether this deferral is the one that governs *this* discard.
+///
+/// The complete key — file, target and side of the system — compared before the
+/// deferral's status is read at all. A status is only evidence about the thing
+/// it belongs to, so "expired" from the wrong row is not a weaker authority, it
+/// is no authority. `DiscardInputs` carries no kind field because the discard
+/// branch *is* PM-2's remote side; that expectation is written here rather than
+/// left to the caller to supply correctly.
+fn governs_this_discard(deferral: &Deferral, inputs: &DiscardInputs<'_>) -> bool {
+    // An exhaustive match rather than `== DeferralKind::Remote`: a variant added
+    // later must be classified deliberately, not default into "close enough to
+    // a discard" — nor silently widen this check by matching a wildcard.
+    let kind_governs = match deferral.kind {
+        DeferralKind::Remote => true,
+        DeferralKind::Local => false,
+    };
+    deferral.file == inputs.file && deferral.target == inputs.target && kind_governs
+}
+
 /// §4.10.3's `discard_permitted`, as a conjunction.
 ///
 /// Returns **every** failing conjunct rather than the first, because a held
@@ -356,6 +390,15 @@ pub fn discard_permitted(inputs: &DiscardInputs<'_>) -> DiscardDecision {
             None => refusals.push(DiscardRefusal::WindowConfiguredButNoDeferral {
                 window_days: window,
             }),
+            // Identity before status, in both branches below. Whose window it
+            // is decides whether its state means anything here.
+            Some(d) if !governs_this_discard(d, inputs) => {
+                refusals.push(DiscardRefusal::DeferralForAnotherKey {
+                    deferral_file: d.file,
+                    deferral_target: d.target,
+                    deferral_kind: d.kind,
+                });
+            }
             Some(d) => match d.status(inputs.now) {
                 DeferralStatus::Expired => {}
                 DeferralStatus::Cancelled => refusals.push(DiscardRefusal::DeferralCancelled),
@@ -367,11 +410,19 @@ pub fn discard_permitted(inputs: &DiscardInputs<'_>) -> DiscardDecision {
                 }
             },
         }
-    } else if let Some(d) = inputs.deferral
-        && d.cancelled_at.is_some()
-    {
-        // A zero window still cannot destroy something the user undeleted.
-        refusals.push(DiscardRefusal::DeferralCancelled);
+    } else if let Some(d) = inputs.deferral {
+        if !governs_this_discard(d, inputs) {
+            // `cancelled_at` is a status too, and reading another row's is the
+            // same mistake pointed the other way.
+            refusals.push(DiscardRefusal::DeferralForAnotherKey {
+                deferral_file: d.file,
+                deferral_target: d.target,
+                deferral_kind: d.kind,
+            });
+        } else if d.cancelled_at.is_some() {
+            // A zero window still cannot destroy something the user undeleted.
+            refusals.push(DiscardRefusal::DeferralCancelled);
+        }
     }
 
     if inputs.gates.resync_required {

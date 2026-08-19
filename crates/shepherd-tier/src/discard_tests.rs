@@ -359,3 +359,364 @@ fn a_hold_blocks_destroy_and_nothing_else() {
         );
     }
 }
+
+// --- the rolling breaker is charged, before anything is deleted -------------
+
+/// A [`RateLedger`] over an in-memory window.
+///
+/// The `Mutex` is not decoration: it is what makes `charge` a genuine
+/// test-and-consume rather than a read followed by a write, which is the
+/// property the real SQLite-backed ledger has to reproduce with a transaction.
+struct MemLedger {
+    window: std::sync::Mutex<RateWindow>,
+}
+
+impl MemLedger {
+    fn new() -> Self {
+        Self {
+            window: std::sync::Mutex::new(RateWindow::default()),
+        }
+    }
+
+    /// The snapshot `evaluate_discard` reads. Advisory by construction — the
+    /// authority is `charge`.
+    fn snapshot(&self) -> RateWindow {
+        self.window.lock().unwrap().clone()
+    }
+
+    fn used(&self, at: Timestamp, window_nanos: i64) -> u32 {
+        self.window.lock().unwrap().count_within(at, window_nanos)
+    }
+}
+
+#[async_trait::async_trait]
+impl RateLedger for MemLedger {
+    async fn charge(
+        &self,
+        _target: TargetId,
+        _root: RootId,
+        at: Timestamp,
+        n: u32,
+        limits: &BreakerLimits,
+    ) -> Result<(), BreakerRefusal> {
+        self.window.lock().unwrap().try_charge(at, n, limits)
+    }
+}
+
+fn episode_with(count: usize, now: Timestamp) -> Episode {
+    let mut e = Episode::open(RootId::new(1), TargetId::new(1), now);
+    e.enumerate(
+        (0..count)
+            .map(|i| Candidate {
+                file: FileId::new(i as i64 + 1),
+                path: format!("/root/{i}.raw"),
+                blake3: None,
+            })
+            .collect(),
+    );
+    e.confirm("operator", now, HOUR);
+    e
+}
+
+/// A remote holding `count` deletable objects, plus the audit log the discard
+/// path insists on.
+struct Remote {
+    dir: std::path::PathBuf,
+    adapter: shepherd_storage::testing::MemAdapter,
+    audit: crate::audit::AuditLog,
+    keys: Vec<shepherd_core::ObjectKey>,
+}
+
+impl Remote {
+    fn new(tag: &str, count: usize) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("shepherd-discard-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let adapter = shepherd_storage::testing::MemAdapter::versioned();
+        let keys: Vec<_> = (0..count)
+            .map(|i| {
+                let k = shepherd_core::ObjectKey::new(format!("objects/ab/cd/obj{i}"));
+                adapter.put_versioned(&k, bytes::Bytes::from_static(b"x"), "v9");
+                k
+            })
+            .collect();
+        let audit = crate::audit::AuditLog::open(&dir.join("audit.jsonl")).unwrap();
+        Self {
+            dir,
+            adapter,
+            audit,
+            keys,
+        }
+    }
+
+    fn guard() -> VersionGuard {
+        VersionGuard::Version(shepherd_core::ObjectVersion::new("v9"))
+    }
+
+    async fn discard(
+        &self,
+        charge: &mut DiscardCharge,
+        i: usize,
+        now: Timestamp,
+    ) -> std::result::Result<(), DestroyError> {
+        execute_discard(
+            charge,
+            shepherd_core::IntentId::new(i as i64 + 1),
+            &(&self.adapter as &dyn shepherd_storage::StorageAdapter),
+            &self.keys[i],
+            &Self::guard(),
+            &self.audit,
+            "version",
+            now,
+        )
+        .await
+    }
+
+    fn deleted(&self) -> usize {
+        self.adapter.deleted_keys().len()
+    }
+}
+
+impl Drop for Remote {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn deferral() -> Deferral {
+    Deferral::open(
+        FileId::new(1),
+        TargetId::new(1),
+        DeferralKind::Remote,
+        14,
+        &clock(0),
+        ClockProvenance::NtpSynced,
+    )
+}
+
+fn limits(max_in_window: u32) -> BreakerLimits {
+    BreakerLimits {
+        max_in_window,
+        window_nanos: DAY,
+        max_per_episode: 500,
+    }
+}
+
+/// **The accepting direction, and the fix's headline fact.** A breaker wired
+/// to refuse everything would satisfy every refusal test below while silently
+/// disabling discard, so this asserts that the episode completes *and* that
+/// the window ends up holding exactly what was spent — not zero (the pre-fix
+/// behaviour) and not double (a reserve that also charges per deletion).
+#[tokio::test]
+async fn an_executed_episode_charges_the_window_exactly_once_per_object() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let e = episode_with(3, now);
+    let remote = Remote::new("charged", 3);
+    let d = deferral();
+    let lim = limits(10);
+
+    let mut charge = reserve_discard(
+        inputs(
+            &clock(20),
+            Some(&d),
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        ),
+        &e,
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+    )
+    .await
+    .expect("both gates permit and the budget is free");
+
+    assert_eq!(charge.reserved(), 3);
+    assert_eq!(
+        ledger.used(now, lim.window_nanos),
+        3,
+        "the charge must be persisted by `reserve_discard`, before any deletion"
+    );
+
+    for i in 0..3 {
+        remote.discard(&mut charge, i, now).await.expect("discard");
+    }
+
+    assert_eq!(remote.deleted(), 3, "all three objects really were deleted");
+    assert_eq!(
+        ledger.used(now, lim.window_nanos),
+        3,
+        "the window must hold exactly the three that were spent"
+    );
+    assert_eq!(charge.remaining(), 0);
+}
+
+/// The rolling window's entire purpose: repeated sub-threshold episodes must
+/// accumulate against one budget. Pre-fix, episode two saw the same unused
+/// window episode one had seen.
+#[tokio::test]
+async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let d = deferral();
+    let lim = limits(3); // two episodes of 2 are individually fine, jointly not
+
+    let first = reserve_discard(
+        inputs(
+            &clock(20),
+            Some(&d),
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        ),
+        &episode_with(2, now),
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+    )
+    .await
+    .expect("the first episode is within budget");
+    assert_eq!(first.reserved(), 2);
+
+    let refusals = reserve_discard(
+        inputs(
+            &clock(20),
+            Some(&d),
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        ),
+        &episode_with(2, now),
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+    )
+    .await
+    .expect_err("2 + 2 exceeds a budget of 3");
+
+    assert_eq!(
+        refusals.breaker,
+        vec![BreakerRefusal::RateWindowExhausted {
+            used: 2,
+            limit: 3,
+            window_nanos: DAY,
+        }],
+        "the second episode must be refused by the window the first one charged"
+    );
+    assert_eq!(
+        ledger.used(now, lim.window_nanos),
+        2,
+        "a refused reservation must not consume budget"
+    );
+}
+
+/// The TOCTOU the finding names. Both episodes are evaluated against the same
+/// snapshot — as two concurrent workers would be — and both pass that
+/// advisory check. Only the atomic charge separates them.
+#[tokio::test]
+async fn two_episodes_evaluating_against_one_snapshot_cannot_both_reserve() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let d = deferral();
+    let lim = limits(2);
+    // The snapshot both racers read, taken once, before either charges.
+    let snapshot = ledger.snapshot();
+
+    for (label, expect_ok) in [("first", true), ("second", false)] {
+        // Precondition: the advisory gate says yes to BOTH, which is exactly
+        // why it cannot be the authority.
+        assert_eq!(
+            evaluate_discard(
+                inputs(
+                    &clock(20),
+                    Some(&d),
+                    Some(PermanentDeleteConfirmation::WindowsCfApi),
+                ),
+                &episode_with(2, now),
+                &snapshot,
+                &lim,
+                now,
+            ),
+            Ok(()),
+            "{label}: the snapshot check must pass for both racers"
+        );
+
+        let got = reserve_discard(
+            inputs(
+                &clock(20),
+                Some(&d),
+                Some(PermanentDeleteConfirmation::WindowsCfApi),
+            ),
+            &episode_with(2, now),
+            &snapshot,
+            &lim,
+            now,
+            &ledger,
+        )
+        .await;
+
+        assert_eq!(
+            got.is_ok(),
+            expect_ok,
+            "{label}: exactly one racer may reserve the budget, got {got:?}"
+        );
+    }
+
+    assert_eq!(
+        ledger.used(now, lim.window_nanos),
+        2,
+        "the budget must have been consumed once, not twice"
+    );
+}
+
+/// The charge is spent **before** the deletion, so an exhausted one stops the
+/// delete from happening at all. Asserted on the fact — the adapter's delete
+/// count — because an assertion on the error alone would pass even if the
+/// object had been destroyed first and the refusal raised afterwards.
+#[tokio::test]
+async fn an_exhausted_charge_refuses_before_anything_is_deleted() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let d = deferral();
+    let lim = limits(10);
+    let remote = Remote::new("exhausted", 2);
+
+    // Reserved for one object; the episode tries to delete two.
+    let mut charge = reserve_discard(
+        inputs(
+            &clock(20),
+            Some(&d),
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        ),
+        &episode_with(1, now),
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+    )
+    .await
+    .expect("reserve");
+
+    remote
+        .discard(&mut charge, 0, now)
+        .await
+        .expect("the object the charge paid for");
+    assert_eq!(remote.deleted(), 1);
+
+    let err = remote
+        .discard(&mut charge, 1, now)
+        .await
+        .expect_err("a second deletion was never paid for");
+    assert!(
+        matches!(
+            err,
+            DestroyError::Breaker(BreakerRefusal::ChargeExhausted { reserved: 1 })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        remote.deleted(),
+        1,
+        "the unpaid deletion must not have reached the remote: the charge is spent \
+         before the object is destroyed, not after"
+    );
+}

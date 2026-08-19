@@ -122,6 +122,12 @@ fn map_catalog_error(e: CatalogError) -> RpcError {
     match e {
         CatalogError::Invariant(m) => RpcError::new(ErrorCode::Unprovable, m),
         CatalogError::Invalid(m) => RpcError::new(ErrorCode::Invalid, m),
+        // `Precondition`, not `Invalid`: the request was well-formed and the
+        // values in it were fine. What did not hold is the state the transition
+        // assumed — which is precisely what `Precondition` names, and which a
+        // caller retrying after a crash can read as "already done" rather than
+        // as a request it must not repeat.
+        CatalogError::AlreadyInState(m) => RpcError::new(ErrorCode::Precondition, m),
         CatalogError::SchemaVersion { found, expected } => RpcError::new(
             ErrorCode::Precondition,
             format!(
@@ -185,6 +191,32 @@ impl ShepherdApi for Session {
                  survive a remount (§4.9 PM-3)"
                     .into(),
             );
+        }
+        // The third gap in the same shape as the two above, and the one whose
+        // absence contradicted a comment three lines up: "Probed, never
+        // assumed". `probe_path_policies` reports whether it actually ran, its
+        // docs say "the caller records the distinction", and this is that
+        // caller — it took `case` and `norm` and dropped `assumed`.
+        //
+        // It matters because `norm_key` is derived from these two policies and
+        // every watcher event is matched against that key. A guessed policy that
+        // guessed wrong produces false absence, which PM-3 shows is
+        // discard-trigger territory — and there was no way, afterwards, to tell
+        // a guessed root from a measured one.
+        //
+        // Warned rather than persisted: recording it durably needs a column on
+        // `scan_root`, and a review round is the wrong place to add one. The
+        // warning is the honest floor — the user hears it while standing in
+        // front of the command that caused it. See the round report.
+        if policies.assumed {
+            warnings.push(format!(
+                "could not probe this root's case and normalization behaviour (it is not \
+                 writable); assuming the platform defaults `{}`/`{}`. §4.9 wants these \
+                 measured, and a wrong guess makes watcher lookups miss (PM-3) — re-add \
+                 this root from a writable mount if you can",
+                policies.case.as_str(),
+                policies.norm.as_str()
+            ));
         }
 
         let stub = match req.stub_mode {
@@ -741,8 +773,32 @@ const FILTERED_CANDIDATE_FACTOR: usize = 16;
 
 /// Absolute ceiling on candidates, whatever the factor computes.
 ///
-/// Bounds both the arena scan and the `IN (...)` list handed to SQLite.
+/// Bounds the arena scan for a *filtered* query, where the factor above can
+/// multiply a modest page into an enormous candidate set. It deliberately does
+/// **not** apply to an unfiltered query: there, `cap` is exactly the page the
+/// caller asked for, and clamping it would turn a legitimately deep page into
+/// an empty result with a `degraded` note attached — a refusal wearing the
+/// costume of an answer. The bind ceiling that made that clamp look necessary
+/// is handled where it actually lives, in [`hydrate`].
 const MAX_CANDIDATES: usize = 10_000;
+
+/// The most bound values one SQLite statement accepts.
+///
+/// `SQLITE_MAX_VARIABLE_NUMBER`, which has defaulted to 32766 rather than the
+/// often-quoted 999 since SQLite 3.32. Stated as the measured property of *this*
+/// build — `libsqlite3-sys` compiles the amalgamation Shepherd ships, so the
+/// value is fixed at our build time and not the host's — and
+/// `a_page_deeper_than_sqlites_bind_limit_returns_its_rows` is what would catch
+/// it changing under us.
+const SQLITE_BIND_LIMIT: usize = 32_766;
+
+/// Candidate ids bound into one hydration statement.
+///
+/// Well under [`SQLITE_BIND_LIMIT`] on purpose. The limit is the cliff; this is
+/// the working size, and the gap between them is what a long `ext` filter is
+/// allowed to consume without the two constants having to be re-derived
+/// together.
+const HYDRATE_CHUNK: usize = 8_000;
 
 /// Turn index candidate ids into wire hits, applying the catalog-side filters.
 ///
@@ -758,24 +814,55 @@ fn hydrate(
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    // A bound parameter per id rather than string interpolation: these ids come
-    // from the index, but "it came from inside the process" is exactly the
-    // reasoning that makes the one interpolated query in a codebase the
-    // injection. SQLite's default parameter ceiling is well above
-    // `MAX_CANDIDATES`.
-    let placeholders = std::iter::repeat_n("?", candidates.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let (filter_sql, filter_params) = filter_clause(filters);
 
-    let mut sql = format!(
-        "SELECT id, root_id, rel_path, size, mtime, state, blake3
-         FROM file
-         WHERE id IN ({placeholders})"
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = candidates
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-        .collect();
+    // The candidate ids and the filter values share one statement's parameter
+    // budget, so the room left for ids is what is left after the filters have
+    // taken theirs. Computed rather than assumed: `filters.ext` is a
+    // caller-supplied list of unbounded length, so a fixed chunk size that
+    // happened to fit today would stop fitting the moment someone sent a long
+    // enough one.
+    let Some(budget) = SQLITE_BIND_LIMIT.checked_sub(filter_params.len()) else {
+        return Err(CatalogError::Invalid(format!(
+            "these search filters need {} bound values, more than the {SQLITE_BIND_LIMIT} \
+             one SQLite statement accepts; narrow `ext`",
+            filter_params.len()
+        )));
+    };
+    if budget == 0 {
+        return Err(CatalogError::Invalid(format!(
+            "these search filters use the whole {SQLITE_BIND_LIMIT}-value budget of one \
+             SQLite statement, leaving no room for a single candidate id; narrow `ext`"
+        )));
+    }
+    let chunk = budget.min(HYDRATE_CHUNK);
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for window in candidates.chunks(chunk) {
+        hydrate_chunk(cat, window, &filter_sql, &filter_params, &mut hits)?;
+    }
+
+    attach_tags(cat, &mut hits)?;
+    if !filters.tags.is_empty() {
+        let want: Vec<String> = filters.tags.iter().map(|t| t.to_lowercase()).collect();
+        // ALL, not ANY: two tag filters narrow a search. ANY would widen it,
+        // which is the opposite of what a user adding a second filter means.
+        hits.retain(|h| {
+            want.iter()
+                .all(|w| h.tags.iter().any(|t| t.to_lowercase() == *w))
+        });
+    }
+    Ok(hits)
+}
+
+/// The catalog-side predicates, as a SQL fragment and the values it binds.
+///
+/// Built once and re-bound per chunk. Rebuilding it inside the loop would be
+/// harmless; **omitting** it from any chunk after the first would not, so it is
+/// a single value the chunk loop cannot forget to use.
+fn filter_clause(filters: &SearchFilters) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut sql = String::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if !filters.ext.is_empty() {
         let marks = std::iter::repeat_n("?", filters.ext.len())
@@ -814,10 +901,39 @@ fn hydrate(
         params.push(Box::new(root));
     }
 
-    let mut hits: Vec<SearchHit> = {
+    (sql, params)
+}
+
+/// Hydrate one chunk of candidate ids, appending to `hits`.
+fn hydrate_chunk(
+    cat: &mut Catalog,
+    candidates: &[i64],
+    filter_sql: &str,
+    filter_params: &[Box<dyn rusqlite::ToSql>],
+    hits: &mut Vec<SearchHit>,
+) -> Result<(), CatalogError> {
+    // A bound parameter per id rather than string interpolation: these ids come
+    // from the index, but "it came from inside the process" is exactly the
+    // reasoning that makes the one interpolated query in a codebase the
+    // injection.
+    let placeholders = std::iter::repeat_n("?", candidates.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let sql = format!(
+        "SELECT id, root_id, rel_path, size, mtime, state, blake3
+         FROM file
+         WHERE id IN ({placeholders}){filter_sql}"
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = candidates
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .chain(filter_params.iter().map(|p| p.as_ref()))
+        .collect();
+
+    {
         let mut stmt = cat.conn().prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        stmt.query_map(refs.as_slice(), |r| {
+        let rows = stmt.query_map(params.as_slice(), |r| {
             Ok(SearchHit {
                 file_id: r.get(0)?,
                 root_id: r.get(1)?,
@@ -840,21 +956,12 @@ fn hydrate(
                 // real score indistinguishable from this placeholder.
                 score: None,
             })
-        })?
-        .collect::<Result<_, _>>()?
-    };
-
-    attach_tags(cat, &mut hits)?;
-    if !filters.tags.is_empty() {
-        let want: Vec<String> = filters.tags.iter().map(|t| t.to_lowercase()).collect();
-        // ALL, not ANY: two tag filters narrow a search. ANY would widen it,
-        // which is the opposite of what a user adding a second filter means.
-        hits.retain(|h| {
-            want.iter()
-                .all(|w| h.tags.iter().any(|t| t.to_lowercase() == *w))
-        });
+        })?;
+        for row in rows {
+            hits.push(row?);
+        }
     }
-    Ok(hits)
+    Ok(())
 }
 
 /// Fill in each hit's tags with one query rather than one per hit.
@@ -862,26 +969,32 @@ fn attach_tags(cat: &mut Catalog, hits: &mut [SearchHit]) -> Result<(), CatalogE
     if hits.is_empty() {
         return Ok(());
     }
-    let placeholders = std::iter::repeat_n("?", hits.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut stmt = cat.conn().prepare(&format!(
-        "SELECT ft.file_id, t.name
-         FROM file_tag ft JOIN tag t ON t.id = ft.tag_id
-         WHERE ft.file_id IN ({placeholders})
-         ORDER BY t.name"
-    ))?;
-    let ids: Vec<&dyn rusqlite::ToSql> = hits
-        .iter()
-        .map(|h| &h.file_id as &dyn rusqlite::ToSql)
-        .collect();
     let mut by_file: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
-    let rows = stmt.query_map(ids.as_slice(), |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (file_id, tag) = row?;
-        by_file.entry(file_id).or_default().push(tag);
+    // Chunked for the same reason `hydrate` is, and it is not a theoretical
+    // second instance: this binds one parameter per *hit*, so a hit list that
+    // cleared the ceiling above would hit it here instead, on a query the
+    // caller never asked about.
+    for window in hits.chunks(HYDRATE_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", window.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = cat.conn().prepare(&format!(
+            "SELECT ft.file_id, t.name
+             FROM file_tag ft JOIN tag t ON t.id = ft.tag_id
+             WHERE ft.file_id IN ({placeholders})
+             ORDER BY t.name"
+        ))?;
+        let ids: Vec<&dyn rusqlite::ToSql> = window
+            .iter()
+            .map(|h| &h.file_id as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(ids.as_slice(), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (file_id, tag) = row?;
+            by_file.entry(file_id).or_default().push(tag);
+        }
     }
     for hit in hits.iter_mut() {
         if let Some(tags) = by_file.remove(&hit.file_id) {
@@ -1049,6 +1162,9 @@ mod tests {
                         atime: None,
                         blake3: None,
                     },
+                    // These tests are not about generations; the sweep that
+                    // reads this column is a separate concern.
+                    1,
                     Timestamp::from_nanos(1),
                 )
                 .unwrap();
@@ -1223,6 +1339,156 @@ mod tests {
         assert!(
             list_roots(&mut cat, true).unwrap().is_empty(),
             "`--forget` deletes the root row too"
+        );
+    }
+
+    /// The ids SQLite assigned to the seeded rows, in insertion order.
+    fn ids_of(cat: &mut Catalog, root: RootId) -> Vec<i64> {
+        let mut stmt = cat
+            .conn()
+            .prepare("SELECT id FROM file WHERE root_id = ?1 ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![root.get()], |r| r.get::<_, i64>(0))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// A candidate list of `len`, containing no id that exists in any catalog.
+    ///
+    /// One million is above every id the seeding helpers here produce, so a
+    /// synthetic id can never collide with a real row and turn a miss into an
+    /// accidental hit.
+    fn synthetic_candidates(len: usize) -> Vec<i64> {
+        (1_000_000..1_000_000 + len as i64).collect()
+    }
+
+    /// A deep page must come back with its rows, not with a SQLite failure.
+    ///
+    /// `search` computes `cap = offset + limit` for an unfiltered query and
+    /// applies no ceiling to it, so a valid page deep into a large catalog
+    /// hands `hydrate` a candidate list of that size, and `hydrate` bound one
+    /// SQL parameter per candidate. This build's real ceiling is **32766** —
+    /// measured, not remembered: `SQLITE_MAX_VARIABLE_NUMBER` has been 32766
+    /// rather than 999 since SQLite 3.32, and `libsqlite3-sys`' bundled build
+    /// is what decides it here. Past that, `prepare` refuses the statement and
+    /// a page that exists and is reachable returns an error instead.
+    ///
+    /// The assertion is on the **rows**, and the real ids are deliberately
+    /// placed on both sides of any plausible chunk boundary and beyond the
+    /// bind ceiling itself. That is what stops the two fixes that would pass a
+    /// weaker test: capping the candidate list would silently drop the ids at
+    /// 35_000 and 39_999, and hydrating only the first batch would drop
+    /// everything past the boundary. Both would return `Ok` with a short list;
+    /// neither returns this page.
+    #[test]
+    fn a_page_deeper_than_sqlites_bind_limit_returns_its_rows() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let root = seed(&mut cat, "/data", &["a.txt", "b.txt", "c.txt"]);
+        let real = ids_of(&mut cat, root);
+        assert_eq!(real.len(), 3);
+
+        let mut candidates = synthetic_candidates(40_000);
+        candidates[9_000] = real[0];
+        candidates[35_000] = real[1];
+        candidates[39_999] = real[2];
+
+        let hits = hydrate(&mut cat, &candidates, &SearchFilters::default())
+            .expect("a page this deep is valid and must be answered, not refused");
+
+        let mut got: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
+        got.sort_unstable();
+        let mut want = real.clone();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "every real row in the candidate list must be hydrated, including the ones \
+             past the bind ceiling"
+        );
+    }
+
+    /// Chunking must not cost the filters their reach.
+    ///
+    /// Splitting one `IN (...)` into several statements means the filter clause
+    /// is rebuilt and re-bound per chunk. A fix that appended the predicates to
+    /// only the first statement would return every row from every later chunk
+    /// unfiltered — a search that quietly widens as the catalog grows.
+    ///
+    /// So the row that must NOT come back is placed past the boundary, where
+    /// only a filter that is still applied there can exclude it.
+    #[test]
+    fn the_filters_still_narrow_every_chunk_of_a_deep_page() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let root = seed(&mut cat, "/data", &["keep.txt", "drop.bin"]);
+        let real = ids_of(&mut cat, root);
+
+        let mut candidates = synthetic_candidates(40_000);
+        candidates[100] = real[0]; // keep.txt, in the first chunk
+        candidates[38_000] = real[1]; // drop.bin, past the bind ceiling
+
+        let filters = SearchFilters {
+            ext: vec!["txt".into()],
+            ..SearchFilters::default()
+        };
+        let hits = hydrate(&mut cat, &candidates, &filters).unwrap();
+
+        let got: Vec<&str> = hits.iter().map(|h| h.rel_path.as_str()).collect();
+        assert_eq!(
+            got,
+            vec!["keep.txt"],
+            "`drop.bin` sits past the chunk boundary; a filter that stopped being applied \
+             there would let it through"
+        );
+    }
+
+    /// Tag hydration binds one parameter per hit, so it has the same ceiling as
+    /// the candidate list and needs the same treatment.
+    ///
+    /// Without it, the bind limit simply moves: `hydrate` would survive 40_000
+    /// candidates and then fail on the way out, on a query the caller never
+    /// asked about. The tag assertion is what makes this more than a crash
+    /// test — the tag has to actually arrive on the hit that owns it.
+    #[test]
+    fn tags_are_attached_across_a_hit_list_larger_than_the_bind_limit() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let names: Vec<String> = (0..40_000).map(|i| format!("f{i}.txt")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let root = seed(&mut cat, "/data", &refs);
+        let real = ids_of(&mut cat, root);
+        assert_eq!(real.len(), 40_000);
+
+        cat.conn_mut()
+            .execute(
+                "INSERT INTO tag (name, source) VALUES ('invoice','user')",
+                [],
+            )
+            .unwrap();
+        let tag_id: i64 = cat
+            .conn()
+            .query_row("SELECT id FROM tag WHERE name = 'invoice'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // On the last row, so it is reached only if every chunk is queried.
+        cat.conn_mut()
+            .execute(
+                "INSERT INTO file_tag (file_id, tag_id) VALUES (?1, ?2)",
+                rusqlite::params![real[39_999], tag_id],
+            )
+            .unwrap();
+
+        let hits = hydrate(&mut cat, &real, &SearchFilters::default())
+            .expect("40_000 hits must not exceed the bind ceiling on the tag query either");
+
+        assert_eq!(hits.len(), 40_000);
+        let tagged = hits
+            .iter()
+            .find(|h| h.file_id == real[39_999])
+            .expect("the last row is a hit");
+        assert_eq!(
+            tagged.tags,
+            vec!["invoice".to_string()],
+            "the tag must reach the hit that owns it, from the last chunk"
         );
     }
 }

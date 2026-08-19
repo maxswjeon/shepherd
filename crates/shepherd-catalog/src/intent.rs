@@ -132,6 +132,112 @@ impl IntentState {
     pub fn is_settled(self) -> bool {
         matches!(self, IntentState::CatalogCommitted | IntentState::Aborted)
     }
+
+    /// §4.4's lifecycle, written out as an edge list.
+    ///
+    /// # Why terminality was not enough
+    ///
+    /// The guard used to ask only whether the *source* was settled. Everything
+    /// else was legal: `prepared` straight to `catalog-committed`, skipping the
+    /// syscall and the audit; `audited` back to `prepared`; any non-settled
+    /// state backwards. Two of those are worse than untidy. A premature
+    /// `catalog-committed` **settles** the row, and settled is exactly the
+    /// predicate [`IntentState::needs_recovery`] and
+    /// [`IntentJournal::unresolved`] use to decide a row is finished — so an
+    /// intent whose destruction protocol never ran drops out of the
+    /// unresolved set and is never examined again. A backward move rewrites
+    /// the journal that a human reads after data goes missing.
+    ///
+    /// # Where each edge comes from
+    ///
+    /// * `prepared → syscall-issued` — the ordinary path.
+    /// * `prepared → aborted` — "Refused before the syscall", the fail-closed
+    ///   exit. It is reachable *only* from here, because that is what "before
+    ///   the syscall" means.
+    /// * `syscall-issued → outcome-known | outcome-ambiguous` — the syscall
+    ///   returned, or the process died before it could be observed.
+    /// * `outcome-known → audited` — the audit append succeeded.
+    /// * `outcome-known → reconstructed-after-crash` — it did not, and the
+    ///   record was rebuilt from this intent. Refusing is not available after
+    ///   the syscall, so this is a state, not an error.
+    /// * `audited → catalog-committed` — the destruction is recorded and the
+    ///   catalog now agrees with the disk.
+    ///
+    /// # Three edges DECIDED IN REVIEW, not transcribed from a spec
+    ///
+    /// **There is no §4.4 state table in this repository.** The edges above are
+    /// derived from this module's own doc comments; the three below were not
+    /// determined by anything in the tree and were **decided during PR #1
+    /// round 2 review**. They are recorded as decisions, with their reasoning,
+    /// so the next reader does not mistake a judgement call for a requirement.
+    ///
+    /// They follow from one principle, stated once because it settles two of
+    /// them: **`aborted` is a claim about the FILE, not about the code path.**
+    /// It must mean "we have positive evidence the bytes were not destroyed",
+    /// because it is the word a reader trusts when deciding whether the user's
+    /// data still exists — and because `aborted` is settled, a wrong one is
+    /// precisely the lie nothing will ever re-examine.
+    ///
+    /// * `outcome-ambiguous → outcome-known` — recovery "must determine what
+    ///   actually happened rather than assume either way"; determining it is
+    ///   this edge.
+    /// * `outcome-ambiguous → aborted` — permitted, but **only for a PROVEN
+    ///   negative**: recovery established that the syscall never took effect.
+    ///   This edge is where that sentence above is enforced rather than merely
+    ///   quoted. It is not a way to give up on an ambiguity.
+    /// * `reconstructed-after-crash → catalog-committed`, and **nothing else**.
+    ///   The absence of `aborted` here is deliberate and is the principle
+    ///   again: this state is reachable only *after* the syscall fired, so
+    ///   `aborted` from here would be a settled row claiming a file is intact
+    ///   when it is already gone — the sole-copy loss this crate exists to
+    ///   prevent, recorded in its own journal. **Do not add it.** (The same
+    ///   care as the `wal_autocheckpoint` note in [`crate::PRAGMAS`]: an
+    ///   absence that reads as an oversight gets helpfully "fixed" later.)
+    ///
+    /// `reconstructed-after-crash` is likewise **not** reachable from
+    /// `outcome-ambiguous`, for a reason worth stating: **you cannot
+    /// reconstruct an audit record of an event you cannot describe.**
+    /// Reconstruction presupposes a known outcome. The route is
+    /// `outcome-ambiguous → outcome-known → reconstructed-after-crash`, which
+    /// costs a caller one extra call and keeps "we know what happened" a
+    /// precondition instead of something reconstruction quietly asserts.
+    ///
+    /// Anything not listed is refused, which is the direction that fails
+    /// closed: a lifecycle gaining a state gets no edges until someone writes
+    /// them.
+    fn successors(self) -> &'static [IntentState] {
+        use IntentState::*;
+        match self {
+            Prepared => &[SyscallIssued, Aborted],
+            SyscallIssued => &[OutcomeKnown, OutcomeAmbiguous],
+            OutcomeAmbiguous => &[OutcomeKnown, Aborted],
+            OutcomeKnown => &[Audited, ReconstructedAfterCrash],
+            Audited => &[CatalogCommitted],
+            ReconstructedAfterCrash => &[CatalogCommitted],
+            CatalogCommitted | Aborted => &[],
+        }
+    }
+
+    /// Whether `self → to` is a legal move.
+    ///
+    /// **A self-transition is not one**, and that is a decision made in PR #1
+    /// round 2 review rather than an inherited behaviour. The old guard did
+    /// permit it, but by accident — `current.is_settled() && current != to`
+    /// exempted a no-op in order to let a settled row alone, and the exemption
+    /// leaked to every other state.
+    ///
+    /// `catalog-committed → catalog-committed` is harmless.
+    /// **`syscall-issued → syscall-issued` means the irreversible syscall was
+    /// issued twice**, which on this path is exactly the event a journal exists
+    /// to make visible. No rule can permit the first without permitting the
+    /// second, so both are refused and idempotency moves from implicit to
+    /// explicit — the refusal is [`CatalogError::AlreadyInState`], which a
+    /// crash-retry can match on and skip. A retry that asks and is told
+    /// "already there" is fine; one that blind-writes and silently succeeds is
+    /// the behaviour being removed.
+    fn may_transition_to(self, to: IntentState) -> bool {
+        self.successors().contains(&to)
+    }
 }
 
 /// One intent row.
@@ -211,20 +317,42 @@ impl<'a> IntentJournal<'a> {
         Ok(IntentId::new(id))
     }
 
-    /// Advance an intent's state.
+    /// Advance an intent's state along §4.4's lifecycle.
     ///
-    /// Refuses to move a settled row. An intent that reached `aborted` and then
-    /// became `syscall-issued` would be a record of a destruction that the
-    /// system had already decided not to perform, and the journal is the thing
-    /// a human reads after data goes missing.
+    /// Every move is checked against [`IntentState::successors`], not merely
+    /// against whether the source is terminal. Terminality alone let a caller
+    /// jump `prepared → catalog-committed`, and a `catalog-committed` row is
+    /// settled — so a premature commit did not just mislabel the intent, it
+    /// removed it from the set recovery is defined over. It also let the
+    /// journal run backwards, and the journal is the thing a human reads after
+    /// data goes missing.
     pub fn transition(&mut self, id: IntentId, to: IntentState) -> Result<()> {
         let current = self
             .get(id)?
             .ok_or_else(|| CatalogError::Invalid(format!("no intent {id}")))?
             .state;
-        if current.is_settled() && current != to {
+        if current == to {
+            return Err(CatalogError::AlreadyInState(format!(
+                "intent {id} is already `{}`",
+                current.as_str()
+            )));
+        }
+        if !current.may_transition_to(to) {
+            let allowed = current.successors();
+            let allowed = if allowed.is_empty() {
+                "it is settled, and settled is the end of the lifecycle".to_string()
+            } else {
+                format!(
+                    "§4.4 allows only {}",
+                    allowed
+                        .iter()
+                        .map(|s| format!("`{}`", s.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                )
+            };
             return Err(CatalogError::Invariant(format!(
-                "intent {id} is settled at `{}` and may not move to `{}`",
+                "intent {id} may not move from `{}` to `{}`: {allowed}",
                 current.as_str(),
                 to.as_str()
             )));
@@ -326,6 +454,61 @@ mod tests {
         }
     }
 
+    const ALL_STATES: [IntentState; 8] = [
+        IntentState::Prepared,
+        IntentState::SyscallIssued,
+        IntentState::OutcomeKnown,
+        IntentState::OutcomeAmbiguous,
+        IntentState::Audited,
+        IntentState::CatalogCommitted,
+        IntentState::Aborted,
+        IntentState::ReconstructedAfterCrash,
+    ];
+
+    /// Drive a fresh intent to `target` along §4.4's lifecycle, one legal step
+    /// at a time.
+    ///
+    /// The tests below used to reach a state by transitioning to it directly
+    /// from `prepared`, which is the very thing the guard now refuses. Routing
+    /// them through the lifecycle is not a workaround: it makes every one of
+    /// them an accepting-direction test as a side effect, so a guard that
+    /// refused everything would fail the whole module rather than pass it.
+    fn walk_to(c: &mut Catalog, path: &str, target: IntentState) -> IntentId {
+        use IntentState::*;
+        let id = IntentJournal::new(c)
+            .prepare(&new_intent(path), Timestamp::from_nanos(1))
+            .unwrap();
+        let route: &[IntentState] = match target {
+            Prepared => &[],
+            Aborted => &[Aborted],
+            SyscallIssued => &[SyscallIssued],
+            OutcomeKnown => &[SyscallIssued, OutcomeKnown],
+            OutcomeAmbiguous => &[SyscallIssued, OutcomeAmbiguous],
+            Audited => &[SyscallIssued, OutcomeKnown, Audited],
+            ReconstructedAfterCrash => &[SyscallIssued, OutcomeKnown, ReconstructedAfterCrash],
+            CatalogCommitted => &[SyscallIssued, OutcomeKnown, Audited, CatalogCommitted],
+        };
+        for step in route {
+            IntentJournal::new(c)
+                .transition(id, *step)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "`{}` is unreachable along the lifecycle: {e}",
+                        target.as_str()
+                    )
+                });
+        }
+        assert_eq!(
+            IntentJournal::new(c).get(id).unwrap().unwrap().state,
+            target
+        );
+        id
+    }
+
+    fn state_of(c: &mut Catalog, id: IntentId) -> IntentState {
+        IntentJournal::new(c).get(id).unwrap().unwrap().state
+    }
+
     #[test]
     fn an_intent_starts_prepared_and_round_trips() {
         let mut c = Catalog::open_in_memory().unwrap();
@@ -389,23 +572,11 @@ mod tests {
     /// and the query enumerated four states that did not include them.
     #[test]
     fn unresolved_returns_exactly_the_states_that_need_recovery() {
-        for s in [
-            IntentState::Prepared,
-            IntentState::SyscallIssued,
-            IntentState::OutcomeKnown,
-            IntentState::OutcomeAmbiguous,
-            IntentState::Audited,
-            IntentState::CatalogCommitted,
-            IntentState::Aborted,
-            IntentState::ReconstructedAfterCrash,
-        ] {
+        for s in ALL_STATES {
             // A fresh catalog per state, so the row under test is the only one
             // that could be listed.
             let mut c = Catalog::open_in_memory().unwrap();
-            let id = IntentJournal::new(&mut c)
-                .prepare(&new_intent("/x"), Timestamp::from_nanos(1))
-                .unwrap();
-            IntentJournal::new(&mut c).transition(id, s).unwrap();
+            let id = walk_to(&mut c, "/x", s);
 
             let un = IntentJournal::new(&mut c).unresolved().unwrap();
             let listed = un.iter().any(|i| i.id.get() == id.get());
@@ -434,23 +605,13 @@ mod tests {
     #[test]
     fn an_audited_intent_is_recovered_and_a_settled_one_is_not() {
         let mut c = Catalog::open_in_memory().unwrap();
-        let t = Timestamp::from_nanos(1);
-        let mut prepare = |p: &str| {
-            IntentJournal::new(&mut c)
-                .prepare(&new_intent(p), t)
-                .unwrap()
-        };
-        let audited = prepare("/audited");
-        let reconstructed = prepare("/reconstructed");
-        let committed = prepare("/committed");
-
-        for (id, s) in [
-            (audited, IntentState::Audited),
-            (reconstructed, IntentState::ReconstructedAfterCrash),
-            (committed, IntentState::CatalogCommitted),
-        ] {
-            IntentJournal::new(&mut c).transition(id, s).unwrap();
-        }
+        let audited = walk_to(&mut c, "/audited", IntentState::Audited);
+        let reconstructed = walk_to(
+            &mut c,
+            "/reconstructed",
+            IntentState::ReconstructedAfterCrash,
+        );
+        let committed = walk_to(&mut c, "/committed", IntentState::CatalogCommitted);
 
         let un = IntentJournal::new(&mut c).unresolved().unwrap();
         let ids: Vec<i64> = un.iter().map(|i| i.id.get()).collect();
@@ -471,6 +632,269 @@ mod tests {
             "a settled row is finished. Listing it would make recovery mean `everything`, \
              which is not a recovery predicate: {ids:?}"
         );
+    }
+
+    /// The skip that costs the most: `prepared` straight to
+    /// `catalog-committed`.
+    ///
+    /// `catalog-committed` is **settled**, and settled is the whole definition
+    /// of "finished" that [`IntentJournal::unresolved`] and
+    /// [`IntentState::needs_recovery`] are written against. So a premature
+    /// commit does not merely mislabel a row — it takes an intent whose syscall
+    /// and audit never happened out of the unresolved set entirely.
+    ///
+    /// **Stated carefully, because the consequence is currently latent.**
+    /// Nothing in this workspace calls `unresolved()` or `needs_recovery()`:
+    /// there is no startup consumer yet, so no run is rescued or lost today.
+    /// What this test asserts is therefore the journal-level fact and not a
+    /// runtime outcome — the refusal happens, the row does not move, and it is
+    /// still in the set `unresolved()` reports.
+    #[test]
+    fn a_premature_commit_is_refused_and_the_row_stays_unresolved() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        let id = IntentJournal::new(&mut c)
+            .prepare(&new_intent("/data/a.raw"), Timestamp::from_nanos(1))
+            .unwrap();
+
+        let err = IntentJournal::new(&mut c)
+            .transition(id, IntentState::CatalogCommitted)
+            .expect_err("a prepared intent must not commit without destroying anything");
+        assert!(
+            err.to_string().contains("may not move from `prepared`"),
+            "the refusal must name the edge it refused, got: {err}"
+        );
+
+        assert_eq!(
+            state_of(&mut c, id),
+            IntentState::Prepared,
+            "the refusal must leave the row where it was"
+        );
+        let un = IntentJournal::new(&mut c).unresolved().unwrap();
+        assert_eq!(
+            un.iter().map(|i| i.id.get()).collect::<Vec<_>>(),
+            vec![id.get()],
+            "an intent that never issued its syscall dropped out of the \
+             unresolved set by being marked committed"
+        );
+    }
+
+    /// The journal is what a human reads after data goes missing, so it may not
+    /// be rewritten to say something earlier happened later.
+    ///
+    /// `audited` means the irreversible syscall ran and was recorded. Moving
+    /// that row back to `prepared` or `syscall-issued` claims the destruction
+    /// is still pending — and the old guard permitted it, because `audited` is
+    /// not terminal and terminality was the only thing checked.
+    #[test]
+    fn the_journal_does_not_run_backwards() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        let id = walk_to(&mut c, "/data/a.raw", IntentState::Audited);
+
+        for back in [IntentState::Prepared, IntentState::SyscallIssued] {
+            let err = IntentJournal::new(&mut c)
+                .transition(id, back)
+                .expect_err("an audited destruction must not become pending again");
+            assert!(
+                err.to_string().contains("may not move from `audited`"),
+                "got: {err}"
+            );
+            assert_eq!(
+                state_of(&mut c, id),
+                IntentState::Audited,
+                "a refused backward move still rewrote the row"
+            );
+        }
+    }
+
+    /// The accepting direction, spelled out rather than left implicit in the
+    /// helpers: the whole ordinary lifecycle runs end to end.
+    ///
+    /// Without this, "refuse every transition" satisfies every negative test
+    /// above it.
+    #[test]
+    fn the_ordinary_lifecycle_runs_end_to_end() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        let id = IntentJournal::new(&mut c)
+            .prepare(&new_intent("/data/a.raw"), Timestamp::from_nanos(1))
+            .unwrap();
+        for step in [
+            IntentState::SyscallIssued,
+            IntentState::OutcomeKnown,
+            IntentState::Audited,
+            IntentState::CatalogCommitted,
+        ] {
+            IntentJournal::new(&mut c)
+                .transition(id, step)
+                .unwrap_or_else(|e| {
+                    panic!("the legal step to `{}` was refused: {e}", step.as_str())
+                });
+            assert_eq!(state_of(&mut c, id), step);
+        }
+        assert!(
+            IntentJournal::new(&mut c).unresolved().unwrap().is_empty(),
+            "a completed intent is not recovery's business"
+        );
+    }
+
+    /// Every one of the 64 ordered pairs, checked against the declared edge
+    /// list — including that a refused move leaves the row untouched.
+    ///
+    /// The named tests above are the spec; this one is the sweep that catches
+    /// an edge nobody thought to name. The eight diagonal pairs are refusals:
+    /// a self-transition is not a legal move — see
+    /// [`IntentState::may_transition_to`].
+    #[test]
+    fn transition_accepts_exactly_the_declared_lifecycle() {
+        for from in ALL_STATES {
+            for to in ALL_STATES {
+                let mut c = Catalog::open_in_memory().unwrap();
+                let id = walk_to(&mut c, "/x", from);
+                let accepted = IntentJournal::new(&mut c).transition(id, to).is_ok();
+                let legal = from.successors().contains(&to);
+                assert_eq!(
+                    accepted,
+                    legal,
+                    "`{}` -> `{}` was {}, but the lifecycle says {}",
+                    from.as_str(),
+                    to.as_str(),
+                    if accepted { "accepted" } else { "refused" },
+                    if legal { "it is legal" } else { "it is not" }
+                );
+                assert_eq!(
+                    state_of(&mut c, id),
+                    if legal { to } else { from },
+                    "the row's state disagrees with the outcome of `{}` -> `{}`",
+                    from.as_str(),
+                    to.as_str()
+                );
+            }
+        }
+    }
+
+    /// `aborted` is a claim about the FILE, not about the code path — the
+    /// principle the review decided two of these edges from, pinned so it
+    /// survives the reasoning being forgotten.
+    ///
+    /// `reconstructed-after-crash` is reachable only after the syscall fired.
+    /// Moving from there to `aborted` would produce a **settled** row asserting
+    /// the bytes are intact when they are already gone: the sole-copy loss this
+    /// crate exists to prevent, written into its own journal, in the one state
+    /// nothing ever re-examines. The sweep in
+    /// [`transition_accepts_exactly_the_declared_lifecycle`] covers this pair
+    /// too, but only against the table — this test says why the table is
+    /// shaped that way, where someone about to "fix" the omission will read it.
+    #[test]
+    fn a_destruction_that_already_happened_can_never_report_itself_aborted() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        let id = walk_to(&mut c, "/data/a.raw", IntentState::ReconstructedAfterCrash);
+        let err = IntentJournal::new(&mut c)
+            .transition(id, IntentState::Aborted)
+            .expect_err(
+                "the file is already destroyed; `aborted` would be a settled row \
+                 claiming it is intact",
+            );
+        assert!(matches!(err, CatalogError::Invariant(_)), "got {err:?}");
+        assert_eq!(state_of(&mut c, id), IntentState::ReconstructedAfterCrash);
+
+        // The accepting direction, so this is not satisfied by stranding the
+        // state: the one edge it does have still works.
+        IntentJournal::new(&mut c)
+            .transition(id, IntentState::CatalogCommitted)
+            .expect("a reconstructed record may still be committed");
+    }
+
+    /// You cannot reconstruct an audit record of an event you cannot describe.
+    ///
+    /// Reconstruction presupposes a **known** outcome, so it is not reachable
+    /// from `outcome-ambiguous` directly. Recovery resolves the ambiguity
+    /// first. This costs a caller one extra transition and keeps "we know what
+    /// happened" a precondition rather than something reconstruction quietly
+    /// asserts on its behalf.
+    #[test]
+    fn an_unresolved_outcome_cannot_be_reconstructed_until_it_is_resolved() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        let id = walk_to(&mut c, "/data/a.raw", IntentState::OutcomeAmbiguous);
+        let err = IntentJournal::new(&mut c)
+            .transition(id, IntentState::ReconstructedAfterCrash)
+            .expect_err("an audit record cannot describe an outcome nobody knows");
+        assert!(matches!(err, CatalogError::Invariant(_)), "got {err:?}");
+
+        // The route that exists: resolve the ambiguity, THEN reconstruct.
+        for step in [
+            IntentState::OutcomeKnown,
+            IntentState::ReconstructedAfterCrash,
+        ] {
+            IntentJournal::new(&mut c)
+                .transition(id, step)
+                .unwrap_or_else(|e| panic!("`{}` was refused: {e}", step.as_str()));
+        }
+        assert_eq!(state_of(&mut c, id), IntentState::ReconstructedAfterCrash);
+    }
+
+    /// Re-asserting a state is refused, and the refusal says which kind it is.
+    ///
+    /// The state that matters is `syscall-issued`: re-asserting it describes
+    /// **the irreversible syscall being issued twice**, which is the single
+    /// event this journal exists to make visible. The old guard accepted it
+    /// silently. `catalog-committed → catalog-committed` is harmless on its
+    /// own, but no rule permits the harmless one without permitting the other,
+    /// so both are refused.
+    ///
+    /// The refusal is a **distinct variant**, not a distinctive message. An
+    /// idempotent crash-retry has to be able to skip on "already there" while
+    /// still failing on "illegal edge", and deciding that by searching the
+    /// error text is how a later rephrasing turns a skip into an outage — or,
+    /// worse, an outage into a skip.
+    #[test]
+    fn re_asserting_a_state_is_refused_and_says_so_by_type() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        let id = walk_to(&mut c, "/data/a.raw", IntentState::SyscallIssued);
+
+        let err = IntentJournal::new(&mut c)
+            .transition(id, IntentState::SyscallIssued)
+            .expect_err("issuing the syscall twice must not be recorded as one issue");
+        assert!(
+            matches!(err, CatalogError::AlreadyInState(_)),
+            "a retry must be able to recognise `already there` by type, not by \
+             reading the message; got {err:?}"
+        );
+        assert_eq!(
+            state_of(&mut c, id),
+            IntentState::SyscallIssued,
+            "the refusal must leave the row where it was"
+        );
+
+        // The other half: an ILLEGAL edge must NOT look like an idempotent
+        // retry, or a caller that skips on `AlreadyInState` would skip past a
+        // genuine lifecycle violation.
+        let other = IntentJournal::new(&mut c)
+            .prepare(&new_intent("/data/b.raw"), Timestamp::from_nanos(1))
+            .unwrap();
+        let err = IntentJournal::new(&mut c)
+            .transition(other, IntentState::CatalogCommitted)
+            .expect_err("prepared -> catalog-committed is illegal");
+        assert!(
+            matches!(err, CatalogError::Invariant(_)),
+            "an illegal edge reported itself as an idempotent retry: {err:?}"
+        );
+    }
+
+    /// The settled states get the same treatment, and it is worth its own
+    /// assertion because this is where the old exemption lived: the guard read
+    /// `current.is_settled() && current != to`, so a settled row could be
+    /// re-asserted and every other state inherited the loophole.
+    #[test]
+    fn a_settled_state_may_not_be_re_asserted_either() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        let id = walk_to(&mut c, "/data/a.raw", IntentState::Aborted);
+        let err = IntentJournal::new(&mut c)
+            .transition(id, IntentState::Aborted)
+            .expect_err("re-asserting a settled state is still not a transition");
+        assert!(
+            matches!(err, CatalogError::AlreadyInState(_)),
+            "got {err:?}"
+        );
+        assert_eq!(state_of(&mut c, id), IntentState::Aborted);
     }
 
     /// The fail-closed exit must stay closed. A row that reached `aborted` and
@@ -513,22 +937,13 @@ mod tests {
     #[test]
     fn all_eight_states_round_trip_with_the_check_constraint() {
         let mut c = Catalog::open_in_memory().unwrap();
-        for s in [
-            IntentState::Prepared,
-            IntentState::SyscallIssued,
-            IntentState::OutcomeKnown,
-            IntentState::OutcomeAmbiguous,
-            IntentState::Audited,
-            IntentState::CatalogCommitted,
-            IntentState::Aborted,
-            IntentState::ReconstructedAfterCrash,
-        ] {
+        for s in ALL_STATES {
             assert_eq!(IntentState::parse(s.as_str()), Some(s));
-            // The schema must accept every one of them.
-            let id = IntentJournal::new(&mut c)
-                .prepare(&new_intent("/x"), Timestamp::from_nanos(1))
-                .unwrap();
-            IntentJournal::new(&mut c).transition(id, s).unwrap();
+            // The schema must accept every one of them — and, now that the
+            // lifecycle is enforced, every one of them must still be REACHABLE
+            // through it. A state the edge list stranded would fail here
+            // instead of sitting in the enum unreferenced.
+            walk_to(&mut c, "/x", s);
         }
     }
 
