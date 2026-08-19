@@ -1189,6 +1189,7 @@ package = "shepherd-daemon"
 test = "the_m1_demo_holds_at_a_million_files"
 ignored = true
 requires_env = "SHEPHERD_M1_CORPUS"
+release = true
 proves = "§9's M1 functional leg at the size §9 names: `root add && scan start && search` over 1,000,000 real files on a real filesystem. files_seen and files_catalogued are BOTH exactly 1,000,000, and unchanged by a rescan — so the scan neither drops nor duplicates at scale, which a nine-file run cannot distinguish. The search needles are asserted against a committed manifest with expected counts including needles that must return ZERO, so a matcher that returned everything fails rather than passes. A smaller run is possible only by setting SHEPHERD_M1_SMALL_RUN_REASON, which forces the reason to be recorded rather than inferred — the same discipline as shepherd-bench's scaled_run_reason. Cited with requires_env because absent the corpus this cannot be produced, and absent evidence fails rather than skips. GAP REMOVED, NOT REWORDED: this guard previously carried `SCALE ONLY, AND THE GAP IS FIVE ORDERS OF MAGNITUDE` with a largest run of NINE files. §9 asked for the 1M corpus and the 1M corpus ran, so no delta remains to state — and a gap kept past its evidence is a gate failing for a reason that no longer exists, which is as wrong as passing for one that never did. COST: this row plus G-1-M1-PERF make `gate --phase 1` a SCHEDULED command — a 1M-file scan and a 10M index build in --release. Budget a window; do not run it into someone else's"
 
 [[guard.evidence]]
@@ -1593,17 +1594,13 @@ PRAGMAS and re-measure, or to accept the two claims as the separate things they 
 are.\
 """
 
-[[guard.evidence]]
-package = "shepherd-daemon"
-test = "the_m1_demo_holds_at_a_million_files"
-ignored = true
-requires_env = "SHEPHERD_M1_CORPUS"
-proves = "PARTIAL — the WAL BOUND rather than the checkpoint mechanism, which is the half E-4 asked for. The WAL is SAMPLED throughout a 1,000,000-file scan and asserted on the MAXIMUM of the series, not on a final reading — the distinction that makes it evidence, since a WAL that grew unboundedly and was checkpointed once at the end would satisfy a closing measurement and fail the property. Observed peak 7.96 MiB against a 64 MiB ceiling, flat while the remaining rows landed"
 
 [[guard.evidence]]
 package = "shepherd-daemon"
 test = "the_m1_demo_holds_at_a_million_files"
 ignored = true
+requires_env = "SHEPHERD_M1_CORPUS"
+release = true
 proves = "the WAL BOUND across the FULL 10,000,000-file scan E-4 named, at the scale E-4 named. SAMPLED throughout — 2,066 readings at 1 s — and asserted on the MAXIMUM of the series rather than a final reading, which is the distinction that makes it evidence: a WAL that grew without bound and was checkpointed once at the end satisfies a closing measurement and fails this. Peak 11.30 MiB against the 64 MiB ceiling, first reached at t=633 s and then FLAT AT THAT MAXIMUM for the remaining 69 percent of the scan while ~6.9M further rows landed and the catalog grew to 4,513 MiB — the log held 0.25 percent of what it wrote. wal_max == wal_final is that plateau and NOT a still-growing log: a PASSIVE checkpoint backfills and SQLite reuses the log in place, so the file records a high-water mark and never shrinks. Daemon VmHWM 2,498 MiB, the Vec<FileStat> ceiling scan_exec.rs names 10M as the pressure point for, holding with room. What this does NOT establish is WHICH mechanism bounds it — see the note on this row. The scan_seconds / rescan_seconds / scan_files_per_sec figures in the artifact were taken on a contended box and the test already refuses to let them mean anything"
 
 [[guard.evidence]]
