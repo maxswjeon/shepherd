@@ -253,6 +253,292 @@ pub fn volume_id_fallback(path: &Path) -> Result<String> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+mod remount_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// WHY THIS TEST IS NOT "MOUNT AT TWO POINTS AND ASSERT ONE fs_id".
+    ///
+    /// That is the obvious shape, and it does not discriminate. Mounting one
+    /// block device at two mount points gives both mounts the SAME superblock,
+    /// so `st_dev` is identical at both — measured on this box, 7:0 and 7:0.
+    /// An implementation that derived `fs_id` from `st_dev` — the one thing
+    /// §4.4 forbids in capitals — passes that test. It would be a check that is
+    /// present but not load-bearing.
+    ///
+    /// What §4.4 actually claims is that `st_dev` is assigned at MOUNT TIME and
+    /// varies across a remount, while `fs_id` must not. So the test has to make
+    /// `st_dev` actually change and assert `fs_id` did not. Detaching the
+    /// loopback device and re-attaching the same backing file on a different
+    /// loop number does exactly that: the filesystem UUID and the inode are
+    /// on-disk and survive, the device number does not.
+    ///
+    /// The `st_dev` change is asserted as a PRECONDITION rather than assumed. If
+    /// the remount happened to reuse the same device number, the test would be
+    /// vacuous, so it fails saying the *simulation* failed rather than reporting
+    /// a green it did not earn.
+    ///
+    /// Ignored because it needs root. §9 rule 1 forbids a gate being satisfied
+    /// by a skipped test, so it is cited with `ignored = true` and run
+    /// explicitly — the opposite of being skipped.
+    #[test]
+    #[ignore = "needs root: builds a loopback ext4 filesystem and mounts it"]
+    fn fs_id_survives_a_remount_that_changes_st_dev() {
+        let fixture = Fixture::new();
+
+        // --- Leg 1: the weak property, kept because it is the row's literal
+        // sentence — one filesystem at two mount points is one identity.
+        let a = fixture.mount("a");
+        let b = fixture.mount("b");
+        let file_a = a.join(FILE);
+        std::fs::write(&file_a, b"payload").expect("write into the fresh fs");
+        let file_b = b.join(FILE);
+
+        let vol_a = volume_id(&file_a).expect("volume_id at mount point a");
+        let vol_b = volume_id(&file_b).expect("volume_id at mount point b");
+        let id_a = fs_id(&file_a, &vol_a).expect("fs_id at mount point a");
+        let id_b = fs_id(&file_b, &vol_b).expect("fs_id at mount point b");
+        assert_eq!(
+            id_a, id_b,
+            "one filesystem reached by two mount points is one identity; the \
+             mount POINT must not enter fs_id"
+        );
+
+        // The UUID is what makes that true, so assert the identity is actually
+        // UUID-derived. Without this the test would also pass for the
+        // `src:<fstype>:<source>` fallback, whose source is `/dev/loopN` and
+        // therefore does NOT survive the remount below.
+        assert!(
+            vol_a.starts_with("uuid:"),
+            "expected a UUID-derived volume id, got {vol_a:?} — the fallback is \
+             device-path-derived and is not remount-stable"
+        );
+
+        let dev_before = std::fs::metadata(&file_a).expect("stat before").dev();
+        let ino_before = std::fs::metadata(&file_a).expect("stat before").ino();
+
+        // --- Leg 2: the actual remount. Detach and re-attach the same backing
+        // file so the kernel hands out a different device number.
+        fixture.unmount_all();
+        fixture.reattach_on_a_different_loop_device();
+        let c = fixture.mount("c");
+        let file_c = c.join(FILE);
+
+        let dev_after = std::fs::metadata(&file_c).expect("stat after").dev();
+        let ino_after = std::fs::metadata(&file_c).expect("stat after").ino();
+
+        // THE PRECONDITION. Without this the rest is vacuous.
+        assert_ne!(
+            dev_before, dev_after,
+            "the remount did not change st_dev ({dev_before}), so this run \
+             proves nothing about remount stability — the SIMULATION failed, \
+             not fs_id"
+        );
+        assert_eq!(
+            ino_before, ino_after,
+            "the inode is on-disk and must survive; if it did not, the fixture \
+             is wrong rather than the code"
+        );
+
+        // --- The property §9 names.
+        let vol_c = volume_id(&file_c).expect("volume_id after remount");
+        let id_c = fs_id(&file_c, &vol_c).expect("fs_id after remount");
+        assert_eq!(
+            vol_a, vol_c,
+            "volume_id changed across a remount; it is derived from the \
+             filesystem UUID precisely so it cannot"
+        );
+        assert_eq!(
+            id_a, id_c,
+            "fs_id changed across a remount while st_dev went {dev_before} -> \
+             {dev_after}. Every catalog row under this root would stop matching \
+             its file, which PM-3 calls discard-trigger territory"
+        );
+    }
+
+    /// The negative that gives the assertion above its meaning: the documented
+    /// fallback identity is NOT remount-stable, so a caller may not treat it as
+    /// interchangeable with the UUID-derived one.
+    ///
+    /// Without this, `volume_id_fallback` reads like a harmless second option.
+    /// It is not: its source is `/dev/loopN`, which is exactly the mount-time
+    /// assignment §4.4 forbids relying on.
+    #[test]
+    #[ignore = "needs root: builds a loopback ext4 filesystem and mounts it"]
+    fn the_fallback_identity_is_explicitly_not_remount_stable() {
+        let fixture = Fixture::new();
+        let a = fixture.mount("a");
+        std::fs::write(a.join(FILE), b"payload").expect("write into the fresh fs");
+        let before = volume_id_fallback(&a.join(FILE)).expect("fallback before");
+
+        fixture.unmount_all();
+        fixture.reattach_on_a_different_loop_device();
+        let c = fixture.mount("c");
+        let after = volume_id_fallback(&c.join(FILE)).expect("fallback after");
+
+        assert_ne!(
+            before, after,
+            "the fallback is device-path-derived; if it ever became stable the \
+             comment calling it WEAKER is what is now wrong"
+        );
+        // And it is labelled, so a human reading the column can tell which kind
+        // of identity a row holds.
+        assert!(before.starts_with("src:"), "unlabelled fallback: {before}");
+    }
+
+    const FILE: &str = "payload.bin";
+
+    /// Owns the image, the loop device and the mount points, and tears all of
+    /// them down on unwind so a panicking assertion cannot leak a mounted
+    /// filesystem or a loop device onto the machine running the suite.
+    struct Fixture {
+        dir: PathBuf,
+        img: PathBuf,
+        loop_dev: std::cell::RefCell<Option<String>>,
+        parked: std::cell::RefCell<Vec<String>>,
+        mounted: std::cell::RefCell<Vec<PathBuf>>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "shepherd-fsid-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create fixture dir");
+            let img = dir.join("disk.img");
+            // 32 MiB is the smallest an ext4 with a sane inode table fits in.
+            let f = std::fs::File::create(&img).expect("create backing file");
+            f.set_len(32 * 1024 * 1024).expect("size backing file");
+            drop(f);
+            // No sudo needed to mkfs a plain file.
+            run("/usr/sbin/mkfs.ext4", &["-q", "-F", &img.to_string_lossy()]);
+            let me = Self {
+                dir,
+                img,
+                loop_dev: std::cell::RefCell::new(None),
+                parked: std::cell::RefCell::new(Vec::new()),
+                mounted: std::cell::RefCell::new(Vec::new()),
+            };
+            *me.loop_dev.borrow_mut() = Some(me.attach());
+            me
+        }
+
+        fn attach(&self) -> String {
+            let out = sudo("/usr/sbin/losetup", &["--find", "--show", &self.img.to_string_lossy()]);
+            let dev = out.trim().to_string();
+            assert!(dev.starts_with("/dev/loop"), "unexpected losetup output {out:?}");
+            // udev needs a moment to publish /dev/disk/by-uuid, which
+            // `volume_id` resolves the source through.
+            for _ in 0..50 {
+                if std::path::Path::new("/dev/disk/by-uuid").read_dir().into_iter().flatten().flatten().any(|e| {
+                    std::fs::canonicalize(e.path()).ok() == std::fs::canonicalize(&dev).ok()
+                }) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            dev
+        }
+
+        fn mount(&self, name: &str) -> PathBuf {
+            let mp = self.dir.join(name);
+            std::fs::create_dir_all(&mp).expect("create mount point");
+            let dev = self.loop_dev.borrow().clone().expect("a loop device is attached");
+            sudo("/usr/bin/mount", &[&dev, &mp.to_string_lossy()]);
+            // The test writes as an unprivileged user into a filesystem whose
+            // root is owned by root.
+            sudo("/usr/bin/chmod", &["0777", &mp.to_string_lossy()]);
+            self.mounted.borrow_mut().push(mp.clone());
+            mp
+        }
+
+        fn unmount_all(&self) {
+            for mp in self.mounted.borrow_mut().drain(..) {
+                sudo("/usr/bin/umount", &[&mp.to_string_lossy()]);
+            }
+        }
+
+        /// Detach and re-attach the backing file, guaranteeing a DIFFERENT loop
+        /// device number — which is what makes `st_dev` change.
+        ///
+        /// `losetup --find` hands out the lowest free number, so re-attaching
+        /// immediately would usually reclaim the number just released. The
+        /// released device is therefore parked (kept attached) so the next
+        /// `--find` is forced onto a different one. Deterministic, rather than
+        /// relying on a race to hand us a different number.
+        fn reattach_on_a_different_loop_device(&self) {
+            let old = self.loop_dev.borrow().clone().expect("attached");
+            sudo("/usr/sbin/losetup", &["-d", &old]);
+            let mut new = self.attach();
+            if new == old {
+                // Reclaimed the same number. Park it; the next attach cannot
+                // reuse an occupied device.
+                self.parked.borrow_mut().push(new.clone());
+                new = self.attach();
+            }
+            assert_ne!(new, old, "failed to force a different loop device");
+            *self.loop_dev.borrow_mut() = Some(new);
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            for mp in self.mounted.borrow_mut().drain(..) {
+                let _ = try_sudo("/usr/bin/umount", &[&mp.to_string_lossy()]);
+            }
+            for dev in self
+                .loop_dev
+                .borrow_mut()
+                .take()
+                .into_iter()
+                .chain(self.parked.borrow_mut().drain(..))
+            {
+                let _ = try_sudo("/usr/sbin/losetup", &["-d", &dev]);
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn run(bin: &str, args: &[&str]) -> String {
+        let out = Command::new(bin)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot execute {bin}: {e}"));
+        assert!(
+            out.status.success(),
+            "{bin} {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// `sudo -n`: never prompt. A test that blocked on a password would hang the
+    /// suite, and one that SKIPPED on a missing password would report a green it
+    /// did not earn — so a missing privilege is a loud failure.
+    fn sudo(bin: &str, args: &[&str]) -> String {
+        let mut a = vec!["-n", bin];
+        a.extend_from_slice(args);
+        run("/usr/bin/sudo", &a)
+    }
+
+    fn try_sudo(bin: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+        let mut a = vec!["-n", bin];
+        a.extend_from_slice(args);
+        Command::new("/usr/bin/sudo").args(&a).output()
+    }
+
+    /// Keeps `Path` in scope for the signatures above without an unused import.
+    #[allow(dead_code)]
+    fn _typecheck(p: &Path) -> Option<&std::ffi::OsStr> {
+        p.file_name()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::linux::*;
 
