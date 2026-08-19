@@ -68,10 +68,24 @@ fn a_restore_reproduces_bytes_mtime_and_mode_on_a_real_filesystem() {
     // The read-back is the claim that matters: not "we called set_modified"
     // but "the filesystem kept it".
     let back = read_back(&target).expect("read back");
-    assert_eq!(back.mtime, Timestamp::from_nanos(MTIME_NANOS));
+    // Read back to the resolution the target can hold, for the same reason
+    // `fidelity::MTIME_RESOLUTION_NANOS` exists: NTFS quantises to 100 ns, so
+    // asserting exact nanoseconds here asserts a POSIX property as universal.
+    let slack = if cfg!(unix) { 1 } else { 100 };
+    assert!(
+        (back.mtime.as_nanos() - MTIME_NANOS).abs() < slack,
+        "restored mtime {} is further than one filesystem tick ({slack} ns) from \
+         the manifest's {MTIME_NANOS}",
+        back.mtime.as_nanos()
+    );
     assert_eq!(back.blake3, m.core.blake3);
     #[cfg(unix)]
-    assert_eq!(back.mode, 0o644);
+    // `mode` only where the target has one — see `MODE_IS_REPRESENTABLE`. On
+    // NTFS the restored file reads back 0 because there are no mode bits, and
+    // demanding 0o644 there demands something the filesystem cannot store.
+    if cfg!(unix) {
+        assert_eq!(back.mode, 0o644);
+    }
 }
 
 /// The reason mtime is in the floor at all.

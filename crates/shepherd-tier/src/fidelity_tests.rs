@@ -55,16 +55,26 @@ fn a_wrong_mtime_is_a_breach_because_it_would_re_match_an_age_rule() {
     );
 }
 
+/// A wrong mode is a breach WHERE A MODE EXISTS, and is not one where it does
+/// not.
+///
+/// Both halves are asserted, because only asserting the POSIX half would let
+/// the Windows behaviour be anything at all — including the mode check silently
+/// disappearing on every platform. That is the failure this file is for.
 #[test]
-fn a_wrong_mode_is_a_breach() {
+fn a_wrong_mode_is_a_breach_where_modes_exist() {
     let m = FidelityManifest::new(core());
     let mut a = restored();
     a.mode = 0o600;
-    assert!(
-        verify_restore(&m, &a)
-            .expect_err("must fail")
-            .iter()
-            .any(|b| matches!(b, FidelityBreach::Mode { .. }))
+    let breached = verify_restore(&m, &a)
+        .err()
+        .is_some_and(|bs| bs.iter().any(|b| matches!(b, FidelityBreach::Mode { .. })));
+    assert_eq!(
+        breached,
+        cfg!(unix),
+        "a differing mode must breach exactly where the target can represent one \
+         — POSIX yes, NTFS no (it has ACLs and a read-only flag, no mode bits). \
+         See `MODE_IS_REPRESENTABLE`"
     );
 }
 
@@ -77,7 +87,14 @@ fn every_breach_is_reported_not_just_the_first() {
         mtime: Timestamp::from_nanos(0),
         mode: 0o600,
     };
-    assert_eq!(verify_restore(&m, &a).expect_err("must fail").len(), 4);
+    // Four breaches on POSIX: content, size, mtime, mode. Three where `mode`
+    // is not representable — the count is derived from the platform rather than
+    // hardcoded, so this still fails if a DIFFERENT breach goes missing.
+    let expected = if cfg!(unix) { 4 } else { 3 };
+    assert_eq!(
+        verify_restore(&m, &a).expect_err("must fail").len(),
+        expected
+    );
 }
 
 // --- the disclosure rule ---------------------------------------------------
