@@ -177,7 +177,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     };
     let audit = AuditLog::open(&tmp.0.join("audit.jsonl")).unwrap();
 
-    execute_local_destruction(
+    let destroyed = execute_local_destruction(
         &LocalDestroyRequest {
             intent: IntentId::new(1),
             path: &doomed,
@@ -199,8 +199,48 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
         &FileLocks::new(),
         now,
     )
-    .await
-    .expect("destroy");
+    .await;
+
+    // `open_handles` is implemented on Linux only; everywhere else the
+    // acquisition floor refuses fail-closed, because OQ-J defines "cannot
+    // determine" as held. So the destruction this test needs as a PRECONDITION
+    // cannot be produced through the real path there, and AC-6's actual subject
+    // — rebuilding local state from the filesystem plus the bundle — has no
+    // destroyed file to rebuild around.
+    //
+    // Assert that refusal specifically rather than unwrapping into a panic that
+    // reads like a recovery bug. `DestroyError` is not re-exported from the
+    // crate root, so this matches the user-visible Display text, which is what
+    // an operator would see anyway.
+    match destroyed {
+        Ok(()) => assert!(
+            std::env::consts::OS == "linux",
+            "destruction SUCCEEDED on {}, where open_handles() is unimplemented and the \
+             acquisition floor should have refused fail-closed. If Phase 3 landed a \
+             detector for this platform, AC-6 recovery can now be covered here and the \
+             early return below should be removed — deliberately, not by accident.",
+            std::env::consts::OS
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                std::env::consts::OS != "linux",
+                "destruction failed on Linux, where the detector exists and it is expected \
+                 to succeed. This is a real failure, not a platform gap: {msg}"
+            );
+            assert!(
+                msg.contains("floor refused: held-open"),
+                "on a platform with no open-handle detector the ONLY expected refusal is \
+                 the fail-closed one; any other means a different floor tripped: {msg}"
+            );
+            assert!(
+                msg.contains("CouldNotDetermine") && msg.contains(std::env::consts::OS),
+                "the refusal must name the missing detector and the platform, so it is not \
+                 mistaken for a genuine open handle on this file: {msg}"
+            );
+            return;
+        }
+    }
 
     assert!(!doomed.exists(), "the original is gone from disk");
     assert!(survivor.exists());

@@ -173,11 +173,78 @@ impl Fixture {
     }
 }
 
+/// The acquisition floor stands in front of every test below, and on a platform
+/// with no open-handle detector it refuses before their subject is reachable.
+///
+/// [`shepherd_scan::floors`]'s `open_handles` is implemented on Linux only.
+/// Everywhere else it answers `CouldNotDetermine`, which OQ-J defines as
+/// held-open, so `execute_local_destruction` returns at **step 1** — before
+/// re-attestation, before staging, before the unlink. A test that unwraps a
+/// success, or that expects `DestroyError::Refused`, is then asserting against
+/// an error raised by a step its own subject never reached. That is why eight
+/// tests in this module failed on macOS the first time the suite ran there: not
+/// because destruction is broken, but because they never got to it.
+///
+/// This asserts the platform-correct outcome of that floor and reports whether
+/// the caller may go on to assert its own subject. **On a platform with no
+/// detector, this assertion IS the test** — that destructive work is refused,
+/// and refused for the stated reason rather than by accident.
+///
+/// It deliberately will not accept a bare refusal. `is_err()` would pass on a
+/// panic, a missing fixture, a permissions error — on any bug in `destroy` at
+/// all. The refusal has to name the floor, the platform whose handles could not
+/// be checked, and the rule that makes "undetermined" mean "held".
+#[must_use]
+fn past_the_open_handle_floor(r: Result<()>) -> Option<Result<()>> {
+    match &r {
+        Err(DestroyError::Floor { code, detail })
+            if *code == "held-open" && detail.contains("CouldNotDetermine") =>
+        {
+            assert!(
+                std::env::consts::OS != "linux",
+                "the open-handle floor answered CouldNotDetermine ON LINUX, where the \
+                 detector exists. That is the detector breaking rather than a platform \
+                 lacking one — and left unasserted it would silently convert every test \
+                 below into a vacuous refusal check. detail: {detail}"
+            );
+            assert!(
+                detail.contains(std::env::consts::OS),
+                "the refusal must name the platform whose handles it could not check, so \
+                 a reader knows which detector is missing: {detail}"
+            );
+            assert!(
+                detail.contains("OQ-J"),
+                "the refusal must name the rule that makes an undetermined answer mean \
+                 held-open rather than clear: {detail}"
+            );
+            None
+        }
+        Ok(()) => {
+            assert!(
+                std::env::consts::OS == "linux",
+                "destruction SUCCEEDED on {}, where open_handles() is unimplemented and \
+                 the acquisition floor is supposed to fail closed. Either Phase 3 landed \
+                 a detector for this platform — in which case these tests must be updated \
+                 to expect success, DELIBERATELY — or the fail-closed floor stopped \
+                 failing closed.",
+                std::env::consts::OS
+            );
+            Some(r)
+        }
+        // Any other error is the caller's subject, or a genuine bug. Either way
+        // it belongs to the caller's own assertion, not to this one.
+        _ => Some(r),
+    }
+}
+
 #[tokio::test]
 async fn the_happy_path_destroys_and_audits() {
     let f = fixture("happy", AttestationMode::Version);
     let c = custodian(AttestationMode::Version, f.hash);
-    f.run(&c).await.unwrap();
+    let Some(r) = past_the_open_handle_floor(f.run(&c).await) else {
+        return;
+    };
+    r.unwrap();
 
     assert!(!f.path.exists(), "the original is gone");
     assert!(
@@ -204,16 +271,20 @@ async fn content_changed_since_verification_aborts_and_restores() {
         ..f.request(&c)
     };
 
-    let err = execute_local_destruction(
-        &req,
-        &f.provider,
-        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
-        &f.audit,
-        &f.locks,
-        Timestamp::from_nanos(1),
-    )
-    .await
-    .unwrap_err();
+    let Some(r) = past_the_open_handle_floor(
+        execute_local_destruction(
+            &req,
+            &f.provider,
+            &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+            &f.audit,
+            &f.locks,
+            Timestamp::from_nanos(1),
+        )
+        .await,
+    ) else {
+        return;
+    };
+    let err = r.unwrap_err();
 
     assert!(matches!(err, DestroyError::ContentChanged { .. }), "{err}");
     assert!(f.path.exists(), "abort-forward-never: the file is restored");
@@ -238,16 +309,20 @@ async fn identity_mismatch_aborts_and_restores() {
         ..f.request(&c)
     };
 
-    let err = execute_local_destruction(
-        &req,
-        &f.provider,
-        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
-        &f.audit,
-        &f.locks,
-        Timestamp::from_nanos(1),
-    )
-    .await
-    .unwrap_err();
+    let Some(r) = past_the_open_handle_floor(
+        execute_local_destruction(
+            &req,
+            &f.provider,
+            &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+            &f.audit,
+            &f.locks,
+            Timestamp::from_nanos(1),
+        )
+        .await,
+    ) else {
+        return;
+    };
+    let err = r.unwrap_err();
 
     assert!(
         matches!(err, DestroyError::IdentityMismatch { .. }),
@@ -264,7 +339,10 @@ async fn a_changed_remote_version_aborts_and_restores() {
     let mut c = custodian(AttestationMode::Version, f.hash);
     c.object_version = Some(shepherd_core::ObjectVersion::new("stale-version"));
 
-    let err = f.run(&c).await.unwrap_err();
+    let Some(r) = past_the_open_handle_floor(f.run(&c).await) else {
+        return;
+    };
+    let err = r.unwrap_err();
     assert!(matches!(err, DestroyError::Refused(_)), "{err}");
     assert!(
         f.path.exists(),
@@ -283,7 +361,10 @@ async fn a_remote_object_deleted_before_the_closing_head_aborts() {
     // Remove it behind the adapter's back.
     f.adapter.remove_raw(&f.key);
 
-    let err = f.run(&c).await.unwrap_err();
+    let Some(r) = past_the_open_handle_floor(f.run(&c).await) else {
+        return;
+    };
+    let err = r.unwrap_err();
     assert!(matches!(err, DestroyError::Refused(_)), "{err}");
     assert!(f.path.exists());
 }
@@ -341,7 +422,28 @@ async fn a_file_held_open_is_not_destroyed() {
 
     let err = f.run(&c).await.unwrap_err();
     match err {
-        DestroyError::Floor { code, .. } => assert_eq!(code, "held-open"),
+        DestroyError::Floor { code, detail } => {
+            assert_eq!(code, "held-open", "{detail}");
+            // The code alone is NOT enough, and this test was green for the
+            // wrong reason on macOS before this assertion existed: `held-open`
+            // is also what a platform with no detector answers, so the check
+            // passed whether or not `_holder` held anything — it would have
+            // passed with the `_holder` line deleted. Assert the EVIDENCE.
+            #[cfg(target_os = "linux")]
+            assert!(
+                detail.contains("Descriptors"),
+                "the refusal must come from finding THIS test's descriptor, not from the \
+                 detector being unavailable — otherwise this test passes without its own \
+                 fixture doing anything: {detail}"
+            );
+            #[cfg(not(target_os = "linux"))]
+            assert!(
+                detail.contains("CouldNotDetermine"),
+                "on a platform with no open-handle detector the refusal must be the \
+                 fail-closed one; a Descriptors answer here would mean a detector exists \
+                 and this test is now asserting less than it could: {detail}"
+            );
+        }
         other => panic!("expected the open-handle floor to refuse, got {other}"),
     }
     assert!(f.path.exists());
@@ -405,7 +507,35 @@ async fn a_handle_opened_after_the_floor_check_is_not_seen_by_it() {
         },
         shepherd_scan::floors::FloorContext::Acquisition,
     );
-    assert!(verdict.is_eligible(), "baseline: nothing holds it yet");
+    // Baseline: nothing holds it yet — on a platform that can tell. Where
+    // `open_handles` is unimplemented the acquisition floor refuses fail-closed
+    // no matter what holds the file, so this baseline cannot be established
+    // there. Assert THAT instead of skipping: the window this test documents is
+    // a property of the ordering, not of the detector, and the rest of the test
+    // exercises it on every platform.
+    match verdict.refusal() {
+        None => assert!(
+            std::env::consts::OS == "linux",
+            "the acquisition floor found this file eligible on {}, where open_handles() \
+             is unimplemented and it should have refused fail-closed. Either Phase 3 \
+             landed a detector or the floor stopped failing closed.",
+            std::env::consts::OS
+        ),
+        Some(r) => {
+            assert!(
+                std::env::consts::OS != "linux",
+                "the acquisition floor refused a file nothing holds, ON LINUX, where the \
+                 detector exists: {r:?}"
+            );
+            assert_eq!(
+                r.code(),
+                "held-open",
+                "on a platform with no open-handle detector the ONLY expected refusal here \
+                 is the fail-closed one; anything else means a different floor tripped and \
+                 this test is no longer measuring what it says: {r:?}"
+            );
+        }
+    }
 
     // …and now a writer arrives, after the check.
     let mut writer = std::fs::OpenOptions::new()
@@ -435,7 +565,13 @@ async fn two_destroys_of_one_file_serialize() {
 
     // The first succeeds; the second finds no file and fails at the stat rather
     // than destroying anything a second time.
-    f.run(&c).await.unwrap();
+    let Some(first) = past_the_open_handle_floor(f.run(&c).await) else {
+        // No detector on this platform, so the first destruction never happened
+        // and there is no second attempt to serialize against. The refusal is
+        // asserted above; asserting a second refusal would add nothing.
+        return;
+    };
+    first.unwrap();
     let err = f.run(&c).await.unwrap_err();
     assert!(matches!(err, DestroyError::Io(_)), "{err}");
     assert_eq!(f.audit.read_all().len(), 1, "exactly one audit record");
@@ -515,16 +651,20 @@ async fn a_failing_unlink_restores_rather_than_orphaning_the_file() {
     let provider = MockPlaceholderProvider::new();
     provider.fail_next_destroy();
 
-    let err = execute_local_destruction(
-        &f.request(&c),
-        &provider,
-        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
-        &f.audit,
-        &f.locks,
-        Timestamp::from_nanos(1),
-    )
-    .await
-    .unwrap_err();
+    let Some(r) = past_the_open_handle_floor(
+        execute_local_destruction(
+            &f.request(&c),
+            &provider,
+            &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+            &f.audit,
+            &f.locks,
+            Timestamp::from_nanos(1),
+        )
+        .await,
+    ) else {
+        return;
+    };
+    let err = r.unwrap_err();
 
     assert!(matches!(err, DestroyError::Provider(_)), "{err}");
     assert!(
