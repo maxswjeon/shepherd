@@ -415,8 +415,24 @@ impl ChainResolution {
     /// acknowledged the target is `custody_eligible = false`, and a gap makes
     /// the replica `incomplete`, which "refuses to be treated as a custody
     /// authority".
+    ///
+    /// **An empty chain is not an unbroken one.** `resolve_chain(&[])` finds
+    /// nothing to fork and no predecessor to be missing, so it reports
+    /// `Single` with no invalid records — a shape indistinguishable, to the
+    /// first two clauses alone, from a healthy chain. It is not one: there is
+    /// no genesis pointer, no segment and no recovery state at all, which is
+    /// what a newly configured target and a target whose listing came back
+    /// empty both look like. Since this predicate authorizes destroying a sole
+    /// local copy, answering yes there is the fail-open direction on the one
+    /// path that cannot be undone, so at least one valid record and a concrete
+    /// head are required. The head clause is not redundant with the record
+    /// clause: `Single` with records but no lone tip means the chain closed on
+    /// itself, and a replay has nowhere to start.
     pub fn custody_eligible(&self) -> bool {
-        matches!(self.status, ChainStatus::Single) && self.invalid.is_empty()
+        matches!(self.status, ChainStatus::Single)
+            && self.invalid.is_empty()
+            && !self.records.is_empty()
+            && self.head.is_some()
     }
 }
 

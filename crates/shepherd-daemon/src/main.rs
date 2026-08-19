@@ -82,6 +82,79 @@ Service installation is intentionally not an IPC method — see the module docs.
 
 // ---------------------------------------------------------------------------
 
+/// Create the state directory — or tighten one that already exists — to `0700`.
+///
+/// # This is the same control as the socket's, on the half that holds the data
+///
+/// §4.3 makes filesystem permissions the *entire* authorization model: "same
+/// user, same machine, not network-exposed", no token and no per-caller check.
+/// [`server::bind`] therefore sets the socket to `0600` under a `0700`
+/// directory. The state directory holds `catalog.db` — the user's complete file
+/// inventory, and the custody rows that are a tiered file's only remote address
+/// — so leaving it world-readable hands over by another route exactly what the
+/// socket's mode exists to withhold.
+///
+/// The per-user assumption is already load-bearing elsewhere:
+/// `targets::resolve_credentials` lets `target.add` fall back to ambient cloud
+/// credentials *only* because the caller's uid is the daemon's uid. This is that
+/// same invariant, seen from the filesystem.
+///
+/// # Why it was `0755` in practice
+///
+/// `create_dir_all` obeys the umask, which is `022` on an ordinary login. On the
+/// normal Linux layout nothing later tightens it either: §4.3 puts the socket in
+/// `$XDG_RUNTIME_DIR`, so `bind`'s `0700` lands on a different directory
+/// entirely. Only the fallback layout — no runtime dir, socket inside the state
+/// directory — ever got it right, and by accident.
+///
+/// # Refusing rather than warning
+///
+/// The mode is **asserted after being set** rather than merely requested, which
+/// is what makes this a check instead of an intention, and a mismatch stops the
+/// daemon. Ownership is checked first so the failure names the actual cause:
+/// `chmod` on someone else's directory fails with `EPERM`, which reads as a
+/// permissions bug rather than as "something other than you owns your catalog".
+#[cfg(unix)]
+fn secure_state_dir(dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+
+    // SAFETY: `geteuid` is always successful per POSIX — it cannot fail, has no
+    // error return, and touches no memory we own.
+    let me = unsafe { libc::geteuid() };
+    let owner = std::fs::metadata(dir)
+        .map_err(|e| format!("cannot inspect {}: {e}", dir.display()))?
+        .uid();
+    if owner != me {
+        return Err(format!(
+            "{} is owned by uid {owner}, but this daemon runs as uid {me}. shepherdd is a \
+             per-user agent (§4.2) and its catalog is the only address of tiered files; it \
+             will not open one under a directory it does not own",
+            dir.display()
+        ));
+    }
+
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("cannot restrict {} to 0700: {e}", dir.display()))?;
+
+    let mode = std::fs::metadata(dir)
+        .map_err(|e| format!("cannot inspect {}: {e}", dir.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o700 {
+        return Err(format!(
+            "{} is mode {mode:04o} after being set to 0700. The catalog will not be opened \
+             under a directory whose permissions the filesystem does not enforce",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+
 /// Serve, on a platform that has a transport.
 ///
 /// The IPC surface is a Unix domain socket (§4.2), and `server` is
@@ -108,8 +181,10 @@ fn cmd_run() -> Result<(), String> {
 fn cmd_run() -> Result<(), String> {
     shepherd_obs::tracing_setup::init_tracing("info");
     let paths = Paths::from_process()?;
-    std::fs::create_dir_all(&paths.state_dir)
-        .map_err(|e| format!("cannot create {}: {e}", paths.state_dir.display()))?;
+    // Before the catalog exists, not after: SQLite creates `catalog.db` with
+    // whatever the directory and the umask allow, and a file created readable
+    // stays readable.
+    secure_state_dir(&paths.state_dir)?;
 
     let catalog = shepherd_catalog::Catalog::open(&paths.catalog())
         .map_err(|e| format!("cannot open {}: {e}", paths.catalog().display()))?;
@@ -350,5 +425,59 @@ fn cmd_doctor() -> Result<(), String> {
         Ok(())
     } else {
         Err("one or more checks failed".into())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "shepherdd-statedir-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn mode_of(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A first run creates it, and the ambient umask does not get a vote.
+    #[test]
+    fn a_new_state_directory_is_owner_only() {
+        let d = tmp("new");
+        secure_state_dir(&d).unwrap();
+        assert_eq!(mode_of(&d), 0o700, "state directory is {:04o}", mode_of(&d));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The case that actually shipped: the directory already exists, created by
+    /// an earlier run under a `022` umask. Accepting it as found is what leaves
+    /// the catalog readable to every account on the host, so it is tightened
+    /// rather than tolerated.
+    ///
+    /// The foreign-ownership refusal above it has no test: a directory owned by
+    /// another uid cannot be created without privileges a test suite must not
+    /// have. It is stated here rather than left as an apparent oversight.
+    #[test]
+    fn an_existing_group_and_world_readable_state_directory_is_tightened() {
+        let d = tmp("loose");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            mode_of(&d),
+            0o755,
+            "the fixture itself has to be loose, or this test asserts nothing"
+        );
+
+        secure_state_dir(&d).unwrap();
+
+        assert_eq!(mode_of(&d), 0o700, "state directory is {:04o}", mode_of(&d));
+        std::fs::remove_dir_all(&d).ok();
     }
 }

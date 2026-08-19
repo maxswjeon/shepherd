@@ -406,3 +406,42 @@ async fn conditional_create_failure_is_a_hard_error_not_a_warning() {
         "the pre-existing object must be untouched — silently overwriting it is the whole bug"
     );
 }
+
+/// An empty listing is not an unbroken chain — it is no chain at all.
+///
+/// `custody_eligible` authorizes destroying a sole local copy. `resolve_chain`
+/// on an empty listing finds nothing to fork and nothing to be missing, so a
+/// predicate that asks only "is the status `Single` and is nothing invalid?"
+/// answers yes for a target holding no genesis pointer, no segment and no
+/// recovery state whatsoever. That is the fail-open direction on the one path
+/// that cannot be undone, and it is reachable on a newly configured target or
+/// one whose listing came back empty.
+#[test]
+fn an_empty_chain_is_not_custody_eligible() {
+    let r = resolve_chain(&[]);
+    assert!(r.records.is_empty());
+    assert_eq!(r.head, None, "there is no head to point at");
+    assert!(
+        !r.custody_eligible(),
+        "a target with no recovery bundle at all must never authorize a sole-copy destruction"
+    );
+}
+
+/// The other half of the pair: the fix must not be "always refuse".
+///
+/// A single sealed genesis record IS a complete, unforked, gapless chain with a
+/// concrete head, and it must still be able to act as a custody authority —
+/// otherwise the guard above would be indistinguishable from breaking custody
+/// entirely.
+#[test]
+fn a_single_valid_record_is_still_custody_eligible() {
+    let g = rec(1, 1, "u1", None);
+    let r = resolve_chain(&listed(std::slice::from_ref(&g)));
+    assert_eq!(r.status, ChainStatus::Single);
+    assert_eq!(r.records.len(), 1);
+    assert_eq!(r.head, Blake3Hash::from_hex(&g.self_blake3));
+    assert!(
+        r.custody_eligible(),
+        "one valid genesis record with a head is a usable custody authority"
+    );
+}

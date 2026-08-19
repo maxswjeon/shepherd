@@ -18,12 +18,26 @@
 //! cannot promise fail-closed and then ship the failure mode behind a log line".
 //! So the probe reports [`Feasibility::Ineligible`] and the root never destroys.
 //!
-//! # One staging directory per mount
+//! # One staging directory per registered root
 //!
-//! `rename` cannot cross filesystems (`EXDEV`), so staging lives beside the
-//! file, at the root of its own mount, created lazily. It is deny-listed from
-//! scan and watch (`shepherd-scan::denylist::STAGING_DIR_NAME`) so its entries
-//! never read as user data appearing and vanishing.
+//! Staging lives at the **registered scan root**, created lazily, and every
+//! file under that root — however deep — stages into that one directory. The
+//! reason is recovery and not tidiness: `list_staged` is called with the
+//! registered root and reads `<root>/.shepherd-staging` alone, so an entry
+//! anywhere else is an entry a crash strands where nothing will look for it.
+//! An earlier version staged under each file's own parent, which meant
+//! `root/a/b/file` left its bytes in `root/a/b/.shepherd-staging` — present on
+//! disk, invisible to recovery.
+//!
+//! `rename` cannot cross filesystems, so this makes a **submount under the
+//! root** stage-ineligible: the rename returns `EXDEV` and destruction aborts
+//! before anything irreversible. That is the fail-closed direction and it is
+//! the correct trade — refusing to destroy is recoverable, staging where
+//! recovery cannot look is not.
+//!
+//! The directory is deny-listed from scan and watch
+//! (`shepherd-scan::denylist::STAGING_DIR_NAME`) so its entries never read as
+//! user data appearing and vanishing.
 //!
 //! # What `0700` on the staging directory does not buy
 //!
@@ -56,11 +70,12 @@ impl DeleteModeProvider {
         Self
     }
 
-    /// The staging directory for the mount holding `path`.
+    /// The staging directory for a registered root.
     ///
-    /// Placed at the scan root rather than beside each file: one directory per
-    /// mount is what §4.10.1 asks for, and it keeps recovery to a single
-    /// listing.
+    /// One per root rather than one beside each file, so recovery is a single
+    /// listing — and so that listing is *complete*. `stage_for_destruction` and
+    /// `list_staged` both route through here, which is what keeps the writer
+    /// and the reader pointed at the same directory.
     fn staging_dir(root: &Path) -> PathBuf {
         root.join(STAGING_DIR_NAME)
     }
@@ -246,7 +261,7 @@ impl PlaceholderProvider for DeleteModeProvider {
         }
     }
 
-    fn stage_for_destruction(&self, path: &Path) -> Result<Staged> {
+    fn stage_for_destruction(&self, root: &Path, path: &Path) -> Result<Staged> {
         // Step 1: acquire the handle FIRST. Everything after this point works
         // through it, so no pathname is re-resolved.
         let handle = std::fs::File::open(path).map_err(|e| ProviderError::Acquire {
@@ -254,7 +269,10 @@ impl PlaceholderProvider for DeleteModeProvider {
             detail: e.to_string(),
         })?;
 
-        let root = path.parent().unwrap_or(Path::new("."));
+        // The REGISTERED ROOT, not `path.parent()`. Recovery calls
+        // `list_staged` with this same root and reads exactly one directory, so
+        // staging a nested file beside itself would hide its bytes from the
+        // only pass that could restore them.
         let dir = Self::ensure_staging(root)?;
 
         // Staged name is derived from identity, not from the user's filename:
@@ -472,7 +490,8 @@ mod tests {
         let p = t.file("a.bin", b"hello");
         let before = std::fs::symlink_metadata(&p).unwrap();
 
-        let Some(staged) = staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&p))
+        let Some(staged) =
+            staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&t.0, &p))
         else {
             return;
         };
@@ -499,7 +518,7 @@ mod tests {
         let t = Tmp::new("handle");
         let p = t.file("a.bin", b"content-that-must-survive");
         let Some(mut staged) =
-            staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&p))
+            staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&t.0, &p))
         else {
             return;
         };
@@ -515,7 +534,7 @@ mod tests {
         let t = Tmp::new("moveback");
         let p = t.file("a.bin", b"payload");
         let provider = DeleteModeProvider::new();
-        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&p)) else {
+        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&t.0, &p)) else {
             return;
         };
         assert!(!p.exists());
@@ -533,7 +552,7 @@ mod tests {
         let t = Tmp::new("conflict");
         let p = t.file("a.bin", b"original");
         let provider = DeleteModeProvider::new();
-        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&p)) else {
+        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&t.0, &p)) else {
             return;
         };
 
@@ -560,7 +579,7 @@ mod tests {
         let t = Tmp::new("recover");
         let p = t.file("a.bin", b"x");
         let provider = DeleteModeProvider::new();
-        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&p)) else {
+        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&t.0, &p)) else {
             return;
         };
         // Simulate a crash: forget the handle without destroying or restoring.
@@ -569,6 +588,52 @@ mod tests {
 
         let found = provider.list_staged(&t.0).unwrap();
         assert_eq!(found, vec![staged_path]);
+    }
+
+    /// A crash after staging a file that lives **below** the root must leave
+    /// its bytes where recovery looks for them.
+    ///
+    /// `list_staged` is called with the registered scan root and inspects
+    /// exactly `<root>/.shepherd-staging`. Staging a nested file beside itself
+    /// puts the bytes in `<root>/a/b/.shepherd-staging`, which recovery never
+    /// lists — and bytes recovery cannot find are bytes the user has lost.
+    ///
+    /// This is a recovery test, not a test of the path computation: it crashes
+    /// (drops the handle without destroying or restoring) and then asks the
+    /// recovery entry point what it can see.
+    #[test]
+    fn a_crash_after_staging_a_nested_file_leaves_it_where_recovery_looks() {
+        let t = Tmp::new("nested-recover");
+        let parent = t.0.join("a").join("b");
+        std::fs::create_dir_all(&parent).unwrap();
+        let p = parent.join("deep.bin");
+        std::fs::write(&p, b"nested-payload").unwrap();
+
+        let provider = DeleteModeProvider::new();
+        let Some(staged) = staged_or_refused(provider.stage_for_destruction(&t.0, &p)) else {
+            return;
+        };
+        // The crash: forget the handle without destroying or restoring.
+        let staged_path = staged.staged.clone();
+        drop(staged);
+
+        let found = provider.list_staged(&t.0).unwrap();
+        assert_eq!(
+            found,
+            vec![staged_path],
+            "recovery lists the REGISTERED ROOT's staging directory and nothing else, so \
+             a nested file's staged entry has to be in it"
+        );
+        assert_eq!(
+            std::fs::read(&found[0]).unwrap(),
+            b"nested-payload",
+            "and the entry recovery found must still hold the file's bytes"
+        );
+        assert!(
+            !parent.join(STAGING_DIR_NAME).exists(),
+            "no staging directory may be created beside the file: an entry there is \
+             undiscoverable by `list_staged(root)`"
+        );
     }
 
     /// The staged entry is still named and still reachable by any process
@@ -580,7 +645,8 @@ mod tests {
     fn a_staged_entry_is_still_reachable_by_the_same_uid() {
         let t = Tmp::new("reopen");
         let p = t.file("a.bin", b"still-here");
-        let Some(staged) = staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&p))
+        let Some(staged) =
+            staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&t.0, &p))
         else {
             return;
         };
@@ -602,7 +668,8 @@ mod tests {
         let p = t.file("a.bin", b"aaaa");
 
         let mut writer = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let Some(staged) = staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&p))
+        let Some(staged) =
+            staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&t.0, &p))
         else {
             return;
         };

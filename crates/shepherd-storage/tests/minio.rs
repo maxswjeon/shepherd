@@ -285,6 +285,7 @@ async fn a_real_resume_skips_parts_the_server_and_the_checkpoint_agree_on() {
             len: range.len,
             local_blake3: hash(&slice),
             etag: Some(r.etag),
+            checksum: r.checksum,
         });
     }
 

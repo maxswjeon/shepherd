@@ -20,8 +20,12 @@
 //! does not under-match — it eventually matches **everything**, including files
 //! in daily use. Under a `discard` policy that is a mass-destruction trigger.
 //!
-//! So [`Matcher::compile`] **rejects** a destructive rule whose age predicate
-//! rests on `atime` where the root's fidelity is `disabled` or `unknown`. It
+//! So [`Matcher::compile`] **rejects** a destructive rule where *any* of its
+//! age predicates rests on `atime` and the root's fidelity is `disabled` or
+//! `unknown` — *any*, because a rule that reaches for `atime` in its second
+//! predicate is exactly as dangerous as one that reaches for it in its first,
+//! and inspecting only the first is how `all: [mtime_older_than_days,
+//! atime_older_than_days]` used to compile on a root where atime is dead. It
 //! calls [`AtimeMode::supports_destructive_age_rule`] rather than re-deriving
 //! the test — that method exists so both sides agree, and re-deriving it is how
 //! `Relatime` (Linux's *default* mount option) nearly got rejected, which would
@@ -147,7 +151,15 @@ impl Matcher {
         // §4.12 rule 4, and the one line in this file that refuses rather than
         // reports. `Accessed` is included: its fallback order ends at `atime`
         // when there is no observed signal, so it inherits the same problem.
-        let rests_on_atime = matches!(age_field, Some(TimeField::Atime | TimeField::Accessed));
+        //
+        // EVERY age predicate is inspected, not the one `age_field` happens to
+        // report. Those are different questions, and answering this one with
+        // `first_age_field` let a compound rule walk straight past the refusal:
+        // in `all: [mtime_older_than_days, atime_older_than_days]` the first age
+        // field is `Mtime`, so the rule compiled — and its atime condition was
+        // then evaluated by the fallback, selecting files on `mtime` under a
+        // rule the user wrote in terms of last access.
+        let rests_on_atime = any_age_field_rests_on_atime(&root);
         if action.is_destructive() && rests_on_atime && !atime_mode.supports_destructive_age_rule()
         {
             return Err(MatchError::AtimeUntrustworthy {
@@ -252,6 +264,32 @@ fn eval_predicate(p: &Predicate, file: &FileStat, ctx: &MatchContext<'_>) -> boo
     }
 }
 
+/// Whether **any** age predicate in the tree reads a signal that can fall back
+/// to `atime` — the question §4.12's destructive refusal asks.
+///
+/// Deliberately not [`first_age_field`]: that answers "which signal does the
+/// preview name", and one predicate cannot speak for a rule whose refusal is a
+/// property of all of them.
+fn any_age_field_rests_on_atime(p: &Predicate) -> bool {
+    match p {
+        Predicate::OlderThan { field, .. } => {
+            matches!(field, TimeField::Atime | TimeField::Accessed)
+        }
+        Predicate::All(ps) | Predicate::Any(ps) => ps.iter().any(any_age_field_rests_on_atime),
+        Predicate::Not(inner) => any_age_field_rests_on_atime(inner),
+        // EXHAUSTIVE ON PURPOSE — no `_` arm. This drives a destructive-rule
+        // REFUSAL, so a wildcard would answer `false` for any variant added
+        // later, and a new predicate carrying a `TimeField` would silently
+        // reopen exactly the bypass this function was written to close. Listing
+        // them makes the next person decide instead of inheriting an answer.
+        Predicate::Ext(_)
+        | Predicate::PathGlob(_)
+        | Predicate::MinSize(_)
+        | Predicate::MaxSize(_)
+        | Predicate::Tag(_) => false,
+    }
+}
+
 /// The first age predicate in the tree, which is what `age_signal` reports.
 fn first_age_field(p: &Predicate) -> Option<TimeField> {
     match p {
@@ -267,7 +305,42 @@ fn compile_predicate(v: &serde_json::Value) -> Result<Predicate> {
         .as_object()
         .ok_or_else(|| MatchError::Invalid("match predicate must be an object".into()))?;
 
-    // Explicit combinators first.
+    // Explicit combinators first — and ALONE in their object. Returning the
+    // moment the key is seen drops every sibling key unread: `max_size` is
+    // discarded, WIDENING a rule whose action may destroy, and a typo'd
+    // predicate slips past the unknown-key refusal below that exists to catch
+    // exactly that.
+    //
+    // Refused rather than folded into a conjunction, because
+    // `{"any":[A,B],"max_size":N}` reads equally well as `(A|B) AND N` or as an
+    // `N` the author meant to put INSIDE the list. Guessing between two honest
+    // readings for a destructive rule is what the empty-list refusal already
+    // declines to do; say so, and let the author write the one they meant.
+    for combinator in ["all", "any", "not"] {
+        if obj.contains_key(combinator) && obj.len() > 1 {
+            let siblings = obj
+                .keys()
+                .filter(|k| k.as_str() != combinator)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("`, `");
+            // The rewrite depends on the combinator: `all` already IS the
+            // conjunction, so the siblings belong in its list; `any` and `not`
+            // have to be wrapped in one.
+            let rewrite = if combinator == "all" {
+                "move them into the `all` list".to_owned()
+            } else {
+                format!("wrap both in one: `{{\"all\": [ {{\"{combinator}\": ...}}, ... ]}}`")
+            };
+            return Err(MatchError::Invalid(format!(
+                "`{combinator}` must be the only key in its object, but it stands beside \
+                 `{siblings}`. Refusing rather than dropping them: a dropped predicate WIDENS \
+                 the rule, and the action may destroy files. If you meant a conjunction, \
+                 {rewrite}"
+            )));
+        }
+    }
+
     if let Some(list) = obj.get("all") {
         return Ok(Predicate::All(compile_list(list)?));
     }

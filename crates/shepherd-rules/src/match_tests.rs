@@ -235,6 +235,105 @@ fn a_rule_without_an_age_predicate_is_unaffected_by_atime_fidelity() {
     );
 }
 
+/// **The bypass `first_age_field` allowed.** The destructive-atime refusal read
+/// only the FIRST age predicate in the tree, so a compound rule whose leading
+/// condition is `mtime` walked straight past it — and the trailing `atime`
+/// condition was then evaluated under the fallback, silently selecting files by
+/// `mtime` for a rule the user wrote in terms of last access. §4.12's rejection
+/// is a property of the RULE, so every age predicate in it has to be checked.
+#[test]
+fn a_trailing_atime_predicate_is_refused_not_only_a_leading_one() {
+    for mode in [AtimeMode::Disabled, AtimeMode::Unknown] {
+        // Leading `mtime`, trailing `atime` — the shape that walked past it.
+        let err = Matcher::compile(
+            "sweep",
+            &serde_json::json!({
+                "all": [
+                    { "mtime_older_than_days": 30 },
+                    { "atime_older_than_days": 365 },
+                ]
+            }),
+            &tier(),
+            mode,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MatchError::AtimeUntrustworthy { .. }),
+            "{mode:?}: a trailing atime predicate must be refused, got {err}"
+        );
+
+        // And buried — under `any`, inside `not`. `older_than_days` is
+        // `Accessed`, whose fallback chain ends at the same untrusted atime, so
+        // depth and polarity change nothing about the answer.
+        let err = Matcher::compile(
+            "sweep-nested",
+            &serde_json::json!({
+                "any": [
+                    { "ext": ["tmp"] },
+                    { "not": { "all": [
+                        { "min_size": 10 },
+                        { "older_than_days": 365 },
+                    ] } },
+                ]
+            }),
+            &tier(),
+            mode,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MatchError::AtimeUntrustworthy { .. }),
+            "{mode:?}: a nested access predicate must be refused, got {err}"
+        );
+    }
+}
+
+/// The other direction, and the one that stops the fix from degenerating into
+/// "refuse every compound destructive rule". `mtime` and `ctime` are read
+/// straight off the file and owe nothing to atime fidelity, so a compound rule
+/// built only from those compiles on the worst root there is.
+#[test]
+fn a_compound_rule_with_no_atime_dependence_is_still_permitted() {
+    assert!(
+        Matcher::compile(
+            "old-big-raws",
+            &serde_json::json!({
+                "all": [
+                    { "mtime_older_than_days": 30 },
+                    { "ext": ["raw"] },
+                    { "not": { "ctime_older_than_days": 3650 } },
+                ]
+            }),
+            &tier(),
+            AtimeMode::Disabled,
+        )
+        .is_ok()
+    );
+}
+
+/// The traversal widens WHICH predicates are inspected. It must not widen WHICH
+/// modes are refused: `relatime` is Linux's default mount option and §4.12
+/// permits it, so a compound atime rule stays legal there.
+#[test]
+fn a_compound_atime_rule_is_still_permitted_under_relatime() {
+    for mode in [AtimeMode::Relatime, AtimeMode::Reliable] {
+        assert!(
+            Matcher::compile(
+                "sweep",
+                &serde_json::json!({
+                    "all": [
+                        { "mtime_older_than_days": 30 },
+                        { "atime_older_than_days": 365 },
+                    ]
+                }),
+                &tier(),
+                mode,
+            )
+            .is_ok(),
+            "{mode:?} must stay permitted"
+        );
+    }
+}
+
 /// §4.12's fallback order, and the provenance the preview must state.
 #[test]
 fn the_age_signal_follows_the_documented_fallback_order() {
@@ -305,6 +404,66 @@ fn an_unknown_predicate_key_is_refused_not_ignored() {
     match err {
         MatchError::Invalid(m) => assert!(m.contains("older_thn_days"), "{m}"),
         other => panic!("expected Invalid, got {other}"),
+    }
+}
+
+/// **A combinator must not be a hole in the rule above this one.** `all`, `any`
+/// and `not` returned the moment the key was seen, so anything beside them was
+/// dropped unread: `max_size` widened away, and — worse — a typo'd
+/// `older_thn_days` escaped the unknown-key refusal entirely, which is the very
+/// defect that refusal exists to catch.
+///
+/// Refused rather than folded into a conjunction, because
+/// `{"any":[A,B],"max_size":N}` has two honest readings — `(A|B) AND N`, or an
+/// `N` the author meant to put INSIDE the list — and picking one for a
+/// destructive rule is the guess the empty-list refusal already declines to
+/// make. Say so and let the author write what they meant.
+#[test]
+fn a_combinator_with_sibling_keys_is_refused_rather_than_silently_dropped() {
+    for bad in [
+        serde_json::json!({ "all": [ { "ext": ["raw"] } ], "max_size": 1000 }),
+        serde_json::json!({ "any": [ { "ext": ["raw"] } ], "min_size": 1000 }),
+        serde_json::json!({ "not": { "ext": ["tmp"] }, "max_size": 1000 }),
+        // The typo the combinator path let through: `older_thn_days` is refused
+        // in a flat object, and must not become acceptable beside an `all`.
+        serde_json::json!({ "all": [ { "ext": ["raw"] } ], "older_thn_days": 365 }),
+        // Two combinators are the same defect wearing a different hat — one of
+        // the two was being dropped.
+        serde_json::json!({ "all": [ { "ext": ["raw"] } ], "any": [ { "ext": ["cr2"] } ] }),
+    ] {
+        let err = Matcher::compile("sibling", &bad, &tier(), AtimeMode::Reliable)
+            .expect_err(&format!("{bad} must not compile"));
+        assert!(
+            matches!(err, MatchError::Invalid(_)),
+            "{bad}: expected Invalid, got {err}"
+        );
+    }
+
+    // And it NAMES what it refused. A refusal that says only "invalid" leaves
+    // the author to find the dropped key themselves, which is most of the
+    // distance back to dropping it silently.
+    let err = Matcher::compile(
+        "sibling",
+        &serde_json::json!({ "all": [ { "ext": ["raw"] } ], "max_size": 1000 }),
+        &tier(),
+        AtimeMode::Reliable,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("max_size") && err.contains("all"), "{err}");
+
+    // The refusal is about the SIBLINGS, not about combinators being suspect: a
+    // bare combinator — including one carrying the same predicate INSIDE the
+    // list, which is the rewrite the error asks for — still compiles.
+    for good in [
+        serde_json::json!({ "all": [ { "ext": ["raw"] }, { "max_size": 1000 } ] }),
+        serde_json::json!({ "any": [ { "ext": ["raw"] }, { "ext": ["cr2"] } ] }),
+        serde_json::json!({ "not": { "ext": ["tmp"] } }),
+    ] {
+        assert!(
+            Matcher::compile("bare", &good, &tier(), AtimeMode::Reliable).is_ok(),
+            "{good} must still compile"
+        );
     }
 }
 

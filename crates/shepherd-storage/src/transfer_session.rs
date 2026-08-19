@@ -52,7 +52,7 @@ use crate::adapter::{
     StorageError, StorageResult, verify_full_content,
 };
 use crate::multipart::{
-    DEFAULT_PART_SIZE, PartCheckpoint, PartPlan, Reconciliation, reconcile_parts,
+    DEFAULT_PART_SIZE, PartAction, PartCheckpoint, PartPlan, Reconciliation, reconcile_parts,
 };
 
 /// How a session ended once an abort was requested.
@@ -228,12 +228,20 @@ impl TransferSession {
                 len: 0,
                 local_blake3: Blake3Hash::from_bytes([0u8; 32]),
                 etag: None,
+                checksum: None,
             });
             self.parts.last_mut().expect("just pushed")
         }
     }
 
     /// Provider receipts for every acknowledged part, in ascending part order.
+    ///
+    /// The checkpoint's checksum is carried, not dropped.
+    /// `CompleteMultipartUpload` requires each part to echo back the checksum
+    /// the provider issued once the session was created with an algorithm —
+    /// `S3Adapter::complete_multipart` says so, and MinIO answers `InvalidPart`
+    /// when it is absent. Reconstructing these with `checksum: None` made every
+    /// upload to a successfully probed target fail at completion.
     fn acknowledged_receipts(&self) -> Vec<PartReceipt> {
         let mut v: Vec<PartReceipt> = self
             .parts
@@ -243,7 +251,7 @@ impl TransferSession {
                     part_no: p.part_no,
                     size: p.len,
                     etag: e.clone(),
-                    checksum: None,
+                    checksum: p.checksum.clone(),
                 })
             })
             .collect();
@@ -254,12 +262,16 @@ impl TransferSession {
     /// Abandon the provider session and start a new attempt epoch.
     ///
     /// Every part receipt is dropped: the receipts were issued by a session the
-    /// provider no longer knows, so they prove nothing about the new one.
+    /// provider no longer knows, so they prove nothing about the new one. That
+    /// includes the checksum — it is the provider's value for a part in a
+    /// session that no longer exists, and echoing it back at the next
+    /// completion would be quoting a receipt from a different upload.
     fn restart_attempt(&mut self) {
         self.attempt_epoch = self.attempt_epoch.saturating_add(1);
         self.upload_id = None;
         for p in &mut self.parts {
             p.etag = None;
+            p.checksum = None;
         }
         self.state = TransferState::Initiating;
     }
@@ -502,6 +514,41 @@ impl<'a> TransferDriver<'a> {
         let recon: Reconciliation = reconcile_parts(&session.plan, &session.parts, &remote);
         outcome.bytes_skipped = recon.bytes_skipped;
 
+        // Adopt the provider's per-part checksum for parts this resume is about
+        // to skip but whose checkpoint holds none — a checkpoint written before
+        // the field existed, or loaded from a store with no column for it.
+        //
+        // This is not the opaque-token rule being relaxed. `reconcile_parts`
+        // has already refused to skip anything the durable ETag and length did
+        // not vouch for, so the part's identity is settled before this runs;
+        // what is copied is the provider's own value for a part the provider
+        // has already been made to agree about, and the provider re-validates
+        // it at completion. The full BLAKE3 re-read in `Verifying` remains the
+        // authority on whether the object is right. Without this, a checkpoint
+        // the store could not hold a checksum for would either complete with
+        // `checksum: None` — the failure this closes — or re-upload every part
+        // on every resume.
+        let mut healed = false;
+        for cp in &mut session.parts {
+            if cp.checksum.is_some() || !cp.is_acknowledged() {
+                continue;
+            }
+            if recon.action_of(cp.part_no) != Some(PartAction::Skip) {
+                continue;
+            }
+            let from_provider = remote
+                .iter()
+                .find(|r| r.part_no == cp.part_no)
+                .and_then(|r| r.checksum.clone());
+            if from_provider.is_some() {
+                cp.checksum = from_provider;
+                healed = true;
+            }
+        }
+        if healed {
+            self.store.save(session).await?;
+        }
+
         for part_no in recon.pending().collect::<Vec<_>>() {
             let range = session
                 .plan
@@ -530,6 +577,7 @@ impl<'a> TransferDriver<'a> {
             cp.len = range.len;
             cp.local_blake3 = local_blake3;
             cp.etag = Some(receipt.etag);
+            cp.checksum = receipt.checksum;
             self.store.save(session).await?;
 
             outcome.bytes_uploaded += range.len;

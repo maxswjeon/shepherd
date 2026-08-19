@@ -47,7 +47,9 @@ pub struct Faults {
 
 #[derive(Debug, Default)]
 struct Upload {
-    parts: HashMap<u32, (Bytes, OpaqueToken)>,
+    /// Per part: the bytes, the opaque receipt, and the provider's own per-part
+    /// checksum when the session was created with a checksum algorithm.
+    parts: HashMap<u32, (Bytes, OpaqueToken, Option<String>)>,
     aborted: bool,
 }
 
@@ -76,6 +78,16 @@ struct Inner {
     /// digest-of-digests must be **dropped**. The second is a safety guard, and
     /// an untested safety guard is a comment.
     whole_object_checksum: Option<ObjectChecksum>,
+    /// Whether multipart sessions carry per-part checksums, as they do once a
+    /// target's registration probe adopted an algorithm.
+    part_checksums: bool,
+    /// The receipts `complete_multipart` was actually handed, in order.
+    ///
+    /// Recorded because "did completion succeed?" is a weaker question than
+    /// "what did completion send?". A resumed session that skipped a part must
+    /// still echo that part's provider checksum back, and the only place that
+    /// claim is observable is here.
+    completion_receipts: Vec<PartReceipt>,
 }
 
 /// An in-memory `StorageAdapter`.
@@ -128,6 +140,34 @@ impl MemAdapter {
     /// count makes it visibly a digest-of-digests.
     pub fn set_whole_object_checksum(&self, c: Option<ObjectChecksum>) {
         self.lock().whole_object_checksum = c;
+    }
+
+    /// Model a provider whose multipart sessions carry **per-part checksums**,
+    /// which is what a target produces once `target.add`'s registration probe
+    /// has adopted an algorithm.
+    ///
+    /// `upload_part` and `list_parts` then return a per-part value, and
+    /// `complete_multipart` **refuses a receipt that does not echo it back**.
+    /// That refusal is not invented: it is MinIO's, recorded verbatim at
+    /// `S3Adapter::complete_multipart` — "without it MinIO rejects the
+    /// completion with `InvalidPart` — the ETag alone is not enough once the
+    /// session was created with a checksum algorithm". Without modelling it,
+    /// every fake completion accepts `checksum: None` and the one configuration
+    /// a freshly registered S3 target actually produces is untested.
+    pub fn require_part_checksums(&self) {
+        self.lock().part_checksums = true;
+    }
+
+    /// The fake provider's per-part checksum: deterministic, and a function of
+    /// the bytes, so a part re-sent with different content gets a different
+    /// value.
+    fn part_checksum(body: &Bytes) -> String {
+        blake3::hash(body).to_hex()[..16].to_string()
+    }
+
+    /// The part receipts the last `complete_multipart` was handed.
+    pub fn completion_receipts(&self) -> Vec<PartReceipt> {
+        self.lock().completion_receipts.clone()
     }
 
     pub fn aborts(&self) -> Vec<String> {
@@ -268,6 +308,7 @@ impl StorageAdapter for MemAdapter {
         }
         let etag = Self::issue_token(&mut inner, "etag");
         let size = body.len() as u64;
+        let checksum = inner.part_checksums.then(|| Self::part_checksum(&body));
         let up = inner
             .uploads
             .get_mut(upload_id.as_opaque())
@@ -279,12 +320,13 @@ impl StorageAdapter for MemAdapter {
                 key: key.as_str().to_owned(),
             });
         }
-        up.parts.insert(part_no, (body, etag.clone()));
+        up.parts
+            .insert(part_no, (body, etag.clone(), checksum.clone()));
         Ok(PartReceipt {
             part_no,
             size,
             etag,
-            checksum: None,
+            checksum,
         })
     }
 
@@ -310,11 +352,11 @@ impl StorageAdapter for MemAdapter {
         let mut v: Vec<PartReceipt> = up
             .parts
             .iter()
-            .map(|(no, (b, e))| PartReceipt {
+            .map(|(no, (b, e, c))| PartReceipt {
                 part_no: *no,
                 size: b.len() as u64,
                 etag: e.clone(),
-                checksum: None,
+                checksum: c.clone(),
             })
             .collect();
         v.sort_by_key(|p| p.part_no);
@@ -336,6 +378,8 @@ impl StorageAdapter for MemAdapter {
                 detail: "If-None-Match: * — key exists".into(),
             });
         }
+        inner.completion_receipts = parts.to_vec();
+
         let up = inner
             .uploads
             .get(upload_id.as_opaque())
@@ -346,7 +390,7 @@ impl StorageAdapter for MemAdapter {
 
         let mut assembled = Vec::new();
         for want in parts {
-            let (bytes, etag) =
+            let (bytes, etag, checksum) =
                 up.parts
                     .get(&want.part_no)
                     .ok_or_else(|| StorageError::PreconditionFailed {
@@ -357,6 +401,19 @@ impl StorageAdapter for MemAdapter {
                 return Err(StorageError::PreconditionFailed {
                     key: key.as_str().to_owned(),
                     detail: format!("part {} etag mismatch", want.part_no),
+                });
+            }
+            // MinIO's `InvalidPart`: once the session carries a checksum
+            // algorithm, the ETag alone is not enough at completion.
+            if checksum.is_some() && want.checksum != *checksum {
+                return Err(StorageError::Provider {
+                    provider: "mem",
+                    op: "complete_multipart".into(),
+                    detail: format!(
+                        "InvalidPart: part {} was uploaded with checksum {:?} and the completion \
+                         echoed {:?}",
+                        want.part_no, checksum, want.checksum
+                    ),
                 });
             }
             assembled.extend_from_slice(bytes);

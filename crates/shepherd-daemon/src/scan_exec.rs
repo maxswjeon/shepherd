@@ -39,6 +39,7 @@
 
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use shepherd_catalog::file_repo::{Availability, FileRepo, ScanRoot};
 use shepherd_catalog::writer::CatalogWriter;
 use shepherd_catalog::{Catalog, CatalogError};
@@ -108,10 +109,14 @@ impl Executor for ScanExecutor {
             .try_with(move |cat| load_scan_input(cat, rid))
             .map_err(|e| e.to_string())?;
         let Some((root, patterns)) = loaded else {
-            // Not retryable in any useful sense — the root is gone. Returning
-            // Err lets the queue's backoff run its course and record why,
-            // rather than reporting success for work that did not happen.
-            return Err(format!("scan root {root_id} no longer exists"));
+            // Not retryable in any useful sense — the root is no longer
+            // registered, whether it was forgotten outright or deregistered
+            // with its catalog kept. Returning Err lets the queue's backoff run
+            // its course and record why, rather than reporting success for work
+            // that did not happen.
+            return Err(format!(
+                "scan root {root_id} is no longer registered for scanning"
+            ));
         };
 
         // PM-3: an unavailable root processes zero absences. Walking one would
@@ -208,10 +213,20 @@ impl Executor for ScanExecutor {
     }
 }
 
-/// The root plus its ignore patterns, in one actor round-trip.
+/// The root this executor may scan, plus its ignore patterns, in one actor
+/// round-trip.
 ///
-/// `ignore_patterns_json` is not on `ScanRoot` — `get_root` is the *identity*
-/// view — so it is read here rather than widening that struct for one caller.
+/// `ignore_patterns_json` and `enabled` are not on `ScanRoot` — `get_root` is
+/// the *identity* view — so they are read here rather than widening that struct
+/// for one caller.
+///
+/// `None` means **this root is not registered for scanning**, and it covers both
+/// forms that takes. `root.remove --forget` deletes the row; the default
+/// `root.remove` keeps the row and its catalog and clears `enabled`, because
+/// `file.root_id` cascades and deleting the row would take every custody record
+/// with it (see `dispatch::remove_root`). A queued job outliving either one must
+/// not walk the tree the user just deregistered, and this is the single point
+/// both reach.
 fn load_scan_input(
     cat: &mut Catalog,
     id: RootId,
@@ -219,14 +234,25 @@ fn load_scan_input(
     let Some(root) = FileRepo::new(cat).get_root(id)? else {
         return Ok(None);
     };
-    let raw: Option<String> = cat
+    // `?`, not `unwrap_or(None)`. `None` here has to mean "the column holds
+    // NULL", and nothing else: a failed read that becomes an empty list is a
+    // root that silently excludes nothing, which is the same wrong direction
+    // the malformed-JSON arm below refuses. `.optional()` keeps the one benign
+    // absence — no such row — separate from a failure to read one.
+    let row: Option<(Option<String>, bool)> = cat
         .conn()
         .query_row(
-            "SELECT ignore_patterns_json FROM scan_root WHERE id = ?1",
+            "SELECT ignore_patterns_json, enabled FROM scan_root WHERE id = ?1",
             rusqlite::params![id.get()],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
         )
-        .unwrap_or(None);
+        .optional()?;
+    let Some((raw, enabled)) = row else {
+        return Ok(None);
+    };
+    if !enabled {
+        return Ok(None);
+    }
     // A malformed pattern list must not silently become "ignore nothing":
     // AC-9's failure direction matters, because a file the user excluded
     // becoming eligible for tiering is the expensive mistake.
@@ -309,6 +335,94 @@ fn summarise_skips(skips: &[Skip]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root with `patterns`, in a fresh in-memory catalog.
+    fn seeded_root(patterns: &[String]) -> (Catalog, RootId) {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let id = FileRepo::new(&mut cat)
+            .insert_root(
+                "/data",
+                shepherd_core::StubMode::Delete,
+                shepherd_catalog::PathCasePolicy::Sensitive,
+                shepherd_catalog::PathNormPolicy::Nfc,
+                shepherd_catalog::AtimeMode::Relatime,
+                None,
+                false,
+                patterns,
+                shepherd_core::Timestamp::from_nanos(1),
+            )
+            .unwrap();
+        (cat, id)
+    }
+
+    /// The ordinary path, asserted so the refusal below cannot be satisfied by
+    /// a `load_scan_input` that has simply stopped working.
+    #[test]
+    fn a_roots_stored_ignore_patterns_reach_the_scan() {
+        let (mut cat, id) = seeded_root(&["*.tmp".to_string(), "cache/".to_string()]);
+        let (_root, patterns) = load_scan_input(&mut cat, id).unwrap().unwrap();
+        assert_eq!(patterns, vec!["*.tmp".to_string(), "cache/".to_string()]);
+    }
+
+    /// A catalog failure reading the ignore list must fail the scan, not read
+    /// as "this root excludes nothing".
+    ///
+    /// The direction is the whole point, and it is the one the malformed-JSON
+    /// arm of the same function already gets right: a file the user explicitly
+    /// excluded, catalogued anyway, becomes a tiering candidate. `unwrap_or(None)`
+    /// collapsed *every* failure of this query — transient, corrupt row, type
+    /// mismatch — into the empty list, which is indistinguishable on the far
+    /// side from a root that legitimately names no exclusions.
+    ///
+    /// The blob stands in for that class of failure: SQLite's TEXT affinity
+    /// stores a blob as a blob, so reading the column as text fails the way a
+    /// corrupt row would.
+    #[test]
+    fn a_catalog_failure_reading_the_ignore_list_fails_the_scan() {
+        let (mut cat, id) = seeded_root(&["*.tmp".to_string()]);
+        cat.conn_mut()
+            .execute(
+                "UPDATE scan_root SET ignore_patterns_json = X'00ff' WHERE id = ?1",
+                rusqlite::params![id.get()],
+            )
+            .unwrap();
+
+        let err = load_scan_input(&mut cat, id)
+            .expect_err("a failed read of the ignore list must not be reported as `no patterns`");
+        assert!(
+            err.to_string().contains("ignore_patterns_json"),
+            "the error must name the column that could not be read, got: {err}"
+        );
+    }
+
+    /// A deregistered root must not be walked by a job that outlived it.
+    ///
+    /// `root.remove` without `--forget` now keeps the row and every catalog row
+    /// under it and clears `enabled`, because deleting the row cascades away the
+    /// custody records (see `dispatch::remove_root`). That is the only reason a
+    /// `scan_root` row can be present and yet not be a scan target, and if this
+    /// executor did not know the difference, removing a root would stop the
+    /// listing without stopping the scanning.
+    #[test]
+    fn a_deregistered_root_is_not_a_scan_target() {
+        let (mut cat, id) = seeded_root(&[]);
+        assert!(
+            load_scan_input(&mut cat, id).unwrap().is_some(),
+            "the root is scannable while it is registered"
+        );
+
+        cat.conn_mut()
+            .execute(
+                "UPDATE scan_root SET enabled = 0 WHERE id = ?1",
+                rusqlite::params![id.get()],
+            )
+            .unwrap();
+
+        assert!(
+            load_scan_input(&mut cat, id).unwrap().is_none(),
+            "a root the user removed must not be scanned merely because its catalog was kept"
+        );
+    }
 
     #[test]
     fn skips_are_summarised_by_kind() {

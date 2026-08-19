@@ -9,7 +9,7 @@
     },
     "forget_catalog": {
       "default": false,
-      "description": "Also drop the root's catalog rows. File bytes are never touched.",
+      "description": "Also drop the root's catalog rows. File bytes are never touched.\n\nWithout it the root is deregistered and every row under it is kept,\nbecause a custody row is the only address of a file that no longer exists\nlocally.",
       "type": "boolean"
     },
     "root_id": {
@@ -26,7 +26,7 @@
   "x-shepherd": {
     "generator": "cargo xtask codegen",
     "generator_version": 1,
-    "proto_version": "1.2",
+    "proto_version": "1.3",
     "registry_fingerprint": "ec2b4050376aac73",
     "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
   }

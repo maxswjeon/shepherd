@@ -186,7 +186,14 @@ pub trait PlaceholderProvider: Send + Sync + fmt::Debug {
     ///
     /// Reversible: [`PlaceholderProvider::restore_staged`] undoes it. Not a
     /// tracked destructive symbol, so any module may call it.
-    fn stage_for_destruction(&self, path: &Path) -> Result<Staged>;
+    ///
+    /// `root` is the **registered scan root**, and it is a parameter rather
+    /// than something this method derives because it is the same `root`
+    /// [`PlaceholderProvider::list_staged`] is called with at startup. Deriving
+    /// it from `path` — the file's own parent, say — puts the staged entry
+    /// somewhere recovery does not look, and bytes recovery cannot find are
+    /// bytes the user has lost.
+    fn stage_for_destruction(&self, root: &Path, path: &Path) -> Result<Staged>;
 
     /// §4.10.1 step 6 — **the irreversible one**.
     ///

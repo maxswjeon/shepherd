@@ -738,6 +738,15 @@ pub enum AttemptError {
     /// The probe never got an answer — a timeout, a dropped connection, a 5xx.
     /// Evidence about the network, and about nothing else.
     Unreachable { step: &'static str, detail: String },
+    /// The provider answered, and its answer was about something other than the
+    /// checksum algorithm: the credential, the permission, or the bucket.
+    ///
+    /// The third direction, and the one whose absence made `Unsupported` a
+    /// dumping ground. `AccessDenied` is a complete, non-transient, perfectly
+    /// well-formed provider answer — it is simply not an answer to the question
+    /// asked, and folding it into `Unsupported` lets a bucket nobody can write
+    /// to be registered as one that merely lacks CRC64NVME.
+    Fatal { step: &'static str, detail: String },
 }
 
 /// What one algorithm's probe did.
@@ -888,6 +897,20 @@ where
                     ),
                 });
             }
+            Err(AttemptError::Fatal { step, detail }) => {
+                return Err(StorageError::Provider {
+                    provider: "s3",
+                    op: format!("probing {} at {step}", alg.as_str()),
+                    detail: format!(
+                        "{detail} — the provider answered, but about authentication, \
+                         authorization or the bucket itself, not about checksum support. This \
+                         target is unusable as configured; it is not a target that lacks \
+                         whole-object checksums. Registering on this result would persist \
+                         `adopted: none` as though it had been measured, and that answer is \
+                         irreversible per object."
+                    ),
+                });
+            }
         }
     }
 
@@ -1014,15 +1037,78 @@ impl ChecksumRoundTrip for S3RoundTrip {
     }
 }
 
-/// Which side of the [`AttemptError`] split a storage failure lands on.
+/// The S3 error codes that are an answer about **checksum support**.
+///
+/// An allowlist, and the direction matters. "The provider answered, so it is
+/// evidence" is true but too coarse: `AccessDenied` is also an answer, and
+/// treating every answer as checksum evidence is how a bucket nobody can write
+/// to gets registered as one that merely lacks CRC64NVME. So an unrecognized
+/// code fails registration, loudly and with the code in the message, rather
+/// than being recorded as non-support — because a wrong `adopted: none` is
+/// permanent per object and costs 649x (ADR 0b §3), while a wrong refusal costs
+/// one re-run of `target.add`.
+///
+/// Seeded only with codes there is evidence for, rather than a guessed vendor
+/// list: `InvalidArgument` is what MinIO returns for a checksum-algorithm
+/// mismatch (recorded verbatim at [`S3Adapter::upload_part`]), `InvalidRequest`
+/// is AWS's answer to an unacceptable checksum algorithm, and `NotImplemented`
+/// is how an S3-compatible provider says it does not offer the feature at all.
+/// A provider that refuses with some fourth code will fail registration once,
+/// visibly, with that code quoted — which is the signal needed to add it here,
+/// and is recoverable in a way that a silent negative is not.
+const CHECKSUM_REJECTION_CODES: &[&str] = &["InvalidArgument", "InvalidRequest", "NotImplemented"];
+
+/// The S3 error code [`S3Adapter::map_err`] folded into a
+/// [`StorageError::Provider`] detail, or `""` when it recorded none.
+///
+/// The inverse of one `format!` rather than a parser: `map_err` writes
+/// `"{code}: {detail}"` when the SDK reported a code and the bare message when
+/// it did not, and S3 error codes are single CamelCase tokens. A prefix
+/// carrying anything but alphanumerics is therefore prose, not a code, and
+/// reads as "no code" — which fails closed, since an unrecognized code is
+/// fatal. Pinned by `the_probe_reads_the_error_code_map_err_wrote`.
+fn provider_error_code(detail: &str) -> &str {
+    match detail.split_once(':') {
+        Some((code, _)) if !code.is_empty() && code.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            code
+        }
+        _ => "",
+    }
+}
+
+/// Which of the three [`AttemptError`] directions a storage failure lands on.
 ///
 /// [`StorageError::Transient`] is the crate's own "this never reached the
 /// service" classification — `map_err` puts dispatch failures, timeouts and
-/// 5xx there. Everything else is the provider answering, which is evidence.
+/// 5xx there. Everything else is the provider answering, but an answer is only
+/// evidence about checksums when it is an answer *about checksums*: see
+/// [`CHECKSUM_REJECTION_CODES`].
+///
+/// The structured variants are routed deliberately rather than swept into the
+/// catch-all. [`StorageError::Unsupported`] is the adapter itself reporting a
+/// missing primitive, which is exactly the claim being probed for.
+/// `NoSuchUpload`, `NotFound`, `PreconditionFailed` and `ContentMismatch`
+/// during a probe mean the round trip came apart for reasons that have nothing
+/// to do with the algorithm, so they refuse registration instead of being
+/// recorded as non-support.
+///
+/// Probe-only: [`S3RoundTrip`] is its sole caller, so nothing here changes how
+/// a production upload's errors are mapped.
 fn classify(step: &'static str, e: StorageError) -> AttemptError {
+    let about_checksums = match &e {
+        StorageError::Unsupported { .. } => true,
+        StorageError::Provider { detail, .. } => {
+            CHECKSUM_REJECTION_CODES.contains(&provider_error_code(detail))
+        }
+        _ => false,
+    };
     match e {
         StorageError::Transient { detail, .. } => AttemptError::Unreachable { step, detail },
-        other => AttemptError::Unsupported {
+        other if about_checksums => AttemptError::Unsupported {
+            step,
+            detail: other.to_string(),
+        },
+        other => AttemptError::Fatal {
             step,
             detail: other.to_string(),
         },
@@ -1052,8 +1138,12 @@ fn classify(step: &'static str, e: StorageError) -> AttemptError {
 /// * `Ok(probe)` with `adopted: None` — the provider answered and supports none
 ///   of the three. Legitimate, and the R2/B2 case this cannot guess at. Scrub
 ///   degrades to full reads: expensive, never wrong.
-/// * `Err(_)` — the provider was never reached. **Not** a statement about the
-///   provider, and a caller must not persist it as one.
+/// * `Err(StorageError::Transient)` — the provider was never reached. **Not** a
+///   statement about the provider, and a caller must not persist it as one.
+/// * `Err(StorageError::Provider)` — the provider answered, about credentials,
+///   permissions or the bucket rather than about checksums. The target is
+///   unusable as configured, which is a different fact from "supports none of
+///   the three" and must not be recorded as that one.
 ///
 /// The probe leaves one ~10 MiB control object per attempted algorithm under
 /// `_shepherd/probe/` while it runs and deletes it afterwards.
@@ -1268,6 +1358,145 @@ mod probe_tests {
             .map(|a| probe_key(*a).as_key().as_str().to_string())
             .collect();
         assert_eq!(keys.len(), 3);
+    }
+
+    fn provider(detail: &str) -> StorageError {
+        StorageError::Provider {
+            provider: "s3",
+            op: "create_multipart".into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// The extractor is the inverse of `map_err`'s `format!`, so it is pinned
+    /// against the shapes that function actually writes rather than against
+    /// invented ones.
+    #[test]
+    fn the_probe_reads_the_error_code_map_err_wrote() {
+        assert_eq!(
+            provider_error_code("AccessDenied: Access Denied"),
+            "AccessDenied"
+        );
+        assert_eq!(
+            provider_error_code("InvalidArgument: checksum missing, want \"CRC64NVME\""),
+            "InvalidArgument"
+        );
+        // `map_err` passes the message through unprefixed when the SDK reported
+        // no code. Prose must not be mistaken for a code — and reading it as
+        // "no code" is the fail-closed direction, since an unrecognized code is
+        // fatal.
+        assert_eq!(provider_error_code("dispatch failure: reset by peer"), "");
+        assert_eq!(provider_error_code("no colon at all"), "");
+    }
+
+    /// **Authentication is not a checksum answer.**
+    ///
+    /// Each of these is a complete, non-transient provider response, and none
+    /// of them says anything about whether the bucket can produce a FULL_OBJECT
+    /// checksum. Classifying them as `Unsupported` is what let `target.add`
+    /// persist an unusable target with the $441/month configuration recorded as
+    /// though it had been measured.
+    #[test]
+    fn authentication_and_bucket_failures_are_fatal_not_unsupported() {
+        for code in [
+            "AccessDenied",
+            "InvalidAccessKeyId",
+            "SignatureDoesNotMatch",
+            "NoSuchBucket",
+            "ExpiredToken",
+        ] {
+            let got = classify("create_multipart", provider(&format!("{code}: refused")));
+            match got {
+                AttemptError::Fatal { step, ref detail } => {
+                    assert_eq!(step, "create_multipart");
+                    assert!(detail.contains(code), "the code must survive: {detail}");
+                }
+                other => panic!("{code} was classified as {other:?}, not as fatal"),
+            }
+        }
+    }
+
+    /// The paired non-zero. Without it the guard above is satisfiable by
+    /// "everything is fatal", which would refuse every legitimate R2/B2 bucket.
+    #[test]
+    fn a_checksum_specific_rejection_is_still_a_negative_result() {
+        for code in CHECKSUM_REJECTION_CODES {
+            assert!(
+                matches!(
+                    classify(
+                        "upload_part",
+                        provider(&format!("{code}: bad checksum algorithm"))
+                    ),
+                    AttemptError::Unsupported { .. }
+                ),
+                "{code} is a provider answering about checksums and must stay a negative"
+            );
+        }
+        // And the adapter's own "this provider lacks the primitive" is exactly
+        // the claim being probed for.
+        assert!(matches!(
+            classify(
+                "create_multipart",
+                StorageError::Unsupported {
+                    provider: "s3",
+                    what: "full-object checksums".into()
+                }
+            ),
+            AttemptError::Unsupported { .. }
+        ));
+    }
+
+    /// A transport failure must still be `Unreachable` and not swept into the
+    /// new variant — the two refusals are different errors on purpose, and only
+    /// one of them is retryable.
+    #[test]
+    fn a_transport_failure_is_still_unreachable_not_fatal() {
+        assert!(matches!(
+            classify(
+                "head",
+                StorageError::Transient {
+                    op: "head".into(),
+                    detail: "connection reset".into()
+                }
+            ),
+            AttemptError::Unreachable { .. }
+        ));
+    }
+
+    /// End to end: a bucket that answers `AccessDenied` to every algorithm must
+    /// fail registration rather than produce `adopted: None`.
+    #[test]
+    fn an_auth_failure_refuses_registration_instead_of_recording_no_support() {
+        let f = Fake::new(&[(
+            "CRC64NVME",
+            Err(AttemptError::Fatal {
+                step: "create_multipart",
+                detail: "s3 error on create_multipart: AccessDenied: Access Denied".into(),
+            }),
+        )]);
+        let err = run(&f).expect_err(
+            "an unusable bucket must not produce a probe record — `adopted: None` is the \
+             $441/month answer and it is irreversible per object",
+        );
+        let text = err.to_string();
+        // The refusal names authentication, not checksum support.
+        assert!(
+            text.contains("AccessDenied") && text.contains("authentication"),
+            "the refusal must say it is about credentials rather than checksums: {text}"
+        );
+        assert!(
+            !text.contains("does not support"),
+            "the refusal must not read as a checksum verdict: {text}"
+        );
+        // Not retryable: `AccessDenied` retried forever is its own bug, which
+        // is why this is `Provider` rather than `Transient`.
+        assert!(
+            matches!(err, StorageError::Provider { .. }) && !err.is_retryable(),
+            "{err:?}"
+        );
+        // It stopped rather than spending two more 10 MiB uploads proving the
+        // same credential still cannot write.
+        assert_eq!(f.asked(), ["CRC64NVME"]);
     }
 }
 

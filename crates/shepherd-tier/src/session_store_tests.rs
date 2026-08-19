@@ -139,6 +139,7 @@ async fn a_session_round_trips_through_a_real_file() {
             len: 16,
             local_blake3: Blake3Hash::from_bytes([9u8; 32]),
             etag: Some(OpaqueToken::new("etag-1")),
+            checksum: None,
         });
         store.save(&s).await.expect("save");
         s
@@ -324,6 +325,7 @@ async fn the_actor_backend_round_trips_identically_to_the_owned_one() {
             len: 16,
             local_blake3: Blake3Hash::from_bytes([3u8; 32]),
             etag: Some(OpaqueToken::new("etag-actor")),
+            checksum: None,
         });
         s
     };
@@ -384,6 +386,7 @@ fn session_for(job: JobId, item: &TierItem, tag: &str) -> TransferSession {
         len: 16,
         local_blake3: Blake3Hash::from_bytes([5u8; 32]),
         etag: Some(OpaqueToken::new(format!("etag-{tag}"))),
+        checksum: None,
     });
     s
 }

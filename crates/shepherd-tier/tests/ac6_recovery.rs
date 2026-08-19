@@ -187,6 +187,14 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     };
     let audit = AuditLog::open(&tmp.0.join("audit.jsonl")).unwrap();
 
+    // The catalog's identity for the doomed file, from the catalog's own
+    // function. The destroy path serializes on this, not on `<dev>:<ino>`.
+    let doomed_fs_id = shepherd_catalog::volume::fs_id(
+        &doomed,
+        root.volume_id.as_deref().expect("the ac6 root has one"),
+    )
+    .expect("fs_id");
+
     let destroyed = execute_local_destruction(
         &LocalDestroyRequest {
             intent: IntentId::new(1),
@@ -195,6 +203,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
             expected_hash: doomed_hash,
             expected_size: doomed_bytes.len() as u64,
             verified_identity: identity_of(&doomed),
+            fs_id: &doomed_fs_id,
             age: Duration::from_secs(3600),
             floor_policy: FloorPolicy {
                 min_size: 1024,

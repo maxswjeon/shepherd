@@ -406,3 +406,164 @@ async fn an_abort_that_the_provider_did_not_confirm_is_recorded_as_ambiguous() {
     let out = rig.driver().run(&mut s).await.expect("abort");
     assert_eq!(out.state, TransferState::Aborted(AbortOutcome::Clean));
 }
+
+/// **A freshly registered S3 target must be able to finish an upload.**
+///
+/// `target.add` now probes for a whole-object checksum and adopts one at
+/// registration, so "the session carries a checksum algorithm" is not a corner
+/// case — it is what a newly registered target produces. In that configuration
+/// `upload_part` returns a per-part checksum and `complete_multipart` requires
+/// it echoed back: MinIO answers `InvalidPart` otherwise, which
+/// `S3Adapter::complete_multipart` records verbatim.
+///
+/// No crash, no restart, no fault injection. This is the ordinary happy path on
+/// the configuration the probe hands back.
+#[tokio::test]
+async fn a_checksum_enabled_session_completes_without_any_restart() {
+    let rig = Rig::new(false);
+    rig.adapter.require_part_checksums();
+    let mut s = rig.session();
+
+    let out = rig
+        .driver()
+        .run(&mut s)
+        .await
+        .expect("a session on a successfully probed target must complete");
+
+    assert_eq!(out.state, TransferState::Committed);
+    assert_eq!(out.parts_sent, 4);
+    assert_eq!(
+        rig.adapter.object(&rig.key).expect("object").as_ref(),
+        rig.source.body().as_ref(),
+        "the assembled object must be byte-identical to the source"
+    );
+}
+
+/// **A checkpoint that carries no checksum must be healed, not trusted and not
+/// re-sent.**
+///
+/// Two things produce exactly this shape and neither is hypothetical: a
+/// checkpoint serialized before the `checksum` field existed, and a durable
+/// store whose `transfer_part` table has no column for it. Both read back with
+/// the ETag intact and the checksum absent.
+///
+/// Trusting it means completing with `checksum: None` on a checksum-enabled
+/// session, which the provider rejects — the original bug, surviving a restart.
+/// Refusing to skip it means re-uploading every part on every resume against
+/// any provider that reports per-part checksums, which is AC-2's failure
+/// condition. Neither is acceptable, so the driver adopts the provider's own
+/// value for a part whose ETag and length already agree.
+#[tokio::test]
+async fn a_resume_heals_checkpoints_that_carry_no_checksum() {
+    let rig = Rig::new(false);
+    rig.adapter.require_part_checksums();
+    let mut s = rig.session();
+
+    // Same kill point as AC-2: parts 1 and 2 durably acknowledged.
+    rig.store.die_at_save(5);
+    let err = rig.driver().run(&mut s).await.expect_err("must die");
+    assert!(err.is_retryable(), "a lost write is transient: {err}");
+
+    // --- restart, through a store that never had a checksum column ---
+    rig.store.revive();
+    let mut resumed = rig.reload().await;
+    for p in &mut resumed.parts {
+        p.checksum = None;
+    }
+    assert_eq!(
+        resumed.parts.iter().filter(|p| p.is_acknowledged()).count(),
+        2,
+        "the ETags survived; only the checksums were never stored"
+    );
+
+    let out = rig
+        .driver()
+        .run(&mut resumed)
+        .await
+        .expect("a resume must not be blocked by a checksum the store could not hold");
+
+    assert_eq!(out.state, TransferState::Committed);
+    assert_eq!(
+        out.bytes_skipped,
+        2 * PART,
+        "the two acknowledged parts must still be skipped — re-sending them is the AC-2 \
+         regression this fix must not buy"
+    );
+    assert!(
+        resumed
+            .parts
+            .iter()
+            .filter(|p| p.is_acknowledged())
+            .all(|p| p.checksum.is_some()),
+        "every acknowledged part must end up holding the provider's checksum: {:?}",
+        resumed.parts
+    );
+    assert_eq!(
+        rig.adapter.object(&rig.key).expect("object").as_ref(),
+        rig.source.body().as_ref()
+    );
+}
+
+/// **The heal is observable where it matters: in what completion was sent.**
+///
+/// `a_resume_heals_checkpoints_that_carry_no_checksum` asserts the resume
+/// commits, which a fake could satisfy by being lenient. The failure being
+/// guarded against is `CompleteMultipartUpload` refusing a resumed
+/// checksum-enabled session, so the load-bearing claim is about the receipts
+/// completion was handed — specifically that a part which was **skipped**
+/// rather than re-sent still carried the provider's own checksum back.
+#[tokio::test]
+async fn a_healed_resume_echoes_the_providers_checksum_for_parts_it_skipped() {
+    let rig = Rig::new(false);
+    rig.adapter.require_part_checksums();
+    let mut s = rig.session();
+
+    rig.store.die_at_save(5);
+    rig.driver().run(&mut s).await.expect_err("must die");
+    rig.store.revive();
+
+    let mut resumed = rig.reload().await;
+    // A store with no checksum column returns exactly this.
+    for p in &mut resumed.parts {
+        p.checksum = None;
+    }
+
+    // What the provider itself holds for the parts that survived the crash.
+    let upload = resumed.upload_id.clone().expect("a live provider session");
+    let held = rig
+        .adapter
+        .list_parts(&rig.key, &upload)
+        .await
+        .expect("list_parts");
+    let expected: Vec<(u32, Option<String>)> = held
+        .iter()
+        .map(|r| (r.part_no, r.checksum.clone()))
+        .collect();
+    assert!(
+        expected.iter().all(|(_, c)| c.is_some()),
+        "the fixture is only meaningful if the provider reports checksums: {expected:?}"
+    );
+
+    let out = rig.driver().run(&mut resumed).await.expect("resume");
+    assert_eq!(out.state, TransferState::Committed);
+    assert_eq!(
+        out.bytes_skipped,
+        2 * PART,
+        "the healed parts must have been SKIPPED — a re-send would supply the checksum \
+         trivially and prove nothing"
+    );
+
+    let sent = rig.adapter.completion_receipts();
+    assert_eq!(sent.len(), 4);
+    for (part_no, provider_value) in expected {
+        let r = sent
+            .iter()
+            .find(|r| r.part_no == part_no)
+            .expect("every part must appear in the completion");
+        assert_eq!(
+            r.checksum, provider_value,
+            "part {part_no} was skipped, so its completion receipt can only carry a checksum \
+             the resume adopted from the provider — and it must be the provider's own value"
+        );
+    }
+}

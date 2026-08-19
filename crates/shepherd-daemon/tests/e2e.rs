@@ -29,6 +29,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -77,6 +78,43 @@ impl Daemon {
             cmd.env(k, v);
         }
         let child = cmd.spawn().expect("spawn shepherdd");
+
+        let d = Daemon { child, dir, socket };
+        d.wait_until_listening();
+        d
+    }
+
+    /// A daemon whose socket does **not** live in its state directory.
+    ///
+    /// That split is the ordinary Linux layout — §4.3 puts the socket in
+    /// `$XDG_RUNTIME_DIR` and the catalog in `$XDG_STATE_HOME` — and the usual
+    /// harness hides it. When the socket's parent *is* the state directory,
+    /// `server::bind`'s own `0700` on the socket directory tightens the state
+    /// directory as a side effect, so a mode assertion there would be asserting
+    /// `bind`'s work rather than the state directory's own.
+    ///
+    /// `dir` is the enclosing temp directory here, not the state directory, so
+    /// that `Drop` cleans up both. The state directory is `dir.join("state")`;
+    /// the catalog helpers above, which look for `catalog.db` directly under
+    /// `dir`, are not usable on a daemon started this way.
+    fn start_with_socket_outside_the_state_dir(tag: &str) -> Daemon {
+        let dir = std::env::temp_dir().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        // Explicitly, rather than by inheriting whatever umask the test runner
+        // has: the case under test is a state directory that already exists and
+        // is readable by every account on the host, which is what
+        // `create_dir_all` produces under the usual `022`.
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let socket = dir.join("daemon.sock");
+        let child = Command::new(env!("CARGO_BIN_EXE_shepherdd"))
+            .arg("run")
+            .env("SHEPHERD_STATE_DIR", &state)
+            .env("SHEPHERD_SOCKET", &socket)
+            .spawn()
+            .expect("spawn shepherdd");
 
         let d = Daemon { child, dir, socket };
         d.wait_until_listening();
@@ -420,6 +458,87 @@ fn roots_can_be_added_listed_and_removed() {
             .unwrap()
             .len(),
         0
+    );
+}
+
+/// The default `root.remove` deregisters a root. It must not delete its catalog.
+///
+/// `file.root_id` is `INTEGER NOT NULL REFERENCES scan_root(id) ON DELETE
+/// CASCADE`, so deleting the `scan_root` row deleted every file row under it —
+/// custody rows included, and a custody row is a tiered file's only remote
+/// address. That ran on the path that reports `catalog_rows_dropped: 0`, and
+/// past the custody refusal, which only runs when `forget_catalog` is true.
+///
+/// Both halves are asserted here because either alone is satisfiable by a bug:
+/// a removal that reports dropping nothing must leave the rows countable
+/// afterwards, and `--forget` must still drop them. The rows are read back
+/// through `status` and `root.list --include-disabled` rather than out of the
+/// database file, so what is under test is what a client can actually see.
+#[test]
+fn a_default_root_remove_keeps_the_catalog_and_forget_still_drops_it() {
+    let d = Daemon::start("softremove");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-softremove");
+    write_file(&root_dir, "a.txt", "hello");
+    write_file(&root_dir, "nested/b.txt", "world");
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    scan_and_expect(&mut c, root_id, 2);
+
+    let removed = c.call("root.remove", serde_json::json!({"root_id": root_id}));
+    assert_eq!(removed["catalog_rows_dropped"], serde_json::json!(0));
+    assert_eq!(removed["custody_rows_dropped"], serde_json::json!(0));
+
+    // The report claimed it dropped nothing. That has to be true of the catalog.
+    let status = c.call("status", serde_json::json!({}));
+    assert_eq!(
+        status["files_catalogued"],
+        serde_json::json!(2),
+        "a removal that reported dropping no rows must not have dropped any: {status}"
+    );
+
+    assert!(
+        c.call("root.list", serde_json::json!({}))["roots"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a removed root is deregistered, so the ordinary listing no longer shows it"
+    );
+    let all = c.call("root.list", serde_json::json!({"include_disabled": true}));
+    let rows = all["roots"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the root row must still be there — it is what the surviving file rows hang off, \
+         and what a later `--forget` needs to find: {all}"
+    );
+    assert_eq!(rows[0]["enabled"], serde_json::json!(false), "{all}");
+    assert_eq!(
+        rows[0]["file_count"],
+        serde_json::json!(2),
+        "the rows are still reachable through the root that owns them: {all}"
+    );
+
+    // And the path that says it destroys still destroys.
+    let forgotten = c.call(
+        "root.remove",
+        serde_json::json!({"root_id": root_id, "forget_catalog": true}),
+    );
+    assert_eq!(forgotten["catalog_rows_dropped"], serde_json::json!(2));
+    let status = c.call("status", serde_json::json!({}));
+    assert_eq!(status["files_catalogued"], serde_json::json!(0), "{status}");
+    assert!(
+        c.call("root.list", serde_json::json!({"include_disabled": true}))["roots"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "`--forget` removes the root row as well"
     );
 }
 
@@ -1111,6 +1230,161 @@ fn events_subscribe_answers_with_an_epoch_and_a_cursor() {
     );
 }
 
+/// Give the daemon a scan's worth of events to buffer, and return the root id.
+fn seed_some_events(d: &Daemon, c: &mut Client, tag: &str) -> i64 {
+    let root_dir = d.dir.join(format!("corpus-{tag}"));
+    write_file(&root_dir, "a.txt", "hello");
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    scan_and_expect(c, root_id, 1);
+    root_id
+}
+
+/// `events.subscribe` must put its own response on the socket before it writes
+/// a single notification.
+///
+/// A client reads the frame that follows a request and parses it as a response
+/// — `shepctl events subscribe` reaches the daemon through `client::call`,
+/// which does precisely that and nothing else. Replay used to be written first,
+/// so a notification landed where the subscription id should have been and the
+/// call died as a protocol error. `resume_from` made that the **normal**
+/// outcome rather than a race: every resuming subscription failed.
+///
+/// The `replayed >= 1` assertion is what stops this passing vacuously — with an
+/// empty replay there is nothing that could have overtaken the response.
+#[test]
+fn a_resuming_subscription_is_answered_before_the_frames_it_replays() {
+    let d = Daemon::start("resumeorder");
+    let mut c = d.connect();
+    seed_some_events(&d, &mut c, "resumeorder");
+
+    // A fresh connection, so nothing else is in flight on it.
+    let mut sub = d.connect();
+    let first = sub.raw("events.subscribe", serde_json::json!({"resume_from": 0}));
+
+    assert!(
+        first.get("method").is_none(),
+        "the first frame after `events.subscribe` must be its RpcResponse; a notification \
+         here is what a client reports as a protocol error: {first}"
+    );
+    let parsed: RpcResponse = serde_json::from_value(first.clone())
+        .unwrap_or_else(|e| panic!("the first frame is not a JSON-RPC response ({e}): {first}"));
+    let result = parsed.outcome().expect("the subscription was refused");
+    assert!(result["subscription_id"].as_u64().unwrap() >= 1, "{result}");
+    assert_eq!(
+        result["resume"]["outcome"],
+        serde_json::json!("resumed"),
+        "{result}"
+    );
+    let replayed = result["resume"]["replayed"].as_u64().unwrap();
+    assert!(
+        replayed >= 1,
+        "nothing was replayed, so this test proves nothing about ordering: {result}"
+    );
+
+    // And the replayed frames follow it, in order, before anything live.
+    let mut last_seq = 0;
+    for i in 0..replayed {
+        let frame = sub.read_frame();
+        assert_eq!(
+            frame["method"],
+            serde_json::json!("event"),
+            "replayed frame {i} is not a notification: {frame}"
+        );
+        let seq = frame["params"]["seq"].as_u64().unwrap();
+        assert!(
+            seq > last_seq,
+            "replay went backwards at frame {i}: {frame}"
+        );
+        last_seq = seq;
+    }
+
+    // The exposed path, exercised as a user reaches it. `client::call` reads
+    // one frame and parses it as a response, so this is the whole finding in
+    // one exit code.
+    let out = Command::new(shepctl())
+        .arg("--socket")
+        .arg(&d.socket)
+        .args(["events", "subscribe", "--resume-from", "0", "--json"])
+        .output()
+        .expect("run shepctl");
+    let env: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("shepctl --json emits one JSON document");
+    assert_eq!(
+        env["ok"],
+        serde_json::json!(true),
+        "`shepctl events subscribe --resume-from` must not fail on its own daemon's reply: \
+         {env}"
+    );
+    assert!(
+        env["data"]["subscription_id"].as_u64().unwrap() >= 1,
+        "{env}"
+    );
+}
+
+/// A resume cursor means nothing outside the daemon run that issued it.
+///
+/// Sequence numbers restart at 1 on every launch, so a cursor carried across a
+/// restart names a *different* event under the same number. `SubscribeResult`
+/// has always returned the `epoch` that makes that detectable, but the request
+/// had nowhere to send one back: the daemon passed no client epoch and its
+/// `EpochChanged` branch was unreachable, so a reconnecting client was replayed
+/// whatever new-run events happened to sit past its old cursor.
+///
+/// Both directions are asserted. A daemon that answered `epoch_changed` to
+/// everything would satisfy the first half and be useless.
+#[test]
+fn a_cursor_from_another_run_is_told_to_take_a_snapshot() {
+    let d = Daemon::start("epochskew");
+    let mut c = d.connect();
+    seed_some_events(&d, &mut c, "epochskew");
+
+    // A cursor that is perfectly valid *by number*, carried over from a run
+    // this daemon is not. Nothing is replayed, so this connection stays clean.
+    let mut stale = d.connect();
+    let refused = stale.call(
+        "events.subscribe",
+        serde_json::json!({"resume_from": 0, "resume_epoch": "a-cursor-from-a-previous-run"}),
+    );
+    assert_eq!(
+        refused["resume"]["outcome"],
+        serde_json::json!("snapshot_required"),
+        "a cursor from another run must not be replayed against this run's numbers: {refused}"
+    );
+    assert_eq!(
+        refused["resume"]["reason"],
+        serde_json::json!("epoch_changed"),
+        "{refused}"
+    );
+
+    // The same cursor, with the epoch this daemon actually issued — which the
+    // refusal above returned, because `epoch` is on every subscribe result.
+    let epoch = refused["epoch"].as_str().unwrap().to_string();
+    let mut fresh = d.connect();
+    let resumed = fresh.raw(
+        "events.subscribe",
+        serde_json::json!({"resume_from": 0, "resume_epoch": epoch}),
+    );
+    let result = serde_json::from_value::<RpcResponse>(resumed.clone())
+        .unwrap_or_else(|e| panic!("not a response ({e}): {resumed}"))
+        .outcome()
+        .expect("the subscription was refused");
+    assert_eq!(
+        result["resume"]["outcome"],
+        serde_json::json!("resumed"),
+        "the epoch this daemon issued must resume, or the check above is just a refusal of \
+         everything: {result}"
+    );
+    assert!(
+        result["resume"]["replayed"].as_u64().unwrap() >= 1,
+        "{result}"
+    );
+}
+
 /// A malformed frame must not kill the connection: the daemon answers and keeps
 /// serving, or one bad `jq` pipeline would drop a UI's whole session.
 #[test]
@@ -1163,6 +1437,36 @@ fn the_live_socket_is_owner_only() {
     let d = Daemon::start("perms");
     let mode = std::fs::metadata(&d.socket).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "socket mode is {mode:04o}");
+}
+
+/// The state directory is owner-only, because the catalog inside it is.
+///
+/// §4.3 makes filesystem permissions the entire authorization model, and the
+/// socket has been `0600` under a `0700` directory since it was written. The
+/// catalog is the other half of the same secret: the user's complete file
+/// inventory, and the custody rows that are a tiered file's only remote address.
+/// `create_dir_all` under a `022` umask left it `0755`, and on this layout —
+/// the ordinary one, socket in the runtime dir — nothing later tightened it.
+///
+/// The daemon is started with its socket *outside* its state directory on
+/// purpose; see the harness note. With the two in the same place, `bind`'s
+/// `0700` would satisfy this assertion without the state directory ever having
+/// been considered.
+#[test]
+fn the_state_directory_is_owner_only() {
+    let d = Daemon::start_with_socket_outside_the_state_dir("statedirmode");
+    let state = d.dir.join("state");
+
+    let mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "the state directory holding catalog.db is {mode:04o}; the daemon is per-user (§4.2) \
+         and its inventory must not be readable by other accounts on the host"
+    );
+    assert!(
+        state.join("catalog.db").exists(),
+        "the daemon must have opened its catalog in the directory this asserted about"
+    );
 }
 
 // ---------------------------------------------------------------------------

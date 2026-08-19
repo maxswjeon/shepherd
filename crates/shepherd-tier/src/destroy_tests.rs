@@ -73,6 +73,22 @@ fn identity_of(path: &std::path::Path) -> FileIdentity {
     }
 }
 
+/// The identity the **catalog** holds for `path`, via the same function that
+/// fills `file.fs_id` and that the upload path is handed.
+///
+/// Deliberately not `format!("{dev}:{ino}")`. That is the string this module's
+/// subject used to lock on, and the whole point of these tests is that it is a
+/// different string from this one.
+fn catalog_fs_id(root: &ScanRoot, path: &std::path::Path) -> shepherd_core::FsId {
+    shepherd_catalog::volume::fs_id(
+        path,
+        root.volume_id
+            .as_deref()
+            .expect("the fixture root carries a volume id"),
+    )
+    .expect("the catalog's fs_id for a file that exists")
+}
+
 fn custodian(mode: AttestationMode, hash: Blake3Hash) -> Location {
     Location {
         target: shepherd_core::TargetId::new(1),
@@ -105,6 +121,9 @@ struct Fixture {
     root: ScanRoot,
     hash: Blake3Hash,
     identity: FileIdentity,
+    /// The catalog's identity for [`Fixture::path`], built the way the catalog
+    /// builds it. Not `<dev>:<ino>` — see [`LocalDestroyRequest::fs_id`].
+    fs_id: shepherd_core::FsId,
     key: ObjectKey,
     adapter: MemAdapter,
     audit: AuditLog,
@@ -130,9 +149,11 @@ fn fixture(tag: &str, mode: AttestationMode) -> Fixture {
     adapter.put_versioned(&key, body.clone().into(), "v9");
 
     let audit = AuditLog::open(&tmp.0.join("audit").join("destroy.jsonl")).unwrap();
+    let root = root(&tmp.0);
     Fixture {
         identity: identity_of(&path),
-        root: root(&tmp.0),
+        fs_id: catalog_fs_id(&root, &path),
+        root,
         path,
         hash,
         key,
@@ -153,6 +174,7 @@ impl Fixture {
             expected_hash: self.hash,
             expected_size: payload().len() as u64,
             verified_identity: self.identity,
+            fs_id: &self.fs_id,
             age: Duration::from_secs(60 * 60 * 24 * 30),
             floor_policy: policy(),
             custodian,
@@ -468,7 +490,9 @@ fn an_mmap_established_before_staging_still_writes_after_it() {
         .unwrap();
     let mut map = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
 
-    let staged = DeleteModeProvider::new().stage_for_destruction(&p).unwrap();
+    let staged = DeleteModeProvider::new()
+        .stage_for_destruction(&t.0, &p)
+        .unwrap();
 
     map[0] = 0xFF;
     map.flush().unwrap();
@@ -542,7 +566,7 @@ async fn a_handle_opened_after_the_floor_check_is_not_seen_by_it() {
         .append(true)
         .open(&f.path)
         .unwrap();
-    let staged = f.provider.stage_for_destruction(&f.path).unwrap();
+    let staged = f.provider.stage_for_destruction(&f.tmp.0, &f.path).unwrap();
     use std::io::Write;
     writer.write_all(b"late").unwrap();
     writer.sync_all().unwrap();
@@ -575,6 +599,135 @@ async fn two_destroys_of_one_file_serialize() {
     let err = f.run(&c).await.unwrap_err();
     assert!(matches!(err, DestroyError::Io(_)), "{err}");
     assert_eq!(f.audit.read_all().len(), 1, "exactly one audit record");
+}
+
+/// The other half of the nested-staging seam, and the one a provider test
+/// cannot reach: `destroy.rs` must hand `stage_for_destruction` the
+/// **registered root**. A provider that stages correctly is no use if its
+/// caller names the wrong directory.
+///
+/// The assertion is where the staging directory ended up, because that is what
+/// startup recovery lists. `<root>/sub/dir/.shepherd-staging` would be a
+/// crash-window in which the bytes exist and nothing can find them.
+#[tokio::test]
+async fn the_destroy_path_stages_a_nested_file_into_the_registered_root() {
+    use shepherd_placeholder::delete_mode::STAGING_DIR_NAME;
+
+    let f = fixture("nested-root", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+
+    // The same bytes as the fixture's own file, so the content-addressed key
+    // and the version already pinned in the adapter still describe it.
+    let parent = f.tmp.0.join("sub").join("dir");
+    std::fs::create_dir_all(&parent).unwrap();
+    let nested = parent.join("deep.bin");
+    std::fs::write(&nested, payload()).unwrap();
+    let nested_fs_id = catalog_fs_id(&f.root, &nested);
+
+    let req = LocalDestroyRequest {
+        path: &nested,
+        verified_identity: identity_of(&nested),
+        fs_id: &nested_fs_id,
+        ..f.request(&c)
+    };
+
+    let Some(r) = past_the_open_handle_floor(
+        execute_local_destruction(
+            &req,
+            &f.provider,
+            &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+            &f.audit,
+            &f.locks,
+            Timestamp::from_nanos(1),
+        )
+        .await,
+    ) else {
+        return;
+    };
+    r.unwrap();
+
+    assert!(!nested.exists(), "the nested file was destroyed");
+    assert!(
+        f.tmp.0.join(STAGING_DIR_NAME).exists(),
+        "staging went through the registered root's directory — the one \
+         `list_staged(root)` reads"
+    );
+    assert!(
+        !parent.join(STAGING_DIR_NAME).exists(),
+        "and NOT beside the file. A staged entry there survives a crash somewhere \
+         recovery never looks, which is the same as losing it"
+    );
+}
+
+/// Per-file serialization is only worth anything if the destroy path and the
+/// **rest of the system** name the same lock.
+///
+/// [`crate::upload`] takes `FileLocks::acquire` on the catalog's `fs_id` —
+/// `<stable-volume-id>:<inode>`. This path once synthesized `<st_dev>:<inode>`
+/// from the verified identity instead, and on any UUID-backed filesystem those
+/// two strings can never be equal: the guard was acquired, held across every
+/// await, and guarded nothing. An upload and a destruction of one file could
+/// run concurrently while both looked serialized.
+///
+/// So the assertion is contention, not shape. A test that checked the key's
+/// *format* would pass on a fix that changed both sides to something equally
+/// wrong; this one fails unless the two actually collide.
+///
+/// The lock is taken **before** the acquisition floor, so this holds on every
+/// unix platform — with or without an open-handle detector.
+#[tokio::test]
+async fn a_destroy_waits_on_the_lock_the_catalog_identity_names() {
+    let f = fixture("contend-catalog", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+
+    // Exactly the value an upload of this same file would be handed.
+    let held = f.locks.acquire(&catalog_fs_id(&f.root, &f.path)).await;
+
+    let blocked = tokio::time::timeout(Duration::from_millis(250), f.run(&c)).await;
+    assert!(
+        blocked.is_err(),
+        "a holder of this file's catalog fs_id lock must block its destruction. It did \
+         not, so the two sides are keyed on different strings and `FileLocks` serializes \
+         nothing between them"
+    );
+
+    // The other direction: releasing lets it through, so the block above was
+    // the lock and not a hang somewhere else in the path.
+    drop(held);
+    let released = tokio::time::timeout(Duration::from_secs(30), f.run(&c))
+        .await
+        .expect("releasing the lock must let the destruction proceed");
+    let _ = past_the_open_handle_floor(released);
+}
+
+/// The pair to the test above, and the reason it cannot be satisfied cheaply.
+///
+/// `<st_dev>:<inode>` is **not** this file's identity — `st_dev` is not stable
+/// across a remount, which is why `volume::fs_id` uses the volume UUID
+/// (G-1-IDENTITY-FSID). Nothing may serialize against it. A "fix" that moved
+/// both the upload and the destroy side onto `<st_dev>:<inode>` would satisfy
+/// the contention test above and fail this one.
+#[tokio::test]
+async fn a_destroy_does_not_wait_on_a_dev_ino_shaped_key() {
+    let f = fixture("contend-devino", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+
+    let stale = shepherd_core::FsId::new(format!("{}:{}", f.identity.dev, f.identity.ino));
+    assert_ne!(
+        stale.as_str(),
+        f.fs_id.as_str(),
+        "the two identity formats must genuinely differ on this filesystem, or neither \
+         half of this pair is measuring anything"
+    );
+
+    let _held = f.locks.acquire(&stale).await;
+    let r = tokio::time::timeout(Duration::from_secs(30), f.run(&c))
+        .await
+        .expect(
+            "a lock on a key that is not this file's identity must not block it; if this \
+             times out, the destroy path is keyed on `<dev>:<ino>` again",
+        );
+    let _ = past_the_open_handle_floor(r);
 }
 
 /// PM-2's seam, and the one T10 must use. Remote destruction routes through

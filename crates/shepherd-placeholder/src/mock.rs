@@ -252,8 +252,8 @@ impl PlaceholderProvider for MockPlaceholderProvider {
         self.inner.probe_feasibility(root)
     }
 
-    fn stage_for_destruction(&self, path: &Path) -> Result<Staged> {
-        self.inner.stage_for_destruction(path)
+    fn stage_for_destruction(&self, root: &Path, path: &Path) -> Result<Staged> {
+        self.inner.stage_for_destruction(root, path)
     }
 
     /// The one primitive this mock does **not** delegate.

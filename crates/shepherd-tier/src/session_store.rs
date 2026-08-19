@@ -432,6 +432,17 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
                 len: bytes as u64,
                 local_blake3: hash_from(local).unwrap_or(Blake3Hash::from_bytes([0u8; 32])),
                 etag: etag.map(OpaqueToken::new),
+                // Not stored and not derivable: `transfer_part` has no checksum
+                // column, so `None` is what the row genuinely says rather than a
+                // placeholder for a value hiding elsewhere.
+                //
+                // What keeps that from being a gap is the resume path: a part
+                // whose etag and size still agree with the provider adopts the
+                // checksum from the provider's own `list_parts` response, which
+                // resume already fetches to verify those two fields. The value
+                // comes back on the same round trip, from the authority that has
+                // to receive it again at completion.
+                checksum: None,
             });
         }
 

@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use shepherd_catalog::file_repo::ScanRoot;
 use shepherd_core::ObjectKey;
-use shepherd_core::{Blake3Hash, IntentId, Timestamp};
+use shepherd_core::{Blake3Hash, FsId, IntentId, Timestamp};
 use shepherd_placeholder::provider::{PlaceholderProvider, Staged};
 use shepherd_scan::floors::{self, FloorContext, FloorInput, FloorPolicy};
 use shepherd_storage::adapter::{ObjectMeta, StorageAdapter, VersionGuard};
@@ -89,6 +89,30 @@ pub struct LocalDestroyRequest<'a> {
     pub expected_size: u64,
     /// Identity as recorded at verification time.
     pub verified_identity: shepherd_placeholder::provider::FileIdentity,
+    /// **The catalog's** identity for this file — `<stable-volume-id>:<inode>`,
+    /// as produced by `shepherd_catalog::volume::fs_id`.
+    ///
+    /// Carried from the caller rather than synthesized here, because the only
+    /// thing a lock key is for is *colliding with the other holder*. This path
+    /// once built `<st_dev>:<inode>` from [`Self::verified_identity`], which is
+    /// a different string from the one [`crate::upload`] locks on for the same
+    /// file — so an upload and a destruction of one file could run
+    /// concurrently while both appeared to be serialized.
+    ///
+    /// The repair is to carry the catalog's value, never to make
+    /// `volume::fs_id` use `st_dev`: G-1-IDENTITY-FSID exists because `st_dev`
+    /// does not survive a remount, and `fs_id_survives_a_remount_that_changes_st_dev`
+    /// is the test that pins it.
+    ///
+    /// **If you are wiring a new caller — the daemon's destroy path, T10's
+    /// discard — pass `file.fs_id` from the catalog, or the value
+    /// `shepherd_catalog::volume::fs_id` returns for this path.** Anything you
+    /// build here from `dev`/`ino` compiles, locks, and protects nothing; the
+    /// failure is silent and it is on the irreversible path.
+    /// `a_destroy_waits_on_the_lock_the_catalog_identity_names` and
+    /// `a_destroy_does_not_wait_on_a_dev_ino_shaped_key` are the pair that
+    /// hold this down from both sides.
+    pub fs_id: &'a FsId,
     /// Age, resolved by the caller per §4.12's fallback order.
     pub age: Duration,
     pub floor_policy: FloorPolicy,
@@ -125,11 +149,12 @@ pub async fn execute_local_destruction(
     }
 
     // Per-file serialization, keyed on identity. Held across every await below.
-    let fs_id = shepherd_core::FsId::new(format!(
-        "{}:{}",
-        req.verified_identity.dev, req.verified_identity.ino
-    ));
-    let _guard = locks.acquire(&fs_id).await;
+    //
+    // On the CATALOG's identity — the caller's value, not one synthesized from
+    // `verified_identity`. A lock key exists to collide with the other holder,
+    // and `<st_dev>:<inode>` never collides with the `<volume-uuid>:<inode>`
+    // that [`crate::upload`] locks on. See [`LocalDestroyRequest::fs_id`].
+    let _guard = locks.acquire(req.fs_id).await;
 
     // --- steps 0 and 1: the acquisition gate ---------------------------------
     //
@@ -145,7 +170,7 @@ pub async fn execute_local_destruction(
         nlink: nlink_of(&md),
         is_symlink: md.is_symlink(),
         allocated_bytes: allocated_of(&md),
-        fs_id: Some(fs_id.clone()),
+        fs_id: Some(req.fs_id.clone()),
         observed_at: now,
     };
     let verdict = floors::evaluate(&req.floor_policy, &input, FloorContext::Acquisition);
@@ -157,7 +182,11 @@ pub async fn execute_local_destruction(
     }
 
     // --- step 2: stage. Reversible from here until step 6. -------------------
-    let staged = provider.stage_for_destruction(req.path)?;
+    //
+    // Staged into the REGISTERED ROOT's staging directory, because that is the
+    // one path startup recovery lists. Staging under the file's own parent
+    // would put a nested file's bytes somewhere `list_staged` never looks.
+    let staged = provider.stage_for_destruction(Path::new(&req.root.path), req.path)?;
 
     // From here on, every failure path must restore rather than proceed.
     // §4.10.4 is abort-forward-never.

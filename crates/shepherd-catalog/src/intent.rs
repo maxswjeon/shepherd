@@ -110,18 +110,22 @@ impl IntentState {
 
     /// Whether a row in this state needs recovery attention at startup.
     ///
-    /// `Prepared` counts. A row that says "about to destroy" and nothing more
-    /// means the daemon died in the window around the syscall, and recovery
-    /// must establish which side of it we are on — not assume the syscall never
-    /// happened because the state was never advanced.
+    /// **Recovery is the complement of settled**, and it is written that way
+    /// rather than as its own list. An enumeration here drifted from
+    /// [`IntentJournal::unresolved`]'s once already, and it dropped `Audited` —
+    /// a destruction that has happened and was never committed to the catalog,
+    /// so the file was gone while the catalog went on claiming it was local.
+    /// Deriving from [`IntentState::is_settled`] means a state added later is
+    /// recovered until someone deliberately declares it terminal, which is the
+    /// fail-closed direction.
+    ///
+    /// `Prepared` counts, and that is the same rule rather than an exception. A
+    /// row that says "about to destroy" and nothing more means the daemon died
+    /// in the window around the syscall, and recovery must establish which side
+    /// of it we are on — not assume the syscall never happened because the state
+    /// was never advanced.
     pub fn needs_recovery(self) -> bool {
-        matches!(
-            self,
-            IntentState::Prepared
-                | IntentState::SyscallIssued
-                | IntentState::OutcomeAmbiguous
-                | IntentState::OutcomeKnown
-        )
+        !self.is_settled()
     }
 
     /// Whether this state is terminal for the intent's lifecycle.
@@ -252,11 +256,20 @@ impl<'a> IntentJournal<'a> {
     /// recovery either completes the operation or moves the file back, and it
     /// never re-issues a destruction it cannot prove is still correct. This
     /// function only enumerates; it decides nothing.
+    ///
+    /// **Phrased as `NOT IN` the settled states**, mirroring
+    /// [`IntentState::needs_recovery`], because the two must agree and the
+    /// cheapest way to make them agree is to state the same short list once
+    /// each. An earlier version enumerated the four *pre*-syscall states, which
+    /// silently dropped `audited` — a row recording a destruction that already
+    /// happened — and `reconstructed-after-crash`, which carries the audit halt.
+    /// Written this way, a state added to the lifecycle is recovered by default
+    /// and has to be declared terminal on purpose.
     pub fn unresolved(&self) -> Result<Vec<DestroyIntent>> {
         let mut stmt = self.0.conn().prepare(
             "SELECT id, kind, file_id, path, size, blake3, state, batch_id, episode_id
              FROM destroy_intent
-             WHERE state IN ('prepared','syscall-issued','outcome-known','outcome-ambiguous')
+             WHERE state NOT IN ('catalog-committed','aborted')
              ORDER BY id",
         )?;
         let rows = stmt
@@ -365,6 +378,98 @@ mod tests {
         assert!(
             !ids.contains(&d.get()),
             "an aborted intent is settled — the destruction was refused"
+        );
+    }
+
+    /// Recovery is the **complement of settled**, checked against the query for
+    /// every state rather than trusting two lists to stay in step.
+    ///
+    /// They were once out of step, and in the dangerous direction: `audited` and
+    /// `reconstructed-after-crash` are both post-syscall and neither is settled,
+    /// and the query enumerated four states that did not include them.
+    #[test]
+    fn unresolved_returns_exactly_the_states_that_need_recovery() {
+        for s in [
+            IntentState::Prepared,
+            IntentState::SyscallIssued,
+            IntentState::OutcomeKnown,
+            IntentState::OutcomeAmbiguous,
+            IntentState::Audited,
+            IntentState::CatalogCommitted,
+            IntentState::Aborted,
+            IntentState::ReconstructedAfterCrash,
+        ] {
+            // A fresh catalog per state, so the row under test is the only one
+            // that could be listed.
+            let mut c = Catalog::open_in_memory().unwrap();
+            let id = IntentJournal::new(&mut c)
+                .prepare(&new_intent("/x"), Timestamp::from_nanos(1))
+                .unwrap();
+            IntentJournal::new(&mut c).transition(id, s).unwrap();
+
+            let un = IntentJournal::new(&mut c).unresolved().unwrap();
+            let listed = un.iter().any(|i| i.id.get() == id.get());
+            assert_eq!(
+                listed,
+                s.needs_recovery(),
+                "`unresolved()` and `needs_recovery()` disagree about `{}`. Whichever is \
+                 right, a state that recovery's predicate claims and its query drops is a \
+                 row startup never examines",
+                s.as_str()
+            );
+        }
+    }
+
+    /// The hole that mattered, named in both directions.
+    ///
+    /// `audited` is the state of a crash **after** the irreversible syscall and
+    /// the audit append but **before** the catalog commit. If startup never
+    /// looks at that row, the file is gone while the catalog goes on claiming it
+    /// is local — the exact outcome the custody model exists to prevent. A
+    /// `reconstructed-after-crash` row forgotten the same way lets the audit
+    /// halt disappear on the next restart.
+    ///
+    /// The negative is what stops the fix from being "recover everything": a
+    /// settled row is not recovery's business.
+    #[test]
+    fn an_audited_intent_is_recovered_and_a_settled_one_is_not() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        let t = Timestamp::from_nanos(1);
+        let mut prepare = |p: &str| {
+            IntentJournal::new(&mut c)
+                .prepare(&new_intent(p), t)
+                .unwrap()
+        };
+        let audited = prepare("/audited");
+        let reconstructed = prepare("/reconstructed");
+        let committed = prepare("/committed");
+
+        for (id, s) in [
+            (audited, IntentState::Audited),
+            (reconstructed, IntentState::ReconstructedAfterCrash),
+            (committed, IntentState::CatalogCommitted),
+        ] {
+            IntentJournal::new(&mut c).transition(id, s).unwrap();
+        }
+
+        let un = IntentJournal::new(&mut c).unresolved().unwrap();
+        let ids: Vec<i64> = un.iter().map(|i| i.id.get()).collect();
+
+        assert!(
+            ids.contains(&audited.get()),
+            "an `audited` row is a destruction that happened and was never committed to \
+             the catalog. Skipping it leaves the file gone while the catalog claims it is \
+             local: {ids:?}"
+        );
+        assert!(
+            ids.contains(&reconstructed.get()),
+            "a `reconstructed-after-crash` row halts destruction until audit writes \
+             succeed. Forgotten at startup, the halt silently lifts: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&committed.get()),
+            "a settled row is finished. Listing it would make recovery mean `everything`, \
+             which is not a recovery predicate: {ids:?}"
         );
     }
 

@@ -453,6 +453,21 @@ package = "shepherd-rules"
 test = "r#match::tests::an_invalid_glob_is_reported_rather_than_matching_nothing"
 proves = "a bad glob is an error, not a silent zero-match — §4.12's rule that a rule which cannot be evaluated must not be treated as evaluated"
 
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_combinator_with_sibling_keys_is_refused_rather_than_silently_dropped"
+proves = """
+FOUND WHILE FIXING THE ROW ABOVE, not looked for. The unknown-key
+refusal early-returned as soon as it matched a combinator, so
+`{"all":[...],"older_thn_days":365}` compiled as the bare `all` with the typo'd
+key DISCARDED — a rule that reads as an age filter and runs as none. The typo
+direction is the one that matters: a user who misspells a predicate gets a rule
+that silently matches more files, not an error. Refused in `compile_predicate`,
+which `compile_readonly` shares, so `search` filters refuse the same way —
+a deliberate wire-behaviour widening, recorded here because it is not what the
+finding asked for.
+"""
+
 [[ac]]
 id = "AC-14"
 owning_gate = "2"
@@ -1510,6 +1525,42 @@ proves = "the gate: a mount whose options name a policy is believed for free and
 package = "shepherd-catalog"
 test = "atime::linux_tests::the_probe_cannot_truncate_a_users_file"
 proves = "the probe writes with a unique name under O_CREAT|O_EXCL and unlinks immediately, so it cannot clobber a user file — stricter than the neighbouring identity::probe_path_policies, which uses fs::write and a fixed name"
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_trailing_atime_predicate_is_refused_not_only_a_leading_one"
+proves = """
+THE REFUSAL DESCENDS INTO COMBINATORS. The §4.12 check read only the
+top-level predicate, so `{"all":[{"ext":"log"},{"older_than_days":365}]}` on a
+`noatime` root compiled and ran — the destructive age rule the guard exists to
+refuse, wearing an `all` wrapper. `any_age_field_rests_on_atime` now recurses
+through All/Any/Not. Asserted at the TRAILING position specifically: a check
+written against a one-element combinator passes while still missing every real
+rule, because real rules put the cheap filter first.
+"""
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_compound_rule_with_no_atime_dependence_is_still_permitted"
+proves = """
+THE ACCEPTANCE DIRECTION, and the row that stops the fix from being
+`refuse every compound rule`. Mutating the recursion to refuse any compound
+destructive rule kills ONLY this test — the refusal tests above stay green — so
+without it the guard could over-refuse forever and the suite would applaud. A
+`{"all":[{"ext":"log"},{"min_size":...}]}` delete rule touches no time field
+and must still compile on a `noatime` root.
+"""
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_compound_atime_rule_is_still_permitted_under_relatime"
+proves = """
+the recursion narrows on the ATIME MODE, not on the shape: the same
+nested age predicate that is refused on Disabled compiles under Relatime. Pairs
+with the row above — one holds the shape axis fixed and varies the mode, the
+other holds the mode and varies the fields — so neither `refuse all compound`
+nor `refuse all age` survives both.
+"""
 
 [[guard]]
 id = "G-1-JOBS"

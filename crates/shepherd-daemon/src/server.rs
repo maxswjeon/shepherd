@@ -166,8 +166,12 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let response = serve_one(&line, &mut session, &writer);
-        write_frame(&writer, &response)?;
+        // `None` means the frame is already on the socket. Only
+        // `events.subscribe` answers that way, because only it has to write
+        // more than one frame and has to write them in a fixed order.
+        if let Some(response) = serve_one(&line, &mut session, &writer) {
+            write_frame(&writer, &response)?;
+        }
     }
     Ok(())
 }
@@ -232,15 +236,22 @@ fn handshake(
 }
 
 /// Parse, gate, dispatch, and encode one request.
+///
+/// `Some` is a frame for the caller to write. `None` means this request has
+/// already written its own reply — see [`subscribe_on_connection`], which is
+/// the only method that does.
 fn serve_one(
     line: &str,
     session: &mut Session,
     writer: &Arc<std::sync::Mutex<UnixStream>>,
-) -> RpcResponse {
+) -> Option<RpcResponse> {
     let frame: RpcRequest = match serde_json::from_str(line) {
         Ok(f) => f,
         Err(e) => {
-            return RpcResponse::failed(None, RpcError::new(ErrorCode::ParseError, e.to_string()));
+            return Some(RpcResponse::failed(
+                None,
+                RpcError::new(ErrorCode::ParseError, e.to_string()),
+            ));
         }
     };
     let id = frame.id.clone();
@@ -252,18 +263,18 @@ fn serve_one(
     if let Some(kind) = MethodKind::from_name(&frame.method)
         && !kind.available_at(session.negotiated.minor)
     {
-        return RpcResponse::failed(
+        return Some(RpcResponse::failed(
             Some(id),
             RpcError::new(
                 ErrorCode::MethodNotFound,
                 format!("no method named `{}`", frame.method),
             ),
-        );
+        ));
     }
 
     let call = match Method::from_parts(&frame.method, &frame.params) {
         Ok(c) => c,
-        Err(e) => return RpcResponse::failed(Some(id), e),
+        Err(e) => return Some(RpcResponse::failed(Some(id), e)),
     };
 
     // `events.subscribe` is the one method whose effect outlives the reply: it
@@ -273,40 +284,78 @@ fn serve_one(
         return subscribe_on_connection(req.clone(), session, writer, id);
     }
 
-    match session.dispatch(call) {
+    Some(match session.dispatch(call) {
         Ok(result) => match result.to_value() {
             Ok(v) => RpcResponse::ok(id, v),
             Err(e) => RpcResponse::failed(Some(id), e),
         },
         Err(e) => RpcResponse::failed(Some(id), e),
-    }
+    })
 }
 
 /// Register a subscription and start pumping frames to this socket.
+///
+/// # The response frame goes out first, and the pump is held until it has
+///
+/// `events.subscribe` is answered by an ordinary `RpcResponse`, and a client
+/// reads the very next frame and parses it as one — `shepctl events subscribe`
+/// reaches the daemon through `client::call`, which does exactly that and
+/// nothing else. So a notification arriving first is not an out-of-order event;
+/// it is a protocol error on a subscription that was otherwise perfectly fine,
+/// and the client never learns its subscription id. Replay made that the
+/// **normal** outcome for every `resume_from`, not a race: the loop that wrote
+/// the buffered frames ran before this function had returned anything for
+/// `handle` to write.
+///
+/// Hence the order below, which is the whole of the fix:
+///
+/// 1. **register**, so no event published from this instant on is missed;
+/// 2. **write the response**, before any notification can reach the socket;
+/// 3. **replay**, so the sequence the client observes is monotonic from its
+///    cursor;
+/// 4. **release the pump**, and only then does live delivery begin.
+///
+/// The pump thread is spawned in step 1 parked on `go_rx` rather than spawned
+/// last, so a thread-spawn failure is still answerable: the client is told
+/// `Busy` instead of being told it is subscribed to a pump that does not exist.
+/// Dropping `go_tx` on any early return unparks it into a `RecvError`, it
+/// returns, `rx` drops, and the hub reaps the subscriber on its next publish.
 fn subscribe_on_connection(
     req: shepherd_proto::SubscribeRequest,
     session: &Session,
     writer: &Arc<std::sync::Mutex<UnixStream>>,
     id: RequestId,
-) -> RpcResponse {
-    let (result, replay, rx) = session
-        .daemon
-        .events
-        .subscribe(req.streams, req.resume_from, None);
+) -> Option<RpcResponse> {
+    let (result, replay, rx) = session.daemon.events.subscribe(
+        req.streams,
+        req.resume_from,
+        // A cursor without the epoch it was issued under cannot be told from a
+        // cursor issued by a previous run, whose numbers start over at 1. The
+        // hub's `EpochChanged` branch was unreachable while this was `None`.
+        req.resume_epoch.as_deref(),
+    );
 
-    // Replay first, so the client sees missed frames before live ones and the
-    // sequence it observes is monotonic.
-    for frame in replay {
-        if write_frame(writer, &RpcNotification::new(frame)).is_err() {
-            break;
+    let response = match serde_json::to_value(&result) {
+        Ok(v) => RpcResponse::ok(id.clone(), v),
+        Err(e) => {
+            return Some(RpcResponse::failed(
+                Some(id),
+                RpcError::new(ErrorCode::InternalError, e.to_string()),
+            ));
         }
-    }
+    };
 
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let sink = Arc::clone(writer);
     let sub = result.subscription_id;
     if let Err(e) = std::thread::Builder::new()
         .name(format!("shepherd-events-{sub}"))
         .spawn(move || {
+            // Parked until the response and the replay are on the socket. An
+            // `Err` means that never happened, so there is nothing to pump.
+            if go_rx.recv().is_err() {
+                return;
+            }
             // Ends when the hub drops the sender (daemon shutdown) or the
             // socket dies.
             for frame in rx {
@@ -317,19 +366,22 @@ fn subscribe_on_connection(
         })
     {
         tracing::warn!(error = %e, "could not start the event pump");
-        return RpcResponse::failed(
+        return Some(RpcResponse::failed(
             Some(id),
             RpcError::new(ErrorCode::Busy, "could not start an event pump thread"),
-        );
+        ));
     }
 
-    match serde_json::to_value(&result) {
-        Ok(v) => RpcResponse::ok(id, v),
-        Err(e) => RpcResponse::failed(
-            Some(id),
-            RpcError::new(ErrorCode::InternalError, e.to_string()),
-        ),
+    if write_frame(writer, &response).is_err() {
+        return None;
     }
+    for frame in replay {
+        if write_frame(writer, &RpcNotification::new(frame)).is_err() {
+            return None;
+        }
+    }
+    let _ = go_tx.send(());
+    None
 }
 
 /// Write one newline-delimited frame, holding the socket lock for exactly as

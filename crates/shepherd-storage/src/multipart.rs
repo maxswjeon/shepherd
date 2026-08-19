@@ -25,6 +25,17 @@
 //! makes the crash-after-upload-before-checkpoint window cost one re-sent part
 //! rather than a silently corrupt object, and it is the direction that cannot
 //! lose data.
+//!
+//! The per-part checksum joins that agreement asymmetrically, because a missing
+//! checksum and a wrong one mean different things. A checkpoint holding a
+//! *different* checksum than the provider reports is two claims about the same
+//! bytes contradicting each other, so the part is re-sent. A checkpoint holding
+//! *no* checksum is saying nothing at all — it predates the field, or came from
+//! a store with no column for it — and once the ETag and length have vouched
+//! for the part, the driver adopts the provider's value rather than re-sending
+//! bytes that are demonstrably already there. Refusing to skip those would cost
+//! a full re-upload on every resume against any provider that returns per-part
+//! checksums, which is AC-2's failure condition, not its guarantee.
 
 use serde::{Deserialize, Serialize};
 
@@ -136,6 +147,33 @@ pub struct PartCheckpoint {
     /// The provider's opaque receipt, present only once the upload returned
     /// **and** this checkpoint was durably committed.
     pub etag: Option<OpaqueToken>,
+    /// The provider's per-part checksum, when the session carries a checksum
+    /// algorithm.
+    ///
+    /// Durable rather than derived, because it cannot be recomputed: it is the
+    /// **provider's** value under the **provider's** algorithm, and
+    /// `CompleteMultipartUpload` requires every part to echo it back once the
+    /// session was created with one. Keeping only the ETag made every
+    /// completion receipt carry `checksum: None`, which a checksum-enabled
+    /// target rejects outright — and since `target.add` adopts an algorithm at
+    /// registration, that is the configuration a freshly registered target
+    /// produces.
+    ///
+    /// This field was added after checkpoints were already being written, so a
+    /// record serialized without it must still deserialize — otherwise an
+    /// upgrade strands every transfer in flight, which is a worse failure than
+    /// the one this field fixes. It does: serde's derive already maps a missing
+    /// field to `None` for an `Option`, so no `#[serde(default)]` is needed
+    /// here and one was removed after a test proved it changed nothing. The
+    /// behaviour is pinned by
+    /// `a_checkpoint_serialized_before_the_checksum_field_still_loads` against
+    /// a literal pre-fix payload, because the guarantee is about the format and
+    /// not about the attribute that was assumed to provide it.
+    ///
+    /// It reads back as `None`, which is exactly what it was — unknown — and
+    /// [`reconcile_parts`] treats that as "adopt whatever the provider reports"
+    /// rather than as a value to be trusted.
+    pub checksum: Option<String>,
 }
 
 impl PartCheckpoint {
@@ -201,9 +239,23 @@ pub fn reconcile_parts(
         };
         // Both sides must agree, on the same part number, the same opaque token
         // AND the same length.
-        let agreed = remote
-            .iter()
-            .any(|r| r.part_no == cp.part_no && r.etag == *etag && r.size == cp.len);
+        //
+        // The checksum is the one field where disagreement is not symmetric. A
+        // checkpoint that records no checksum is a checkpoint from before the
+        // field existed, or from a store with no column for it — it is silence,
+        // not a claim, and the driver heals it from the provider's own listing
+        // once the ETag and length have already vouched for the part. A
+        // checkpoint that records a *different* checksum is a contradiction
+        // between two claims about the same bytes, and that is re-sent.
+        let agreed = remote.iter().any(|r| {
+            r.part_no == cp.part_no
+                && r.etag == *etag
+                && r.size == cp.len
+                && match (&cp.checksum, &r.checksum) {
+                    (Some(local), remote) => Some(local) == remote.as_ref(),
+                    (None, _) => true,
+                }
+        });
         if agreed {
             *slot = PartAction::Skip;
             bytes_skipped += cp.len;
@@ -221,6 +273,12 @@ pub fn reconcile_parts(
 }
 
 impl Reconciliation {
+    /// What was decided for a 1-based part number, or `None` if it is not in
+    /// the plan.
+    pub fn action_of(&self, part_no: u32) -> Option<PartAction> {
+        self.actions.get(part_no.checked_sub(1)? as usize).copied()
+    }
+
     /// Parts still to send.
     pub fn pending(&self) -> impl Iterator<Item = u32> + '_ {
         self.actions
@@ -312,6 +370,7 @@ mod tests {
                 len,
                 local_blake3: h(1),
                 etag: Some(OpaqueToken::new("e1")),
+                checksum: None,
             },
             // 2: crashed after the upload, before the checkpoint commit.
             PartCheckpoint {
@@ -320,6 +379,7 @@ mod tests {
                 len,
                 local_blake3: h(2),
                 etag: None,
+                checksum: None,
             },
         ];
         let remote = vec![
@@ -360,6 +420,7 @@ mod tests {
                 len,
                 local_blake3: h(1),
                 etag: Some(OpaqueToken::new(etag)),
+                checksum: None,
             }]
         };
 
@@ -398,6 +459,7 @@ mod tests {
             len: 5 * 1024 * 1024,
             local_blake3: h(1),
             etag: Some(OpaqueToken::new("e1")),
+            checksum: None,
         }];
         // Session expired and the provider dropped the parts.
         let r = reconcile_parts(&plan, &local, &[]);
@@ -414,10 +476,125 @@ mod tests {
             len: 1,
             local_blake3: h(9),
             etag: Some(OpaqueToken::new("e")),
+            checksum: None,
         }];
         let r = reconcile_parts(&plan, &local, &[]);
         assert_eq!(r.actions.len(), 1);
         assert_eq!(r.actions[0], PartAction::Send);
+    }
+
+    /// Two claims about the same bytes that disagree. The ETag and the length
+    /// both match, so only the checksum separates them — and a part completed
+    /// under a checksum the provider no longer reports would be rejected at
+    /// completion, so it is re-sent.
+    #[test]
+    fn a_contradicting_part_checksum_forces_a_resend() {
+        let plan = PartPlan::new(5 * 1024 * 1024, &caps(), 5 * 1024 * 1024).unwrap();
+        let len = 5 * 1024 * 1024;
+        let local = vec![PartCheckpoint {
+            part_no: 1,
+            offset: 0,
+            len,
+            local_blake3: h(1),
+            etag: Some(OpaqueToken::new("e1")),
+            checksum: Some("mine".into()),
+        }];
+        let remote = vec![PartReceipt {
+            part_no: 1,
+            size: len,
+            etag: OpaqueToken::new("e1"),
+            checksum: Some("theirs".into()),
+        }];
+        assert_eq!(
+            reconcile_parts(&plan, &local, &remote).actions[0],
+            PartAction::Send
+        );
+
+        // And the provider dropping a checksum the checkpoint holds is the same
+        // disagreement from the other side.
+        let remote_silent = vec![PartReceipt {
+            part_no: 1,
+            size: len,
+            etag: OpaqueToken::new("e1"),
+            checksum: None,
+        }];
+        assert_eq!(
+            reconcile_parts(&plan, &local, &remote_silent).actions[0],
+            PartAction::Send
+        );
+    }
+
+    /// The paired non-zero: a checkpoint that records **no** checksum is
+    /// silence, not a contradiction. Re-sending those would mean a full
+    /// re-upload on every resume against any provider that reports per-part
+    /// checksums — AC-2's failure condition. The driver heals them from the
+    /// listing instead.
+    #[test]
+    fn a_checkpoint_with_no_checksum_is_still_skippable() {
+        let plan = PartPlan::new(5 * 1024 * 1024, &caps(), 5 * 1024 * 1024).unwrap();
+        let len = 5 * 1024 * 1024;
+        let local = vec![PartCheckpoint {
+            part_no: 1,
+            offset: 0,
+            len,
+            local_blake3: h(1),
+            etag: Some(OpaqueToken::new("e1")),
+            checksum: None,
+        }];
+        let remote = vec![PartReceipt {
+            part_no: 1,
+            size: len,
+            etag: OpaqueToken::new("e1"),
+            checksum: Some("theirs".into()),
+        }];
+        let r = reconcile_parts(&plan, &local, &remote);
+        assert_eq!(r.actions[0], PartAction::Skip);
+        assert_eq!(r.bytes_skipped, len);
+        assert_eq!(r.action_of(1), Some(PartAction::Skip));
+        assert_eq!(r.action_of(0), None, "part numbers are 1-based");
+        assert_eq!(r.action_of(2), None);
+    }
+
+    /// **The durable format question, answered deliberately rather than by
+    /// accident.** `checksum` was added to a struct that was already being
+    /// serialized. A checkpoint written before it existed carries no such key,
+    /// and it must still load — a transfer in flight when the daemon is
+    /// upgraded would otherwise become unresumable, which is a worse failure
+    /// than the one being fixed.
+    #[test]
+    fn a_checkpoint_serialized_before_the_checksum_field_still_loads() {
+        // A LITERAL payload in the pre-fix on-disk shape — not one this crate's
+        // own serializer produced. Round-tripping through the current encoder
+        // could only ever prove the encoder agrees with itself; it says nothing
+        // about a record already sitting in a store, which is the thing at
+        // risk. The only difference from the current encoding is the absent
+        // `checksum` key.
+        let pre_fix = r#"{"part_no":3,"offset":20,"len":10,"local_blake3":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"etag":"e3"}"#;
+
+        let cp: PartCheckpoint = serde_json::from_str(pre_fix).expect(
+            "a checkpoint written before this field existed must still deserialize — an \
+             in-flight transfer must not be stranded by an upgrade",
+        );
+        assert_eq!(cp.part_no, 3);
+        assert_eq!(cp.offset, 20);
+        assert_eq!(cp.len, 10);
+        assert_eq!(cp.local_blake3, h(1));
+        assert!(cp.is_acknowledged(), "the ETag still vouches for the part");
+        assert_eq!(
+            cp.checksum, None,
+            "absent reads back as unknown, which is what it was"
+        );
+
+        // The paired direction: the same payload WITH the key is read, not
+        // defaulted away — otherwise `serde(default)` could be masking a field
+        // that never deserializes at all.
+        let with_key = r#"{"part_no":3,"offset":20,"len":10,"local_blake3":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"etag":"e3","checksum":"provider-value"}"#;
+        assert_eq!(
+            serde_json::from_str::<PartCheckpoint>(with_key)
+                .expect("de")
+                .checksum,
+            Some("provider-value".to_string())
+        );
     }
 
     #[test]
@@ -430,6 +607,7 @@ mod tests {
             len,
             local_blake3: h(1),
             etag: Some(OpaqueToken::new("e1")),
+            checksum: None,
         }];
         let remote = vec![PartReceipt {
             part_no: 1,

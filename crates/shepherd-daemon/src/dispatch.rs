@@ -685,20 +685,41 @@ fn count_custody_rows(cat: &mut Catalog, root: RootId) -> Result<u64, CatalogErr
     Ok(n as u64)
 }
 
+/// Deregister a root, and delete its catalog only if that was asked for.
+///
+/// # Why the default does not delete the `scan_root` row
+///
+/// `file.root_id` is `INTEGER NOT NULL REFERENCES scan_root(id) ON DELETE
+/// CASCADE`. Deleting the root row therefore deletes every file row under it —
+/// including the `stub`/`remote` rows that are a tiered file's *only* remote
+/// address — and it did so on the path that reports `catalog_rows_dropped: 0`,
+/// past a custody refusal that only runs when `forget` is true. A silent
+/// cascade behind a zero is the failure this function is arranged against.
+///
+/// So the default *deregisters*: the row stays, `enabled` goes to 0, and every
+/// file row under it stays reachable through the same root id. `root.list` hides
+/// it (its `WHERE` already respects `enabled`), `scan.start` with no root skips
+/// it for the same reason, and `scan_exec` refuses it by name if a job for it is
+/// still queued. `--forget` remains the operation that destroys, and it says so.
 fn remove_root(cat: &mut Catalog, root: RootId, forget: bool) -> Result<u64, CatalogError> {
     let tx = cat.conn_mut().transaction()?;
     let dropped = if forget {
-        tx.execute(
+        let n = tx.execute(
             "DELETE FROM file WHERE root_id = ?1",
             rusqlite::params![root.get()],
-        )? as u64
+        )? as u64;
+        tx.execute(
+            "DELETE FROM scan_root WHERE id = ?1",
+            rusqlite::params![root.get()],
+        )?;
+        n
     } else {
+        tx.execute(
+            "UPDATE scan_root SET enabled = 0 WHERE id = ?1",
+            rusqlite::params![root.get()],
+        )?;
         0
     };
-    tx.execute(
-        "DELETE FROM scan_root WHERE id = ?1",
-        rusqlite::params![root.get()],
-    )?;
     tx.commit()?;
     Ok(dropped)
 }
@@ -1115,5 +1136,93 @@ mod tests {
             .execute("UPDATE file SET state = 'missing'", [])
             .unwrap();
         assert_eq!(count_custody_rows(&mut cat, root).unwrap(), 0);
+    }
+
+    fn file_count(cat: &mut Catalog, root: RootId) -> u64 {
+        cat.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM file WHERE root_id = ?1",
+                rusqlite::params![root.get()],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+    }
+
+    /// The default `root.remove` must leave the catalog exactly where it was.
+    ///
+    /// `file.root_id` is declared `ON DELETE CASCADE`, so deleting the
+    /// `scan_root` row deletes every file row under it — custody rows included,
+    /// and a custody row is a tiered file's only remote address. That happened
+    /// on the path that reports `catalog_rows_dropped: 0`, and the refusal that
+    /// exists to stop it only runs when `forget` is true, so nothing was in the
+    /// way. Deregistering is the operation the default asks for; deleting is
+    /// not.
+    ///
+    /// What is asserted is that the rows are still THERE and still reachable
+    /// through the root's id — `count_custody_rows`, the refusal's own
+    /// predicate, must still see them. An `Ok` return would have been just as
+    /// true of the cascade.
+    #[test]
+    fn removing_a_root_without_forget_disables_it_and_keeps_every_row() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let root = seed(&mut cat, "/data", &["a.txt", "b.txt", "c.txt"]);
+        cat.conn_mut()
+            .execute(
+                "UPDATE file SET state = 'remote' WHERE rel_path = 'a.txt'",
+                [],
+            )
+            .unwrap();
+
+        let dropped = remove_root(&mut cat, root, false).unwrap();
+
+        assert_eq!(dropped, 0, "nothing was asked to be forgotten");
+        assert_eq!(
+            file_count(&mut cat, root),
+            3,
+            "the catalog rows must survive a removal that did not ask to forget them"
+        );
+        assert_eq!(
+            count_custody_rows(&mut cat, root).unwrap(),
+            1,
+            "the custody row is the tiered file's only remote address, and the refusal that \
+             guards it can only see rows that still exist"
+        );
+
+        assert!(
+            list_roots(&mut cat, false).unwrap().is_empty(),
+            "a removed root is deregistered: it must not appear in the ordinary listing"
+        );
+        let all = list_roots(&mut cat, true).unwrap();
+        assert_eq!(all.len(), 1, "the root row itself must still exist");
+        assert!(!all[0].enabled, "and it must be disabled: {:?}", all[0]);
+    }
+
+    /// Removing twice without `--forget` stays Ok and still keeps the rows, so
+    /// a user who soft-removed can still escalate to `--forget` afterwards.
+    #[test]
+    fn a_second_removal_without_forget_is_idempotent() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let root = seed(&mut cat, "/data", &["a.txt"]);
+        remove_root(&mut cat, root, false).unwrap();
+        assert_eq!(remove_root(&mut cat, root, false).unwrap(), 0);
+        assert_eq!(file_count(&mut cat, root), 1);
+    }
+
+    /// `--forget` is the one that was actually asked for, and it still drops
+    /// everything — otherwise the fix above would have turned the destructive
+    /// path into a no-op and the count into a second lie.
+    #[test]
+    fn removing_a_root_with_forget_drops_the_rows_and_the_root() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let root = seed(&mut cat, "/data", &["a.txt", "b.txt"]);
+
+        let dropped = remove_root(&mut cat, root, true).unwrap();
+
+        assert_eq!(dropped, 2, "both rows were dropped and both were reported");
+        assert_eq!(file_count(&mut cat, root), 0);
+        assert!(
+            list_roots(&mut cat, true).unwrap().is_empty(),
+            "`--forget` deletes the root row too"
+        );
     }
 }

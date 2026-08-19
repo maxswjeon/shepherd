@@ -525,6 +525,15 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
     };
     let mtime = Timestamp::from_nanos(1);
 
+    // The catalog's identity, from the catalog's own function — the destroy
+    // path locks on this value, and it must be the one an upload of this same
+    // file would be handed.
+    let fs_id = shepherd_catalog::volume::fs_id(
+        &corpus.target,
+        root.volume_id.as_deref().expect("the corpus root has one"),
+    )
+    .expect("fs_id");
+
     execute_local_destruction(
         &LocalDestroyRequest {
             intent: IntentId::new(1),
@@ -533,6 +542,7 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
             expected_hash: hash,
             expected_size: corpus.payload.len() as u64,
             verified_identity: identity_of(&corpus.target),
+            fs_id: &fs_id,
             age: Duration::from_secs(3600),
             floor_policy: FloorPolicy {
                 min_size: 1024 * 1024,

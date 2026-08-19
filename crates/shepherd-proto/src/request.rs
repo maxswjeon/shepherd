@@ -225,6 +225,10 @@ pub struct RootRemoveRequest {
     /// The root to deregister.
     pub root_id: i64,
     /// Also drop the root's catalog rows. File bytes are never touched.
+    ///
+    /// Without it the root is deregistered and every row under it is kept,
+    /// because a custody row is the only address of a file that no longer exists
+    /// locally.
     #[serde(default)]
     pub forget_catalog: bool,
     /// Proceed even when dropping rows would discard `Custody`-class records —
@@ -394,6 +398,15 @@ pub struct SubscribeRequest {
     /// produced.
     #[serde(default)]
     pub resume_from: Option<Seq>,
+    /// The `epoch` of the `events.subscribe` result `resume_from` came from.
+    ///
+    /// Sequence numbers restart at 1 on every daemon run, so a cursor only
+    /// means anything within the run that issued it. Sending the epoch back is
+    /// what lets the daemon answer `snapshot_required` / `epoch_changed`
+    /// instead of replaying a different run's events under numbers this client
+    /// has already used. Omitting it asks the daemon to trust the cursor.
+    #[serde(default)]
+    pub resume_epoch: Option<String>,
 }
 
 #[cfg(test)]
@@ -435,6 +448,13 @@ mod tests {
         assert!(
             r.ignore_patterns.is_empty(),
             "1.2's field, omitted by a 1.1 client"
+        );
+
+        let e: SubscribeRequest = serde_json::from_str(r#"{"resume_from":7}"#).unwrap();
+        assert_eq!(e.resume_from, Some(Seq(7)));
+        assert!(
+            e.resume_epoch.is_none(),
+            "1.3's field, omitted by a 1.2 client"
         );
 
         let s: SearchRequest = serde_json::from_str(r#"{"query":"report"}"#).unwrap();

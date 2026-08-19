@@ -65,7 +65,23 @@ use serde::{Deserialize, Serialize};
 ///   a restart-window phenomenon rather than a steady state, which is the only
 ///   reason this is tolerable; a client that must be sure can compare
 ///   `root.list`'s echo of what was stored against what it sent.
-pub const PROTO_VERSION: ProtoVersion = ProtoVersion::new(1, 2);
+/// * **1.3** — added the optional `events.subscribe.resume_epoch` field.
+///   `SubscribeResult` has carried an `epoch` since 1.0, because sequence
+///   numbers restart at 1 on every daemon run and a cursor therefore only means
+///   anything within the run that issued it — but the *request* had nowhere to
+///   put one back, so the daemon passed no client epoch and its `EpochChanged`
+///   branch was unreachable. A client reconnecting across a restart was
+///   replayed whatever new-run events happened to sit past its old cursor,
+///   under numbers it had already used, rather than being told to take a
+///   snapshot.
+///
+///   **The skew direction, again worth naming.** A 1.2 daemon ignores
+///   `resume_epoch` and answers `resumed` for a cursor from a run it knows
+///   nothing about — which is precisely the pre-1.3 behaviour, so nothing gets
+///   worse, it just does not get better until the daemon is the newer half. A
+///   client that must be sure compares `SubscribeResult.epoch` against the
+///   epoch it sent; that field has been on the wire since 1.0.
+pub const PROTO_VERSION: ProtoVersion = ProtoVersion::new(1, 3);
 
 /// The additive-evolution rules, stated once so they can be quoted in review.
 ///
