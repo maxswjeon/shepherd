@@ -118,6 +118,26 @@ impl<'a> FileRepo<'a> {
     }
 
     /// Register a scan root with its probed identity policies.
+    ///
+    /// # Why `hosted_optin` and `ignore_patterns` are parameters and not
+    /// defaults
+    ///
+    /// Both columns existed from migration 0001 and neither was ever written.
+    /// `hosted_optin` is a **consent** flag — `DEFAULT 0` made every root read
+    /// back as "the user did not consent", which is the safe direction and
+    /// therefore the one nobody notices; a user who *did* consent was silently
+    /// overruled. `ignore_patterns_json`'s `DEFAULT '[]'` was the opposite
+    /// direction and worse: a user's exclusions silently did not exist, so
+    /// AC-9's matcher honoured an empty list on every scan that has ever run.
+    ///
+    /// Passing both here rather than defaulting them is what makes this
+    /// function the single producer for each. Callers state consent and
+    /// exclusions explicitly or not at all.
+    ///
+    /// `ignore_patterns` is stored as the JSON array `scan_exec` reads back.
+    /// It is **not** validated here — `shepherd-catalog` may not depend on
+    /// `shepherd-scan`, so the compile happens at the registration boundary
+    /// (`dispatch::root_add`) where a bad pattern can still be refused.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_root(
         &mut self,
@@ -127,17 +147,22 @@ impl<'a> FileRepo<'a> {
         norm_policy: PathNormPolicy,
         atime_mode: AtimeMode,
         volume_id: Option<&str>,
+        hosted_optin: bool,
+        ignore_patterns: &[String],
         now: Timestamp,
     ) -> Result<RootId> {
         let stub = match stub_mode {
             StubMode::Dehydrate => "dehydrate",
             StubMode::Delete => "delete",
         };
+        let patterns_json = serde_json::to_string(ignore_patterns).map_err(|e| {
+            CatalogError::Invalid(format!("ignore patterns are not serializable as JSON: {e}"))
+        })?;
         self.0.conn_mut().execute(
             "INSERT INTO scan_root
                  (path, stub_mode, path_case_policy, path_norm_policy, atime_mode,
-                  volume_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                  volume_id, hosted_optin, ignore_patterns_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 path,
                 stub,
@@ -145,6 +170,8 @@ impl<'a> FileRepo<'a> {
                 norm_policy.as_str(),
                 atime_mode.as_str(),
                 volume_id,
+                hosted_optin as i64,
+                patterns_json,
                 now.as_nanos()
             ],
         )?;
@@ -216,6 +243,29 @@ impl<'a> FileRepo<'a> {
     /// `norm_key` is computed here from the root's policies rather than taken
     /// from the caller, so no call site can forget it or compute it with the
     /// wrong root's policy.
+    ///
+    /// **`state` is written on insert and never on update.** A scanner that
+    /// stat'd a file has established exactly one thing about custody: the bytes
+    /// are on local disk, so a NEW row is `'local'`. It has established nothing
+    /// about an EXISTING row — a tiered file is a placeholder that still stats,
+    /// and folding it back to `'local'` on the next scan would erase the only
+    /// record that its bytes live elsewhere. So the conflict branch leaves the
+    /// column alone.
+    ///
+    /// Naming the column is **documentary, not corrective**, and saying so
+    /// here is the point. The schema default is already `'local'` and the
+    /// conflict branch already omitted `state`, so this statement behaves
+    /// exactly as it did when the column was unnamed. What was missing was not
+    /// the write — it was any test pinning the second half, which held by
+    /// accident: adding `state = excluded.state` to the list below would have
+    /// revoked custody on every tiered file at the next scan and broken
+    /// nothing. `a_rescan_does_not_revoke_a_tiered_rows_custody` is that pin.
+    ///
+    /// The reason `file.state` nonetheless only ever holds `'local'` is
+    /// separate and still open: **nothing in the tree writes `'stub'` or
+    /// `'remote'`**, here or anywhere else, because tiering is Phase 2/3 work.
+    /// That is what makes `WHERE state IN ('stub','remote')` a filter over a
+    /// single-valued column, and it is not fixed by this statement.
     pub fn upsert_file(&mut self, root: &ScanRoot, stat: &FileStat, now: Timestamp) -> Result<()> {
         if stat.root != root.id {
             return Err(CatalogError::Invalid(format!(
@@ -228,8 +278,8 @@ impl<'a> FileRepo<'a> {
         self.0.conn_mut().execute(
             "INSERT INTO file
                  (root_id, rel_path, name, ext, size, mtime, ctime, atime,
-                  norm_key, first_seen_at, blake3, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?10)
+                  norm_key, first_seen_at, blake3, state, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'local', ?10)
              ON CONFLICT(root_id, rel_path) DO UPDATE SET
                  name = excluded.name, ext = excluded.ext, size = excluded.size,
                  mtime = excluded.mtime, ctime = excluded.ctime, atime = excluded.atime,
@@ -237,6 +287,11 @@ impl<'a> FileRepo<'a> {
                  -- first_seen_at is NEVER overwritten: §4.12 makes it the
                  -- min-age floor source where mtime is untrusted or in the
                  -- future, and a re-scan must not reset a file's apparent age.
+                 --
+                 -- state is NOT in this list either, and for the same shape of
+                 -- reason: a stub or a tiered placeholder still stats, so a
+                 -- re-scan that wrote excluded.state ('local') would silently
+                 -- revoke custody on every file the tierer had moved.
                  blake3 = COALESCE(excluded.blake3, file.blake3)",
             params![
                 root.id.get(),
@@ -399,6 +454,8 @@ mod tests {
                 PathNormPolicy::Nfc,
                 AtimeMode::Relatime,
                 Some("uuid:abc"),
+                false,
+                &[],
                 Timestamp::from_nanos(1),
             )
             .unwrap();
@@ -455,6 +512,67 @@ mod tests {
             first, 100,
             "re-scanning must not reset apparent age — it is the min-age floor source"
         );
+    }
+
+    /// A new row is `'local'` and says so, rather than inheriting the schema
+    /// default from a statement that never mentions the column.
+    ///
+    /// The paired half is [`a_rescan_does_not_revoke_a_tiered_row_s_custody`]:
+    /// on its own, "a fresh row is local" is satisfied by a column nothing
+    /// writes, since `'local'` is also the default.
+    #[test]
+    fn a_freshly_scanned_row_is_local() {
+        let (mut cat, root) = fixture();
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &stat(root.id, "a.txt"), Timestamp::from_nanos(1))
+            .unwrap();
+        let st: String = cat
+            .conn()
+            .query_row("SELECT state FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(st, "local");
+    }
+
+    /// The load-bearing half of writing `state` explicitly.
+    ///
+    /// A tiered file is a placeholder that still stats, so the scanner hands
+    /// `upsert_file` an ordinary `FileStat` for it on every pass. If the
+    /// conflict branch took `excluded.state`, each re-scan would rewrite
+    /// `'stub'`/`'remote'` back to `'local'` — dropping the catalog's only
+    /// record that the bytes are elsewhere, and taking `root.remove`'s custody
+    /// refusal down with it.
+    #[test]
+    fn a_rescan_does_not_revoke_a_tiered_rows_custody() {
+        let (mut cat, root) = fixture();
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &stat(root.id, "a.txt"), Timestamp::from_nanos(1))
+            .unwrap();
+        // Stand in for the tierer, which is Phase 2/3 work. What is under test
+        // is the re-scan, not who set the state.
+        cat.conn_mut()
+            .execute("UPDATE file SET state = 'stub'", [])
+            .unwrap();
+
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &stat(root.id, "a.txt"), Timestamp::from_nanos(2))
+            .unwrap();
+
+        let st: String = cat
+            .conn()
+            .query_row("SELECT state FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            st, "stub",
+            "a re-scan reset a tiered row to local — every custody record under \
+             this root would be lost on the next scan"
+        );
+        // The rest of the row still updated, so the assertion above is about
+        // `state` specifically and not about the upsert having done nothing.
+        let updated: i64 = cat
+            .conn()
+            .query_row("SELECT updated_at FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(updated, 2, "the re-scan must still have written the row");
     }
 
     #[test]
