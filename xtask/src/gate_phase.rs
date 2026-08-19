@@ -921,7 +921,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             id: "AC-99".into(),
             outcomes: vec![],
             missing_reason: None,
-                note: String::new(),
+            note: String::new(),
         };
         assert!(!r.ok());
     }
@@ -990,7 +990,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
                 (ev.clone(), CheckOutcome::Passed { count: 2 }),
             ],
             missing_reason: None,
-                note: String::new(),
+            note: String::new(),
         };
         assert!(all_good.ok());
 
@@ -1001,7 +1001,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
                 (ev, CheckOutcome::MatchedNothing),
             ],
             missing_reason: None,
-                note: String::new(),
+            note: String::new(),
         };
         assert!(!one_bad.ok());
     }

@@ -532,10 +532,9 @@ async fn the_registration_probe_adopts_a_checksum_the_provider_actually_round_tr
             // Every earlier algorithm in the preference order must have been
             // tried and rejected — otherwise the adoption skipped a stronger
             // one silently.
-            for earlier in
-                shepherd_storage::s3::FULL_OBJECT_PREFERENCE
-                    .iter()
-                    .take_while(|a| **a != alg)
+            for earlier in shepherd_storage::s3::FULL_OBJECT_PREFERENCE
+                .iter()
+                .take_while(|a| **a != alg)
             {
                 let a = probe
                     .attempts

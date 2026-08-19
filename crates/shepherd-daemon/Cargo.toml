@@ -30,8 +30,16 @@ shepherd-obs.workspace = true
 shepherd-proto.workspace = true
 shepherd-scan.workspace = true
 shepherd-secrets.workspace = true
+# `target.add` registers a storage target, and §4.5's registration-time
+# whole-object-checksum probe lives here. This is the daemon's only async edge:
+# see `targets::probe_multipart_checksum_blocking` for why the runtime it needs
+# is built per call rather than owned by the process.
+shepherd-storage.workspace = true
 
 rusqlite.workspace = true
+# Only `target.add` awaits anything. `enable_all` needs the io and time drivers,
+# which the `aws-sdk-s3` edge under `shepherd-storage` already unifies in.
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -49,3 +57,8 @@ libc = { workspace = true }
 # CLI, so it needs the wire types it would otherwise have to hand-roll.
 shepherd-proto.workspace = true
 serde_json = { workspace = true }
+# `target.add`'s stored effective config is not on the wire — `TargetSummary`
+# carries no checksum field and `target.list` is still refused — so the e2e
+# reads the committed row out of the daemon's own catalog. WAL gives it a
+# consistent cross-process read without disturbing the writer.
+rusqlite = { workspace = true }

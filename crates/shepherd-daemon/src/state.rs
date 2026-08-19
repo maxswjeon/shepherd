@@ -7,6 +7,7 @@ use shepherd_catalog::writer::{CatalogActor, CatalogWriter};
 use shepherd_index::{MetaIndex, MetaIndexBuilder};
 use shepherd_proto::response::{CheckStatus, DoctorCheck};
 use shepherd_proto::{Capability, ErrorCode, RpcError, capability};
+use shepherd_secrets::SecretStore;
 
 use crate::events::EventHub;
 use crate::paths::Paths;
@@ -18,6 +19,18 @@ pub struct Daemon {
     pub paths: Paths,
     pub started_at: Instant,
     pub capabilities: Vec<Capability>,
+    /// Where `credentials_ref` is resolved.
+    ///
+    /// Read-only from the daemon's point of view: `target.add` looks a handle
+    /// up, and no IPC method stores or returns credential material. §4.1 keeps
+    /// secrets off the wire and out of the catalog entirely, so this is the one
+    /// place in the process that ever holds a resolved value, and it holds it
+    /// only for as long as one registration takes.
+    ///
+    /// Built here rather than per connection so the backend chain — environment
+    /// first, then the state directory's keyfile — is one fact about the
+    /// process instead of a decision each handler re-makes.
+    pub secrets: SecretStore,
     /// The §4.6 metadata name index.
     ///
     /// `Option`, not a default-empty index, and the distinction is the whole
@@ -40,11 +53,13 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(actor: CatalogActor, events: EventHub, paths: Paths) -> Arc<Self> {
         let writer = actor.handle();
+        let paths_for_secrets = paths.secrets();
         Arc::new(Self {
             writer,
             events,
             paths,
             started_at: Instant::now(),
+            secrets: SecretStore::with_keyfile(paths_for_secrets),
             index: RwLock::new(None),
             // Advertised because the event buffer and its resume cursor exist
             // (`shepherd_proto::event`). Placeholders and hosted inference are

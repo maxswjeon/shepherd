@@ -37,6 +37,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
+use serde::Serialize;
 use shepherd_core::{ObjectKey, ObjectVersion};
 
 use crate::adapter::{
@@ -740,7 +741,17 @@ pub enum AttemptError {
 }
 
 /// What one algorithm's probe did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` and not `Deserialize`: `step` is a `&'static str`, and the only
+/// consumer is a registration path that **writes** this record down beside the
+/// target it produced. Reading it back is not a capability anything has asked
+/// for, and adding it would mean owning those strings for no live reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// Internally tagged, so a serialized attempt reads
+// `{"algorithm": "...", "outcome": {"result": "rejected", "step": ..., "detail": ...}}`.
+// `result` rather than the type's own name, because the field holding it is
+// already called `outcome` and `outcome.outcome` reads like a bug.
+#[serde(rename_all = "snake_case", tag = "result")]
 pub enum AttemptOutcome {
     /// A genuine multipart upload completed and HEAD returned a whole-object
     /// checksum of this algorithm. `value` is the checksum the provider
@@ -754,7 +765,7 @@ pub enum AttemptOutcome {
 }
 
 /// One algorithm's line in the probe record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProbeAttempt {
     pub algorithm: ChecksumAlgorithm,
     pub outcome: AttemptOutcome,
@@ -768,7 +779,7 @@ pub struct ProbeAttempt {
 /// cannot be revisited without re-uploading every object, so it has to arrive
 /// with the per-algorithm reasons that produced it. A boolean would make a
 /// wrong negative indistinguishable from a right one forever.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChecksumProbe {
     /// The algorithm to configure. `None` means the provider supports none of
     /// them and scrub must read multipart objects back in full — the expensive
@@ -948,7 +959,12 @@ impl ChecksumRoundTrip for S3RoundTrip {
         // scratch control object whose bytes carry no meaning, which is the one
         // case where overwrite is not a lost fact.
         if let Err(e) = adapter
-            .complete_multipart(&object, &upload, &receipts, CreatePrecondition::Unconditional)
+            .complete_multipart(
+                &object,
+                &upload,
+                &receipts,
+                CreatePrecondition::Unconditional,
+            )
             .await
         {
             let _ = adapter.abort_multipart(&object, &upload).await;
@@ -966,12 +982,12 @@ impl ChecksumRoundTrip for S3RoundTrip {
         // `ChecksumType` there while reporting it correctly on HEAD, so the
         // attributes call produces a false negative on a provider that
         // supports the feature. Recorded in E-5 from handling the API directly.
-        let checksum = head
-            .and_then(|m| m.whole_object_checksum)
-            .ok_or_else(|| AttemptError::Unsupported {
+        let checksum = head.and_then(|m| m.whole_object_checksum).ok_or_else(|| {
+            AttemptError::Unsupported {
                 step: "head",
                 detail: "the object completed but HEAD returned no whole-object checksum".into(),
-            })?;
+            }
+        })?;
 
         if !checksum.whole_object {
             return Err(AttemptError::Unsupported {
@@ -1145,7 +1161,10 @@ mod probe_tests {
     #[test]
     fn a_provider_that_refuses_crc64_falls_through_to_crc32c() {
         let f = Fake::new(&[
-            ("CRC64NVME", unsupported("InvalidRequest: unknown algorithm")),
+            (
+                "CRC64NVME",
+                unsupported("InvalidRequest: unknown algorithm"),
+            ),
             ("CRC32C", Ok("72M33w==".into())),
         ]);
         let p = run(&f).unwrap();
@@ -1180,7 +1199,11 @@ mod probe_tests {
             );
         }
         // And it names where it was pointed, so the negative is reproducible.
-        assert!(p.summary().contains("http://probe.invalid"), "{}", p.summary());
+        assert!(
+            p.summary().contains("http://probe.invalid"),
+            "{}",
+            p.summary()
+        );
     }
 
     /// **The load-bearing case.** E-5: a false negative here is silent,
@@ -1230,7 +1253,9 @@ mod probe_tests {
         for alg in FULL_OBJECT_PREFERENCE {
             let k = probe_key(alg);
             assert!(
-                k.as_key().as_str().starts_with(shepherd_core::CONTROL_PREFIX),
+                k.as_key()
+                    .as_str()
+                    .starts_with(shepherd_core::CONTROL_PREFIX),
                 "{}",
                 k.as_key().as_str()
             );

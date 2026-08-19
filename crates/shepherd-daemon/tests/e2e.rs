@@ -16,10 +16,13 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use shepherd_proto::request::RpcRequest;
@@ -39,21 +42,69 @@ struct Daemon {
 
 impl Daemon {
     fn start(tag: &str) -> Daemon {
+        Daemon::start_with_env(tag, &[])
+    }
+
+    /// A daemon with extra environment.
+    ///
+    /// `target.add` resolves `credentials_ref` through
+    /// `shepherd_secrets::SecretStore`, whose chain reads the environment
+    /// first. Handing the child a `SHEPHERD_SECRET_*` var is therefore how a
+    /// test supplies a target's credentials without writing a keyfile — and it
+    /// exercises the real resolution path rather than bypassing it.
+    fn start_with_env(tag: &str, env: &[(&str, &str)]) -> Daemon {
         let dir = std::env::temp_dir().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("daemon.sock");
 
-        let child = Command::new(env!("CARGO_BIN_EXE_shepherdd"))
-            .arg("run")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shepherdd"));
+        cmd.arg("run")
             .env("SHEPHERD_STATE_DIR", &dir)
-            .env("SHEPHERD_SOCKET", &socket)
-            .spawn()
-            .expect("spawn shepherdd");
+            .env("SHEPHERD_SOCKET", &socket);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("spawn shepherdd");
 
         let d = Daemon { child, dir, socket };
         d.wait_until_listening();
         d
+    }
+
+    /// The `config_json` the daemon committed for a target, read out of its own
+    /// catalog.
+    ///
+    /// Not on the wire: `TargetSummary` carries no checksum field and
+    /// `target.list` is still refused, and widening the protocol to make a test
+    /// easier would be the test dictating the product. WAL gives a second
+    /// process a consistent read, and the row is committed before `target.add`
+    /// returns.
+    fn stored_target_config(&self, name: &str) -> serde_json::Value {
+        let conn = rusqlite::Connection::open_with_flags(
+            self.dir.join("catalog.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open the daemon's catalog read-only");
+        let raw: String = conn
+            .query_row(
+                "SELECT config_json FROM target WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("no committed target row named `{name}`: {e}"));
+        serde_json::from_str(&raw).expect("config_json is json")
+    }
+
+    /// How many targets the daemon has committed.
+    fn target_count(&self) -> i64 {
+        let conn = rusqlite::Connection::open_with_flags(
+            self.dir.join("catalog.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open the daemon's catalog read-only");
+        conn.query_row("SELECT COUNT(*) FROM target", [], |r| r.get(0))
+            .unwrap()
     }
 
     fn wait_until_listening(&self) {
@@ -469,7 +520,12 @@ fn probe_params(method: &str) -> serde_json::Value {
         "scan.status" => serde_json::json!({}),
         "search" => serde_json::json!({"query": "probe"}),
         "status" => serde_json::json!({}),
-        "target.add" => serde_json::json!({"name": "probe", "adapter": "s3"}),
+        // An empty `config` is missing the required `bucket`, so the handler
+        // refuses with `Invalid` before it opens a socket to anything. That is
+        // "reached" in exactly the sense this probe measures, and it keeps the
+        // reachability sweep free of network I/O — the registration probe's own
+        // behaviour is asserted by the dedicated `target.add` tests instead.
+        "target.add" => serde_json::json!({"name": "probe", "adapter": "s3", "config": {}}),
         "target.list" => serde_json::json!({}),
         "target.test" => serde_json::json!({"target_id": 999_999}),
         "rule.list" => serde_json::json!({}),
@@ -520,44 +576,52 @@ fn every_registry_method_is_probed_and_exactly_the_recorded_ones_are_refused() {
     /// `search.filters.path_glob` is a capability rather than a method and is
     /// asserted separately below.
     ///
-    /// **`target.add` carries an ordering constraint, and this is the only place
-    /// anyone is forced to read it.** `S3Config::multipart_checksum` decides
-    /// whether an S3 upload requests a **whole-object** checksum, and `s3.rs`'s
-    /// own doc says the value must be probed *at registration* because a
-    /// checksum not requested at upload **cannot be retrofitted without
-    /// re-uploading the object**. Serving `target.add` without probing would
-    /// permanently fix every object written through that target into the
-    /// no-checksum configuration — measured at ADR 0b §3 as **$441/month
-    /// against $0.68** on a 50 TB corpus, 649x, per object, irreversible.
+    /// **`target.add` is no longer here, and the constraint that kept it here
+    /// is now a property of the shipped code rather than a warning to a future
+    /// author.** It is restated because the constraint did not go away when the
+    /// refusal did — it moved from "do not serve this yet" to "do not undo
+    /// this".
     ///
-    /// That has been harmless only because `target.add` is refused: with no way
-    /// to register a target there are no objects to strand.
+    /// `S3Config::multipart_checksum` decides whether an S3 upload requests a
+    /// **whole-object** checksum. It cannot be retrofitted: a checksum not
+    /// requested at upload requires re-uploading the object to obtain, so a
+    /// target registered without one fixes every object written through it into
+    /// the no-checksum configuration — **$441/month against $0.68** on a 50 TB
+    /// corpus, 649x, per object, irreversible (ADR 0b §3). Registration is the
+    /// only moment at which the choice exists.
     ///
-    /// **The producer now exists** — `shepherd_storage::s3::probe_multipart_checksum`
-    /// (E-5's settled design: probe at registration, adopt the first of
-    /// CRC64NVME → CRC32C → CRC32 that round-trips, record the outcome **with
-    /// its evidence** rather than as a boolean). So the constraint is no longer
-    /// "a probe must be written" but "the probe must be CALLED":
+    /// `Session::target_add` therefore calls
+    /// `shepherd_storage::s3::probe_multipart_checksum` **before** the `target`
+    /// row is inserted, and stores what it returned in `target.config_json`.
+    /// Three properties of that path are load-bearing, and each is asserted by
+    /// a test in this file rather than left to review:
     ///
-    /// > Whoever deletes `"target.add"` from this list owes a call to
-    /// > `probe_multipart_checksum` on the registration path, and must persist
-    /// > its `ChecksumProbe` — including the per-algorithm reasons behind a
-    /// > negative. `Ok(adopted: None)` is a legitimate provider answer;
-    /// > `Err(_)` means the provider was never reached and must fail the
-    /// > registration rather than be stored as "supports nothing", because a
-    /// > false negative there is silent, permanent and indistinguishable from a
-    /// > real measurement.
+    /// > 1. The probe is **called**, and its adopted algorithm lands in the
+    /// >    stored config — otherwise every upload silently takes the expensive
+    /// >    path. (`a_registered_target_carries_what_the_probe_measured`, and
+    /// >    the MinIO-backed positive below it.)
+    /// > 2. `Ok(adopted: None)` — the provider answered and supports none of
+    /// >    CRC64NVME → CRC32C → CRC32 — is stored **with the per-algorithm
+    /// >    reasons**, never as a bare boolean, so a wrong negative is
+    /// >    distinguishable from a right one after the fact.
+    /// > 3. `Err(_)` — the provider was never reached — **refuses the
+    /// >    registration** and writes no row. Persisting it as "supports
+    /// >    nothing" would be silent, permanent, and indistinguishable from a
+    /// >    real measurement.
+    /// >    (`a_target_whose_provider_cannot_be_reached_is_not_registered_at_all`.)
     ///
-    /// Serving it also needs a Phase-2 registration path that does not exist:
-    /// `shepherd-daemon` has no `tokio` runtime and no `shepherd-storage` edge,
-    /// and nothing parses `TargetAddRequest::config` or resolves
-    /// `credentials_ref`. That is why this row still stands.
+    /// A change that keeps those tests passing while removing the probe call is
+    /// the failure to watch for: mutation-check by deleting the call and
+    /// confirming they fail before trusting them.
+    ///
+    /// `target.list` and `target.test` stay refused deliberately. Neither fell
+    /// out of serving `target.add` — `target.test` in particular is its own
+    /// reachability-and-permissions probe — and serving a method with less than
+    /// it promises is what this whole test exists to catch.
     const UNSERVED: &[&str] = &[
         "restore",
         "rule.list",
         "rule.preview",
-        // See the ordering constraint above before serving this one.
-        "target.add",
         "target.list",
         "target.test",
         "tier.plan",
@@ -635,15 +699,15 @@ fn every_registry_method_is_probed_and_exactly_the_recorded_ones_are_refused() {
          \n  recorded:    {:?}\nIf a method started being served, delete it from UNSERVED — that \
          is the good direction. If one stopped, something unwired it from the daemon and no \
          per-AC test would have noticed.\n\
-         \nIF THE CHANGE IS `target.add`, READ THIS FIRST: serving it requires the registration \
-         path to CALL `shepherd_storage::s3::probe_multipart_checksum` and persist the \
-         `ChecksumProbe` it returns. A checksum not requested at upload cannot be retrofitted \
-         without re-uploading, so every object written through an unprobed target is permanently \
-         in the no-checksum configuration — $441/month against $0.68 on 50 TB, 649x (ADR 0b §3). \
-         The probe adopts the first of CRC64NVME -> CRC32C -> CRC32 that round-trips and records \
-         per-algorithm evidence rather than a boolean. `Ok(adopted: None)` is a real provider \
-         answer and is safe; `Err(_)` means the provider was never reached and MUST fail the \
-         registration, never be stored as `unsupported`. See open-questions E-5.",
+         \nIF `target.add` IS BACK IN THE REFUSED SET, READ THIS FIRST: it is served, and it is \
+         served together with a registration-time call to \
+         `shepherd_storage::s3::probe_multipart_checksum` whose result is persisted in \
+         `target.config_json`. Unwiring the method takes that probe out of the product with it. \
+         A checksum not requested at upload cannot be retrofitted without re-uploading, so every \
+         object written through an unprobed target is permanently in the no-checksum \
+         configuration — $441/month against $0.68 on 50 TB, 649x (ADR 0b §3). If the method is \
+         being retired on purpose, retire the probe's caller deliberately and say so here; if \
+         this is a surprise, something unwired it. See open-questions E-5.",
         refused, recorded
     );
     assert!(
@@ -1205,11 +1269,23 @@ fn shepherdd_doctor_works_with_no_daemon_running() {
     let config = home.join(".config");
     std::fs::create_dir_all(&config).unwrap();
     let socket = dir.join("nothing.sock");
-    // The exact path `shepherd-daemon::service::systemd::unit_path()` would
-    // resolve given `XDG_CONFIG_HOME=config` — computed independently here
-    // from the documented env-var contract, not by calling that function,
-    // so this assertion cannot pass by tautology.
-    let unit_path = config.join("systemd/user/shepherd.service");
+    // The exact path `service::registration()` would resolve, computed
+    // independently here from each platform's documented contract rather than
+    // by calling that function, so the assertion cannot pass by tautology.
+    //
+    // PER PLATFORM, because `registration()` is: `systemd::unit_path()` on
+    // Linux, which honours `XDG_CONFIG_HOME`, and `launchd::plist_path()` on
+    // macOS, which reads `HOME` and ignores `XDG_CONFIG_HOME` entirely. The
+    // first version of this hardcoded the systemd path and passed on Linux
+    // while failing on macOS — caught by this repository's first-ever CI run,
+    // which is the whole argument for having one: a test that encodes one
+    // platform's layout as though it were the contract is invisible until
+    // another platform runs it.
+    let unit_path = if cfg!(target_os = "macos") {
+        home.join("Library/LaunchAgents/kr.swjeon.shepherd.plist")
+    } else {
+        config.join("systemd/user/shepherd.service")
+    };
 
     let run_doctor = || {
         Command::new(env!("CARGO_BIN_EXE_shepherdd"))
@@ -1225,6 +1301,10 @@ fn shepherdd_doctor_works_with_no_daemon_running() {
     let out = run_doctor();
     let text = String::from_utf8_lossy(&out.stdout);
 
+    // The lingering check is a systemd concept and `doctor` only reports it
+    // there; on macOS the equivalent line is absent by design rather than
+    // missing. Asserted per platform so this cannot silently stop checking.
+    #[cfg(not(target_os = "macos"))]
     assert!(
         text.contains("systemd lingering"),
         "the lingering check must run without a daemon: {text}"
@@ -2465,4 +2545,327 @@ fn hosted_optin_is_stored_as_the_user_set_it_rather_than_defaulted() {
     };
     assert!(by_path(&consented), "{listed}");
     assert!(!by_path(&withheld), "{listed}");
+}
+
+// ---------------------------------------------------------------------------
+// `target.add` — the registration-time whole-object-checksum probe
+// ---------------------------------------------------------------------------
+
+/// An S3 endpoint that answers every request with one canned refusal.
+///
+/// # Why a fake rather than only MinIO
+///
+/// The probe's two provider-facing answers are **not symmetric**, and MinIO can
+/// only demonstrate one of them: it supports CRC64NVME, so a MinIO run always
+/// takes the adopt-on-the-first-algorithm path and never once reaches the
+/// "provider supports none of the three" branch. That branch is the expensive
+/// one — it is what commits every object written through the target to full-read
+/// scrub — so leaving it to an emulator that cannot produce it would mean the
+/// degrade path ships untested behind a green MinIO run.
+///
+/// `400 InvalidRequest` specifically. `s3.rs`'s `map_err` routes 5xx,
+/// throttling and dispatch failures to `StorageError::Transient`, which the
+/// probe classifies as `Unreachable` — "we never got an answer" — and which
+/// **refuses** the registration. A 400 with a non-retryable code is the
+/// provider answering, which is the case under test here.
+struct FakeS3 {
+    endpoint: String,
+    stop: Arc<AtomicBool>,
+    joiner: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeS3 {
+    fn refusing_every_algorithm() -> FakeS3 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a fake s3");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let joiner = std::thread::spawn(move || {
+            const BODY: &str = concat!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+                "<Error><Code>InvalidRequest</Code>",
+                "<Message>this provider does not support the requested checksum algorithm",
+                "</Message><Resource>/</Resource><RequestId>fake-s3</RequestId></Error>"
+            );
+            while !flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                        // The refused call is `CreateMultipartUpload`, which
+                        // carries no body, so the request head is all there is
+                        // to drain before answering.
+                        let mut buf = [0u8; 8192];
+                        let _ = sock.read(&mut buf);
+                        let _ = write!(
+                            sock,
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/xml\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                            BODY.len()
+                        );
+                        let _ = sock.flush();
+                        let _ = sock.shutdown(std::net::Shutdown::Both);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        FakeS3 {
+            endpoint,
+            stop,
+            joiner: Some(joiner),
+        }
+    }
+}
+
+impl Drop for FakeS3 {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(j) = self.joiner.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// The credential the registration path resolves, in the shape the secret
+/// store holds it. `SecretRef("target/probe")` reads
+/// `SHEPHERD_SECRET_TARGET_PROBE`, which is the first backend in the chain.
+const PROBE_SECRET_VAR: &str = "SHEPHERD_SECRET_TARGET_PROBE";
+const PROBE_SECRET: &str = r#"{"access_key_id":"probe","secret_access_key":"probe-secret"}"#;
+
+/// **A registered target carries what the probe measured, evidence included.**
+///
+/// This is the test the `UNSERVED` comment above names. It asserts the thing a
+/// reviewer cannot see by reading `dispatch.rs`: that `target.add` did not just
+/// write a row, but reached the provider first and wrote down what it said.
+///
+/// The provider here refuses all three algorithms, so the correct outcome is
+/// the **degraded** one — `adopted: null`, scrub reads multipart objects back in
+/// full, expensive and never wrong. The two ways to get that wrong are both
+/// checked:
+///
+/// * adopting an algorithm the provider never confirmed — asserted by the
+///   absence of `multipart_checksum` from the stored config;
+/// * recording the negative as a bare fact with no reasons — asserted by
+///   requiring a per-algorithm outcome for each of CRC64NVME, CRC32C and CRC32,
+///   because a false negative is permanent and, without its reasons,
+///   indistinguishable from a true one.
+///
+/// **Mutation check.** Delete the `probe_multipart_checksum_blocking` call in
+/// `Session::target_add` and this test fails: `checksum_probe` is written from
+/// the returned record and from nothing else, so its absence is not something
+/// the handler can fake.
+#[test]
+fn a_registered_target_carries_what_the_probe_measured() {
+    let fake = FakeS3::refusing_every_algorithm();
+    let d = Daemon::start_with_env("target-add-degrade", &[(PROBE_SECRET_VAR, PROBE_SECRET)]);
+    let mut c = d.connect();
+
+    let added = c.call(
+        "target.add",
+        serde_json::json!({
+            "name": "refusing",
+            "adapter": "s3",
+            "config": {
+                "bucket": "archive",
+                "endpoint_url": fake.endpoint,
+                "region": "us-east-1",
+                "force_path_style": true,
+            },
+            "credentials_ref": "target/probe",
+        }),
+    );
+    assert_eq!(added["target"]["name"], serde_json::json!("refusing"));
+    assert_eq!(
+        added["target"]["custody_eligible"],
+        serde_json::json!(false),
+        "§4.4: registration does not confer custody: {added}"
+    );
+
+    let stored = d.stored_target_config("refusing");
+
+    assert!(
+        stored.get("multipart_checksum").is_none(),
+        "the provider refused every algorithm and the target adopted one anyway. Adopting the \
+         request rather than the answer is how a probe reports support the provider never gave, \
+         and every multipart object written through this target would then appear corrupt the \
+         first time scrub compared it: {stored}"
+    );
+
+    let probe = stored.get("checksum_probe").unwrap_or_else(|| {
+        panic!(
+            "no `checksum_probe` in the stored config, so `target.add` registered this target \
+             WITHOUT calling `shepherd_storage::s3::probe_multipart_checksum`. Every object \
+             written through it is now permanently in the no-checksum configuration — 649x on \
+             scrub, per object, unrecoverable without re-uploading. See the `UNSERVED` comment \
+             in this file: {stored}"
+        )
+    });
+
+    assert_eq!(
+        probe["adopted"],
+        serde_json::Value::Null,
+        "a provider that refused all three must be recorded as adopting none: {probe}"
+    );
+    assert_eq!(
+        probe["endpoint"],
+        serde_json::json!(fake.endpoint),
+        "a probe that reports a negative without naming where it was pointed is \
+         indistinguishable from one that never left the emulator: {probe}"
+    );
+
+    // The evidence, per algorithm, in preference order. This is what makes a
+    // wrong negative recoverable later.
+    let attempts = probe["attempts"].as_array().expect("attempts array");
+    let names: Vec<&str> = attempts
+        .iter()
+        .map(|a| a["algorithm"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["crc64-nvme", "crc32c", "crc32"],
+        "the preference order is the design and it is recorded, not implied: {probe}"
+    );
+    for a in attempts {
+        assert_eq!(
+            a["outcome"]["result"],
+            serde_json::json!("rejected"),
+            "the provider answered `no` to this algorithm, so the record must say so — and say \
+             why: {a}"
+        );
+        let detail = a["outcome"]["detail"].as_str().unwrap_or("");
+        assert!(
+            detail.contains("InvalidRequest"),
+            "the refusal was stored without the provider's reason, which is the half that makes \
+             a negative auditable: {a}"
+        );
+    }
+}
+
+/// **A provider that cannot be reached is not a provider that said no.**
+///
+/// The asymmetry E-5 turns on. `Err(_)` from the probe means the round trip
+/// never happened, so it proves nothing about the provider — and storing it as
+/// "supports nothing" would be silent, permanent, and indistinguishable from a
+/// real measurement for the life of every object written afterwards.
+///
+/// So the registration is refused **and no row is written**. The second half is
+/// the one worth asserting: a handler that inserted first and probed second
+/// would pass a test that only checked the error code, while leaving behind
+/// exactly the stranded target this is meant to prevent.
+#[test]
+fn a_target_whose_provider_cannot_be_reached_is_not_registered_at_all() {
+    let d = Daemon::start_with_env(
+        "target-add-unreachable",
+        &[(PROBE_SECRET_VAR, PROBE_SECRET)],
+    );
+    let mut c = d.connect();
+
+    let err = c.call_err(
+        "target.add",
+        serde_json::json!({
+            "name": "unreachable",
+            "adapter": "s3",
+            "config": {
+                // Port 1 is privileged and unbound: the connection is refused
+                // immediately rather than timing out.
+                "bucket": "archive",
+                "endpoint_url": "http://127.0.0.1:1",
+                "region": "us-east-1",
+                "force_path_style": true,
+            },
+            "credentials_ref": "target/probe",
+        }),
+    );
+    assert_eq!(
+        err.kind(),
+        Some(shepherd_proto::ErrorCode::TargetUnreachable),
+        "an unreachable provider is a retryable transport failure, not a verdict about the \
+         provider: {err}"
+    );
+    assert_eq!(
+        d.target_count(),
+        0,
+        "the registration failed and left a target row behind. That row's uploads would run \
+         with no whole-object checksum forever, on the strength of a probe that never reached \
+         anything"
+    );
+}
+
+/// **The positive leg, against a real provider.**
+///
+/// `#[ignore]`d like every other MinIO test here, because a test that silently
+/// passes when its dependency is absent is worse than one that is visibly
+/// skipped.
+///
+/// ```text
+/// docker compose -f tests/docker-compose.yml up -d --wait
+/// SHEPHERD_MINIO_ENDPOINT=http://127.0.0.1:9000 \
+///   cargo test -p shepherd-daemon --test e2e -- --ignored --nocapture \
+///   a_minio_target_adopts_the_strongest_algorithm_that_round_trips
+/// ```
+///
+/// The fake above proves the degrade path and that the probe is called at all;
+/// only a real provider can prove the other direction — that a bucket which
+/// **does** support whole-object checksums ends up configured to use them,
+/// which is the entire $441-against-$0.68 point. The adopted value is asserted
+/// in its stored form, since that string is what a later phase hydrates a
+/// `S3Config` from.
+#[test]
+#[ignore = "needs the MinIO in tests/docker-compose.yml"]
+fn a_minio_target_adopts_the_strongest_algorithm_that_round_trips() {
+    let endpoint = std::env::var("SHEPHERD_MINIO_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+    let d = Daemon::start_with_env(
+        "target-add-minio",
+        &[(
+            PROBE_SECRET_VAR,
+            r#"{"access_key_id":"shepherdtest","secret_access_key":"shepherdtest"}"#,
+        )],
+    );
+    let mut c = d.connect();
+    // Three 10 MiB multipart round trips against a container is not a
+    // twenty-second operation on every machine.
+    c.set_read_timeout(Duration::from_secs(120));
+
+    c.call(
+        "target.add",
+        serde_json::json!({
+            "name": "minio",
+            "adapter": "s3",
+            "config": {
+                "bucket": "shepherd-plain",
+                "endpoint_url": endpoint,
+                "region": "us-east-1",
+                "force_path_style": true,
+            },
+            "credentials_ref": "target/probe",
+        }),
+    );
+
+    let stored = d.stored_target_config("minio");
+    assert_eq!(
+        stored["multipart_checksum"],
+        serde_json::json!("crc64-nvme"),
+        "MinIO round-trips CRC64NVME on a genuine two-part upload, so registration must adopt \
+         it — this field is what every later upload through this target reads, and it cannot be \
+         set after the fact without re-uploading every object: {stored}"
+    );
+    assert_eq!(
+        stored["checksum_probe"]["attempts"][0]["outcome"]["result"],
+        serde_json::json!("round_tripped"),
+        "the adoption must be recorded with the value the provider actually returned, not as a \
+         boolean: {stored}"
+    );
+    assert_eq!(
+        stored["checksum_probe"]["attempts"][1]["outcome"]["result"],
+        serde_json::json!("not_attempted"),
+        "a provider that answered on the first algorithm must not be billed for two more 10 MiB \
+         uploads: {stored}"
+    );
 }

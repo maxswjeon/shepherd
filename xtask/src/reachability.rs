@@ -502,7 +502,7 @@ mod tests {
         );
         assert!(
             !r.refusals.is_empty(),
-            "the scan found NO refusals at all. dispatch.rs refuses eight methods today, so \
+            "the scan found NO refusals at all. dispatch.rs refuses seven methods today, so \
              zero means the scan stopped working, not that the daemon started serving them"
         );
     }
@@ -520,7 +520,14 @@ mod tests {
             "no refusal names Phase 2. Either the daemon now serves tiering — in which case \
              delete this test and the gate goes green honestly — or the scan broke"
         );
-        for expected in ["tier.run", "restore", "rule.preview", "target.add"] {
+        // `target.add` was here and is now served: it is the one Phase 2 method
+        // whose ordering constraint could not wait for the rest of the phase,
+        // because a target's whole-object checksum is decided at registration
+        // and cannot be retrofitted without re-uploading every object. Removing
+        // it from this list is the good direction — see the `UNSERVED` comment
+        // in `shepherd-daemon`'s e2e suite, which asserts the same fact against
+        // the daemon's actual answers rather than against `dispatch.rs`'s text.
+        for expected in ["tier.run", "restore", "rule.preview"] {
             assert!(
                 two.iter().any(|r| r.subject == expected),
                 "`{expected}` is Phase 2 machinery and the scan did not find it refused; got {:?}",

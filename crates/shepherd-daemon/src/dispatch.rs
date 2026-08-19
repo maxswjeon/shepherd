@@ -12,14 +12,30 @@
 //!
 //! | served here | answered `MethodNotImplemented` |
 //! |---|---|
-//! | `root.add`, `root.list`, `root.remove` | `target.*` (storage is T9, Phase 2) |
+//! | `root.add`, `root.list`, `root.remove` | `target.list`, `target.test` (Phase 2) |
 //! | `scan.start`, `scan.status` | `rule.*` (the engine is Phase 2) |
 //! | `search` (T7's metadata index) | `tier.*`, `restore` (Phase 2) |
 //! | `status`, `doctor`, `events.subscribe` | |
+//! | `target.add` (see below) | |
 //!
 //! The unimplemented ones return [`ErrorCode::MethodNotImplemented`] rather
 //! than a stopgap. The distinct error code, and `shepctl`'s exit status 4, are
 //! what make "not built yet" legible to a script.
+//!
+//! # `target.add` is served ahead of the rest of `target.*`, on purpose
+//!
+//! Registration is the **only** moment at which a target's whole-object
+//! multipart checksum can be decided: the value cannot be retrofitted without
+//! re-uploading every object written through the target, at a measured 649x
+//! scrub cost (ADR 0b §3). `shepherd_storage::s3::probe_multipart_checksum`
+//! settles it, and [`crate::targets`] is where the daemon calls it — before the
+//! `target` row exists, so a probe that cannot reach the provider refuses the
+//! registration instead of recording a guess that looks like a measurement
+//! forever after.
+//!
+//! `target.list` and `target.test` stay refused. Neither falls out of this
+//! change, each needs work of its own, and serving a method with less than it
+//! promises is the failure mode this whole file is arranged against.
 //!
 //! # `search` is served by the index, and by nothing else
 //!
@@ -40,6 +56,7 @@ use std::sync::Arc;
 
 use shepherd_catalog::file_repo::FileRepo;
 use shepherd_catalog::job_repo::JobClass;
+use shepherd_catalog::target_repo::TargetRepo;
 use shepherd_catalog::writer::CatalogWriter;
 use shepherd_catalog::{Catalog, CatalogError};
 use shepherd_core::{RootId, Timestamp};
@@ -50,6 +67,7 @@ use shepherd_proto::{ErrorCode, Negotiated, RpcError, ShepherdApi};
 
 use crate::events::EventHub;
 use crate::state::Daemon;
+use crate::targets::{self, S3TargetConfig};
 
 /// One connection's view of the daemon.
 ///
@@ -144,7 +162,13 @@ impl ShepherdApi for Session {
         // Probed, never assumed — §4.9 exists because retrofitting identity
         // after Phase 2 destroys files is the scenario it prevents.
         let policies = shepherd_catalog::identity::probe_path_policies(&path);
-        let atime_mode = shepherd_catalog::atime::detect(&path);
+        // `detect_with_write_probe`, not `detect`: on Linux a strict mount is
+        // recorded as the ABSENCE of an atime flag, so the option string alone
+        // cannot tell strict from unstated and answers `Relatime` for both.
+        // This is the one call site allowed to spend a write measuring the
+        // difference — §4.12 forbids guessing it, and `probe_path_policies`
+        // just above already writes to this same directory.
+        let atime_mode = shepherd_catalog::atime::detect_with_write_probe(&path);
         let volume = shepherd_catalog::volume::volume_id(&path).ok();
 
         let mut warnings = Vec::new();
@@ -458,11 +482,128 @@ impl ShepherdApi for Session {
         })
     }
 
-    // --- registered, not served at Phase 1 --------------------------------
+    // --- targets ----------------------------------------------------------
 
-    fn target_add(&mut self, _: TargetAddRequest) -> Result<TargetAddResult, RpcError> {
-        Err(not_implemented("target.add", "storage lands in Phase 2"))
+    /// Register a storage target, **probing it before it exists**.
+    ///
+    /// # The order of the steps below is the design
+    ///
+    /// Everything that can refuse cheaply refuses first, then the probe runs,
+    /// and only then does a row appear. Two of those orderings are load-bearing
+    /// rather than tidy:
+    ///
+    /// 1. **The probe runs before the insert.** A probe that cannot reach the
+    ///    provider returns `Err`, and this method turns that into a refusal. If
+    ///    the row were written first, the failure would leave a registered
+    ///    target whose `multipart_checksum` is absent — which is
+    ///    indistinguishable from a provider that genuinely supports none, is
+    ///    permanent for every object written afterwards, and costs 649x on
+    ///    scrub. "We could not tell" and "it does not support it" are different
+    ///    facts and only one of them may be persisted.
+    /// 2. **The name check runs before the probe.** Not for correctness —
+    ///    `target.name` is `UNIQUE` and the insert would catch it — but the
+    ///    probe uploads up to three 10 MiB multipart objects, and paying for
+    ///    that to answer a question about a registration already doomed by a
+    ///    name clash is a bill nobody agreed to.
+    ///
+    /// # What this deliberately does not probe
+    ///
+    /// `target.attestation_mode` is also documented as probed at registration
+    /// (§4.10.2) and is left at its fail-closed `'none'` default here. That is
+    /// a separate probe against a different provider property — bucket
+    /// versioning — with its own destroy-path consequences, and guessing it
+    /// from a successful checksum probe would be exactly the "silently landing
+    /// on B while believing A" the schema comment warns about. A target
+    /// registered by this build authorizes no destruction, which is the correct
+    /// answer until someone writes that probe.
+    fn target_add(&mut self, req: TargetAddRequest) -> Result<TargetAddResult, RpcError> {
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                "`name` must not be empty; it is how every later command refers to this target",
+            ));
+        }
+        if req.adapter != targets::S3_ADAPTER {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!(
+                    "`{}` is not an adapter this build can register. Served: `{}`. A target row                      for an adapter the daemon cannot construct would be a registration that                      every later phase has to special-case.",
+                    req.adapter,
+                    targets::S3_ADAPTER
+                ),
+            ));
+        }
+
+        let cfg = S3TargetConfig::parse_request(&req.config)?;
+        // Resolved, used to build one `S3Config`, and never logged, never
+        // stored, never returned. See `targets`' module docs.
+        let credentials =
+            targets::resolve_credentials(&self.daemon.secrets, req.credentials_ref.as_deref())?;
+
+        let taken = {
+            let n = name.clone();
+            self.cat(move |c| TargetRepo::new(c).name_exists(&n))?
+        };
+        if taken {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!("a target named `{name}` is already registered"),
+            ));
+        }
+
+        let probe = targets::probe_multipart_checksum_blocking(&cfg.to_s3_config(credentials))?;
+        // The summary carries the per-algorithm evidence and no credential
+        // material — `ChecksumProbe` holds an endpoint and a bucket, never an
+        // `S3Config`.
+        tracing::info!(
+            target_name = %name,
+            probe = %probe.summary(),
+            "registration checksum probe completed"
+        );
+
+        let config_json = serde_json::to_string(&cfg.with_probe(&probe)?).map_err(|e| {
+            RpcError::new(
+                ErrorCode::InternalError,
+                format!("the effective target config could not be serialized: {e}"),
+            )
+        })?;
+
+        let id = {
+            let (n, cref) = (name.clone(), req.credentials_ref.clone());
+            self.cat(move |c| {
+                TargetRepo::new(c).insert(
+                    &n,
+                    targets::S3_ADAPTER,
+                    // Not plugin-backed: `s3` is a first-party adapter.
+                    false,
+                    // §4.4 custody is a deliberate decision about where a sole
+                    // copy may live, not something a registration confers.
+                    false,
+                    &config_json,
+                    cref.as_deref(),
+                )
+            })?
+        };
+
+        Ok(TargetAddResult {
+            target: TargetSummary {
+                target_id: id.get(),
+                name,
+                adapter: targets::S3_ADAPTER.to_string(),
+                enabled: true,
+                is_third_party: false,
+                custody_eligible: false,
+                // Not persisted, so not claimed. `reachable` is the one thing
+                // this call genuinely observed: the probe completed a real
+                // multipart round trip against the bucket to get here.
+                last_health_at: None,
+                reachable: Some(true),
+            },
+        })
     }
+
+    // --- registered, not served at Phase 1 --------------------------------
 
     fn target_list(&mut self, _: TargetListRequest) -> Result<TargetListResult, RpcError> {
         Err(not_implemented("target.list", "storage lands in Phase 2"))

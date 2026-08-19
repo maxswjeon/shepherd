@@ -311,7 +311,9 @@ mod tests {
         let c = contract();
         let limit = bar("metadata_p95_ms");
         let want_rows = c["fixture"]["rows"].as_integer().map(|i| i as u64);
-        let want_clients = c["execution"]["query_clients"].as_integer().map(|i| i as u64);
+        let want_clients = c["execution"]["query_clients"]
+            .as_integer()
+            .map(|i| i as u64);
         let want_pin = c["reference_machine"]["pin_to_cores"].as_str();
 
         for cache in ["cold", "warm"] {
@@ -330,8 +332,15 @@ mod tests {
                 "{key} was measured against a different bar than bench-contract.toml fixes. \
                  Moving the bar after the run is the one edit that makes any measurement pass"
             );
-            assert!(p95 < limit, "{key} p95 is {p95:.2} ms against the {limit} ms bar");
-            assert_eq!(b[&key]["pass"].as_bool(), Some(true), "{key} records pass=false");
+            assert!(
+                p95 < limit,
+                "{key} p95 is {p95:.2} ms against the {limit} ms bar"
+            );
+            assert_eq!(
+                b[&key]["pass"].as_bool(),
+                Some(true),
+                "{key} records pass=false"
+            );
             assert_eq!(
                 b[&key]["rows"].as_u64(),
                 want_rows,
@@ -367,7 +376,10 @@ mod tests {
             let per_run = b[&key]["background_rows_ingested_per_run"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{key} has no background_rows_ingested_per_run"));
-            assert!(!per_run.is_empty(), "{key} recorded no per-run ingest counts");
+            assert!(
+                !per_run.is_empty(),
+                "{key} recorded no per-run ingest counts"
+            );
             for (i, v) in per_run.iter().enumerate() {
                 assert!(
                     v.as_u64().unwrap_or(0) > 0,

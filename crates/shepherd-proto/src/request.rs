@@ -432,7 +432,10 @@ mod tests {
         let r: RootAddRequest =
             serde_json::from_str(r#"{"path":"/srv/data","stub_mode":"delete"}"#).unwrap();
         assert!(!r.hosted_optin);
-        assert!(r.ignore_patterns.is_empty(), "1.2's field, omitted by a 1.1 client");
+        assert!(
+            r.ignore_patterns.is_empty(),
+            "1.2's field, omitted by a 1.1 client"
+        );
 
         let s: SearchRequest = serde_json::from_str(r#"{"query":"report"}"#).unwrap();
         assert_eq!(s.limit, 50, "defaulted, not zero");
@@ -458,7 +461,8 @@ mod tests {
         // a list that round-trips as a set would silently invert a negation.
         assert_eq!(r.ignore_patterns, ["*.tmp", "!keep.tmp", "build/"]);
 
-        let back: RootAddRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        let back: RootAddRequest =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back, r);
     }
 

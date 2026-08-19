@@ -31,12 +31,32 @@ impl<'a> TargetRepo<'a> {
     /// [`crate::migrate::assert_invariants`] stand behind it. Three independent
     /// guards for one property is the level §4.4 asks for: "there is no API,
     /// setting, acknowledgement or migration path that can set it true".
+    ///
+    /// # `config_json` is written here, not later
+    ///
+    /// The column has existed since 0001 and nothing wrote it, because nothing
+    /// registered a target. `target.add` now does, and it stores the
+    /// **effective** config — the caller's fields plus the whole-object
+    /// checksum algorithm its registration-time probe adopted. That value
+    /// cannot be retrofitted onto objects already uploaded without re-uploading
+    /// them, so it has to be durable in the same statement that makes the
+    /// target exist: a target row without it is a target whose uploads have
+    /// already made the irreversible choice.
+    ///
+    /// # `credentials_ref` is a name, never a secret
+    ///
+    /// §4.1 keeps credential material out of the catalog and off the IPC
+    /// surface entirely. What lands here is a `shepherd_secrets::SecretRef`
+    /// string — a handle meaning "look this up" — and the resolved value is
+    /// never a column, never a log field, and never part of `config_json`.
     pub fn insert(
         &mut self,
         name: &str,
         adapter: &str,
         is_third_party: bool,
         custody_eligible: bool,
+        config_json: &str,
+        credentials_ref: Option<&str>,
     ) -> Result<TargetId> {
         let custody = custody_eligible && !is_third_party;
         if custody_eligible && is_third_party {
@@ -46,11 +66,34 @@ impl<'a> TargetRepo<'a> {
             );
         }
         self.0.conn_mut().execute(
-            "INSERT INTO target (name, adapter, is_third_party, custody_eligible)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![name, adapter, is_third_party as i64, custody as i64],
+            "INSERT INTO target (name, adapter, is_third_party, custody_eligible,
+                                 config_json, credentials_ref)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                name,
+                adapter,
+                is_third_party as i64,
+                custody as i64,
+                config_json,
+                credentials_ref
+            ],
         )?;
         Ok(TargetId::new(self.0.conn().last_insert_rowid()))
+    }
+
+    /// Whether a target already carries this name.
+    ///
+    /// `name` is `UNIQUE`, so the insert would catch a collision anyway. This
+    /// exists so `target.add` can catch it **before** the registration probe,
+    /// which uploads three 10 MiB multipart objects to answer a question about
+    /// a target that is about to be rejected on a name clash.
+    pub fn name_exists(&self, name: &str) -> Result<bool> {
+        let n: i64 = self.0.conn().query_row(
+            "SELECT COUNT(*) FROM target WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     pub fn get(&self, id: TargetId) -> Result<Option<Target>> {
@@ -142,11 +185,48 @@ impl<'a> TargetRepo<'a> {
 mod tests {
     use super::*;
 
+    /// The two columns `target.add` depends on, asserted at the level that
+    /// writes them.
+    ///
+    /// They existed in 0001 and were dropped on the floor by every insert until
+    /// registration needed them, so "the parameter is accepted" and "the value
+    /// is stored" are genuinely different claims here. `config_json` carries
+    /// the probed whole-object checksum algorithm; losing it silently would put
+    /// every upload through this target back on the no-checksum path with
+    /// nothing to notice by.
+    #[test]
+    fn the_effective_config_and_the_credential_handle_are_actually_stored() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let id = TargetRepo::new(&mut cat)
+            .insert(
+                "probed",
+                "s3",
+                false,
+                false,
+                r#"{"bucket":"b","multipart_checksum":"crc64-nvme"}"#,
+                Some("target/archive"),
+            )
+            .unwrap();
+        let (cfg, cref): (String, Option<String>) = cat
+            .conn()
+            .query_row(
+                "SELECT config_json, credentials_ref FROM target WHERE id = ?1",
+                params![id.get()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            cfg.contains("crc64-nvme"),
+            "the probed algorithm did not survive the insert: {cfg}"
+        );
+        assert_eq!(cref.as_deref(), Some("target/archive"));
+    }
+
     #[test]
     fn a_third_party_target_cannot_be_given_custody_through_the_api() {
         let mut cat = Catalog::open_in_memory().unwrap();
         let id = TargetRepo::new(&mut cat)
-            .insert("plugin-backed", "wasm", true, true)
+            .insert("plugin-backed", "wasm", true, true, "{}", None)
             .unwrap();
         let t = TargetRepo::new(&mut cat).get(id).unwrap().unwrap();
         assert!(t.is_third_party);
@@ -162,7 +242,7 @@ mod tests {
     fn a_first_party_target_keeps_custody() {
         let mut cat = Catalog::open_in_memory().unwrap();
         let id = TargetRepo::new(&mut cat)
-            .insert("s3", "aws", false, true)
+            .insert("s3", "aws", false, true, "{}", None)
             .unwrap();
         assert!(
             TargetRepo::new(&mut cat)
@@ -179,7 +259,7 @@ mod tests {
     fn sequence_allocation_is_monotonic_and_never_repeats() {
         let mut cat = Catalog::open_in_memory().unwrap();
         let id = TargetRepo::new(&mut cat)
-            .insert("s3", "aws", false, true)
+            .insert("s3", "aws", false, true, "{}", None)
             .unwrap();
         let mut seen = std::collections::BTreeSet::new();
         let mut last = 0;
@@ -206,7 +286,7 @@ mod tests {
         let handed_out = {
             let mut cat = Catalog::open(&db).unwrap();
             let id = TargetRepo::new(&mut cat)
-                .insert("s3", "aws", false, true)
+                .insert("s3", "aws", false, true, "{}", None)
                 .unwrap();
             TargetRepo::new(&mut cat).allocate_sequence(id).unwrap()
         };
@@ -228,7 +308,7 @@ mod tests {
     fn writer_epoch_increments_once_per_start() {
         let mut cat = Catalog::open_in_memory().unwrap();
         let id = TargetRepo::new(&mut cat)
-            .insert("s3", "aws", false, true)
+            .insert("s3", "aws", false, true, "{}", None)
             .unwrap();
         assert_eq!(TargetRepo::new(&mut cat).begin_writer_epoch(id).unwrap(), 1);
         assert_eq!(TargetRepo::new(&mut cat).begin_writer_epoch(id).unwrap(), 2);

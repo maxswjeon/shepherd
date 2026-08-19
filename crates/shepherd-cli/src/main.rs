@@ -858,7 +858,10 @@ mod tests {
     /// JSON blob the user would have to quote.
     #[test]
     fn ignore_patterns_becomes_a_repeatable_flag_carrying_an_ordered_array() {
-        assert_eq!(spec(MethodKind::RootAdd, "ignore_patterns").kind, ArgKind::List);
+        assert_eq!(
+            spec(MethodKind::RootAdd, "ignore_patterns").kind,
+            ArgKind::List
+        );
         assert!(!spec(MethodKind::RootAdd, "ignore_patterns").required);
 
         let m = build_cli()
@@ -888,11 +891,21 @@ mod tests {
         // omits the flag leaves the daemon's `'[]'` alone rather than
         // overwriting it with an explicit empty list.
         let bare = build_cli()
-            .try_get_matches_from(["shepctl", "root", "add", "/srv/data", "--stub-mode", "delete"])
+            .try_get_matches_from([
+                "shepctl",
+                "root",
+                "add",
+                "/srv/data",
+                "--stub-mode",
+                "delete",
+            ])
             .expect("root add");
         let (kind, leaf) = resolve_method(&bare).unwrap();
         assert!(
-            params_from_matches(kind, leaf).unwrap().get("ignore_patterns").is_none(),
+            params_from_matches(kind, leaf)
+                .unwrap()
+                .get("ignore_patterns")
+                .is_none(),
             "an unset list flag must not appear in the request"
         );
     }

@@ -2517,7 +2517,9 @@ dependencies = [
  "shepherd-proto",
  "shepherd-scan",
  "shepherd-secrets",
+ "shepherd-storage",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
