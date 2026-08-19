@@ -355,6 +355,7 @@ mod tests {
     /// which is a stronger property than detecting the loop after entering it.
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_symlink_cycle_terminates_without_multiplying_emissions() {
         let t = Tmp::new("cycle");
         t.dir("a/b");
@@ -387,6 +388,7 @@ mod tests {
     /// mechanism, and without a test it is a claim rather than a property.
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn two_paths_to_one_directory_share_an_identity() {
         let t = Tmp::new("dirid");
         t.dir("real");
@@ -410,6 +412,7 @@ mod tests {
     /// like a tiering candidate.
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn symlinks_are_emitted_with_their_own_metadata_not_the_targets() {
         let t = Tmp::new("link");
         t.file("big.bin", &vec![0u8; 100_000]);
@@ -432,6 +435,7 @@ mod tests {
     /// belong to whatever it points at.
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn symlinked_directories_outside_the_root_are_not_descended_twice() {
         let t = Tmp::new("dirlink");
         t.file("real/x.txt", b"x");

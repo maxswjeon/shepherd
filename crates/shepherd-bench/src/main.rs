@@ -34,6 +34,13 @@
 //! not describe.
 
 mod ann_bench;
+// POSIX-only: `bench-meta-daemon` measures §9's M1 leg 2 THROUGH a live daemon,
+// and the daemon's IPC surface is a Unix domain socket (§4.2). Windows needs a
+// named pipe, which §6 defers to Phase 3. The module is gated and the two
+// subcommands REFUSE below rather than vanishing, so `shepherd-bench --help`
+// still lists them and says why they are unavailable here — a subcommand that
+// silently does not exist is indistinguishable from one nobody implemented.
+#[cfg(unix)]
 mod daemon_meta;
 mod gen_files;
 mod generate;
@@ -796,8 +803,17 @@ fn run() -> Result<(), String> {
         }
         "gen-trace" => generate::gen_trace(&args),
         "gen-catalog" => generate::gen_catalog(&args),
+        #[cfg(unix)]
         "inject-catalog" => daemon_meta::inject_catalog(&args),
+        #[cfg(unix)]
         "bench-meta-daemon" => daemon_meta::bench_daemon(&args),
+        #[cfg(not(unix))]
+        cmd @ ("inject-catalog" | "bench-meta-daemon") => Err(format!(
+            "`{cmd}` drives a live daemon over its IPC socket to measure §9's M1 \
+             leg 2, and that socket is a Unix domain socket. It is not available \
+             on {} yet (Phase 3, named pipe). Every other subcommand works here",
+            std::env::consts::OS
+        )),
         "gen-files" => gen_files::gen_files(&args),
         "capacity" => generate::capacity(&args),
         "build-ann" => ann_bench::build(&args),

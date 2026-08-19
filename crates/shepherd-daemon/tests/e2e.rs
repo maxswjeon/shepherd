@@ -1,3 +1,14 @@
+//! POSIX-only. This suite drives a REAL `shepherdd` over its IPC surface,
+//! which is a Unix domain socket (§4.2); Windows needs a named pipe and §6
+//! defers that to Phase 3. Gated at file level so the crate still COMPILES on
+//! Windows and every other target runs there — §9 wants a platform break found
+//! on the commit that caused it, and that needs the other legs to keep
+//! building.
+//!
+//! This is a real coverage gap on Windows and is meant to read as one: the
+//! entire served surface is unexercised there.
+#![cfg(unix)]
+
 //! End-to-end: a real `shepherdd` process, driven by a real client.
 //!
 //! This is the test that retires T5's standing caveat — "shepctl has never
