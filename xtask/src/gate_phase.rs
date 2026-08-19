@@ -80,6 +80,22 @@ struct Entry {
     /// be argued green while a stated gap stands is an AC that will be.
     #[serde(default)]
     evidence_missing: Option<String>,
+    /// In-band intent: why this row is owned where it is, what an earlier
+    /// version of it claimed, what a reader should not conclude from it.
+    ///
+    /// This field existed in the map and in `gate --audit`'s `Entry` while THIS
+    /// struct omitted it, so serde discarded it on every row and 44 `note =`
+    /// lines had never once been rendered by `gate --phase`. That is the same
+    /// defect the rest of this file is built against: a field that reads as
+    /// present and carries nothing.
+    ///
+    /// It is printed **in full and before the NO-EVIDENCE `continue`**. In full
+    /// because a truncated note rots silently — the sentence that was cut is
+    /// exactly the qualification someone wrote it to preserve. Before the
+    /// `continue` because the rows with no evidence at all are the ones whose
+    /// note is doing the most work.
+    #[serde(default)]
+    note: String,
 }
 
 /// One runnable proof.
@@ -183,6 +199,8 @@ pub struct AcResult {
     pub id: String,
     pub outcomes: Vec<(Evidence, CheckOutcome)>,
     pub missing_reason: Option<String>,
+    /// The map's `note` for this row, verbatim. See [`Entry::note`].
+    pub note: String,
 }
 
 impl AcResult {
@@ -261,6 +279,16 @@ impl PhaseReport {
                 "FAIL"
             };
             let _ = writeln!(s, "[{status}] {}", r.id);
+            // Before the NO-EVIDENCE `continue` below, and never truncated.
+            if !r.note.is_empty() {
+                let mut lines = r.note.trim_end().lines();
+                if let Some(first) = lines.next() {
+                    let _ = writeln!(s, "         note: {first}");
+                }
+                for rest in lines {
+                    let _ = writeln!(s, "               {rest}");
+                }
+            }
             if r.outcomes.is_empty() {
                 let why = r.missing_reason.as_deref().unwrap_or(
                     "no evidence declared in ac-map.toml. An AC the phase OWNS with nothing \
@@ -504,6 +532,7 @@ pub fn run(
             id: entry.id.clone(),
             outcomes,
             missing_reason: entry.evidence_missing.clone(),
+            note: entry.note.clone(),
         });
     }
 
@@ -804,6 +833,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
                     CheckOutcome::Passed { count: 1 },
                 )],
                 missing_reason: None,
+                note: String::new(),
             }],
             uncovered: vec![],
             stated_gaps: vec![],
@@ -891,8 +921,56 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             id: "AC-99".into(),
             outcomes: vec![],
             missing_reason: None,
+                note: String::new(),
         };
         assert!(!r.ok());
+    }
+
+    /// `note` was absent from this file's `Entry` while `gate --audit`'s had
+    /// it, so serde discarded it on every row and **44 `note =` lines in
+    /// ac-map.toml had never once been rendered by `gate --phase`**. The field
+    /// read as present in the map and carried nothing.
+    ///
+    /// Pinned by a unit test rather than by the gate run, because the gate
+    /// takes minutes and this is the assertion that catches the field being
+    /// dropped again. Two properties, each from the way the field failed:
+    ///
+    /// * a row with **no evidence at all** still prints its note. That path
+    ///   `continue`s early, and it is where a note does the most work — there
+    ///   is nothing else on the row.
+    /// * the note is printed **whole**. Asserted on the note's LAST words: a
+    ///   render that truncated would still contain the first ones, so checking
+    ///   the head would be a check that cannot fail.
+    #[test]
+    fn a_rows_note_renders_in_full_and_survives_the_no_evidence_path() {
+        const NOTE: &str =
+            "HEAD moved from 1 — Phase 1 had no tiering, so it could not exercise this TAIL";
+
+        let mut r = passing_report();
+        r.results[0].note = NOTE.into();
+        let with_evidence = r.render();
+        assert!(
+            with_evidence.contains(NOTE),
+            "an evidence-bearing row dropped its note:\n{with_evidence}"
+        );
+
+        // The same note on a row the render `continue`s past.
+        r.results[0].outcomes.clear();
+        let no_evidence = r.render();
+        assert!(
+            no_evidence.contains("NO EVIDENCE"),
+            "fixture is wrong — this row should take the no-evidence path"
+        );
+        assert!(
+            no_evidence.contains(NOTE),
+            "the note was swallowed by the no-evidence `continue`, which is the path where \
+             it is the only thing on the row:\n{no_evidence}"
+        );
+        assert!(
+            no_evidence.contains("TAIL"),
+            "the note was truncated — the cut sentence is exactly the qualification someone \
+             wrote it to preserve"
+        );
     }
 
     #[test]
@@ -912,6 +990,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
                 (ev.clone(), CheckOutcome::Passed { count: 2 }),
             ],
             missing_reason: None,
+                note: String::new(),
         };
         assert!(all_good.ok());
 
@@ -922,6 +1001,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
                 (ev, CheckOutcome::MatchedNothing),
             ],
             missing_reason: None,
+                note: String::new(),
         };
         assert!(!one_bad.ok());
     }
