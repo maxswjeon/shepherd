@@ -514,6 +514,65 @@ pub fn strip_comment(line: &str) -> &str {
     }
 }
 
+/// Blank string-literal contents and strip comments, carrying literal state
+/// ACROSS lines.
+///
+/// Rule 4 matches identifiers to find CALLS. Without this it also matches
+/// MENTIONS, and those are different claims. The case that forced it:
+/// `ac2_resume_50gb.rs` prints a cleanup hint whose text explains that the test
+/// deliberately does NOT call `delete_object`, and rule 4 reported it — so a
+/// message about respecting the fence read as a breach of it. A check that
+/// fires on prose describing the thing matches the name rather than the use,
+/// which is what this rule exists to catch everywhere else.
+///
+/// STATE CROSSES LINES because the literal did. A first attempt blanked each
+/// line independently and still reported the violation: the match sits on a
+/// `\n\` continuation line that contains no quote of its own, so a per-line
+/// scanner cannot know it is inside a string. That is the same shape of error
+/// as the defect being fixed — a check looking at the wrong unit.
+///
+/// Conservative toward REPORTING. Raw and byte strings set `raw_guard`, after
+/// which the line is passed through untouched rather than half-parsed, and an
+/// unterminated quote simply leaves `in_str` set for the next line. Anything
+/// this cannot read confidently still reaches the matcher: a false positive
+/// costs a conversation, a false negative costs the fence.
+fn clean_line(line: &str, in_str: &mut bool) -> String {
+    if line.contains("r\"") || line.contains("r#\"") || line.contains("b\"") {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut escaped = false;
+    let bytes: Vec<char> = line.chars().collect();
+    let mut k = 0;
+    while k < bytes.len() {
+        let c = bytes[k];
+        if *in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                *in_str = false;
+                out.push(c);
+                k += 1;
+                continue;
+            }
+            out.push(' ');
+        } else {
+            // A `//` outside a literal starts a comment: nothing after it is code.
+            if c == '/' && k + 1 < bytes.len() && bytes[k + 1] == '/' {
+                break;
+            }
+            if c == '"' {
+                *in_str = true;
+            }
+            out.push(c);
+        }
+        k += 1;
+    }
+    out
+}
+
 fn rel(root: &Path, p: &Path) -> String {
     p.strip_prefix(root)
         .unwrap_or(p)
@@ -533,8 +592,11 @@ pub fn scan_rule4(root: &Path, policy: &Rule4) -> Result<(Vec<String>, usize), S
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let relp = rel(root, path);
 
+        // Literal state is per FILE, not per line — see `clean_line`.
+        let mut in_str = false;
         for (lineno, raw) in text.lines().enumerate() {
-            let line = strip_comment(raw);
+            let stripped = clean_line(raw, &mut in_str);
+            let line = stripped.as_str();
             if line.trim().is_empty() {
                 continue;
             }

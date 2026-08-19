@@ -1398,41 +1398,42 @@ proves = "the negative, so the fallback cannot be quietly treated as interchange
 id = "G-1-ATIME"
 owning_gate = "1"
 exercises = ["shepherd-catalog::atime", "shepherd-rules::match"]
-note = "§9: `atime_mode detection correct on all three platforms`"
-evidence_missing = """
-THE TWO MISSING PLATFORMS ARE IMPLEMENTED AND VERIFIED ON REAL HARDWARE. THE \
-DETECTOR STILL HAS NO TEST. This row previously read `one platform, and not \
-the detector`; the first half is closed and the second is not.
+note = """
+§9: `atime_mode detection correct on all three platforms`. CLOSED, and the
+Linux half was the last to fall because it was the one nobody had questioned.
 
-CLOSED. macOS and Windows no longer return Unknown by default. macOS \
-`detect()` reads `statfs` flags; the no-flag case was PROBED rather than \
-assumed, on a real APFS volume — atime backdated to 2020, one read advanced \
-it, a second read 3s later did not — which is Linux `relatime` semantics, so \
-the default maps to `Relatime` and not to `Reliable`. Windows `detect()` reads \
-`NtfsDisableLastAccessUpdate`, which has FOUR states, not the two \
-`learn.microsoft.com` documents; the table was transcribed from `fsutil \
-behavior set disablelastaccess` on the host, and the host's own registry value \
-`0x80000003` carries a flag bit `fsutil` does not print. State `2` \
-(system-managed, and the Windows DEFAULT) maps to `Unknown` deliberately: \
-`detect()` has exactly one production call site, is persisted and read back, \
-and is NEVER REFRESHED, so in system-managed mode the OS can flip the policy \
-with nobody re-running it — the optimistic mapping would silently authorise \
-destructive age rules fleet-wide. The mapping is an explicit allowlist rather \
-than a `& 1` mask, and a test fails if someone swaps it for a mask.
+macOS and Windows detectors landed with direct tests. Writing Linux's exposed a
+correctness gap the option strings hide: the kernel names `noatime` and
+`relatime` in mountinfo and names `strictatime` NOWHERE — strict is the ABSENCE
+of a flag, measured on tmpfs AND ext4. So `classify_mount_options` cannot tell a
+strict mount from an undescribed one, answers `Relatime` for both, and
+`AtimeMode::Reliable` was UNREACHABLE on Linux, leaving §4.12's fallback chain
+with a rung this platform could never reach.
 
-STILL MISSING, and it is precisely the half the original row named first: \
-`atime::detect()` HAS NO TEST ON LINUX. macOS now covers it directly \
-(`detect_answers_a_real_volume_instead_of_unknown`, plus \
-`a_path_that_does_not_exist_is_unknown_not_a_guess` for the fail-closed path) \
-and Windows covers the real host registry value \
-(`the_probe_hosts_real_registry_value_reads_as_disabled`). But on LINUX, where \
-`detect()` parses /proc/self/mountinfo and where every other atime assertion in \
-this workspace runs, the detector itself is still asserted by nothing — the \
-Linux tests all drive the classifier over supplied strings.
+`detect()` still behaves exactly that way and still never answers `Reliable`.
+The ambiguity is resolved where it can be resolved honestly — in
+`detect_with_write_probe()`, on the `target.add` path — by MEASURING, which is
+how macOS resolved its identical `statfs` ambiguity. It corners
+`relatime_need_update()` by driving all three of its update conditions false
+and VERIFYING from the inode that it did, so an advance on the second read can
+only be strictatime.
 
-So `correct on all three platforms` is now true of the classification on all \
-three and of the detector on two. The platform with the most coverage of \
-everything else has the least of this.
+It can only ever REACH `Reliable`, never default to it: every failure path
+returns the mount-option answer. On this host `/dev/shm` — a real mount whose
+options are silent — reads `Reliable` where the option string reads `Relatime`.
+
+WHAT THIS ROW SHOULD NOT BE READ AS CLAIMING: `detect()` unqualified is still
+option-based on Linux and still cannot see a strict mount. Only the probing
+entry point can, and only at registration.
+
+WHAT THIS GATE CANNOT RUN, stated because three macOS citations were removed
+from this row rather than left to report `filter matched NOTHING` forever:
+`atime::macos_tests::*` is `#[cfg(target_os = "macos")]`, so it does not exist
+in the binary a Linux gate builds. Those tests are real and they pass — on the
+macOS CI leg, which as of 2026-08-19 exists and is green. Citing them here made
+the row red for a bookkeeping reason while the evidence itself was fine, which
+is its own kind of false signal. The Windows classifier tests ARE cited below:
+they are pure mapping tests in the shared module and run on every leg.
 """
 
 [[guard.evidence]]
@@ -1470,20 +1471,8 @@ package = "shepherd-rules"
 test = "r#match::tests::the_age_signal_follows_the_documented_fallback_order"
 proves = "the fallback order is asserted rather than assumed: observed access, then atime only when Reliable, then mtime — so a preview can disclose which signal drove a match"
 
-[[guard.evidence]]
-package = "shepherd-catalog"
-test = "atime::macos_tests::detect_answers_a_real_volume_instead_of_unknown"
-proves = "macOS detect() answers a real volume rather than degrading to Unknown — run on hardware, and paired with a_path_that_does_not_exist_is_unknown_not_a_guess so the fail-closed path is asserted too rather than only the success path"
 
-[[guard.evidence]]
-package = "shepherd-catalog"
-test = "atime::macos_tests::the_default_flag_set_is_relatime_and_never_reliable"
-proves = "the conservative mapping the probe justified: neither MNT_NOATIME nor MNT_STRICTATIME set maps to Relatime, never Reliable. Reliable is the only value that both authorises destructive age rules and lets OS atime feed last_observed_access, so the optimistic mapping is the dangerous error. Verified behaviourally on a real APFS volume — atime backdated to 2020, one read advanced it, a second read 3s later did not, which is relatime semantics"
 
-[[guard.evidence]]
-package = "shepherd-catalog"
-test = "atime::macos_tests::the_libc_constant_is_the_header_constant"
-proves = "the macOS tests use literal sys/mount.h values rather than the libc constant the implementation uses, so a wrong constant is caught rather than agreed with"
 
 [[guard.evidence]]
 package = "shepherd-catalog"
@@ -1499,6 +1488,32 @@ proves = "the four-state mapping is an explicit allowlist, not a `& 1` mask — 
 package = "shepherd-catalog"
 test = "atime::tests::the_probe_hosts_real_registry_value_reads_as_disabled"
 proves = "the real Windows host value 0x80000003 — which carries a flag bit `fsutil` does not print, while `fsutil` shows 3 — classifies as Disabled, agreeing with an observed non-advancing atime rather than only with a registry string"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::detect_agrees_with_findmnt_about_the_options_in_force"
+proves = "Linux detect() — the COMPOSITION, not its parts — cross-checked against findmnt, util-linux's independent implementation of the same longest-prefix resolution over the same kernel table. Re-parsing mountinfo with our own function would compare it to itself and pass on a broken one, the same reason the launchd uid test checks against `id -u` rather than getuid()"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::detect_changes_its_answer_when_the_mount_options_change"
+ignored = true
+proves = "the one that catches a constant: the other Linux tests all run against whatever /tmp happens to be, so each passes against a detect() hardcoded to that answer. This mounts a tmpfs noatime, remounts it, and REQUIRES the answer to change. Needs root, hence ignored"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::a_relatime_mount_is_never_measured_as_reliable"
+proves = "the probe can only ever REACH Reliable, never default to it — a relatime mount stays Relatime through the probe, which is the direction that matters because Reliable is the value that both authorises destructive age rules and lets OS atime feed last_observed_access"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::a_mount_that_already_names_its_policy_is_never_written_to"
+proves = "the gate: a mount whose options name a policy is believed for free and receives no write at all. Asserted on the DIRECTORY'S MTIME rather than on the returned mode, because probing a relatime mount also returns Relatime — no assertion on the answer could see whether a write happened"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::the_probe_cannot_truncate_a_users_file"
+proves = "the probe writes with a unique name under O_CREAT|O_EXCL and unlinks immediately, so it cannot clobber a user file — stricter than the neighbouring identity::probe_path_policies, which uses fs::write and a fixed name"
 
 [[guard]]
 id = "G-1-JOBS"
@@ -1677,42 +1692,50 @@ proves = "the systemctl half of §9's verb `installs`: install() runs against th
 id = "G-1-INSTALL-MACOS"
 owning_gate = "1"
 exercises = ["shepherd-daemon::service"]
-note = "§9: `and macOS (LaunchAgent)`"
-evidence_missing = """
-THE HARDWARE EXISTS NOW AND THE ROUND TRIP RAN. WHAT IS STILL MISSING IS \
-`AT LOGIN`, AND IT IS THE HALF A HEADLESS BOX CANNOT ANSWER. This row \
-previously read `HARDWARE ... there is no Mac here`; that sentence is retired.
+note = """
+§9: `and macOS (LaunchAgent)`. CLOSED, including the half a headless box could
+not answer.
 
-WHAT RAN, on macOS 26.5.2 (Mac16,10, arm64): `plutil -lint` OK; \
-`launchctl bootstrap gui/501 <plist>` exit 0; `launchctl print \
-gui/501/kr.swjeon.shepherd` reporting `state = running`, a real pid, \
-`last exit code = (never exited)` and `properties = runatload` — launchd \
-echoing back that it parsed the key. The agent did not merely load, it WORKED: \
-it created `catalog.db`, `catalog.db-wal` and `daemon.sock` under \
-`~/.local/state/shepherd`. Teardown clean — `bootout` exit 0, no process, \
-`shepherdd uninstall` removed the plist, machine left as found.
+`launchctl bootstrap` acceptance, the agent running with a real pid, and a
+clean `bootout`/`uninstall` were demonstrated on host hardware earlier. What
+remained was §9's actual verb reaching all the way to LOGIN, and it is now
+measured POSITIVE in a throwaway `tart` VM (macOS 26.6.1, cloned from
+`macos-tahoe-base`, destroyed afterwards) rather than by changing the host's
+auto-login posture.
 
-A DEFECT FOUND BY DOING IT, which is the argument for §9's verb being \
-`installs` rather than `generates`: `launchd.rs::uid()` read \
-`std::env::var("UID")` and fell back to the LITERAL STRING `"$(id -u)"`. \
-`Command::new` invokes no shell, and `UID` is a shell parameter rather than an \
-exported variable (`env | grep -c '^UID='` is 0 on a normal login), so the \
-fallback was the LIVE path, not the rare one. `launchctl` received \
-`gui/$(id -u)`, answered `Unrecognized target specifier`, exited 64, the agent \
-never loaded — AND `shepherdd install` STILL EXITED 0, because a failed \
-bootstrap is recorded as a note. Clean A/B: exporting `UID=501` and changing \
-nothing else made the identical binary load the agent. Fixed to \
-`libc::getuid()`; the exit-0-on-bootstrap-failure behaviour is deliberately \
-UNCHANGED, because on a headless Mac there is no GUI session and that \
-bootstrap SHOULD fail without failing the install.
+THREE COLD BOOTS, and the middle one only means something because of the other
+two. Boot 1 installed via the real `shepherdd install`, then STERILIZED:
+`bootout`, `launchctl print` answering `Could not find service`, no process,
+`~/.local/state/shepherd` deleted, and the label verified ABSENT from
+`print-disabled` so no disabled override crossed the reboot. Only the plist
+did. Boot 2, with nobody logging in by hand, gave `state = running`,
+`runs = 1`, `properties = runatload`, and a socket and catalog rebuilt +34 s
+after boot having been deleted before shutdown — with the daemon starting at
+17:48:24 against a first contact with the guest at 17:48:31, so it was already
+running before anyone spoke to the VM. Boot 3 was the control: same VM, same
+auto-login, `uninstall` the only variable, sampled at +150 s — far past the
++31 s the positive took, so `absent` cannot mean `sampled too early`. Nothing
+ran, while the BINARY and the `gui/501` login domain (427 active services) both
+remained present, so the absence names the LaunchAgent rather than a missing
+binary or a missing session.
 
-WHAT IS STILL MISSING, and why it is not closable here: §9's clause includes \
-the agent starting AT LOGIN, and that was NOT demonstrated. `bootstrap` plus \
-`RunAtLoad` accepted plus the agent genuinely running is not the same claim. \
-`defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser` does \
-not exist, so auto-login is off, and a reboot over headless SSH produces no GUI \
-session — making the result INCONCLUSIVE rather than negative. It closes with a \
-console operator or with auto-login enabled, and not otherwise.
+A DEFECT IN THE METHOD, caught before it became a finding: the Mac's prebuilt
+`shepherdd` predated the `libc::getuid()` fix and still carried the literal
+`$(id -u)`. Shipping it would have reproduced `Unrecognized target specifier`,
+the agent would never have loaded, and the report would have read `does not
+start at login` — a false red indistinguishable from a real one. The binary
+under test is pinned to `ae6e43e`, sha256 `c4e6d2c1...`, verified identical at
+every hop.
+
+PLATFORM-BOUND AND NOT GATE-EXECUTABLE, like G-0C-SPIKES. The gate runs
+`cargo test` on Linux; `launchd` and `loginwindow` are macOS components and a
+cold boot is not a cargo target. The Linux half IS gate-executable and is cited
+below. Evidence for the macOS half:
+`.omc/artifacts/g1-install-macos-login/` — REPORT.md plus the raw per-boot
+captures. Auto-login was already enabled in the base image; it is the
+instrumentation that PRODUCES a login, not the claim under test, and the
+sterilized pre-reboot state plus the uninstalled control are what isolate the
+claim.
 """
 
 [[guard.evidence]]
