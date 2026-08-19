@@ -165,6 +165,15 @@ pub struct RootSummary {
     pub path_case_policy: PathCasePolicy,
     pub path_norm_policy: PathNormPolicy,
     pub atime_mode: AtimeMode,
+    /// The `.gitignore`-syntax exclusions **as stored**, not as sent.
+    ///
+    /// Echoed because the additive rule makes the write side silent in the one
+    /// direction that matters: a 1.1 daemon ignores a 1.2 client's
+    /// `root.add.ignore_patterns` rather than rejecting it, and the user's
+    /// exclusions simply do not exist. Reading the stored list back is what
+    /// turns that into something a client can detect.
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
     pub file_count: u64,
     pub bytes_total: u64,
 }
@@ -277,7 +286,32 @@ pub struct RootRemoveResult {
 pub struct ScanStartResult {
     pub job_ids: Vec<i64>,
     pub roots_started: Vec<i64>,
-    /// Roots skipped, with the reason — disabled, unmounted, already scanning.
+    /// Roots whose scan job could not be enqueued, with the catalog's error.
+    //
+    // The line above is the wire contract and is kept to one sentence because
+    // `JsonSchema` copies it verbatim into `schemas/method/scan.start.result.json`.
+    // The record of what it used to say belongs here, where it is read by
+    // whoever changes this file rather than by every client:
+    //
+    // It said "Roots skipped, with the reason — disabled, unmounted, already
+    // scanning", and named none of the three correctly. `Session::scan_start`
+    // pushes to this vector in exactly one place, the error arm of
+    // `Queue::enqueue`, so the reason is always a `CatalogError` from a job
+    // INSERT. The three it advertised each resolve somewhere else:
+    //
+    //   * disabled — never reaches the loop. The all-roots branch selects via
+    //     `list_roots(.., include_disabled = false)`, so a disabled root is
+    //     omitted silently rather than reported here; naming a root by id
+    //     skips the `enabled` check altogether.
+    //   * unmounted — enqueued, and reported in `roots_started`. PM-3's
+    //     refusal is at job-run time in `scan_exec`, deliberately: an
+    //     availability read at request time is stale before the walk starts.
+    //   * already scanning — not detected at all. Nothing de-duplicates a
+    //     concurrent scan of one root.
+    //
+    // Narrowed rather than implemented: each of those is a behaviour change,
+    // and one of them would duplicate a safety check that is placed later on
+    // purpose.
     #[serde(default)]
     pub skipped: Vec<SkippedRoot>,
 }

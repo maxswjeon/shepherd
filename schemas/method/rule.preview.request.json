@@ -26,7 +26,7 @@
   "x-shepherd": {
     "generator": "cargo xtask codegen",
     "generator_version": 1,
-    "proto_version": "1.1",
+    "proto_version": "1.2",
     "registry_fingerprint": "ec2b4050376aac73",
     "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
   }

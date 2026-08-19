@@ -51,7 +51,21 @@ use serde::{Deserialize, Serialize};
 /// * **1.1** — added `doctor` (§4.2 and the §9 gate both require
 ///   `shepctl doctor`; it is a real capability, so it is a registered method
 ///   rather than an exemption from AC-54's `CLI == registered_methods`).
-pub const PROTO_VERSION: ProtoVersion = ProtoVersion::new(1, 1);
+/// * **1.2** — added the optional `root.add.ignore_patterns` field. AC-9's
+///   `**User**` ignore patterns had a column (`scan_root.ignore_patterns_json`)
+///   and a matcher (`shepherd_scan::IgnoreSet`) but no way for a client to
+///   supply them, so every scan ran against `'[]'`. An optional request field
+///   is exactly what the policy below permits at a minor.
+///
+///   **The skew direction is worth naming, because it is silent.** By the
+///   unknown-fields rule a 1.1 daemon *ignores* `ignore_patterns` from a 1.2
+///   client rather than rejecting it, so the root registers with no exclusions
+///   and files the user meant to exclude are scanned — and, under a rule that
+///   tiers them, destroyed. Singular packaging (§4.2) makes client-newer skew
+///   a restart-window phenomenon rather than a steady state, which is the only
+///   reason this is tolerable; a client that must be sure can compare
+///   `root.list`'s echo of what was stored against what it sent.
+pub const PROTO_VERSION: ProtoVersion = ProtoVersion::new(1, 2);
 
 /// The additive-evolution rules, stated once so they can be quoted in review.
 ///

@@ -61,6 +61,14 @@
         "hosted_optin": {
           "type": "boolean"
         },
+        "ignore_patterns": {
+          "default": [],
+          "description": "The `.gitignore`-syntax exclusions **as stored**, not as sent.\n\nEchoed because the additive rule makes the write side silent in the one\ndirection that matters: a 1.1 daemon ignores a 1.2 client's\n`root.add.ignore_patterns` rather than rejecting it, and the user's\nexclusions simply do not exist. Reading the stored list back is what\nturns that into something a client can detect.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "path": {
           "type": "string"
         },
@@ -130,7 +138,7 @@
   "x-shepherd": {
     "generator": "cargo xtask codegen",
     "generator_version": 1,
-    "proto_version": "1.1",
+    "proto_version": "1.2",
     "registry_fingerprint": "ec2b4050376aac73",
     "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
   }

@@ -90,7 +90,7 @@ mod tests {
     fn the_protocol_version_is_what_the_minor_history_says() {
         assert_eq!(
             (PROTO_VERSION.major, PROTO_VERSION.minor),
-            (1, 1),
+            (1, 2),
             "if this bump is deliberate, update `version.rs`'s minor history in \
              the same change and set every new method's `since` to the new minor"
         );

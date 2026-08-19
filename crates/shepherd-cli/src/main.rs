@@ -849,6 +849,54 @@ mod tests {
         }
     }
 
+    /// AC-9's reachability leg on the CLI side.
+    ///
+    /// The whole of AC-9's gap was that no client could supply an ignore
+    /// pattern. `--ignore-patterns` is derived from the schema rather than
+    /// hand-written, so what needs asserting is that the derivation produced a
+    /// **repeatable** flag carrying an ordered array, not a single string or a
+    /// JSON blob the user would have to quote.
+    #[test]
+    fn ignore_patterns_becomes_a_repeatable_flag_carrying_an_ordered_array() {
+        assert_eq!(spec(MethodKind::RootAdd, "ignore_patterns").kind, ArgKind::List);
+        assert!(!spec(MethodKind::RootAdd, "ignore_patterns").required);
+
+        let m = build_cli()
+            .try_get_matches_from([
+                "shepctl",
+                "root",
+                "add",
+                "/srv/data",
+                "--stub-mode",
+                "delete",
+                "--ignore-patterns",
+                "build/",
+                "--ignore-patterns",
+                "!build/keep.txt",
+            ])
+            .expect("root add with patterns");
+        let (kind, leaf) = resolve_method(&m).unwrap();
+        let params = params_from_matches(kind, leaf).unwrap();
+        // Order preserved: `.gitignore` is last-match-wins, so a flag that
+        // reordered or de-duplicated would invert the negation.
+        assert_eq!(
+            params["ignore_patterns"],
+            serde_json::json!(["build/", "!build/keep.txt"])
+        );
+
+        // The paired negative: unset must send nothing, so a 1.2 client that
+        // omits the flag leaves the daemon's `'[]'` alone rather than
+        // overwriting it with an explicit empty list.
+        let bare = build_cli()
+            .try_get_matches_from(["shepctl", "root", "add", "/srv/data", "--stub-mode", "delete"])
+            .expect("root add");
+        let (kind, leaf) = resolve_method(&bare).unwrap();
+        assert!(
+            params_from_matches(kind, leaf).unwrap().get("ignore_patterns").is_none(),
+            "an unset list flag must not appear in the request"
+        );
+    }
+
     #[test]
     fn a_nested_object_degrades_to_a_json_literal() {
         assert_eq!(spec(MethodKind::Search, "filters").kind, ArgKind::Json);

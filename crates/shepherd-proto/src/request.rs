@@ -190,6 +190,20 @@ pub struct RootAddRequest {
     /// Defaults to `false`: consent is opt-in per root.
     #[serde(default)]
     pub hosted_optin: bool,
+    /// `.gitignore`-syntax patterns excluding paths under this root from scan
+    /// **and** tier (AC-9). Later patterns win, as in `.gitignore`.
+    ///
+    /// Added at proto 1.2, and it is the field AC-9's `**User**` was always
+    /// about: `scan_root.ignore_patterns_json` has existed since schema 0001
+    /// and `shepherd-scan::IgnoreSet` has honoured whatever it was handed, but
+    /// until this field there was no way for a client to hand it anything, so
+    /// every scan ran against `'[]'`.
+    ///
+    /// Empty is the pre-1.2 behaviour exactly, which is why this is a `Vec`
+    /// defaulting to empty rather than an `Option`: "the client did not say"
+    /// and "the client said nothing is ignored" must produce the same scan.
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
 }
 
 /// `root.list`.
@@ -418,11 +432,34 @@ mod tests {
         let r: RootAddRequest =
             serde_json::from_str(r#"{"path":"/srv/data","stub_mode":"delete"}"#).unwrap();
         assert!(!r.hosted_optin);
+        assert!(r.ignore_patterns.is_empty(), "1.2's field, omitted by a 1.1 client");
 
         let s: SearchRequest = serde_json::from_str(r#"{"query":"report"}"#).unwrap();
         assert_eq!(s.limit, 50, "defaulted, not zero");
         assert_eq!(s.mode, SearchMode::Metadata);
         assert_eq!(s.filters, SearchFilters::default());
+    }
+
+    /// The paired half of the assertion above.
+    ///
+    /// `ignore_patterns` defaulting to empty is indistinguishable from the
+    /// field not existing at all — which is exactly the state AC-9 was in
+    /// before 1.2, and exactly why an "it defaults to empty" test alone proves
+    /// nothing. Supplying a list and reading it back **in order** is what
+    /// separates "the field is wired" from "the field is declared".
+    #[test]
+    fn supplied_ignore_patterns_survive_the_wire_in_order() {
+        let r: RootAddRequest = serde_json::from_str(
+            r#"{"path":"/srv/data","stub_mode":"delete",
+                "ignore_patterns":["*.tmp","!keep.tmp","build/"]}"#,
+        )
+        .unwrap();
+        // Order is semantic, not cosmetic: `.gitignore` is last-match-wins, so
+        // a list that round-trips as a set would silently invert a negation.
+        assert_eq!(r.ignore_patterns, ["*.tmp", "!keep.tmp", "build/"]);
+
+        let back: RootAddRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
     }
 
     #[test]

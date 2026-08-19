@@ -175,7 +175,27 @@ impl ShepherdApi for Session {
             ));
         }
 
+        // Compiled here, at the registration boundary, so an unusable pattern
+        // is refused while the user is still standing in front of the command
+        // that named it. `scan_exec` compiles the stored list again and fails
+        // the job if it is bad, which is the right backstop but the wrong place
+        // to learn about a typo: by then the root is registered, the scan has
+        // been queued, and the failure arrives as a job error detached from the
+        // request that caused it.
+        //
+        // The failure direction is what makes this worth a second compile.
+        // `IgnoreSet::new` rejecting a pattern is the loud case; the quiet one
+        // is a root that registers happily and then never excludes anything.
+        if let Err(e) = shepherd_scan::IgnoreSet::new(&path, &req.ignore_patterns) {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!("this root's ignore patterns cannot be compiled: {e}"),
+            ));
+        }
+
         let path_string = req.path.clone();
+        let hosted_optin = req.hosted_optin;
+        let ignore_patterns = req.ignore_patterns.clone();
         let now = self.now();
         let root_id = self.cat(move |cat| {
             FileRepo::new(cat).insert_root(
@@ -185,6 +205,8 @@ impl ShepherdApi for Session {
                 policies.norm,
                 atime_mode,
                 volume.as_deref(),
+                hosted_optin,
+                &ignore_patterns,
                 now,
             )
         })?;
@@ -725,6 +747,7 @@ fn list_roots(cat: &mut Catalog, include_disabled: bool) -> Result<Vec<RootSumma
     let mut stmt = cat.conn().prepare(
         "SELECT r.id, r.path, r.enabled, r.stub_mode, r.hosted_optin, r.availability,
                 r.resync_required, r.path_case_policy, r.path_norm_policy, r.atime_mode,
+                r.ignore_patterns_json,
                 (SELECT COUNT(*) FROM file f WHERE f.root_id = r.id),
                 (SELECT COALESCE(SUM(f.size), 0) FROM file f WHERE f.root_id = r.id)
          FROM scan_root r
@@ -763,8 +786,15 @@ fn list_roots(cat: &mut Catalog, include_disabled: bool) -> Result<Vec<RootSumma
                     "disabled" => AtimeMode::Disabled,
                     _ => AtimeMode::Unknown,
                 },
-                file_count: r.get::<_, i64>(10)? as u64,
-                bytes_total: r.get::<_, i64>(11)? as u64,
+                // Reported as stored. A list that will not parse is surfaced as
+                // empty here rather than failing `root.list`, because the
+                // parse that must be strict is `scan_exec`'s — that one decides
+                // whether files get excluded, and it already refuses to treat
+                // malformed JSON as "ignore nothing". Two strict parsers would
+                // make an unlistable root unfixable.
+                ignore_patterns: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or_default(),
+                file_count: r.get::<_, i64>(11)? as u64,
+                bytes_total: r.get::<_, i64>(12)? as u64,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -821,4 +851,128 @@ fn scan_states(cat: &mut Catalog, root_id: Option<i64>) -> Result<Vec<ScanState>
     }
     out.sort_by_key(|s| s.root_id);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shepherd_catalog::{AtimeMode, PathCasePolicy, PathNormPolicy};
+    use shepherd_core::{FileStat, StubMode};
+
+    fn seed(cat: &mut Catalog, path: &str, files: &[&str]) -> RootId {
+        let id = FileRepo::new(cat)
+            .insert_root(
+                path,
+                StubMode::Delete,
+                PathCasePolicy::Sensitive,
+                PathNormPolicy::Nfc,
+                AtimeMode::Relatime,
+                None,
+                false,
+                &[],
+                Timestamp::from_nanos(1),
+            )
+            .unwrap();
+        let root = FileRepo::new(cat).get_root(id).unwrap().unwrap();
+        for f in files {
+            FileRepo::new(cat)
+                .upsert_file(
+                    &root,
+                    &FileStat {
+                        root: id,
+                        rel_path: (*f).into(),
+                        size: 1,
+                        mtime: Timestamp::from_nanos(1),
+                        ctime: Timestamp::from_nanos(1),
+                        atime: None,
+                        blake3: None,
+                    },
+                    Timestamp::from_nanos(1),
+                )
+                .unwrap();
+        }
+        id
+    }
+
+    /// `count_custody_rows` is the entire basis of `root.remove`'s refusal to
+    /// forget a catalog that is the only address of tiered bytes, so what has
+    /// to be established is that it **can return a non-zero number**.
+    ///
+    /// Asserting only the zero could not establish that, and for a while did
+    /// not: `upsert_file`'s INSERT did not name `state`, so no row in any
+    /// catalog ever held `'stub'` or `'remote'`, and this query answered 0 for
+    /// a reason that had nothing to do with custody. A safety refusal whose
+    /// predicate is false by construction is not a refusal.
+    ///
+    /// So the zero and the non-zero are asserted through the same function,
+    /// against the same catalog, one `UPDATE` apart. The `UPDATE` stands in for
+    /// the tierer (Phase 2/3); what is under test is the count, not its writer.
+    #[test]
+    fn the_custody_count_is_zero_before_tiering_and_non_zero_after() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let root = seed(&mut cat, "/data", &["a.txt", "b.txt", "c.txt"]);
+
+        assert_eq!(
+            count_custody_rows(&mut cat, root).unwrap(),
+            0,
+            "nothing is tiered yet"
+        );
+
+        cat.conn_mut()
+            .execute(
+                "UPDATE file SET state = 'stub' WHERE rel_path = 'a.txt'",
+                [],
+            )
+            .unwrap();
+        cat.conn_mut()
+            .execute(
+                "UPDATE file SET state = 'remote' WHERE rel_path = 'b.txt'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            count_custody_rows(&mut cat, root).unwrap(),
+            2,
+            "both custody states must be counted — this is what makes the zero above mean \
+             `nothing is tiered` rather than `this query cannot see anything`"
+        );
+    }
+
+    /// The refusal is per-root, and a count that ignored `root_id` would read
+    /// as the safest possible bug: `root.remove --forget` on an untiered root
+    /// would be refused because some *other* root holds custody.
+    #[test]
+    fn the_custody_count_does_not_see_another_roots_tiered_rows() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let a = seed(&mut cat, "/a", &["one.txt"]);
+        let b = seed(&mut cat, "/b", &["two.txt"]);
+
+        cat.conn_mut()
+            .execute(
+                "UPDATE file SET state = 'remote' WHERE root_id = ?1",
+                rusqlite::params![b.get()],
+            )
+            .unwrap();
+
+        assert_eq!(count_custody_rows(&mut cat, b).unwrap(), 1);
+        assert_eq!(
+            count_custody_rows(&mut cat, a).unwrap(),
+            0,
+            "root /a holds no custody; another root's tiered rows must not block removing it"
+        );
+    }
+
+    /// `missing` is not custody. It means the bytes were where the catalog said
+    /// and are not there now — dropping that row loses a record of a loss, not
+    /// the only address of a file that still exists somewhere.
+    #[test]
+    fn a_missing_row_is_not_counted_as_custody() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let root = seed(&mut cat, "/data", &["gone.txt"]);
+        cat.conn_mut()
+            .execute("UPDATE file SET state = 'missing'", [])
+            .unwrap();
+        assert_eq!(count_custody_rows(&mut cat, root).unwrap(), 0);
+    }
 }
