@@ -98,6 +98,43 @@ pub fn uninstall() -> Result<Outcome> {
     }
 }
 
+/// Where this platform's service unit would live, and whether it exists.
+///
+/// This is a filesystem check, not a query to systemd/launchd — it answers
+/// "has `install` ever been run" (AC-61's "registration state"), not "is the
+/// unit currently enabled or running". Claiming more than the file check
+/// supports would be a confident wrong answer, which is worse than the honest
+/// gap `shepherd-cli::client::not_running_message` already declines to close.
+pub fn registration() -> (String, bool) {
+    let path = if cfg!(target_os = "macos") {
+        launchd::plist_path()
+    } else {
+        systemd::unit_path()
+    };
+    match path {
+        Ok(p) => (p.display().to_string(), p.exists()),
+        Err(e) => (format!("(could not determine: {e})"), false),
+    }
+}
+
+/// The command that starts the daemon, given whether it is registered as a
+/// service.
+///
+/// A registered-but-stopped service is started through the service manager —
+/// `shepherdd run` in the foreground would fight `Restart=on-failure` /
+/// `RunAtLoad` the next time the service manager tries to start it. An
+/// unregistered daemon has no service to start, so the foreground command is
+/// the honest answer.
+pub fn start_command(registered: bool) -> &'static str {
+    if !registered {
+        "shepherdd run"
+    } else if cfg!(target_os = "macos") {
+        "launchctl kickstart -k gui/$UID/kr.swjeon.shepherd"
+    } else {
+        "systemctl --user start shepherd"
+    }
+}
+
 /// Stated once, used by both arms and by the tests.
 pub const WINDOWS_NOTE: &str = "\
 `shepherdd install` is not available on Windows. §4.2 puts the Windows startup \
@@ -118,5 +155,21 @@ mod tests {
             WINDOWS_NOTE.contains("shepherdd run"),
             "an unsupported install must still tell the user what they CAN do"
         );
+    }
+
+    /// An unregistered daemon has no service to start through, regardless of
+    /// platform — AC-61's remediation must be something that actually exists.
+    #[test]
+    fn start_command_is_the_foreground_run_when_unregistered() {
+        assert_eq!(start_command(false), "shepherdd run");
+    }
+
+    /// A registered-but-stopped daemon must be started through the service
+    /// manager, not `shepherdd run` in the foreground — see [`start_command`]'s
+    /// doc comment for why running it by hand would fight the manager's own
+    /// restart policy.
+    #[test]
+    fn start_command_is_never_the_foreground_run_when_registered() {
+        assert_ne!(start_command(true), "shepherdd run");
     }
 }

@@ -110,8 +110,34 @@ pub fn uninstall() -> Result<Outcome> {
     })
 }
 
+/// The real uid, for the `gui/<uid>` domain target `bootstrap` and `bootout`
+/// both take.
+///
+/// This read `std::env::var("UID")` and fell back to the literal string
+/// `"$(id -u)"`. `Command::new` never invokes a shell, so nothing expanded it —
+/// and `UID` is a shell *parameter*, not an exported environment variable
+/// (`env | grep -c '^UID='` is `0` on a normal login), so the fallback was the
+/// live path rather than the rare one. Measured on macOS 26.5.2: `launchctl`
+/// received `gui/$(id -u)`, answered `Unrecognized target specifier` and exited
+/// 64, the agent never loaded — and `shepherdd install` still exited 0, because
+/// a failed bootstrap is recorded as a note. Exporting `UID=501` and changing
+/// nothing else made the identical binary load the agent.
+///
+/// The exit-0-on-bootstrap-failure behaviour is left alone deliberately: on a
+/// headless Mac there is no GUI session and that bootstrap *should* fail
+/// without failing the install. It was not the defect; this was.
 fn uid() -> String {
-    std::env::var("UID").unwrap_or_else(|_| "$(id -u)".into())
+    #[cfg(unix)]
+    {
+        // SAFETY: `getuid` is always successful per POSIX — it cannot fail, has
+        // no error return, and touches no memory we own.
+        unsafe { libc::getuid() }.to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        // `service::launchd` compiles everywhere; only macOS dispatches to it.
+        String::new()
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +165,44 @@ mod tests {
         let t = plist_text(Path::new("/x"));
         assert!(t.contains("<key>RunAtLoad</key>"));
         assert!(!t.contains("KeepAlive"));
+    }
+
+    /// `uid()` fed `gui/$(id -u)` to `launchctl` for as long as this file has
+    /// existed, and nothing caught it because the only assertions here were
+    /// about the plist's *text*. A well-formed plist that launchd never loads
+    /// passes every other test in this module.
+    ///
+    /// Checked against `id -u` rather than against `libc::getuid()`, which is
+    /// what the implementation already calls — comparing a function to itself
+    /// would pass just as happily on the broken version.
+    #[test]
+    #[cfg(unix)]
+    fn the_domain_target_is_a_real_uid_and_never_a_shell_substitution() {
+        let u = uid();
+
+        assert!(
+            !u.contains('$'),
+            "a shell substitution reached the launchctl domain target: {u:?}. \
+             Command::new invokes no shell, so launchctl receives this \
+             literally and answers `Unrecognized target specifier` (exit 64)"
+        );
+        assert!(
+            !u.is_empty() && u.chars().all(|c| c.is_ascii_digit()),
+            "launchctl's domain target is gui/<uid>; uid() produced {u:?}"
+        );
+
+        // Independent source: `id -u` is a different mechanism from getuid(),
+        // so this compares two answers rather than one answer to itself.
+        let out = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("`id -u` is POSIX and must exist wherever this test runs");
+        let from_id = String::from_utf8(out.stdout).expect("`id -u` prints ASCII");
+        assert_eq!(
+            u,
+            from_id.trim(),
+            "uid() disagrees with `id -u` — the shell substitution this \
+             function used to emit was literally spelling out that command"
+        );
     }
 }

@@ -37,6 +37,13 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# `launchd::uid()` needs the real uid. It read `std::env::var("UID")` and fell
+# back to the literal string `$(id -u)`; `Command::new` runs no shell, so
+# nothing ever expanded it. Target-scoped because `service::launchd` compiles
+# on every platform even though only macOS dispatches to it.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # The E2E drives the daemon with a typed client rather than only through the
 # CLI, so it needs the wire types it would otherwise have to hand-roll.

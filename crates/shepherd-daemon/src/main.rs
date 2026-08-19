@@ -258,9 +258,18 @@ fn cmd_doctor() -> Result<(), String> {
                 if running {
                     shepherd_obs::doctor::CheckStatus::Ok
                 } else {
+                    let (unit_path, registered) = service::registration();
+                    let registration = if registered {
+                        format!("registered: service unit exists at {unit_path}")
+                    } else {
+                        format!("not registered: no service unit at {unit_path}")
+                    };
                     shepherd_obs::doctor::CheckStatus::warn(
-                        format!("no daemon is listening on {}", paths.socket.display()),
-                        "shepherdd run",
+                        format!(
+                            "no daemon is listening on {}; {registration}",
+                            paths.socket.display()
+                        ),
+                        service::start_command(registered),
                     )
                 },
             ));
