@@ -225,6 +225,36 @@ struct CredentialMaterial {
 /// **No error here quotes the stored value.** `serde_json`'s own message
 /// includes surrounding input, so the parse error is discarded and replaced
 /// with fixed text naming only the reference.
+///
+/// # The invariant that makes the ambient branch safe, written down because it
+/// # is currently load-bearing and was implicit
+///
+/// With `credentials_ref` absent, a registration can send AMBIENT credentials
+/// to a caller-chosen `endpoint_url`. That is safe here for exactly one reason:
+/// **the caller of `target.add` already has the daemon's own authority.** The
+/// socket is `0o600` inside a `0o700` directory (`server.rs:79,98`, and
+/// ASSERTED at `:368,:374` — not merely set), and the daemon is per-user on
+/// both platforms: a `systemd --user` unit on Linux, a `gui/<uid>` LaunchAgent
+/// on macOS. Caller uid == daemon uid, so anyone who can reach this method can
+/// already make the same request themselves with the same credentials and the
+/// same network position. There is no privilege gradient to cross.
+///
+/// **It stops being safe the moment that stops being true** — a system-wide
+/// daemon, a socket reachable by another uid, a proxy that forwards RPCs on
+/// someone else's behalf, or any remote transport. Any of those turns this
+/// branch into genuine credential forwarding to an attacker-chosen host.
+/// Whoever makes that change owns closing this, and the closure is a
+/// caller-identity check, NOT an endpoint blocklist.
+///
+/// An automated review proposed exactly that blocklist — refuse `127/8`,
+/// RFC-1918 and `169.254/16`. It is recorded here as rejected, with the reason,
+/// so it does not get re-proposed and quietly accepted: `endpoint_url` exists
+/// to point at self-hosted storage, this module's own tests register
+/// `http://127.0.0.1:9000`, and ADR 0b's capacity model is written around a
+/// self-hosted MinIO deployment. A backup tool whose purpose is "point it at
+/// your own storage" cannot blocklist private address space. The blocklist
+/// would break the documented use case while leaving the actual conditional —
+/// caller identity — unexamined.
 pub fn resolve_credentials(
     store: &SecretStore,
     credentials_ref: Option<&str>,
