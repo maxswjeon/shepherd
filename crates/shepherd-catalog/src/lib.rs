@@ -78,6 +78,32 @@ pub type Result<T> = std::result::Result<T, CatalogError>;
 ///   [`schema::MIGRATION_0001`].
 /// * `busy_timeout` — a reader that arrives mid-checkpoint waits rather than
 ///   returning `SQLITE_BUSY` to a user-facing query.
+///
+/// **`wal_autocheckpoint` IS DELIBERATELY ABSENT, AND IT IS WHAT BOUNDS THE
+/// WAL TODAY — not the dedicated checkpoint thread.** SQLite's default (1000
+/// pages, ~4 MiB) is therefore armed on every production connection, the
+/// writer's included. Measured across two full 10,000,000-file scans: the WAL
+/// high-water was 11.30 MiB loaded and 10.84 MiB idle, against a 64 MiB
+/// ceiling. A checkpointer running only on `checkpoint_loop`'s 30 s period
+/// would have had to hold `write_rate × 30 s` ≈ 72 MiB between ticks — past
+/// that ceiling — and the idle run, writing **14.4 % faster, produced a
+/// *smaller* log**, which is the wrong sign for a clock-driven bound and the
+/// right one for a page-count trigger plus batch overshoot.
+///
+/// **IF YOU COME HERE TO ADD `wal_autocheckpoint = 0`** — a legitimate change,
+/// and the one `G-1-CHECKPOINT`'s gate row names as an honest way to close its
+/// attribution gap — then go and read
+/// `writer::tests::the_checkpoint_lands_on_a_connection_the_writer_thread_does_not_own`
+/// first. It disables `wal_autocheckpoint` on the writer's connection itself
+/// and asserts the read-back is `0`. Once this constant does the same thing,
+/// **that line will look redundant. Deleting it silently guts the test**: it is
+/// what rules out SQLite's own checkpointer as the explanation for the file
+/// growth the test measures, so without it the test still PASSES and stops
+/// DISCRIMINATING. Update its comment to say it is belt-and-braces; do not
+/// remove it. A check that survives as a passing assertion while losing the
+/// mechanism it was written to detect is this codebase's recurring defect,
+/// and reintroducing it into the test written to catch that defect would be a
+/// poor joke.
 pub const PRAGMAS: &[(&str, &str)] = &[
     ("journal_mode", "WAL"),
     ("foreign_keys", "ON"),
