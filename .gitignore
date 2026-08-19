@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# OMC operational state. Kept out of the repo by convention; note that this
+# means `.omc/plans/shepherd-consensus-plan.md` is NOT present in a CI checkout,
+# which is why `cargo xtask claim-ledger` is a local gate command and not a CI
+# step. `cargo xtask gate --audit` reads `xtask/ac-map.toml`, which IS committed,
+# so it does run in CI.
+/.omc/
+/.remember/
+
+# Phase 0b/0c artifacts that are generated, large, or machine-specific.
+/fixtures/
+# `bench-baseline.json` is deliberately NOT ignored. It is the §9 Phase 0a/0b
+# gate's evidence artifact, and a gate whose evidence exists only on the machine
+# that produced it cannot be audited afterwards — which is exactly what someone
+# re-deriving the index decision in six months would need. It is tens of KiB of
+# summary statistics, not bulk data: per-candidate p50/p95/p99, RSS, on-disk
+# size, warm-vs-cold, per-class hit counts, and the probed reference machine.
+# Per-query latency samples are reduced to percentiles in-process and never
+# written, so there is no large raw trace to keep out.

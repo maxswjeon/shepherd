@@ -1,0 +1,23 @@
+# Line endings are LF everywhere, in the working tree as well as in the object
+# store.
+#
+# Not a style preference. `xtask/section9-gate-table.json` is a GENERATED
+# artifact whose test asserts that regenerating it "must reproduce it byte for
+# byte", and `gate --audit` FAILS when it disagrees with §9. Git's default
+# `core.autocrlf` on Windows rewrites LF to CRLF on checkout, so the file the
+# generator produced and the file the test read back differed by a byte per
+# line — and the whole point of that artifact is that they cannot.
+#
+# Found by the first native Windows CI run of this repository: everything else
+# was green and this failed with
+# `left: "{\n  \"row_count\"...` / `right: "{\r\n  \"row_count\"...`.
+#
+# `text=auto` still lets git normalise on commit; `eol=lf` is what stops the
+# checkout from undoing it.
+* text=auto eol=lf
+
+# Belt and braces for the artifacts whose byte-identity is asserted, so a future
+# narrowing of the line above cannot quietly reintroduce this.
+*.json  text eol=lf
+*.toml  text eol=lf
+*.rs    text eol=lf

@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    # `feat/**` is here because the repository's DEFAULT BRANCH is currently a
+    # feat/ branch, so without it no push to the default branch could ever run
+    # CI — and GitHub never registered the workflow at all, which also made
+    # `workflow_dispatch` return 404. Found 2026-08-19 while trying to give
+    # G-0A-CI a real run: `gh api .../actions/workflows` reported 0 workflows
+    # on a repo whose Actions were enabled and whose ci.yml was pushed.
+    branches: ["main", "develop", "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The three-platform matrix. Linux is the primary development and CI target
+  # (§3), but the whole workspace must build and test on all three from Phase 0a
+  # so a platform-specific break is found on the commit that caused it. Note
+  # `shepherd-usnhelper` is Windows-only in behaviour but compiles everywhere
+  # for exactly this reason.
+  build:
+    name: build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup honours rust-toolchain.toml, which pins the exact version and
+      # requests rustfmt + clippy. `rustup show` forces the install before the
+      # cache key is computed from it.
+      - name: Install pinned toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+  # §4.1's dependency rules and §9 rule 6's ownership audit. Kept in a separate
+  # job so a failure reads as "a safety invariant was violated" rather than as a
+  # build break, and so it cannot be skipped by a matrix leg going red first.
+  gates:
+    name: safety gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-gates-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ubuntu-gates-cargo-
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # `clippy::disallowed_methods` is denied workspace-wide and is the lint
+      # half of §4.1 rule 4. It only fires under clippy, so this step is what
+      # gives that half any teeth at all.
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # §4.1 dependency rules 1-4 plus the §4.5 opendal boundary. Non-zero exit
+      # fails the build; that is the point of the command.
+      - name: check-deps (§4.1)
+        run: cargo xtask check-deps
+
+      # §9 rule 6: no AC may be owned by a phase earlier than the one whose §6
+      # creates-list supplies the machinery that AC exercises.
+      - name: gate --audit (§9 rule 6)
+        run: cargo xtask gate --audit
+
+      # §4.3: `schemas/` is derived from `shepherd_proto::MethodKind::ALL` and
+      # committed, so a wire-format change is a reviewable diff. This step fails
+      # when the tree and the method table disagree — including a stale schema
+      # for a method that no longer exists. A schema generated into `target/` at
+      # build time would always match and would prove nothing; the committed
+      # artifact is what AC-56's "stable machine-readable output" is checked
+      # against.
+      - name: codegen --check (§4.3 IPC artifacts)
+        run: cargo xtask codegen --check
+
+      # AC-54's `CLI == registered_methods` half. The §9 Phase 1 gate requires
+      # this from Phase 1, not Phase 8. It also runs inside `cargo test
+      # --workspace` in the build matrix; it is named separately here so a CI
+      # log shows the AC by name rather than one green line among hundreds, and
+      # so a failure reads as "a parity invariant broke".
+      #
+      # The other half, `UI ⊆ CLI`, is Phase 8's: a Rust trait cannot type-check
+      # a TypeScript `invoke()` call site, so it needs the generated TS client to
+      # be the only permitted IPC path with raw `invoke` banned by lint.
+      #
+      # The `1 passed` guard is not belt-and-braces. `cargo test <filter> --
+      # --exact` exits 0 when the filter matches NOTHING, so a renamed or
+      # deleted test would turn this step permanently green while checking
+      # nothing — the exact defect §9 rule 6 records, reintroduced by the step
+      # meant to prevent it. Verified by running it with a deliberately wrong
+      # name: zero tests, exit 0.
+      - name: AC-54 CLI == registered_methods
+        run: |
+          set -o pipefail
+          out="$(cargo test -p shepherd-cli --bin shepctl \
+                   tests::ac54_cli_equals_registered_methods -- --exact)"
+          echo "$out"
+          echo "$out" | grep -q '^test result: ok\. 1 passed' || {
+            echo "::error::the AC-54 parity test did not run. A cargo test filter that"
+            echo "::error::matches nothing exits 0, so this step must assert it ran."
+            exit 1
+          }
+
+      # NOTE: `cargo xtask claim-ledger` is deliberately NOT a CI step. It reads
+      # the plan at .omc/plans/shepherd-consensus-plan.md, which is not
+      # committed (see .gitignore), so a CI run cannot see it. Adding a step
+      # that silently skipped when the file was missing would be a gate that
+      # reports success without doing anything — the exact failure §9 rule 6
+      # records. It is a local gate command; run it where the plan lives.
