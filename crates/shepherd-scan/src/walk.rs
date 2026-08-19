@@ -342,7 +342,15 @@ mod tests {
 
         let mut paths: Vec<_> = out.files.iter().map(|f| f.rel_path.clone()).collect();
         paths.sort();
-        assert_eq!(paths, vec!["a.txt", "sub/b.txt"]);
+        // `rel_path` documents "separators left exactly as the OS gave them",
+        // and normalisation is the catalog's job (§4.9). So the expectation is
+        // built with the OS separator rather than a hardcoded `/`: the previous
+        // literal asserted a POSIX layout as though it were the contract, passed
+        // on unix, and failed on Windows against a function behaving exactly as
+        // documented. A test that contradicts the doc comment of the function it
+        // covers is testing its author's assumption, not the code.
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(paths, vec!["a.txt".to_string(), format!("sub{sep}b.txt")]);
         assert_eq!(out.files[0].size, 5);
         assert!(
             out.files.iter().all(|f| f.blake3.is_none()),
