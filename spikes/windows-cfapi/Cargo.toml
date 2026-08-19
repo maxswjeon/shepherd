@@ -1,0 +1,42 @@
+# Its own workspace root, deliberately.
+#
+# This crate sits inside the shepherd repository but is NOT a member of its
+# workspace (`members = ["crates/*", "xtask"]`). Without this empty
+# `[workspace]` table, `cargo build` run from this directory fails with
+# "current package believes it's in a workspace when it's not" — the shepherd
+# root manifest is found by the upward search and does not list this package.
+#
+# Declaring the workspace here rather than adding an `exclude` to the root
+# manifest keeps the change inside the spike: the root manifest is shared and
+# frequently edited, and this file is not.
+#
+# It is excluded on purpose. `windows` 0.58 with the CloudFilters feature does
+# not build on Linux, and the gate runs on Linux — see ../README.md on why
+# these spikes are deliberately not gate-executable.
+[workspace]
+
+[package]
+name = "cfsuite"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_CorrelationVector",
+    "Win32_System_SystemInformation",
+]
+
+[[bin]]
+name = "cfreg"
+path = "src/cfreg.rs"
+
+[[bin]]
+name = "cfserve"
+path = "src/cfserve.rs"
+
+[profile.release]
+debug = false

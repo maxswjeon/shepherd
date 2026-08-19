@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  One entitlement, and its presence is load-bearing. Rationale, and the two
+  entitlements deliberately ABSENT, are in FINDINGS.md under "Entitlements".
+
+  Keep prose here short and free of double-hyphens: AMFI parses this file with
+  its own XML reader, a double-hyphen is illegal inside an XML comment, and the
+  failure is `AMFIUnserializeXML: syntax error`, after which NOTHING embeds.
+  That reproduces the exact symptom of the MH_BUNDLE bug for an unrelated
+  reason, which is a bad trap to leave in a file about not leaving such traps.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.app-sandbox</key><true/>
+</dict>
+</plist>
