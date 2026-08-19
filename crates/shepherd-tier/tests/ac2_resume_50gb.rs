@@ -1,3 +1,13 @@
+//! POSIX-only: this file asserts POSIX file identity and permissions on the resumed artifact, via `std::os::unix`'s `MetadataExt`
+//! and `PermissionsExt`. Gated at file level rather than per-item so
+//! Windows COMPILES the crate and runs everything else, instead of the
+//! whole workspace failing to build on one leg — §9 wants a platform
+//! break found on the commit that caused it, which needs the other
+//! platforms to still build.
+//!
+//! This is a real coverage gap on Windows and is meant to read as one.
+#![cfg(unix)]
+
 //! **AC-2 at its stated size**: kill the daemon mid-upload of a 50 GB object,
 //! restart, resume without re-sending verified parts.
 //!

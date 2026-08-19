@@ -29,8 +29,10 @@ use shepherd_catalog::writer::CatalogActor;
 use shepherd_daemon::events::EventHub;
 use shepherd_daemon::paths::Paths;
 use shepherd_daemon::scan_exec::ScanExecutor;
+#[cfg(unix)]
+use shepherd_daemon::server;
 use shepherd_daemon::state::Daemon;
-use shepherd_daemon::{EVENT_BUFFER, server, service};
+use shepherd_daemon::{EVENT_BUFFER, service};
 use shepherd_jobs::worker::{Pool, Registry};
 use shepherd_jobs::{POOL_SIZE, Recovery, recover};
 
@@ -80,6 +82,29 @@ Service installation is intentionally not an IPC method — see the module docs.
 
 // ---------------------------------------------------------------------------
 
+/// Serve, on a platform that has a transport.
+///
+/// The IPC surface is a Unix domain socket (§4.2), and `server` is
+/// `#[cfg(unix)]` for that reason. Windows needs a named pipe and a startup
+/// task, which §6 defers to Phase 3 alongside package identity.
+///
+/// This refuses rather than being absent: the whole workspace must BUILD and
+/// TEST on all three platforms from Phase 0a so a platform break is found on
+/// the commit that caused it, and a `run` that silently does not exist on
+/// Windows would leave the binary compiling while doing nothing — the same
+/// shape as a check that passes without its subject. `cargo test` on Windows
+/// now reaches every other command.
+#[cfg(not(unix))]
+fn cmd_run() -> Result<(), String> {
+    Err(format!(
+        "the daemon's IPC transport is not implemented on {} yet (Phase 3): \
+         it is a Unix domain socket, and Windows needs a named pipe and a \
+         startup task with package identity. Every other subcommand works here",
+        std::env::consts::OS
+    ))
+}
+
+#[cfg(unix)]
 fn cmd_run() -> Result<(), String> {
     shepherd_obs::tracing_setup::init_tracing("info");
     let paths = Paths::from_process()?;
@@ -252,27 +277,51 @@ fn cmd_doctor() -> Result<(), String> {
 
     match Paths::from_process() {
         Ok(paths) => {
-            let running = std::os::unix::net::UnixStream::connect(&paths.socket).is_ok();
-            doctor.push(shepherd_obs::doctor::Check::new(
-                "daemon",
-                if running {
-                    shepherd_obs::doctor::CheckStatus::Ok
-                } else {
-                    let (unit_path, registered) = service::registration();
-                    let registration = if registered {
-                        format!("registered: service unit exists at {unit_path}")
-                    } else {
-                        format!("not registered: no service unit at {unit_path}")
-                    };
-                    shepherd_obs::doctor::CheckStatus::warn(
-                        format!(
-                            "no daemon is listening on {}; {registration}",
-                            paths.socket.display()
+            // `Some(false)` means "asked, nothing listening". `None` means
+            // "could not ask" — there is no transport to try on this platform,
+            // so reporting `not running` would be a claim the check never
+            // made. Same fail-closed distinction as `floors::open_handles`.
+            #[cfg(unix)]
+            let running = Some(std::os::unix::net::UnixStream::connect(&paths.socket).is_ok());
+            #[cfg(not(unix))]
+            let running: Option<bool> = None;
+            if running.is_none() {
+                doctor.push(shepherd_obs::doctor::Check::new(
+                    "daemon",
+                    shepherd_obs::doctor::CheckStatus::Warn {
+                        detail: format!(
+                            "cannot tell whether a daemon is running on {}: the IPC \
+                             transport is a Unix domain socket and is not implemented \
+                             here yet (Phase 3). This is `could not determine`, not \
+                             `not running`",
+                            std::env::consts::OS
                         ),
-                        service::start_command(registered),
-                    )
-                },
-            ));
+                        remediation: None,
+                    },
+                ));
+            }
+            if let Some(running) = running {
+                doctor.push(shepherd_obs::doctor::Check::new(
+                    "daemon",
+                    if running {
+                        shepherd_obs::doctor::CheckStatus::Ok
+                    } else {
+                        let (unit_path, registered) = service::registration();
+                        let registration = if registered {
+                            format!("registered: service unit exists at {unit_path}")
+                        } else {
+                            format!("not registered: no service unit at {unit_path}")
+                        };
+                        shepherd_obs::doctor::CheckStatus::warn(
+                            format!(
+                                "no daemon is listening on {}; {registration}",
+                                paths.socket.display()
+                            ),
+                            service::start_command(registered),
+                        )
+                    },
+                ));
+            }
             doctor.push(shepherd_obs::doctor::Check::new(
                 "catalog",
                 if paths.catalog().exists() {

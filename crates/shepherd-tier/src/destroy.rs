@@ -397,6 +397,20 @@ fn allocated_of(md: &std::fs::Metadata) -> Option<u64> {
     }
 }
 
-#[cfg(test)]
+// POSIX-only, and that is a COVERAGE GAP rather than a solved problem.
+//
+// These tests assert file identity through `std::os::unix::fs::MetadataExt`
+// (`dev`/`ino`) to prove a destroy did not silently act on a replaced file.
+// Windows has an equivalent — `file_index` and `volume_serial_number` — and
+// nobody has written it, so the whole module is gated rather than half-ported.
+//
+// What Windows therefore does NOT run: the acquisition-floor refusals these
+// tests now assert on every non-Linux platform. That refusal is real on Windows
+// too — `open_handles()` is Linux-only, so the floor fails closed there exactly
+// as it does on macOS — and nothing checks it. Phase 3 owns Windows destroy;
+// whoever takes it should port `identity_of` first and delete this comment,
+// because the value of these tests off-Linux is precisely that they assert the
+// refusal rather than the destruction.
+#[cfg(all(test, unix))]
 #[path = "destroy_tests.rs"]
 mod tests;

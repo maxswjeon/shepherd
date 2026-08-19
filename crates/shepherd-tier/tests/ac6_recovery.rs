@@ -1,3 +1,13 @@
+//! POSIX-only: this file asserts POSIX file identity while rebuilding state from a destroyed file, via `std::os::unix`'s `MetadataExt`
+//! and `PermissionsExt`. Gated at file level rather than per-item so
+//! Windows COMPILES the crate and runs everything else, instead of the
+//! whole workspace failing to build on one leg — §9 wants a platform
+//! break found on the commit that caused it, which needs the other
+//! platforms to still build.
+//!
+//! This is a real coverage gap on Windows and is meant to read as one.
+#![cfg(unix)]
+
 //! **AC-6** — drop all local state after tiering-and-destroying, then rebuild
 //! from the filesystem **plus the four-class recovery bundle** (§4.10.3a).
 //!

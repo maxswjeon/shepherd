@@ -761,6 +761,22 @@ fn write_symlink_corner(root: &Path, bytes: &AtomicU64) -> Result<Vec<Sample>, S
         size: n,
     }];
 
+    // The corpus deliberately carries a symlink, a dangling link and an
+    // outward link, because they are what the walker's cycle guard and its
+    // `(dev, ino)` bookkeeping are for. Creating them is POSIX: Windows needs
+    // either developer mode or SeCreateSymbolicLinkPrivilege, so a generator
+    // that silently skipped them would hand the scanner a corpus missing the
+    // exact shapes it is meant to be tested against — a fixture that looks
+    // complete and is not. It refuses instead.
+    #[cfg(not(unix))]
+    return Err(format!(
+        "the M1 corpus generator needs POSIX symlinks and is not implemented on \
+         {} yet: the corpus's symlink, dangling-link and outward-link cases are \
+         what the walker's cycle guard is tested against, and generating a \
+         corpus without them would silently weaken every assertion made over it",
+        std::env::consts::OS
+    ));
+    #[cfg(unix)]
     let link = |from: &str, to: &str| -> Result<(), String> {
         let p = root.join(from);
         symlink(to, &p).map_err(|e| format!("symlink {from} -> {to}: {e}"))?;

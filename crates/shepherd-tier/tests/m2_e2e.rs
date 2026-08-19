@@ -1,3 +1,13 @@
+//! POSIX-only: this file asserts POSIX modes and link counts across the tiering round trip, via `std::os::unix`'s `MetadataExt`
+//! and `PermissionsExt`. Gated at file level rather than per-item so
+//! Windows COMPILES the crate and runs everything else, instead of the
+//! whole workspace failing to build on one leg — §9 wants a platform
+//! break found on the commit that caused it, which needs the other
+//! platforms to still build.
+//!
+//! This is a real coverage gap on Windows and is meant to read as one.
+#![cfg(unix)]
+
 //! **M2's end-to-end round trip** (§6 Phase 2, T11).
 //!
 //! ```text
