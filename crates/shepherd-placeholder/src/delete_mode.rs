@@ -394,30 +394,36 @@ mod tests {
     #[must_use]
     fn staged_or_refused(r: Result<Staged>) -> Option<Staged> {
         match r {
-            Ok(s) => {
-                assert!(
-                    cfg!(unix),
-                    "staging SUCCEEDED on {}, where file identity is unsupported \
-                     and the provider is supposed to fail closed. Either the \
-                     platform gained an identity binding — in which case these \
-                     tests must be updated to expect success, DELIBERATELY — or \
-                     the refusal stopped refusing",
-                    std::env::consts::OS
-                );
-                Some(s)
-            }
+            // `#[cfg]` on the arms rather than `assert!(cfg!(unix), ..)`:
+            // clippy is right that the latter is a constant assertion. This
+            // makes the two platforms genuinely different code, which is what
+            // they are.
+            #[cfg(unix)]
+            Ok(s) => Some(s),
+            #[cfg(not(unix))]
+            Ok(_) => panic!(
+                "staging SUCCEEDED on {}, where file identity is unsupported and \
+                 the provider is supposed to fail closed. Either this platform \
+                 gained an identity binding — in which case these tests must be \
+                 updated to expect success, DELIBERATELY — or the refusal stopped \
+                 refusing",
+                std::env::consts::OS
+            ),
             Err(ProviderError::Unsupported(what)) => {
-                assert!(
-                    !cfg!(unix),
+                #[cfg(unix)]
+                panic!(
                     "staging refused as `unsupported: {what}` ON UNIX, where file \
                      identity IS available. That is the binding breaking, not a \
                      platform lacking one"
                 );
-                assert_eq!(
-                    what, "file identity",
-                    "the refusal must name what could not be bound"
-                );
-                None
+                #[cfg(not(unix))]
+                {
+                    assert_eq!(
+                        what, "file identity",
+                        "the refusal must name what could not be bound"
+                    );
+                    None
+                }
             }
             Err(e) => panic!("staging failed for an unexpected reason: {e:?}"),
         }
