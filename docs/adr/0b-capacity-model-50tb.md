@@ -111,7 +111,51 @@ WAL to **~6.3 GB** `[X]`.
 |---|---|
 | **Reject threshold** | **WAL exceeds 1 GB at any point during the 10M-file initial scan** |
 | Consequence | forces a checkpoint at least every ~1.6M files |
-| **Verdict** | **PASS conditional on §4.4's dedicated PASSIVE-checkpoint connection actually running during the initial scan.** Unchecked, the projection breaches by 6.3×. |
+| **Verdict** | **PASS — but conditional on SQLite's page-count `wal_autocheckpoint`, NOT on §4.4's dedicated PASSIVE-checkpoint connection. See the correction below.** |
+
+> **CORRECTION 2026-08-19 — this verdict named the wrong component, and the one
+> it named was measured and does not deliver.**
+>
+> The condition above originally read *"PASS conditional on §4.4's dedicated
+> PASSIVE-checkpoint connection actually running during the initial scan."* It
+> **is** running — `main.rs:91` passes a checkpoint path to
+> `CatalogActor::start` — and it is **not** what keeps the WAL bounded.
+>
+> Measured directly, same 1M-file corpus, same machine, same session, same
+> binary, one pragma different:
+>
+> | | WAL peak | vs this ADR's 1 GB reject threshold |
+> |---|---|---|
+> | `wal_autocheckpoint` **on** (production today) | **7.9 MiB** | 127× under |
+> | `wal_autocheckpoint` **off**, 30 s dedicated PASSIVE thread alone | **6,378.8 MiB** | **6.4× over** |
+>
+> So the reject threshold this ADR sets is **breached by the mechanism this ADR
+> conditioned its PASS on**, and met by the one it did not mention.
+>
+> **Why the dedicated connection cannot do it, and why a shorter interval will
+> not help.** A PASSIVE checkpoint cannot backfill frames a reader still holds.
+> During an initial scan the metadata index rebuild reads continuously, so the
+> PASSIVE checkpoints are repeatedly blocked and the WAL tracks **corpus size
+> rather than the checkpoint interval** — it did not plateau at one interval's
+> writes, it grew across three. `wal_autocheckpoint` succeeds because it fires
+> at a commit boundary **on the writing connection**, where backfill is
+> possible.
+>
+> **Operational consequence, which is the reason this correction is worth
+> writing down at all:** `catalog::PRAGMAS` does not set `wal_autocheckpoint`,
+> so the bound rests on SQLite's default (1000 pages) being left alone. Anyone
+> who sets it to `0` — or opens a catalog connection without `PRAGMAS` — loses
+> the bound, and until this correction both this ADR and §4.4 told them the
+> dedicated thread had them covered. The warning now lives at the `PRAGMAS`
+> definition as well.
+>
+> **One figure this ADR should re-derive rather than inherit:** the projection
+> above uses ~630 B of WAL per file, which would put a 1M-file scan near 630 MB.
+> The measured 6,378.8 MiB is roughly 10× that per file. The likeliest cause is
+> that six indexes dirty more pages per insert at 1M rows than the small-scale
+> sample the 630 B came from — but that is a hypothesis, not a measurement, and
+> it does not change either verdict. Flagged so the number is not re-used as
+> though it had been checked at scale.
 
 Threshold rationale: a WAL beyond 1 GB means a crash replays more than a gigabyte
 before the daemon is usable, and the eventual checkpoint stalls writers for its

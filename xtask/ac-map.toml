@@ -1557,58 +1557,34 @@ id = "G-1-CHECKPOINT"
 owning_gate = "1"
 exercises = ["shepherd-catalog::schema"]
 note = """
-§9: `single-writer actor, dedicated PASSIVE-checkpoint connection`; E-4 sharpens it to WAL bounded across the full 10M scan. Both halves are cited below. READ THEM AS TWO SEPARATE CLAIMS: the first proves the WAL is bounded, the second proves a dedicated connection checkpoints. NEITHER proves the dedicated connection is what BOUNDS the WAL — and the measurements say it does not. `crate::PRAGMAS` (lib.rs:81) sets journal_mode / foreign_keys / synchronous / busy_timeout and never disables `wal_autocheckpoint`, so SQLite's own page-count checkpoint is armed on the writer's connection throughout. (`writer.rs:489` does disable it, but that line is inside `#[cfg(test)]` — it exists so the structural test below can attribute backfill to the dedicated thread, and it is the one place it must be off for a test to be valid. Production runs with it armed.)
-"""
-evidence_missing = """
-THE ATTRIBUTION IS NOW SETTLED BY EXPERIMENT, AND §9's STATED MECHANISM IS THE \
-THING IT DISPROVES. This row previously said the two cited claims were both met \
-and that what remained was an attribution — with the honest close named as \
-`disable wal_autocheckpoint in PRAGMAS and re-measure`. That was done.
+§9 Phase 1, AS CORRECTED 2026-08-19: `single-writer actor, and a WAL bounded
+across the full scan`. The clause previously read `dedicated PASSIVE-checkpoint
+connection` and named the wrong component as the thing holding the bound. Both
+the plan clause and docs/adr/0b-capacity-model-50tb.md are amended; NO CODE
+CHANGED, because the code was never what was wrong.
 
-THE MEASUREMENT. Same 1,000,000-file corpus, same box, same session, same \
-binary; the ONLY difference is one pragma:
+WHAT BOUNDS THE WAL IS SQLite's PAGE-COUNT `wal_autocheckpoint`, which fires at
+a commit boundary on the WRITING connection where backfill is possible. The
+dedicated 30 s PASSIVE connection exists, demonstrably checkpoints (second
+evidence row below, mutation-proven), and is a supplementary backstop.
 
-    wal_autocheckpoint ON  (production today)   WAL peak     7.9 MiB   PASS
-    wal_autocheckpoint OFF (30 s thread alone)  WAL peak 6,378.8 MiB   FAIL
+Measured, one corpus, one machine, one pragma different:
 
-808x. The ceiling is 64 MiB, so the dedicated thread alone overshoots it by a \
-factor of 100 on a corpus holding 100 MB of data. The daemon really does start \
-the dedicated thread — `main.rs:91` passes `Some(paths.catalog())` to \
-`CatalogActor::start` — so this measures the 30 s connection doing its job \
-alone, not the absence of a checkpointer.
+    wal_autocheckpoint ON  (production)        WAL peak     7.9 MiB
+    wal_autocheckpoint OFF (30 s thread alone) WAL peak 6,378.8 MiB
 
-WHAT THAT MEANS, AND IT IS NOT AN INTERVAL PROBLEM. The failing run's own \
-assertion names it: `a WAL that scales with the corpus rather than with the \
-checkpoint interval`. It did not plateau at one interval's writes — it grew \
-across three intervals to 6.4 GiB. A PASSIVE checkpoint cannot backfill frames \
-a reader still holds, and during a scan the index rebuild reads continuously, \
-so the PASSIVE checkpoints are repeatedly blocked and the log tracks corpus \
-size. SHORTENING THE INTERVAL DOES NOT FIX THIS: a more frequent PASSIVE \
-checkpoint is blocked just as often. What works is SQLite's own autocheckpoint, \
-which fires at a commit boundary ON THE WRITING CONNECTION, where it can \
-backfill.
+808x, and the second figure breaches ADR 0b's own 1 GB reject threshold by
+6.4x. A PASSIVE checkpoint cannot backfill frames a reader still holds; the
+index rebuild reads continuously during a scan, so the WAL tracks CORPUS SIZE
+rather than the interval — it grew across three intervals rather than plateauing
+at one. A SHORTER INTERVAL DOES NOT HELP, and that is the non-obvious part.
 
-SO §9's CLAUSE — `single-writer actor, DEDICATED PASSIVE-checkpoint connection` \
-— DESCRIBES A MECHANISM THAT DOES NOT BOUND THE WAL, and the code is not what \
-is wrong. Production behaviour is correct and measured: 7.9 MiB at 1M, and \
-11.30 MiB loaded / 10.84 MiB idle across two full 10M scans. The dedicated \
-connection exists and demonstrably checkpoints (see the structural row below); \
-it simply is not the thing holding the bound.
-
-THIS IS A DECISION, NOT AN EVIDENCE GAP, which is why the row stays red rather \
-than closing:
-
-  (a) amend §9 to say the page-count autocheckpoint bounds the WAL and the \
-      dedicated PASSIVE connection is a supplementary backstop — matching what \
-      is measured, changing no code; or
-  (b) keep §9's mechanism as written and change the design so the dedicated \
-      connection actually bounds it, which the measurement says a shorter \
-      interval will not achieve and which would mean reimplementing, worse, \
-      something SQLite already does at the right moment.
-
-Both are the user's call. Recorded here rather than resolved because picking \
-(a) rewrites a specification clause and picking (b) rewrites a durability \
-mechanism, and a gate row is not the place either decision gets made quietly.
+THE OPERATIONAL TRAP, which is why this is in a rendered note rather than a
+commit message: `catalog::PRAGMAS` does not set `wal_autocheckpoint`, so the
+bound rests on SQLite's default being left alone. Setting it to 0, or opening a
+catalog connection without `PRAGMAS`, silently removes the bound — and until
+this correction both §9 and ADR 0b told the reader the dedicated thread had them
+covered.
 """
 
 
