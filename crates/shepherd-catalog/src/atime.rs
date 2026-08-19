@@ -95,8 +95,13 @@ impl AtimeMode {
 ///
 /// Pure, so it is testable on fixture strings rather than on whatever the test
 /// machine happens to have mounted. The precedence follows the kernel's: an
-/// explicit `noatime` wins over everything, `strictatime` means genuinely every
-/// access, and Linux's default when nothing is said is `relatime`.
+/// explicit `noatime` wins over everything, and `strictatime` means genuinely
+/// every access.
+///
+/// **What the kernel says when nothing is said is NOT `relatime`** — it is
+/// `strictatime`, recorded as the absence of any atime flag. This function
+/// still answers `Relatime` there, on purpose; the reasoning is at the final
+/// arm, and it is the difference between a fail-safe imprecision and a guess.
 ///
 /// `lazytime` is not an atime policy — it defers *writeback* of timestamps, not
 /// their update — so it is transparent here and deliberately ignored.
@@ -113,7 +118,39 @@ pub fn classify_mount_options(options: &str) -> AtimeMode {
     if opts.any(|o| o == "relatime") {
         return AtimeMode::Relatime;
     }
-    // Linux mounts default to relatime when no atime option is present.
+    // NO ATIME OPTION MEANS `strictatime`, NOT `relatime` — and this returns
+    // `Relatime` anyway, deliberately.
+    //
+    // The kernel names `noatime` and `relatime` in `/proc/self/mountinfo` and
+    // names `strictatime` NOWHERE; strict behaviour is recorded as the absence
+    // of a flag. Measured on both tmpfs and ext4 (2026-08-19):
+    //
+    //     mount -o strictatime -> "rw"              <- the strict case
+    //     mount -o relatime    -> "rw,relatime"
+    //     mount -o noatime     -> "rw,noatime"
+    //
+    // Two consequences, both stated because the previous comment here asserted
+    // the opposite and would have misled anyone who trusted it:
+    //
+    // 1. The `strictatime` arm above CANNOT FIRE from real mountinfo. It is
+    //    reachable only from a hand-written option string, which is how the
+    //    unit tests reach it. It is kept because the option is legal input and
+    //    silently dropping a case the classifier claims to handle is worse than
+    //    an arm that rarely fires — but nobody should read its presence as
+    //    evidence that `Reliable` is achievable on Linux.
+    // 2. THEREFORE `AtimeMode::Reliable` IS CURRENTLY UNREACHABLE ON LINUX via
+    //    `detect()`, and `only_reliable_atime_may_feed_the_observed_access_signal`
+    //    can never be satisfied here. A genuinely strict mount is classified
+    //    `Relatime`, which REFUSES to feed `last_observed_access` and still
+    //    permits destructive age rules. That is fail-safe and imprecise, not
+    //    fail-open.
+    //
+    // The honest fix is macOS's: PROBE the no-flag case rather than infer it —
+    // backdate an atime, read, and see whether it advanced. macOS does exactly
+    // that and maps its own no-flag case to `Relatime` on the evidence. Until
+    // Linux does the same, inferring `Reliable` from an absent flag would be
+    // deciding a destructive-rule input by assumption, which is the one
+    // direction this module must not guess in.
     AtimeMode::Relatime
 }
 
@@ -853,5 +890,171 @@ mod macos_tests {
         let mode = detect(Path::new("/no/such/path/shepherd-atime-probe"));
         assert_eq!(mode, AtimeMode::Unknown);
         assert!(!mode.supports_destructive_age_rule());
+    }
+}
+
+/// Linux `detect()` itself — the composition, not its parts.
+///
+/// `G-1-ATIME` carried this gap the longest: the mountinfo PARSER and the
+/// option CLASSIFIER were both well covered, and `detect_linux` — which
+/// canonicalises a path, reads `/proc/self/mountinfo`, resolves the
+/// longest-prefix mount and takes the stricter of the mount and superblock
+/// classifications — was asserted by nothing on the one platform where every
+/// other atime assertion runs. macOS and Windows gained direct coverage when
+/// their detectors landed; Linux, which had the detector all along, did not.
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// The composition answers from the real kernel table rather than falling
+    /// through to `Unknown`.
+    #[test]
+    fn detect_answers_a_real_mount_instead_of_unknown() {
+        let mode = detect(Path::new("/tmp"));
+        assert_ne!(
+            mode,
+            AtimeMode::Unknown,
+            "Linux detect() must read /proc/self/mountinfo and classify, not \
+             fall through to Unknown"
+        );
+        assert!(matches!(
+            mode,
+            AtimeMode::Disabled | AtimeMode::Relatime | AtimeMode::Reliable
+        ));
+    }
+
+    /// Fail-closed: `canonicalize` fails, so the whole chain must degrade to
+    /// `Unknown` rather than to a default that authorises destruction.
+    #[test]
+    fn a_path_that_does_not_exist_is_unknown_not_a_guess() {
+        let mode = detect(Path::new("/no/such/path/shepherd-atime-probe"));
+        assert_eq!(mode, AtimeMode::Unknown);
+        assert!(!mode.supports_destructive_age_rule());
+    }
+
+    /// Cross-check against `findmnt`, not against our own parser.
+    ///
+    /// `findmnt` is util-linux: an independent implementation of the same
+    /// longest-prefix resolution over the same kernel table. Re-parsing
+    /// `/proc/self/mountinfo` here with `linux_mountinfo` would compare the
+    /// function to itself and pass on a broken one — the same reason the
+    /// launchd uid test checks against `id -u` rather than `getuid()`.
+    #[test]
+    fn detect_agrees_with_findmnt_about_the_options_in_force() {
+        let out = match Command::new("findmnt")
+            .args(["-no", "OPTIONS", "--target", "/tmp"])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            // util-linux absent: skip rather than assert a tautology in its place.
+            _ => return,
+        };
+        let opts = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(!opts.is_empty(), "findmnt returned no options for /tmp");
+
+        let expected = if opts.split(',').any(|o| o == "noatime") {
+            AtimeMode::Disabled
+        } else if opts.split(',').any(|o| o == "strictatime") {
+            AtimeMode::Reliable
+        } else {
+            AtimeMode::Relatime
+        };
+
+        assert_eq!(
+            detect(Path::new("/tmp")),
+            expected,
+            "detect() disagrees with findmnt, which read the same kernel table \
+             by a different implementation. findmnt says: {opts}"
+        );
+    }
+
+    /// The load-bearing one: drive `detect()` across mounts whose options the
+    /// test CONTROLS, and require it to change its answer.
+    ///
+    /// The three tests above all run against whatever `/tmp` happens to be, so
+    /// each of them passes against a `detect()` hardcoded to that one answer.
+    /// This one mounts a tmpfs `noatime`, requires `Disabled`, remounts it
+    /// `strictatime`, and requires `Reliable` — so a constant return value
+    /// fails whichever constant it is. Needs root; `#[ignore]`d for the same
+    /// reason as `volume::remount_tests`.
+    #[test]
+    #[ignore = "needs root to mount tmpfs"]
+    fn detect_changes_its_answer_when_the_mount_options_change() {
+        let dir = std::env::temp_dir().join("shepherd-atime-mount-probe");
+        let _ = Command::new("sudo")
+            .args(["umount", "-l"])
+            .arg(&dir)
+            .output();
+        std::fs::create_dir_all(&dir).expect("mkdir probe mountpoint");
+
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("sudo")
+                    .args(["umount", "-l"])
+                    .arg(&self.0)
+                    .output();
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _guard = Cleanup(dir.clone());
+
+        let mount = |opts: &str| {
+            let st = Command::new("sudo")
+                .args(["mount", "-t", "tmpfs", "-o", opts, "shepherd-atime-probe"])
+                .arg(&dir)
+                .status()
+                .expect("run mount");
+            assert!(st.success(), "mount -o {opts} failed");
+        };
+        let remount = |opts: &str| {
+            let st = Command::new("sudo")
+                .args(["mount", "-o", &format!("remount,{opts}")])
+                .arg(&dir)
+                .status()
+                .expect("run remount");
+            assert!(st.success(), "remount -o {opts} failed");
+        };
+
+        mount("noatime");
+        assert_eq!(
+            detect(&dir),
+            AtimeMode::Disabled,
+            "a tmpfs mounted noatime must classify as Disabled; detect() is \
+             either not reading this mount or not honouring the option"
+        );
+
+        // The second leg deliberately asserts `Relatime`, NOT `Reliable`, and
+        // the reason is a measured kernel fact rather than a compromise: the
+        // kernel names `noatime` and `relatime` in mountinfo and names
+        // `strictatime` nowhere, so a strict mount reads as `rw` with no atime
+        // option and classifies as `Relatime`. Verified on tmpfs AND ext4.
+        // Asserting `Reliable` here would be asserting something Linux cannot
+        // currently produce — see `classify_mount_options`.
+        //
+        // It still catches a constant, which is this test's whole job: the
+        // answer MUST CHANGE across the remount, and it must change to the
+        // value the kernel table actually justifies.
+        remount("strictatime");
+        let after = detect(&dir);
+        assert_ne!(
+            after,
+            AtimeMode::Disabled,
+            "detect() still says Disabled after the mount stopped being \
+             noatime — it is not re-reading the kernel table, or it is caching"
+        );
+        assert_eq!(
+            after,
+            AtimeMode::Relatime,
+            "a mount with no atime option in mountinfo classifies as Relatime. \
+             If this ever reads Reliable, either the kernel began naming \
+             strictatime or someone inferred it from an absent flag — the \
+             second would be guessing a destructive-rule input"
+        );
+        assert!(
+            !after.may_fold_into_observed_access(),
+            "Relatime must not feed last_observed_access"
+        );
     }
 }
