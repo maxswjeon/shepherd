@@ -273,6 +273,140 @@ mod tests {
     /// latency-and-RSS alone would have picked a different candidate. A
     /// contract that quietly lost them would let the decision be re-derived on
     /// the two axes it was corrected away from.
+    /// **The metadata bar measured THROUGH THE DAEMON**, which is a different
+    /// claim from `the_recorded_metadata_p95_clears_the_precommitted_bar_...`
+    /// above and is why it gets its own test rather than another `cache` in
+    /// that loop.
+    ///
+    /// `meta_bench_arena_*` is Phase 0b: the arena built inside the bench
+    /// process, four OS threads querying it directly. `bench-contract.toml`
+    /// `[execution]` records that substitution in its own words and names what
+    /// the number therefore excludes — *"IPC and serialisation cost"*. §9's M1
+    /// leg 2 asks for the bar over a 10M-row catalog **injected by
+    /// shepherd-bench and queried through the daemon**, re-measured *from*
+    /// Phase 1. A gate for that clause cannot cite the 0b number however good
+    /// it is: right bar, wrong measurement.
+    ///
+    /// Most of what follows asserts **what the number is a measurement of**,
+    /// not its size. A p95 can clear 50 ms because the daemon is fast, or
+    /// because it searched an empty index, answered one client, ran unpinned on
+    /// 32 cores, or ran with the background ingest silently inert. Each of those
+    /// is checked. Two have already happened in this repository: the tantivy
+    /// candidate scored beautifully while matching nothing, and this harness's
+    /// own ingest thread was quiescent for two runs of every three until the
+    /// per-run counts exposed it.
+    ///
+    /// `drift_flagged` is asserted to be **present**, never to be false. It is
+    /// `true` in both recorded cells (17.08% cold, 12.92% warm against the
+    /// contract's 10%). That is a real caveat on a real pass, and the point of
+    /// pinning it here is that a future re-measure cannot drop the field and
+    /// quietly upgrade a flagged pass into a clean one.
+    ///
+    /// Like everything in this module this is an **artifact re-read, not a
+    /// re-measurement**. It says the recorded Phase 1 through-daemon result
+    /// clears the precommitted bar. It does not say the bar holds today.
+    #[test]
+    fn the_metadata_bar_holds_through_the_daemon_on_an_injected_catalog() {
+        let b = baseline();
+        let c = contract();
+        let limit = bar("metadata_p95_ms");
+        let want_rows = c["fixture"]["rows"].as_integer().map(|i| i as u64);
+        let want_clients = c["execution"]["query_clients"].as_integer().map(|i| i as u64);
+        let want_pin = c["reference_machine"]["pin_to_cores"].as_str();
+
+        for cache in ["cold", "warm"] {
+            let key = format!("meta_daemon_bench_{cache}");
+            assert!(
+                b.get(&key).is_some(),
+                "bench-baseline.json has no `{key}`. §9's M1 leg 2 wants the metadata bar \
+                 through the daemon on an injected catalog; a 0b in-process number cannot \
+                 stand in for it"
+            );
+
+            let p95 = f64_at(&b, &[&key, "stats", "accepted_p95_ms"]);
+            assert_eq!(
+                f64_at(&b, &[&key, "bar_ms"]),
+                limit,
+                "{key} was measured against a different bar than bench-contract.toml fixes. \
+                 Moving the bar after the run is the one edit that makes any measurement pass"
+            );
+            assert!(p95 < limit, "{key} p95 is {p95:.2} ms against the {limit} ms bar");
+            assert_eq!(b[&key]["pass"].as_bool(), Some(true), "{key} records pass=false");
+            assert_eq!(
+                b[&key]["rows"].as_u64(),
+                want_rows,
+                "{key} ran over a different row count than the contract fixes — the 10M in \
+                 \"< 50 ms p95 at 10M\" is half the claim"
+            );
+
+            // A p95 over queries that matched nothing measures absence, fast.
+            assert_eq!(
+                b[&key]["zero_hit_queries"].as_u64(),
+                Some(0),
+                "{key} records zero-hit queries; every lexical query in the committed trace \
+                 is a substring of a row the corpus contains, so a zero hit means the daemon \
+                 was not searching the injected catalog"
+            );
+            assert_eq!(
+                b[&key]["query_clients"].as_u64(),
+                want_clients,
+                "{key} did not run at the contract's client concurrency"
+            );
+            assert_eq!(
+                b[&key]["daemon_cpus_allowed_list"].as_str(),
+                want_pin,
+                "{key} did not run pinned to the contract's cores; the scan is embarrassingly \
+                 parallel, so an unpinned run on this 32-vCPU box can clear a bar the declared \
+                 8-core reference machine fails"
+            );
+
+            // Background ingest, per run. A total cannot distinguish three runs
+            // ingesting evenly from one run doing all of it while two ran
+            // quiescent under the same label — which is what actually happened
+            // here before the cursor was fixed.
+            let per_run = b[&key]["background_rows_ingested_per_run"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} has no background_rows_ingested_per_run"));
+            assert!(!per_run.is_empty(), "{key} recorded no per-run ingest counts");
+            for (i, v) in per_run.iter().enumerate() {
+                assert!(
+                    v.as_u64().unwrap_or(0) > 0,
+                    "{key} run {i} ingested 0 rows while carrying the label `under background \
+                     ingest`. [execution] fixes background_ingest, and a quiescent run hides \
+                     exactly the contention the clause exists to measure"
+                );
+            }
+
+            // The caveat travels with the number.
+            assert!(
+                b[&key]["stats"]["drift_flagged"].is_boolean(),
+                "{key} does not record drift_flagged. Both recorded cells exceed the \
+                 contract's drift threshold, and a re-measure that drops this field would \
+                 turn a flagged pass into an apparently clean one"
+            );
+
+            // The guard admitted these runs; these samples are what justify
+            // them. Different claims — see MIN_IDLE_BEFORE_RUN's docs, which
+            // record that no absolute idle threshold discriminates on this host.
+            for field in [
+                "pinned_core_idle_fraction_before_each_run",
+                "pinned_core_idle_fraction_after_each_run",
+            ] {
+                let s = b[&key][field]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{key} has no {field}"));
+                assert_eq!(
+                    s.len(),
+                    per_run.len(),
+                    "{key} recorded {} {field} samples for {} runs; the contention evidence \
+                     must cover every run, not some of them",
+                    s.len(),
+                    per_run.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_contract_still_scores_every_axis_the_tiebreak_rule_names() {
         let c = contract();
