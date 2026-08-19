@@ -776,10 +776,17 @@ fn write_symlink_corner(root: &Path, bytes: &AtomicU64) -> Result<Vec<Sample>, S
          corpus without them would silently weaken every assertion made over it",
         std::env::consts::OS
     ));
-    #[cfg(unix)]
     let link = |from: &str, to: &str| -> Result<(), String> {
         let p = root.join(from);
+        // The early return above means this never runs off-POSIX. It still has
+        // to COMPILE there, which the first version of this fix forgot: a
+        // `#[cfg]` on the binding left every later `link(..)` call resolving to
+        // the built-in `#[link]` attribute instead. Gating the BODY keeps the
+        // symbol on every platform.
+        #[cfg(unix)]
         symlink(to, &p).map_err(|e| format!("symlink {from} -> {to}: {e}"))?;
+        #[cfg(not(unix))]
+        let _ = (&p, to);
         Ok(())
     };
     link("links/zzsymlinked-link.txt", "zzsymlinked-target.txt")?;

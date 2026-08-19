@@ -2596,8 +2596,28 @@ impl FakeS3 {
                         // The refused call is `CreateMultipartUpload`, which
                         // carries no body, so the request head is all there is
                         // to drain before answering.
-                        let mut buf = [0u8; 8192];
-                        let _ = sock.read(&mut buf);
+                        // Drain the WHOLE request head before answering.
+                        // A single `read` can leave bytes in the receive queue,
+                        // and closing a socket with unread data sends an RST on
+                        // macOS — the client then sees a connection reset rather
+                        // than this 400, the SDK reports a transport error, and
+                        // the probe answers `Unreachable` instead of `refused`.
+                        // That is the WRONG BRANCH for this test, and it passed
+                        // on Linux, which usually delivers the response anyway.
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            match sock.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    head.extend_from_slice(&buf[..n]);
+                                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
                         let _ = write!(
                             sock,
                             "HTTP/1.1 400 Bad Request\r\nContent-Type: application/xml\r\n\
@@ -2605,7 +2625,10 @@ impl FakeS3 {
                             BODY.len()
                         );
                         let _ = sock.flush();
-                        let _ = sock.shutdown(std::net::Shutdown::Both);
+                        // Half-close: signal end-of-response and let the client
+                        // close its own side. `Shutdown::Both` here is what
+                        // triggers the RST described above.
+                        let _ = sock.shutdown(std::net::Shutdown::Write);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5));
