@@ -16,7 +16,11 @@
 //!   anyone. Promising exactness there would be promising something no
 //!   implementation can deliver, which is worse than a stated limit. Any
 //!   difference the target COULD have represented and did not is still a
-//!   breach.
+//!   breach. **`mode` is preserved only where the target can represent one at
+//!   all** — POSIX yes, Windows no, since NTFS has ACLs and a read-only flag
+//!   and no mode bits. On Windows `mode` is NOT preserved, and that is stated
+//!   here rather than discovered: see `MODE_IS_REPRESENTABLE`, which also
+//!   records why mapping owner-write onto the read-only flag was rejected.
 //! * Captured where the provider allows: xattrs, POSIX ACLs, macOS resource
 //!   forks and Finder tags, NTFS alternate data streams.
 //! * **Anything not captured is documented as not preserved** rather than
@@ -197,6 +201,23 @@ pub enum FidelityBreach {
 /// because the resolution there is 1 ns.
 const MTIME_RESOLUTION_NANOS: i64 = if cfg!(unix) { 1 } else { 100 };
 
+/// Whether this platform's filesystems can represent a POSIX `mode` at all.
+///
+/// **True on POSIX. False on Windows**, which has ACLs and a read-only flag and
+/// no mode bits. A restore onto NTFS reads back `mode: 0` against a manifest
+/// recording `0o644`, so an unconditional comparison reports a breach for
+/// something the target cannot hold — the same shape as the `mtime` limit above
+/// and, again, found by the first native Windows CI run rather than by reading.
+///
+/// **`mode` is therefore NOT preserved on Windows, and this constant is where
+/// that is written down.** The alternative considered and rejected was mapping
+/// the owner-write bit onto the read-only flag: that would preserve one bit of
+/// nine while reporting success, which claims more fidelity than it delivers.
+/// This module's own third rule is that anything not captured is DOCUMENTED as
+/// not preserved rather than silently dropped, and a partial mapping dressed as
+/// a pass is exactly the silent drop it forbids.
+const MODE_IS_REPRESENTABLE: bool = cfg!(unix);
+
 /// Whether a restored mtime is as faithful as the target filesystem allows.
 ///
 /// Not `abs() < resolution` on a whim: a difference SMALLER than one tick is
@@ -235,7 +256,7 @@ pub fn verify_restore(
             actual: actual.mtime,
         });
     }
-    if actual.mode != c.mode {
+    if MODE_IS_REPRESENTABLE && actual.mode != c.mode {
         breaches.push(FidelityBreach::Mode {
             expected: c.mode,
             actual: actual.mode,
