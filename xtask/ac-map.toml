@@ -457,7 +457,9 @@ proves = "a bad glob is an error, not a silent zero-match — §4.12's rule that
 package = "shepherd-rules"
 test = "r#match::tests::a_combinator_with_sibling_keys_is_refused_rather_than_silently_dropped"
 proves = """
-FOUND WHILE FIXING THE ROW ABOVE, not looked for. The unknown-key
+A CODEX P1 IN ITS OWN RIGHT, recorded here because the worker that fixed it
+reported it as an incidental discovery while fixing the row above — it was
+both, and the review record is the authority on provenance. The unknown-key
 refusal early-returned as soon as it matched a combinator, so
 `{"all":[...],"older_thn_days":365}` compiled as the bare `all` with the typo'd
 key DISCARDED — a rule that reads as an age filter and runs as none. The typo
