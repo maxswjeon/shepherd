@@ -1,17 +1,32 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  One entitlement, and its presence is load-bearing. Rationale, and the two
-  entitlements deliberately ABSENT, are in FINDINGS.md under "Entitlements".
+  Two entitlements, and BOTH are load-bearing. Rationale, and the one
+  entitlement deliberately ABSENT, are in FINDINGS.md under "Entitlements".
 
   Keep prose here short and free of double-hyphens: AMFI parses this file with
   its own XML reader, a double-hyphen is illegal inside an XML comment, and the
   failure is `AMFIUnserializeXML: syntax error`, after which NOTHING embeds.
   That reproduces the exact symptom of the MH_BUNDLE bug for an unrelated
   reason, which is a bad trap to leave in a file about not leaving such traps.
+
+  com.apple.security.application-groups MUST list exactly the string that
+  Info-appex.plist gives for NSExtensionFileProviderDocumentGroup. Omitting it
+  does not fail loudly: `codesign` is happy, `pluginkit` lists the extension,
+  and only `fileproviderd` says why, once, at ERROR level:
+
+      Extension ... doesn't have a group container for document group
+      group.kr.swjeon.shepherd.spike specified via
+      NSExtensionFileProviderDocumentGroup. Ignoring the extension.
+
+  The caller sees `-2014 ApplicationExtensionNotFound`, which reads as "your
+  extension was never discovered" when in fact it was discovered and then
+  discarded. Verified 2026-08-19 on host and in a fresh VM. See FINDINGS.md.
 -->
 <plist version="1.0">
 <dict>
   <key>com.apple.security.app-sandbox</key><true/>
+  <key>com.apple.security.application-groups</key>
+  <array><string>group.kr.swjeon.shepherd.spike</string></array>
 </dict>
 </plist>

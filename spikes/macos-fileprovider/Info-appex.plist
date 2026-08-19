@@ -24,10 +24,16 @@
     <key>NSExtensionPointIdentifier</key><string>com.apple.fileprovider-nonui</string>
     <key>NSExtensionPrincipalClass</key><string>Provider</string>
 
-    <!-- Required by the extension point. NOTE the container it names is NOT
-         functional under ad-hoc signing: containermanagerd rejects the group
-         at launch because ad-hoc has no team identifier. The extension still
-         registers a domain. See Provider.entitlements and FINDINGS.md. -->
+    <!-- Required by the extension point, and Provider.entitlements MUST grant
+         com.apple.security.application-groups for exactly this string.
+         fileproviderd checks the two against each other and, if the
+         entitlement is missing, logs "doesn't have a group container for
+         document group ... Ignoring the extension" and answers the caller
+         -2014, which reads as "never discovered". NOTE separately that the
+         container it names is NOT writable under ad-hoc signing:
+         containermanagerd rejects the group because ad-hoc has no team
+         identifier. The extension still registers a domain. Admission and
+         access are two different checks. See FINDINGS.md. -->
     <key>NSExtensionFileProviderDocumentGroup</key><string>group.kr.swjeon.shepherd.spike</string>
 
     <key>NSExtensionFileProviderEnabledByDefault</key><true/>
