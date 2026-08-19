@@ -478,3 +478,132 @@ async fn whole_object_checksums_on_multipart_are_probed_not_assumed() {
         .await
         .expect("content must round-trip regardless of checksum support");
 }
+
+/// **E-5's producer, run against a real provider.**
+///
+/// `probe_multipart_checksum` is the registration-time producer for
+/// `S3Config::multipart_checksum` — the field that has always had three
+/// readers, a doc saying it must be probed at registration, and no writer
+/// outside a test. The selection logic (preference order, fallback,
+/// unreachable-is-not-a-negative) is unit-tested in `s3.rs` against a scripted
+/// provider, because no single real provider exercises more than one path
+/// through it. This is the other half: that the round trip it performs is a
+/// real one.
+///
+/// **It reports rather than asserting which way it goes**, in the style of
+/// `whole_object_checksums_on_multipart_are_probed_not_assumed` above: R2 and
+/// B2 are genuinely unknown and guessing at them is what E-3 had to walk back.
+/// What it does assert is the invariant that must hold on any provider —
+/// whatever is adopted must have come back from HEAD as `whole_object`, and a
+/// negative must carry a reason for every algorithm rather than being a bare
+/// `None`.
+#[tokio::test]
+#[ignore = "requires MinIO, or SHEPHERD_S3_BUCKET for a real endpoint"]
+async fn the_registration_probe_adopts_a_checksum_the_provider_actually_round_trips() {
+    let (cfg, provider) = probe_target();
+    println!("FINDING: probing {provider}");
+
+    let probe = shepherd_storage::s3::probe_multipart_checksum(&cfg)
+        .await
+        .expect("the provider must be reachable to run this test at all");
+
+    println!("FINDING: {}", probe.summary());
+
+    match probe.adopted {
+        Some(alg) => {
+            // The adopted algorithm's own attempt must be the round-tripped
+            // one. A probe that adopted an algorithm whose attempt was recorded
+            // as rejected would be reporting the request rather than the answer.
+            let attempt = probe
+                .attempts
+                .iter()
+                .find(|a| a.algorithm == alg)
+                .expect("the adopted algorithm must appear in the attempts");
+            match &attempt.outcome {
+                shepherd_storage::s3::AttemptOutcome::RoundTripped { value } => {
+                    assert!(!value.is_empty(), "an adopted checksum must carry a value");
+                    println!(
+                        "FINDING: {provider} round-tripped {} = {value}",
+                        alg.as_str()
+                    );
+                }
+                other => panic!("adopted {} but recorded {other:?}", alg.as_str()),
+            }
+            // Every earlier algorithm in the preference order must have been
+            // tried and rejected — otherwise the adoption skipped a stronger
+            // one silently.
+            for earlier in
+                shepherd_storage::s3::FULL_OBJECT_PREFERENCE
+                    .iter()
+                    .take_while(|a| **a != alg)
+            {
+                let a = probe
+                    .attempts
+                    .iter()
+                    .find(|x| x.algorithm == *earlier)
+                    .unwrap();
+                assert!(
+                    matches!(
+                        a.outcome,
+                        shepherd_storage::s3::AttemptOutcome::Rejected { .. }
+                    ),
+                    "{} was skipped rather than refused: {a:?}",
+                    earlier.as_str()
+                );
+            }
+        }
+        None => {
+            println!(
+                "FINDING: {provider} supports no FULL_OBJECT checksum; scrub must read \
+                 multipart objects back in full there."
+            );
+            assert_eq!(probe.attempts.len(), 3);
+            for a in &probe.attempts {
+                assert!(
+                    matches!(
+                        a.outcome,
+                        shepherd_storage::s3::AttemptOutcome::Rejected { .. }
+                    ),
+                    "a negative must name a reason for {}: {a:?}",
+                    a.algorithm.as_str()
+                );
+            }
+        }
+    }
+}
+
+/// The other direction, and the one that decides whether a $441/month mistake
+/// becomes permanent: an unreachable endpoint must be an error, never a
+/// recorded "this provider supports nothing".
+///
+/// Not `#[ignore]`d — it needs no provider, only the absence of one — so it
+/// runs on every `cargo test`. That matters: the fail-closed leg of a probe is
+/// exactly the leg that rots when it lives only behind a gate nobody runs.
+#[tokio::test]
+async fn an_unreachable_endpoint_fails_registration_rather_than_recording_no_support() {
+    let cfg = S3Config {
+        bucket: "shepherd-nonexistent-probe".into(),
+        // Reserved by RFC 6761 to never resolve.
+        endpoint_url: Some("http://probe.invalid:9".into()),
+        region: Some("us-east-1".into()),
+        force_path_style: true,
+        credentials: Some(StaticCredentials {
+            access_key_id: "x".into(),
+            secret_access_key: "y".into(),
+        }),
+        multipart_checksum: None,
+    };
+
+    let err = shepherd_storage::s3::probe_multipart_checksum(&cfg)
+        .await
+        .expect_err(
+            "an unreachable endpoint must not produce a probe record — recording \
+             `adopted: None` here is permanent and indistinguishable from a genuine \
+             measurement afterwards",
+        );
+    assert!(
+        err.to_string().contains("proves nothing"),
+        "the refusal must explain why it is not a negative result: {err}"
+    );
+    assert!(err.is_retryable(), "and it must be retryable: {err:?}");
+}

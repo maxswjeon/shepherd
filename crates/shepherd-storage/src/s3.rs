@@ -696,6 +696,556 @@ impl StorageAdapter for S3Adapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The registration-time whole-object-checksum probe (E-5)
+// ---------------------------------------------------------------------------
+
+/// The three algorithms that can produce a **FULL_OBJECT** multipart checksum,
+/// strongest first.
+///
+/// The SHA family is deliberately absent and its absence is load-bearing: for
+/// multipart uploads SHA1/SHA256 are COMPOSITE-only — a digest-of-digests over
+/// the part checksums, which can never be compared against a checksum of the
+/// bytes. Adopting one would produce a value that looks like an integrity
+/// check, is stored like one, and makes every multipart object appear corrupt
+/// the first time scrub compares it.
+pub const FULL_OBJECT_PREFERENCE: [ChecksumAlgorithm; 3] = [
+    ChecksumAlgorithm::Crc64Nvme,
+    ChecksumAlgorithm::Crc32c,
+    ChecksumAlgorithm::Crc32,
+];
+
+/// Why one algorithm's round trip did not complete.
+///
+/// **The split is the entire point of this type.** E-5: "a false negative here
+/// is silent, permanent, and indistinguishable from genuine non-support". A
+/// timeout while probing CRC64NVME and a provider that genuinely rejects
+/// CRC64NVME produce the same *shape* of failure and must not produce the same
+/// *conclusion* — one is "this provider cannot do it", the other is "we do not
+/// know", and recording the second as the first permanently strands every
+/// object written through the target afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptError {
+    /// The provider answered, and its answer was no. Evidence about the
+    /// provider.
+    Unsupported {
+        /// Which call refused: `create_multipart`, `upload_part`,
+        /// `complete_multipart` or `head`.
+        step: &'static str,
+        detail: String,
+    },
+    /// The probe never got an answer — a timeout, a dropped connection, a 5xx.
+    /// Evidence about the network, and about nothing else.
+    Unreachable { step: &'static str, detail: String },
+}
+
+/// What one algorithm's probe did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    /// A genuine multipart upload completed and HEAD returned a whole-object
+    /// checksum of this algorithm. `value` is the checksum the provider
+    /// returned, kept because "record the outcome WITH its evidence rather than
+    /// as a boolean" is E-5's explicit instruction.
+    RoundTripped { value: String },
+    /// The provider refused this algorithm, at this step, for this reason.
+    Rejected { step: &'static str, detail: String },
+    /// Not attempted: an earlier algorithm was already adopted.
+    NotAttempted,
+}
+
+/// One algorithm's line in the probe record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeAttempt {
+    pub algorithm: ChecksumAlgorithm,
+    pub outcome: AttemptOutcome,
+}
+
+/// The record of a registration-time probe.
+///
+/// Deliberately not a `bool` and not a bare `Option<ChecksumAlgorithm>`. The
+/// negative result — "this provider supports none of them" — is a claim that
+/// costs $441/month against $0.68 on a 50 TB corpus (ADR 0b §3, 649x) and
+/// cannot be revisited without re-uploading every object, so it has to arrive
+/// with the per-algorithm reasons that produced it. A boolean would make a
+/// wrong negative indistinguishable from a right one forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksumProbe {
+    /// The algorithm to configure. `None` means the provider supports none of
+    /// them and scrub must read multipart objects back in full — the expensive
+    /// answer, never the wrong one.
+    pub adopted: Option<ChecksumAlgorithm>,
+    /// The endpoint actually reached. A probe that reports a negative without
+    /// naming where it was pointed is indistinguishable from one that never
+    /// left the emulator.
+    pub endpoint: String,
+    pub bucket: String,
+    /// Every algorithm tried, in preference order, with what happened.
+    pub attempts: Vec<ProbeAttempt>,
+}
+
+impl ChecksumProbe {
+    /// A one-line human summary, for the registration log and the report.
+    pub fn summary(&self) -> String {
+        let head = match self.adopted {
+            Some(a) => format!("adopted {}", a.as_str()),
+            None => "adopted none: scrub must read multipart objects in full".to_string(),
+        };
+        let detail: Vec<String> = self
+            .attempts
+            .iter()
+            .map(|a| match &a.outcome {
+                AttemptOutcome::RoundTripped { value } => {
+                    format!("{}=round-tripped({value})", a.algorithm.as_str())
+                }
+                AttemptOutcome::Rejected { step, detail } => {
+                    format!("{}=rejected at {step}: {detail}", a.algorithm.as_str())
+                }
+                AttemptOutcome::NotAttempted => format!("{}=not attempted", a.algorithm.as_str()),
+            })
+            .collect();
+        format!(
+            "{head} against {} bucket `{}` [{}]",
+            self.endpoint,
+            self.bucket,
+            detail.join("; ")
+        )
+    }
+}
+
+/// One algorithm's end-to-end round trip, as the probe needs it.
+///
+/// A trait so the *selection* — the ordering, and what each failure kind means
+/// — is testable without a provider. The ordering is the part a plain
+/// integration test cannot check: an integration test against a provider that
+/// supports CRC64NVME never exercises the fallback at all, and one against a
+/// provider that supports none never exercises adoption.
+#[async_trait::async_trait]
+pub(crate) trait ChecksumRoundTrip {
+    /// Upload a genuine multipart object requesting `alg` as a FULL_OBJECT
+    /// checksum and read the value back. `Ok` only if HEAD returned a
+    /// whole-object checksum **of that algorithm**.
+    async fn round_trip(&self, alg: ChecksumAlgorithm) -> Result<String, AttemptError>;
+}
+
+/// Try each algorithm in `order` and adopt the first that round-trips.
+///
+/// Returns `Err` — refusing to produce a record at all — the moment any attempt
+/// is [`AttemptError::Unreachable`]. That is the fail-closed direction: a
+/// registration that could not reach the provider must fail loudly rather than
+/// persist "this provider supports nothing", because the second is permanent
+/// and looks exactly like a correct measurement afterwards.
+pub(crate) async fn adopt_first_round_trip<P>(
+    prober: &P,
+    order: &[ChecksumAlgorithm],
+    endpoint: &str,
+    bucket: &str,
+) -> StorageResult<ChecksumProbe>
+where
+    P: ChecksumRoundTrip + Sync,
+{
+    let mut attempts = Vec::with_capacity(order.len());
+    let mut adopted = None;
+
+    for &alg in order {
+        if adopted.is_some() {
+            attempts.push(ProbeAttempt {
+                algorithm: alg,
+                outcome: AttemptOutcome::NotAttempted,
+            });
+            continue;
+        }
+        match prober.round_trip(alg).await {
+            Ok(value) => {
+                adopted = Some(alg);
+                attempts.push(ProbeAttempt {
+                    algorithm: alg,
+                    outcome: AttemptOutcome::RoundTripped { value },
+                });
+            }
+            Err(AttemptError::Unsupported { step, detail }) => attempts.push(ProbeAttempt {
+                algorithm: alg,
+                outcome: AttemptOutcome::Rejected { step, detail },
+            }),
+            Err(AttemptError::Unreachable { step, detail }) => {
+                return Err(StorageError::Transient {
+                    op: format!("probing {} at {step}", alg.as_str()),
+                    detail: format!(
+                        "{detail} — the provider was not reached, so this run proves nothing \
+                         about whether it supports whole-object checksums. Registering a target \
+                         on this result would record `unsupported` permanently for every object \
+                         written through it."
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(ChecksumProbe {
+        adopted,
+        endpoint: endpoint.to_string(),
+        bucket: bucket.to_string(),
+        attempts,
+    })
+}
+
+/// The probe object's key.
+///
+/// Under `_shepherd/`, so it is a [`ControlKey`] and can be cleaned up with
+/// `delete_system_object`. `delete_object` is off limits here by §4.1 rule 4 —
+/// `shepherd-tier::destroy` is its sole caller — and that constraint is a
+/// feature rather than an obstacle: a registration probe has no business being
+/// able to reach the verb that destroys user data.
+fn probe_key(alg: ChecksumAlgorithm) -> ControlKey {
+    ControlKey::under(format!("probe/checksum-{}", alg.as_str().to_lowercase()))
+}
+
+/// One S3 target, probed one algorithm at a time through the **real** upload
+/// path.
+struct S3RoundTrip {
+    cfg: S3Config,
+}
+
+#[async_trait::async_trait]
+impl ChecksumRoundTrip for S3RoundTrip {
+    async fn round_trip(&self, alg: ChecksumAlgorithm) -> Result<String, AttemptError> {
+        // A fresh adapter per algorithm, because `multipart_checksum` is fixed
+        // at construction and `create_multipart`/`upload_part` read it from
+        // there. This is deliberate: the probe then exercises the exact code
+        // path production uploads take, rather than a parallel implementation
+        // of it that could drift.
+        let cfg = S3Config {
+            multipart_checksum: Some(alg),
+            ..self.cfg.clone()
+        };
+        let adapter = S3Adapter::new(cfg).await.map_err(|e| classify("new", e))?;
+
+        let key = probe_key(alg);
+        let object = key.as_key().clone();
+
+        let upload = adapter
+            .create_multipart(&object)
+            .await
+            .map_err(|e| classify("create_multipart", e))?;
+
+        // Genuinely multipart: two parts at the S3 minimum. A single-part
+        // upload would return an ETag that *is* a content digest, so it would
+        // report success for the one case the whole exercise does not care
+        // about.
+        let mut receipts = Vec::new();
+        for part_no in 1..=2u32 {
+            let body = Bytes::from(vec![part_no as u8; S3_MIN_PART as usize]);
+            match adapter.upload_part(&object, &upload, part_no, body).await {
+                Ok(r) => receipts.push(r),
+                Err(e) => {
+                    let _ = adapter.abort_multipart(&object, &upload).await;
+                    return Err(classify("upload_part", e));
+                }
+            }
+        }
+
+        // `IfAbsent` would fail on the second registration against the same
+        // bucket, since the probe key is fixed per algorithm. This object is a
+        // scratch control object whose bytes carry no meaning, which is the one
+        // case where overwrite is not a lost fact.
+        if let Err(e) = adapter
+            .complete_multipart(&object, &upload, &receipts, CreatePrecondition::Unconditional)
+            .await
+        {
+            let _ = adapter.abort_multipart(&object, &upload).await;
+            return Err(classify("complete_multipart", e));
+        }
+
+        let head = adapter.head(&object).await.map_err(|e| classify("head", e));
+        // Clean up whatever the outcome. A failure to delete is not a probe
+        // failure — it leaves one 10 MiB control object behind, which is a
+        // storage cost and not a correctness one.
+        let _ = adapter.delete_system_object(&key).await;
+        let head = head?;
+
+        // Read from HEAD, never from `GetObjectAttributes`: MinIO omits
+        // `ChecksumType` there while reporting it correctly on HEAD, so the
+        // attributes call produces a false negative on a provider that
+        // supports the feature. Recorded in E-5 from handling the API directly.
+        let checksum = head
+            .and_then(|m| m.whole_object_checksum)
+            .ok_or_else(|| AttemptError::Unsupported {
+                step: "head",
+                detail: "the object completed but HEAD returned no whole-object checksum".into(),
+            })?;
+
+        if !checksum.whole_object {
+            return Err(AttemptError::Unsupported {
+                step: "head",
+                detail: format!(
+                    "HEAD returned a {} checksum that is COMPOSITE, not FULL_OBJECT — a \
+                     digest-of-digests can never be compared against a checksum of the bytes",
+                    checksum.algorithm.as_str()
+                ),
+            });
+        }
+        if checksum.algorithm != alg {
+            return Err(AttemptError::Unsupported {
+                step: "head",
+                detail: format!(
+                    "asked for {} and the provider stored {} — adopting the request rather than \
+                     the answer is how a probe reports support the provider never gave",
+                    alg.as_str(),
+                    checksum.algorithm.as_str()
+                ),
+            });
+        }
+        Ok(checksum.value)
+    }
+}
+
+/// Which side of the [`AttemptError`] split a storage failure lands on.
+///
+/// [`StorageError::Transient`] is the crate's own "this never reached the
+/// service" classification — `map_err` puts dispatch failures, timeouts and
+/// 5xx there. Everything else is the provider answering, which is evidence.
+fn classify(step: &'static str, e: StorageError) -> AttemptError {
+    match e {
+        StorageError::Transient { detail, .. } => AttemptError::Unreachable { step, detail },
+        other => AttemptError::Unsupported {
+            step,
+            detail: other.to_string(),
+        },
+    }
+}
+
+/// **Probe a bucket for whole-object multipart checksum support, at
+/// registration time.**
+///
+/// This is the producer for [`S3Config::multipart_checksum`] that E-5 records
+/// as owed. The field's own doc has always said the value "must be probed at
+/// registration" because "a checksum not requested at upload cannot be
+/// retrofitted without re-uploading the object" — this is that probe.
+///
+/// # What it costs to skip
+///
+/// Measured, not estimated (ADR 0b §3): scrub over a 50 TB corpus costs
+/// **$441/month** with no whole-object checksum against **$0.68** with one —
+/// 649x — because the 2% of files large enough to be multipart hold 60.3% of
+/// the bytes and their ETags are digest-of-digests, so the only integrity check
+/// left for them is a full read. The setting is **irreversible per object**: an
+/// object already uploaded without the checksum keeps the expensive
+/// configuration for its lifetime.
+///
+/// # Failure directions, which are not symmetric
+///
+/// * `Ok(probe)` with `adopted: None` — the provider answered and supports none
+///   of the three. Legitimate, and the R2/B2 case this cannot guess at. Scrub
+///   degrades to full reads: expensive, never wrong.
+/// * `Err(_)` — the provider was never reached. **Not** a statement about the
+///   provider, and a caller must not persist it as one.
+///
+/// The probe leaves one ~10 MiB control object per attempted algorithm under
+/// `_shepherd/probe/` while it runs and deletes it afterwards.
+pub async fn probe_multipart_checksum(cfg: &S3Config) -> StorageResult<ChecksumProbe> {
+    let endpoint = cfg
+        .endpoint_url
+        .clone()
+        .unwrap_or_else(|| "aws s3 (default endpoint)".to_string());
+    let bucket = cfg.bucket.clone();
+    let prober = S3RoundTrip { cfg: cfg.clone() };
+    adopt_first_round_trip(&prober, &FULL_OBJECT_PREFERENCE, &endpoint, &bucket).await
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// A scripted provider: what each algorithm does, and what was asked.
+    struct Fake {
+        script: BTreeMap<&'static str, Result<String, AttemptError>>,
+        asked: Mutex<Vec<&'static str>>,
+    }
+
+    impl Fake {
+        fn new(script: &[(&'static str, Result<String, AttemptError>)]) -> Self {
+            Self {
+                script: script.iter().cloned().collect(),
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+        fn asked(&self) -> Vec<&'static str> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChecksumRoundTrip for Fake {
+        async fn round_trip(&self, alg: ChecksumAlgorithm) -> Result<String, AttemptError> {
+            self.asked.lock().unwrap().push(alg.as_str());
+            self.script
+                .get(alg.as_str())
+                .cloned()
+                .unwrap_or(Err(AttemptError::Unsupported {
+                    step: "create_multipart",
+                    detail: "not in script".into(),
+                }))
+        }
+    }
+
+    fn unsupported(detail: &str) -> Result<String, AttemptError> {
+        Err(AttemptError::Unsupported {
+            step: "create_multipart",
+            detail: detail.into(),
+        })
+    }
+
+    fn run<P: ChecksumRoundTrip + Sync>(p: &P) -> StorageResult<ChecksumProbe> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(adopt_first_round_trip(
+                p,
+                &FULL_OBJECT_PREFERENCE,
+                "http://probe.invalid",
+                "b",
+            ))
+    }
+
+    /// The preference order is the whole design, so it is asserted rather than
+    /// left to the constant's declaration order.
+    #[test]
+    fn the_preference_order_is_crc64_then_crc32c_then_crc32() {
+        assert_eq!(
+            FULL_OBJECT_PREFERENCE.map(|a| a.as_str()),
+            ["CRC64NVME", "CRC32C", "CRC32"]
+        );
+    }
+
+    #[test]
+    fn the_first_algorithm_that_round_trips_is_adopted_and_the_rest_are_not_tried() {
+        let f = Fake::new(&[("CRC64NVME", Ok("CnmyweQWB7U=".into()))]);
+        let p = run(&f).unwrap();
+        assert_eq!(p.adopted, Some(ChecksumAlgorithm::Crc64Nvme));
+        assert_eq!(
+            f.asked(),
+            ["CRC64NVME"],
+            "a provider that answered on the first algorithm must not be billed for two more \
+             10 MiB uploads"
+        );
+        // The evidence, not merely the verdict.
+        assert_eq!(
+            p.attempts[0].outcome,
+            AttemptOutcome::RoundTripped {
+                value: "CnmyweQWB7U=".into()
+            }
+        );
+        assert_eq!(p.attempts[1].outcome, AttemptOutcome::NotAttempted);
+    }
+
+    /// The fallback leg. An integration test against any single provider
+    /// exercises exactly one path through this function; only a scripted one
+    /// reaches the middle.
+    #[test]
+    fn a_provider_that_refuses_crc64_falls_through_to_crc32c() {
+        let f = Fake::new(&[
+            ("CRC64NVME", unsupported("InvalidRequest: unknown algorithm")),
+            ("CRC32C", Ok("72M33w==".into())),
+        ]);
+        let p = run(&f).unwrap();
+        assert_eq!(p.adopted, Some(ChecksumAlgorithm::Crc32c));
+        assert_eq!(f.asked(), ["CRC64NVME", "CRC32C"]);
+        // The refusal is kept with its reason. A caller looking at a CRC32C
+        // target later can see it was a fallback and why.
+        assert!(
+            matches!(&p.attempts[0].outcome, AttemptOutcome::Rejected { detail, .. }
+                     if detail.contains("unknown algorithm")),
+            "{:?}",
+            p.attempts[0]
+        );
+    }
+
+    #[test]
+    fn a_provider_that_refuses_all_three_adopts_none_and_says_why_for_each() {
+        let f = Fake::new(&[
+            ("CRC64NVME", unsupported("no crc64")),
+            ("CRC32C", unsupported("no crc32c")),
+            ("CRC32", unsupported("no crc32")),
+        ]);
+        let p = run(&f).unwrap();
+        assert_eq!(p.adopted, None);
+        assert_eq!(f.asked(), ["CRC64NVME", "CRC32C", "CRC32"]);
+        assert_eq!(p.attempts.len(), 3);
+        for a in &p.attempts {
+            assert!(
+                matches!(&a.outcome, AttemptOutcome::Rejected { .. }),
+                "a negative must carry the reason for EVERY algorithm, or it is a boolean \
+                 wearing a struct: {a:?}"
+            );
+        }
+        // And it names where it was pointed, so the negative is reproducible.
+        assert!(p.summary().contains("http://probe.invalid"), "{}", p.summary());
+    }
+
+    /// **The load-bearing case.** E-5: a false negative here is silent,
+    /// permanent, and indistinguishable from genuine non-support.
+    #[test]
+    fn an_unreachable_provider_is_an_error_and_never_a_negative_result() {
+        let f = Fake::new(&[(
+            "CRC64NVME",
+            Err(AttemptError::Unreachable {
+                step: "create_multipart",
+                detail: "connection reset".into(),
+            }),
+        )]);
+        let err = run(&f).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Transient { .. }),
+            "an unreachable provider must be retryable, not a verdict: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("proves nothing"),
+            "the error must say why it is not a negative result: {err}"
+        );
+        // It stopped rather than continuing to "measure" an unreachable host.
+        assert_eq!(f.asked(), ["CRC64NVME"]);
+    }
+
+    /// The paired non-zero for the test above: the same failure text, arriving
+    /// as a provider answer rather than a transport failure, IS a negative
+    /// result. Without this pair, `an_unreachable_provider_...` would pass on
+    /// an implementation that errored on every failure whatsoever.
+    #[test]
+    fn the_same_step_failing_as_a_provider_answer_is_a_negative_not_an_error() {
+        let f = Fake::new(&[
+            ("CRC64NVME", unsupported("connection reset")),
+            ("CRC32C", unsupported("connection reset")),
+            ("CRC32", unsupported("connection reset")),
+        ]);
+        let p = run(&f).expect("a provider answer is a result, not an error");
+        assert_eq!(p.adopted, None);
+    }
+
+    /// The probe writes under `_shepherd/`, which is what makes cleanup
+    /// possible without `delete_object` — whose sole caller is
+    /// `shepherd-tier::destroy` (§4.1 rule 4).
+    #[test]
+    fn the_probe_object_is_a_control_object() {
+        for alg in FULL_OBJECT_PREFERENCE {
+            let k = probe_key(alg);
+            assert!(
+                k.as_key().as_str().starts_with(shepherd_core::CONTROL_PREFIX),
+                "{}",
+                k.as_key().as_str()
+            );
+            assert!(ControlKey::new(k.as_key().clone()).is_some());
+        }
+        // Distinct per algorithm: a shared key would make a second algorithm's
+        // HEAD read the first one's object.
+        let keys: std::collections::BTreeSet<String> = FULL_OBJECT_PREFERENCE
+            .iter()
+            .map(|a| probe_key(*a).as_key().as_str().to_string())
+            .collect();
+        assert_eq!(keys.len(), 3);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
