@@ -1888,7 +1888,11 @@ quote = "single-writer actor"
 covered_by = ["G-1-WRITER"]
 
 [[phase.requirement]]
-quote = "dedicated PASSIVE-checkpoint connection"
+quote = "WAL bounded across the full scan by SQLite's page-count autocheckpoint"
+covered_by = ["G-1-CHECKPOINT"]
+
+[[phase.requirement]]
+quote = "dedicated PASSIVE-checkpoint connection as a supplementary backstop"
 covered_by = ["G-1-CHECKPOINT"]
 
 [[phase.requirement]]
