@@ -613,6 +613,25 @@ impl MemSource {
         i.0 = body.into();
         i.1 = Timestamp::from_nanos(i.1.as_nanos() + 1);
     }
+
+    /// PM-1's sharper form: an in-place edit the cheap fingerprint cannot see.
+    ///
+    /// Same length, same mtime, same `fs_id`. That is what an editor which
+    /// restores timestamps looks like, and what a write landing inside one
+    /// mtime tick looks like on a coarse-granularity filesystem. `mutate` is
+    /// the ordinary case the stat gate catches; this is the case it cannot,
+    /// and it is why the driver proves the bytes it actually read hash to the
+    /// planned value instead of trusting the stat.
+    pub fn mutate_preserving_fingerprint(&self, body: impl Into<Bytes>) {
+        let mut i = self.inner.lock().expect("poisoned");
+        let body = body.into();
+        assert_eq!(
+            body.len(),
+            i.0.len(),
+            "a fingerprint-preserving edit must not change the length"
+        );
+        i.0 = body;
+    }
 }
 
 #[async_trait::async_trait]

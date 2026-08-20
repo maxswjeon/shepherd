@@ -559,7 +559,20 @@ impl StorageAdapter for S3Adapter {
                 key_marker = page.next_key_marker().map(str::to_owned);
                 id_marker = page.next_upload_id_marker().map(str::to_owned);
                 if key_marker.is_none() && id_marker.is_none() {
-                    break;
+                    // Truncated but no marker, refused for the same reason
+                    // `list_parts` refuses it: the page cannot be continued, so
+                    // it cannot be reported as the whole list. This used to
+                    // `break` and return the partial page as exhaustive, which
+                    // is worse here than there — `adopt_or_reap` aborts the
+                    // orphans it was told about and then creates a new session,
+                    // so the undiscovered multiparts keep accruing storage cost
+                    // with nothing left to report them. One malformed response,
+                    // two readings, is the drift this refusal closes.
+                    return Err(StorageError::Provider {
+                        provider: "s3",
+                        op: "list_multipart_uploads".into(),
+                        detail: "response was truncated but carried no continuation marker".into(),
+                    });
                 }
             } else {
                 break;
@@ -1657,6 +1670,208 @@ mod tests {
         let rendered = format!("{c:?}");
         assert!(!rendered.contains("super-secret-value"), "{rendered}");
         assert!(rendered.contains("AKIAEXAMPLE"));
+    }
+
+    // -----------------------------------------------------------------
+    // Pagination, scripted at the transport.
+    //
+    // Both listing loops decide what to do from `is_truncated` plus the
+    // continuation markers, and the case that matters — truncated while
+    // carrying no marker at all — is a malformed response no real provider
+    // can be asked to emit on demand. So the responses are scripted below
+    // the SDK and the real `S3Adapter` runs against them unmodified.
+    // -----------------------------------------------------------------
+
+    use aws_smithy_runtime_api::client::http::{
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+    use std::sync::{Arc, Mutex};
+
+    /// Answers each request with the next scripted body, and records the URIs
+    /// it was asked for so a test can assert which markers were sent back.
+    #[derive(Debug, Clone)]
+    struct ScriptedHttp {
+        pages: Arc<Mutex<std::collections::VecDeque<String>>>,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedHttp {
+        fn new(pages: &[&str]) -> Self {
+            Self {
+                pages: Arc::new(Mutex::new(pages.iter().map(|p| (*p).to_owned()).collect())),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().expect("poisoned").clone()
+        }
+    }
+
+    impl HttpConnector for ScriptedHttp {
+        fn call(&self, request: aws_sdk_s3::config::http::HttpRequest) -> HttpConnectorFuture {
+            self.seen
+                .lock()
+                .expect("poisoned")
+                .push(request.uri().to_owned());
+            let body = self
+                .pages
+                .lock()
+                .expect("poisoned")
+                .pop_front()
+                .expect("the adapter made more requests than the script has pages");
+            HttpConnectorFuture::ready(Ok(aws_sdk_s3::config::http::HttpResponse::new(
+                200.try_into().expect("200 is a status code"),
+                aws_sdk_s3::primitives::SdkBody::from(body),
+            )))
+        }
+    }
+
+    impl HttpClient for ScriptedHttp {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    fn adapter_over(http: ScriptedHttp) -> S3Adapter {
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "AKIAEXAMPLE",
+                "secret",
+                None,
+                None,
+                "shepherd-test",
+            ))
+            .force_path_style(true)
+            .endpoint_url("http://s3.invalid")
+            .http_client(http)
+            .build();
+        S3Adapter {
+            client: aws_sdk_s3::Client::from_conf(conf),
+            bucket: "shepherd-test".into(),
+            caps: caps(),
+            multipart_checksum: None,
+        }
+    }
+
+    const UPLOADS_TRUNCATED_NO_MARKERS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>shepherd-test</Bucket>
+  <MaxUploads>1000</MaxUploads>
+  <IsTruncated>true</IsTruncated>
+  <Upload><Key>objects/aa/bb/one</Key><UploadId>upload-1</UploadId></Upload>
+</ListMultipartUploadsResult>"#;
+
+    const UPLOADS_TRUNCATED_WITH_MARKERS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>shepherd-test</Bucket>
+  <MaxUploads>1000</MaxUploads>
+  <IsTruncated>true</IsTruncated>
+  <NextKeyMarker>objects/aa/bb/one</NextKeyMarker>
+  <NextUploadIdMarker>upload-1</NextUploadIdMarker>
+  <Upload><Key>objects/aa/bb/one</Key><UploadId>upload-1</UploadId></Upload>
+</ListMultipartUploadsResult>"#;
+
+    const UPLOADS_LAST_PAGE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>shepherd-test</Bucket>
+  <MaxUploads>1000</MaxUploads>
+  <IsTruncated>false</IsTruncated>
+  <Upload><Key>objects/aa/bb/two</Key><UploadId>upload-2</UploadId></Upload>
+</ListMultipartUploadsResult>"#;
+
+    /// The finding: a partial page reported as exhaustive.
+    ///
+    /// `TransferDriver::adopt_or_reap` aborts the orphans on whatever this
+    /// returns and then starts a new session, so a page silently treated as
+    /// the whole list leaves the undiscovered multiparts accruing storage
+    /// cost with nothing reporting it. The assertion is on the returned
+    /// value, not on `is_err()`: pre-fix this call **succeeds**, and it is
+    /// the success that is the defect.
+    #[tokio::test]
+    async fn a_truncated_upload_listing_with_no_continuation_markers_is_refused() {
+        let http = ScriptedHttp::new(&[UPLOADS_TRUNCATED_NO_MARKERS]);
+        let adapter = adapter_over(http);
+
+        let out = adapter.list_incomplete_uploads("objects/").await;
+
+        let err = out.expect_err(
+            "a truncated page with no marker cannot be continued, so it cannot be reported as              the complete list of live uploads",
+        );
+        assert!(
+            matches!(
+                &err,
+                StorageError::Provider { provider, op, .. }
+                    if *provider == "s3" && op == "list_multipart_uploads"
+            ),
+            "must fail the same way `list_parts` already fails on this exact response, got {err:?}"
+        );
+    }
+
+    /// The sibling this one had to be made to agree with.
+    ///
+    /// Pinned so the two cannot drift apart again in the other direction.
+    #[tokio::test]
+    async fn a_truncated_part_listing_with_no_continuation_marker_is_refused() {
+        let page = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>shepherd-test</Bucket>
+  <IsTruncated>true</IsTruncated>
+  <Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><Size>10</Size></Part>
+</ListPartsResult>"#;
+        let adapter = adapter_over(ScriptedHttp::new(&[page]));
+
+        let err = adapter
+            .list_parts(
+                &ObjectKey::new("objects/aa/bb/one"),
+                &OpaqueToken::new("u1"),
+            )
+            .await
+            .expect_err("a truncated part list with no marker is not a complete part list");
+        assert!(
+            matches!(
+                &err,
+                StorageError::Provider { provider, op, .. }
+                    if *provider == "s3" && op == "list_parts"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// The accepting direction, and the one that proves the fix is not
+    /// "refuse whenever truncated": a well-formed truncated page is followed,
+    /// the markers really are sent back, and the union of both pages returns.
+    #[tokio::test]
+    async fn a_truncated_upload_listing_with_markers_is_followed_to_the_next_page() {
+        let http = ScriptedHttp::new(&[UPLOADS_TRUNCATED_WITH_MARKERS, UPLOADS_LAST_PAGE]);
+        let adapter = adapter_over(http.clone());
+
+        let live = adapter
+            .list_incomplete_uploads("objects/")
+            .await
+            .expect("a page carrying its markers is continuable");
+
+        let ids: Vec<&str> = live.iter().map(|u| u.upload_id.as_opaque()).collect();
+        assert_eq!(
+            ids,
+            vec!["upload-1", "upload-2"],
+            "both pages must be returned, or `adopt_or_reap` leaves orphans behind"
+        );
+
+        let seen = http.requests();
+        assert_eq!(seen.len(), 2, "the second page must have been fetched");
+        assert!(
+            seen[1].contains("key-marker=objects") && seen[1].contains("upload-id-marker=upload-1"),
+            "the second request must carry both markers from the first page: {}",
+            seen[1]
+        );
     }
 
     #[test]

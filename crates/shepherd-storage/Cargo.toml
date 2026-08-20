@@ -47,3 +47,17 @@ aws-sdk-s3.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# The scripted-transport seam for the `s3.rs` pagination tests.
+#
+# Both pagination loops decide correctness from `is_truncated` plus the
+# continuation markers, and the combination they must refuse — truncated while
+# carrying no marker at all — is one no real provider, MinIO included, can be
+# asked to produce on demand. So the HTTP response is scripted below the SDK.
+# Only the two connector traits are needed, in about forty lines of test code.
+#
+# Not a workspace dependency because it adds nothing to the build: `aws-sdk-s3`
+# already depends on this exact crate with this exact feature, so the edge
+# brings in no new package and changes no resolved version. `Cargo.lock` does
+# move, by exactly one line — this crate's own dependency-list entry.
+aws-smithy-runtime-api = { version = "1.14", features = ["client"] }

@@ -567,3 +567,180 @@ async fn a_healed_resume_echoes_the_providers_checksum_for_parts_it_skipped() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PM-1, the sharper form: the source moves *while* the parts are being read.
+//
+// The fingerprint gate at the top of `upload_pending` runs once, before any
+// part is read. Everything below is about the window it does not cover, and
+// the assertion that matters in every one of them is about the REMOTE OBJECT,
+// not about the error value: pre-fix these paths also return
+// `ContentMismatch` — from `verify()`, after `complete_multipart` has already
+// published the mixed bytes under an immutable content-addressed key that no
+// retry can replace. Same error, opposite outcome. Only `adapter.object()` and
+// the persisted state tell the two apart.
+// ---------------------------------------------------------------------------
+
+/// A source that edits itself in place between two part reads.
+struct EditsBetweenReads {
+    inner: MemSource,
+    /// Apply the edit once this many `read_range` calls have completed.
+    edit_after_read: usize,
+    reads: std::sync::Mutex<usize>,
+    replacement: Vec<u8>,
+}
+
+impl EditsBetweenReads {
+    fn new(body: Vec<u8>, edit_after_read: usize, replacement: Vec<u8>) -> Self {
+        Self {
+            inner: MemSource::new(body),
+            edit_after_read,
+            reads: std::sync::Mutex::new(0),
+            replacement,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SourceReader for EditsBetweenReads {
+    async fn fingerprint(&self) -> StorageResult<SourceFingerprint> {
+        self.inner.fingerprint().await
+    }
+
+    async fn read_range(&self, range: ByteRange) -> StorageResult<Bytes> {
+        let body = self.inner.read_range(range).await?;
+        let mut n = self.reads.lock().expect("poisoned");
+        *n += 1;
+        if *n == self.edit_after_read {
+            self.inner
+                .mutate_preserving_fingerprint(self.replacement.clone());
+        }
+        Ok(body)
+    }
+}
+
+/// PM-1 — the edit lands after the gate, between two part reads.
+///
+/// Parts 1 and 2 carry the original bytes, parts 3 and 4 carry the edited
+/// ones, and no such file ever existed on disk. Nothing may be published.
+#[tokio::test]
+async fn a_source_edited_between_part_reads_publishes_nothing() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+
+    let mut edited = body_of(BODY);
+    edited[35] ^= 0xff; // inside part 4, read after the edit lands
+    let src = EditsBetweenReads::new(body_of(BODY), 2, edited.clone());
+
+    let mut d = TransferDriver::new(&rig.adapter, &rig.store, &src);
+    d.verify_chunk = PART;
+    let err = d
+        .run(&mut s)
+        .await
+        .expect_err("an object spliced from two different files must not be published");
+
+    assert!(
+        rig.adapter.object(&rig.key).is_none(),
+        "the key is content-addressed and immutable: publishing mixed bytes under it \
+         poisons it for every future retry. Published {:?}",
+        rig.adapter.object(&rig.key)
+    );
+    assert_eq!(
+        s.state,
+        TransferState::Uploading,
+        "the run must fail before `Completing`, not strand the session in `Verifying`"
+    );
+    assert!(
+        matches!(err, StorageError::ContentMismatch { .. }),
+        "expected the read-stream hash to fail closed, got {err:?}"
+    );
+}
+
+/// The accepting direction, and the reason the check is a hash and not a stat.
+///
+/// The edit lands after part 1 was already read and sent, and touches only
+/// part 1's own range — so the bytes that actually went to the provider are
+/// exactly the planned bytes, and the transfer is correct. A post-read
+/// re-`stat` would refuse this; hashing what was read accepts it.
+#[tokio::test]
+async fn an_edit_confined_to_an_already_uploaded_range_still_commits() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+
+    let mut edited = body_of(BODY);
+    edited[3] ^= 0xff; // inside part 1, which has already been read
+    let src = EditsBetweenReads::new(body_of(BODY), 1, edited);
+
+    let mut d = TransferDriver::new(&rig.adapter, &rig.store, &src);
+    d.verify_chunk = PART;
+    let out = d
+        .run(&mut s)
+        .await
+        .expect("the uploaded bytes are the planned bytes");
+
+    assert_eq!(out.state, TransferState::Committed);
+    assert_eq!(
+        rig.adapter.object(&rig.key).expect("object").as_ref(),
+        body_of(BODY).as_slice(),
+        "the published object must be the planned content"
+    );
+}
+
+/// A resume must prove the parts an EARLIER attempt uploaded still match the
+/// source, not merely that the source is intact now.
+///
+/// The first attempt reads a file that has been edited in place without
+/// disturbing size, mtime or `fs_id`, so its fingerprint gate passes and parts
+/// 1 and 2 land carrying the edited bytes. The file is then restored. The
+/// resume now sees a source that fingerprints correctly AND hashes to the
+/// planned value — every whole-file check passes — while parts 1 and 2 on the
+/// provider are still the edited bytes. `PartCheckpoint::local_blake3` is the
+/// only record that can tell, which is exactly what its doc comment says it is
+/// for.
+#[tokio::test]
+async fn a_resume_refuses_to_complete_over_parts_an_earlier_attempt_mis_uploaded() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+    let planned = body_of(BODY);
+
+    // The edit is invisible to the stat and lands in part 1.
+    let mut edited = planned.clone();
+    edited[3] ^= 0xff;
+    rig.source.mutate_preserving_fingerprint(edited);
+
+    // Saves: 1 = Initiating, 2 = Uploading, 3 = part1, 4 = part2, 5 = part3.
+    rig.store.die_at_save(5);
+    rig.driver().run(&mut s).await.expect_err("must die");
+
+    // The user restores the file before the daemon comes back.
+    rig.source.mutate_preserving_fingerprint(planned.clone());
+    rig.store.revive();
+
+    let mut resumed = rig.reload().await;
+    assert_eq!(
+        resumed.parts.iter().filter(|p| p.is_acknowledged()).count(),
+        2,
+        "two parts were durably acknowledged, and both carry the edited bytes"
+    );
+
+    let err =
+        rig.driver().run(&mut resumed).await.expect_err(
+            "parts uploaded from content that is no longer on disk must not be completed",
+        );
+
+    assert!(
+        rig.adapter.object(&rig.key).is_none(),
+        "nothing may be published: the object would be edited parts 1-2 spliced onto \
+         planned parts 3-4. Published {:?}",
+        rig.adapter.object(&rig.key)
+    );
+    assert_eq!(
+        resumed.state,
+        TransferState::Uploading,
+        "the resume must fail before `Completing`"
+    );
+    assert!(
+        matches!(err, StorageError::ContentMismatch { .. }),
+        "expected the per-part local hash to fail closed, got {err:?}"
+    );
+}

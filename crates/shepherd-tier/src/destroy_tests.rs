@@ -825,3 +825,259 @@ async fn a_failing_unlink_restores_rather_than_orphaning_the_file() {
         "nothing was destroyed, so nothing may be audited as destroyed"
     );
 }
+
+// --- the halt is GLOBAL, which means it has to be a gate --------------------
+
+/// A [`RemoteGate`] that parks inside the closing HEAD until it is released.
+///
+/// The closing HEAD is the last step before the irreversible one, so a destroy
+/// parked here is **admitted**: past the top-of-function halt check, past the
+/// floors, staged, re-hashed. That is precisely the state the finding describes
+/// — and parking is how the interleaving is made explicit rather than hoped
+/// for. A test that called destroy twice and waited would prove nothing.
+struct ParkedRemote<'a> {
+    inner: &'a dyn shepherd_storage::StorageAdapter,
+    /// Signalled when the closing HEAD is reached.
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    /// Awaited there, so the caller chooses when this destroy goes on.
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl RemoteGate for ParkedRemote<'_> {
+    async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.inner
+            .head(key)
+            .await
+            .map_err(|e| DestroyError::Storage(e.to_string()))
+    }
+
+    /// Never reached: the local destroy path does not remove remote objects.
+    /// Answering without touching the adapter keeps this double out of the
+    /// remote-destruction seam entirely.
+    async fn remove_object(&self, _key: &ObjectKey, _guard: &VersionGuard) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A second file in the fixture's root, identical to the first.
+///
+/// Same bytes means the same content-addressed key, so the closing HEAD finds
+/// the object the fixture already published — and a **different inode**, so
+/// `FileLocks` lets the two destructions run at the same time. That is the
+/// point: per-file locking is exactly what does not serialize them.
+fn sibling(f: &Fixture, name: &str) -> (PathBuf, FileIdentity, shepherd_core::FsId) {
+    let p = f.tmp.file(name, &payload());
+    let id = identity_of(&p);
+    let fs_id = catalog_fs_id(&f.root, &p);
+    (p, id, fs_id)
+}
+
+/// §4.10.4's halt is **global**: "subsequent destruction halts until audit
+/// writes succeed again". The check at the top of `execute_local_destruction`
+/// cannot deliver that on its own, because it is one-time and per-call — two
+/// destructions of two files pass it against the same unhalted state, and
+/// nothing re-reads it between then and the syscall.
+///
+/// So the audit failure of one destroy has to be able to stop another that was
+/// **already admitted**. This test puts the second destroy one step short of
+/// the unlink, runs the first start to finish with an audit log that cannot be
+/// written, and then lets the second go on.
+///
+/// The assertion is the FILE, not the error. Both destroys fail either way —
+/// the append is broken for both — so an `is_err()` check passes against the
+/// unfixed code while the second file is being destroyed after the halt.
+#[tokio::test]
+async fn a_destroy_already_admitted_does_not_unlink_after_another_one_halts_the_audit() {
+    let f = fixture("halt-race", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let (second, second_id, second_fs_id) = sibling(&f, "second.bin");
+
+    // Every append now fails at `open`: the same mechanism
+    // `audit::tests::a_failed_write_halts_destruction` uses. `AuditLog::open`
+    // creates the parent directory and not the file, so the name is free.
+    std::fs::create_dir(f.tmp.0.join("audit").join("destroy.jsonl"))
+        .expect("block the audit log with a directory at its path");
+
+    let req2 = LocalDestroyRequest {
+        path: &second,
+        verified_identity: second_id,
+        fs_id: &second_fs_id,
+        ..f.request(&c)
+    };
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let parked = ParkedRemote {
+        inner: &f.adapter,
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+    let second_destroy = execute_local_destruction(
+        &req2,
+        &f.provider,
+        &parked,
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(2),
+    );
+    tokio::pin!(second_destroy);
+
+    // Drive the second destroy until it parks. Reaching the closing HEAD is the
+    // proof that it is admitted — it read the halt flag, found it clear, and
+    // has already staged its file.
+    tokio::select! {
+        r = &mut second_destroy => {
+            // On a platform with no open-handle detector this refused at the
+            // floor and never reached its subject.
+            assert!(
+                past_the_open_handle_floor(r).is_none(),
+                "the second destroy finished without reaching the closing HEAD"
+            );
+            return;
+        }
+        () = entered.notified() => {}
+    }
+
+    // The first destroy, start to finish, while the second is in flight. It
+    // crosses the unlink and then cannot record it, which is what halts the log.
+    //
+    // Bounded, because the failure mode of an over-broad gate is a DEADLOCK
+    // rather than a wrong answer: a gate taken for the whole path is held by the
+    // parked destroy, which is waiting for a release that only arrives once this
+    // one returns. A hung suite reports nothing; this reports which fix is wrong.
+    let first = tokio::time::timeout(Duration::from_secs(30), f.run(&c))
+        .await
+        .expect(
+            "a destroy blocked while another was merely IN FLIGHT — the gate covers more \
+             than the irreversible step",
+        );
+    let Some(first) = past_the_open_handle_floor(first) else {
+        return;
+    };
+    let err = first.unwrap_err();
+    assert!(matches!(err, DestroyError::Audit(_)), "{err}");
+    assert!(
+        !f.path.exists(),
+        "the first destroy has to genuinely cross the irreversible step, or the \
+         halt it sets is not the one this test is about"
+    );
+    assert!(
+        f.audit.is_halted(),
+        "a failed audit append must halt destruction"
+    );
+
+    release.notify_one();
+    let err2 = tokio::time::timeout(Duration::from_secs(30), second_destroy)
+        .await
+        .expect("the released destroy must be able to finish")
+        .expect_err("destruction is halted, so the admitted destroy must refuse");
+
+    assert!(
+        second.exists(),
+        "THE HALT IS NOT GLOBAL: {} was unlinked after an audit failure had already \
+         halted destruction. The check at the top of the destroy path ran before the \
+         halt existed, and nothing consulted it again before the syscall.",
+        second.display()
+    );
+    assert_eq!(
+        std::fs::read(&second).expect("read the survivor"),
+        payload(),
+        "abort-forward-never: a refusal at the gate restores the staged file"
+    );
+    assert!(
+        matches!(
+            err2,
+            DestroyError::Audit(crate::audit::AuditError::Halted { .. })
+        ),
+        "the refusal must be the HALT rather than this destroy's own failed \
+         append — the second means it already destroyed the file: {err2:?}"
+    );
+    assert!(
+        f.provider.list_staged(&f.tmp.0).unwrap().is_empty(),
+        "nothing is left in staging"
+    );
+}
+
+/// The accepting direction, and the reason the gate is around the irreversible
+/// step rather than around the whole path.
+///
+/// A "fix" that took a global lock for the duration of `execute_local_destruction`
+/// would satisfy the test above and **deadlock here**: the parked destroy holds
+/// the lock while waiting for a release that only comes after the other destroy
+/// finishes. So both awaits are bounded, and a deadlock is a failure with a name
+/// rather than a hung suite.
+///
+/// A gate that simply refused the second destroy would fail here too.
+#[tokio::test]
+async fn two_concurrent_destroys_with_a_healthy_audit_log_both_complete() {
+    let f = fixture("halt-race-ok", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let (second, second_id, second_fs_id) = sibling(&f, "second.bin");
+
+    let req2 = LocalDestroyRequest {
+        path: &second,
+        verified_identity: second_id,
+        fs_id: &second_fs_id,
+        ..f.request(&c)
+    };
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let parked = ParkedRemote {
+        inner: &f.adapter,
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+    let second_destroy = execute_local_destruction(
+        &req2,
+        &f.provider,
+        &parked,
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(2),
+    );
+    tokio::pin!(second_destroy);
+
+    tokio::select! {
+        r = &mut second_destroy => {
+            assert!(
+                past_the_open_handle_floor(r).is_none(),
+                "the second destroy finished without reaching the closing HEAD"
+            );
+            return;
+        }
+        () = entered.notified() => {}
+    }
+
+    let first = tokio::time::timeout(Duration::from_secs(30), f.run(&c))
+        .await
+        .expect(
+            "a destroy blocked while another was merely IN FLIGHT. The gate is around \
+             more than the irreversible step, so two destructions of two different \
+             files cannot overlap at all",
+        );
+    let Some(first) = past_the_open_handle_floor(first) else {
+        return;
+    };
+    first.unwrap();
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), second_destroy)
+        .await
+        .expect("the released destroy must be able to finish")
+        .unwrap();
+
+    assert!(!f.path.exists(), "the first file is gone");
+    assert!(!second.exists(), "the second file is gone");
+    assert_eq!(
+        f.audit.read_all().len(),
+        2,
+        "two destructions, two audit records"
+    );
+    assert!(!f.audit.is_halted());
+    assert!(
+        f.provider.list_staged(&f.tmp.0).unwrap().is_empty(),
+        "nothing is left in staging"
+    );
+}

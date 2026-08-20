@@ -52,9 +52,10 @@
 //! about: hydrating a row's size, mtime, state, hash and tags, and applying the
 //! property filters. See `hydrate`.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use shepherd_catalog::file_repo::FileRepo;
+use shepherd_catalog::file_repo::{Enrollment, FileRepo};
 use shepherd_catalog::job_repo::JobClass;
 use shepherd_catalog::target_repo::TargetRepo;
 use shepherd_catalog::writer::CatalogWriter;
@@ -188,23 +189,60 @@ impl ShepherdApi for Session {
         // registration and the scan cannot come to different conclusions about
         // what is denied.
         //
-        // The component and the path are read exactly as `shepherd_scan::walk`
-        // reads them, with no `canonicalize`: a root whose own name is innocent
-        // but which points at a denied tree still reaches the probes. Deciding
-        // what a symlinked root means is a separate question, and resolving it
-        // here would answer it by accident.
-        let component = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if let Some(reason) = shepherd_scan::DenyList::builtin().deny_dir(&component, &path) {
+        // EVERY component of both names the root has — see `deny_registration`.
+        // Reading only the final component refused `<repo>/.git` while letting
+        // `<repo>/.git/objects` through on the innocence of `objects`, and let
+        // an innocently-named symlink into a denied tree through on the alias's
+        // own name. Both then reached the probes below, which is the trespass
+        // this block exists to prevent.
+        let canonical = match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.is_symlink() => match std::fs::canonicalize(&path) {
+                Ok(c) => Some(c),
+                // Fail closed. `is_dir()` above follows the link, so a target
+                // that resolved for that check and not for this one is exotic
+                // (a parent that turned unsearchable) — and the direction to be
+                // exotic in is refusing, not probing a tree whose identity was
+                // never established.
+                Err(e) => {
+                    return Err(RpcError::new(
+                        ErrorCode::Refused,
+                        format!(
+                            "`{}` is a symlink whose target cannot be resolved ({e}), so \
+                             Shepherd cannot check it against the AC-7 deny list. It is \
+                             refused rather than probed.",
+                            req.path
+                        ),
+                    ));
+                }
+            },
+            _ => None,
+        };
+        if let Some((denied, reason)) = deny_registration(
+            &shepherd_scan::DenyList::builtin(),
+            &path,
+            canonical.as_deref(),
+        ) {
+            let denied = denied.display();
+            // The path the user typed is always named, so a refusal is
+            // attributable when several roots are added from one script; the
+            // denied path is named too, and separately, because they are not
+            // the same thing once ancestors and aliases are in scope — leaving
+            // it out sends the user to look at `objects` for a rule that
+            // matched `.git` two components above it.
+            let what = if denied.to_string() == req.path {
+                format!("`{}` is", req.path)
+            } else {
+                format!(
+                    "`{}` is inside or resolves into `{denied}`, which is",
+                    req.path
+                )
+            };
             return Err(RpcError::new(
                 ErrorCode::Refused,
                 format!(
-                    "`{}` is on Shepherd's built-in deny list as `{}` (AC-7), a list of trees \
+                    "{what} on Shepherd's built-in deny list as `{}` (AC-7), a list of trees \
                      Shepherd never catalogues and never writes to. It cannot be registered \
                      as a scan root.",
-                    req.path,
                     reason.as_str()
                 ),
             ));
@@ -364,8 +402,15 @@ impl ShepherdApi for Session {
         //     staging must still land `destruction_ineligible = 0`, or "mark
         //     everything ineligible" passes every refusal test while quietly
         //     disabling tiering.
-        let root_id = self.cat(move |cat| {
-            FileRepo::new(cat).insert_root(
+        //
+        // `enroll_root`, not `insert_root`: the default `root.remove` keeps the
+        // `scan_root` row and every file row under it, so the same path can
+        // already be present as a DISABLED row. A plain insert hit
+        // `scan_root.path`'s unique constraint and surfaced as a raw storage
+        // error, leaving `--forget` — which destroys the custody rows the
+        // retention exists to protect — as the only way back in.
+        let enrolled = self.cat(move |cat| {
+            FileRepo::new(cat).enroll_root(
                 &path_string,
                 stub,
                 policies.case,
@@ -377,6 +422,48 @@ impl ShepherdApi for Session {
                 now,
             )
         })?;
+
+        let root_id = match enrolled {
+            Enrollment::Created(id) => id,
+            Enrollment::Reactivated {
+                id,
+                retained_files,
+                retained_custody,
+                kept_policies,
+            } => {
+                // Warned, not silent, and not a new result field: reporting this
+                // structurally means a field on `RootAddResult`, which is
+                // `shepherd-proto`'s to add. The warning is the honest floor —
+                // the user hears it while standing in front of the command that
+                // caused it. See the round report.
+                warnings.push(format!(
+                    "this root was re-enrolled, not newly enrolled: an earlier `root.remove` \
+                     deregistered it and kept its catalog, and {retained_files} file row(s) \
+                     came back with it ({retained_custody} of them tiered, whose catalog row \
+                     is the only address of their remote bytes). Their recorded state is \
+                     unchanged — a re-enrollment has not looked at the disk. Run a scan to \
+                     reconcile them."
+                ));
+                if let Some((stored_case, stored_norm)) = kept_policies {
+                    // The direction that matters: the STORED policies were kept,
+                    // because every retained row's `norm_key` was derived from
+                    // them and swapping them without recomputing the keys makes
+                    // watcher lookups miss — which PM-3 calls absence.
+                    warnings.push(format!(
+                        "this root's case and normalization policies now probe as `{}`/`{}` \
+                         but were recorded as `{stored_case}`/`{stored_norm}` when it was \
+                         first enrolled. The RECORDED pair was kept: every retained file \
+                         row's `norm_key` is derived from it, and changing it without \
+                         recomputing those keys makes watcher lookups miss, which §4.9 PM-3 \
+                         treats as absence. If this root really did move to a different \
+                         filesystem, re-add it with `--forget` from a clean catalog.",
+                        policies.case.as_str(),
+                        policies.norm.as_str()
+                    ));
+                }
+                id
+            }
+        };
 
         let root = self.load_root(root_id)?;
         Ok(RootAddResult { root, warnings })
@@ -828,6 +915,80 @@ fn catalog_totals(cat: &mut Catalog) -> Result<Totals, CatalogError> {
     })
 }
 
+/// The AC-7 deny decision for a path being **registered**, over every component
+/// of both names it has.
+///
+/// # Why this is deeper than the walker's `deny_root`
+///
+/// `shepherd_scan::walk` seeds its traversal with the root and consults
+/// `deny_dir` from the second directory onwards, so its root check only ever has
+/// to read the root's own final component — nothing above the root is inside the
+/// walk at all. Registration is a different question: it is the gate, and
+/// `probe_path_policies` and `detect_with_write_probe` **write into the
+/// directory** before any scan exists. A root that merely *lives inside* a
+/// denied tree (`<repo>/.git/objects`) is therefore a trespass at registration
+/// even though the walker would never have descended to it, and the final
+/// component there — `objects` — is innocent.
+///
+/// So registration refuses a strict **superset** of what the walker refuses.
+/// That is the fail-closed direction and the safe way for the two to differ: no
+/// root can be registered that the walker would later decline, only the reverse.
+///
+/// # Why the canonical name is read only when the root is itself a symlink
+///
+/// Deliberately the same scope as `walk::deny_root`, and it is a scope, not an
+/// oversight. Canonicalizing unconditionally resolves macOS's `/var/folders`
+/// temp tree to `/private/var/...`, which the `/private/var` absolute-prefix
+/// rule then denies — refusing ordinary roots for their platform's symlink
+/// layout rather than for anything the user did.
+///
+/// # What this does NOT close
+///
+/// A root reached through a symlinked *ancestor* — `/tmp/x/sub` where
+/// `x -> /repo/.git`. `symlink_metadata` on the root reports a directory, not a
+/// link, so no canonical name is taken and the literal components are all
+/// innocent. `walk::deny_root` declares the same gap for the same reason; making
+/// registration canonicalize unconditionally to close it is what the paragraph
+/// above rules out.
+fn deny_registration(
+    deny: &shepherd_scan::DenyList,
+    literal: &Path,
+    canonical: Option<&Path>,
+) -> Option<(PathBuf, shepherd_scan::DenyReason)> {
+    // Literal first, matching `walk::deny_root`'s order: a link *named* `.git`
+    // is refused on its own name even when it points somewhere ordinary, and the
+    // reported path is then the alias the operator typed.
+    if let Some(hit) = deny_any_component(deny, literal) {
+        return Some(hit);
+    }
+    deny_any_component(deny, canonical?)
+}
+
+/// `deny_dir` applied to the path and to each of its parents.
+///
+/// `Path::ancestors` yields the path itself first and each parent after it, so
+/// the **deepest** match is the one reported — `/repo/.git/objects` names
+/// `/repo/.git`, the directory the rule is actually about.
+///
+/// Each ancestor is passed as its own `abs`, so the absolute-prefix rules are
+/// asked the question they are phrased for ("is THIS directory inside `/proc`")
+/// rather than being re-asked about the leaf every time. The root of the
+/// filesystem yields an empty component, which matches no name or suffix while
+/// the prefix comparison still runs — the same degradation `walk::deny_root`
+/// documents for a root with no final component.
+fn deny_any_component(
+    deny: &shepherd_scan::DenyList,
+    path: &Path,
+) -> Option<(PathBuf, shepherd_scan::DenyReason)> {
+    path.ancestors().find_map(|a| {
+        let component = a
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        deny.deny_dir(&component, a).map(|r| (a.to_path_buf(), r))
+    })
+}
+
 fn count_custody_rows(cat: &mut Catalog, root: RootId) -> Result<u64, CatalogError> {
     let n: i64 = cat.conn().query_row(
         "SELECT COUNT(*) FROM file WHERE root_id = ?1 AND state IN ('stub', 'remote')",
@@ -1251,6 +1412,117 @@ fn scan_states(cat: &mut Catalog, root_id: Option<i64>) -> Result<Vec<ScanState>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registration deny decision, exercised directly.
+    ///
+    /// A function rather than an inline block for the same reason
+    /// `walk::deny_root` is one: the interesting shapes cannot be built on the
+    /// filesystem of whatever machine runs the suite. `/Library/Caches` does not
+    /// exist on Linux, `canonicalize` needs its target to exist, and the macOS
+    /// case below is *specifically* about a layout Linux does not have. Pinning
+    /// the decision itself covers all of them on every platform, and the e2e
+    /// tests then pin the property no pure function can — that the refusal
+    /// arrives BEFORE the probes write.
+    #[test]
+    fn the_registration_deny_decision_reads_every_component_of_both_names() {
+        let d = shepherd_scan::DenyList::builtin();
+        let pb = PathBuf::from;
+        use shepherd_scan::DenyReason;
+
+        // The root itself, unchanged from the round-3 behaviour.
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/proj/.git"), None),
+            Some((pb("/home/u/proj/.git"), DenyReason::VersionControl)),
+        );
+
+        // Codex's case: a CHILD of a denied tree. The final component is
+        // innocent, which is exactly why reading only it let this through.
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/proj/.git/objects/pack"), None),
+            Some((pb("/home/u/proj/.git"), DenyReason::VersionControl)),
+            "the DENIED ancestor is reported, not the innocent leaf that was typed"
+        );
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/proj/node_modules/a/b"), None),
+            Some((pb("/home/u/proj/node_modules"), DenyReason::PackageCache)),
+        );
+
+        // An innocent alias resolving into a denied tree, at both depths.
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/backup"), Some(&pb("/srv/x/.git"))),
+            Some((pb("/srv/x/.git"), DenyReason::VersionControl)),
+        );
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/backup"), Some(&pb("/srv/x/.git/objects"))),
+            Some((pb("/srv/x/.git"), DenyReason::VersionControl)),
+            "a canonicalization that still read only the final component would miss this"
+        );
+
+        // Literal beats canonical: a link NAMED for a denied tree is refused on
+        // its own name, and the alias is what gets reported — the same ordering
+        // `walk::deny_root` documents.
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/.git"), Some(&pb("/srv/ordinary"))),
+            Some((pb("/home/u/.git"), DenyReason::VersionControl)),
+        );
+
+        // --- the accepting directions ------------------------------------
+        //
+        // "refuse anything with a denied name anywhere above it" and "refuse
+        // every symlinked root" both pass every assertion above while making
+        // large parts of a user's disk unregisterable.
+        assert_eq!(deny_registration(&d, &pb("/home/u/data/2026"), None), None);
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/mygit/data"), None),
+            None,
+            "round 1's component rule, now at depth: a substring is still not a component"
+        );
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/my_node_modules/pkg"), None),
+            None
+        );
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/.gitignore/data"), None),
+            None,
+            "`.gitignore` is not `.git`, at any depth"
+        );
+        assert_eq!(
+            deny_registration(&d, &pb("/home/u/alias"), Some(&pb("/mnt/big/corpus"))),
+            None,
+            "an ordinary alias must still register, or aliases into big corpora — which is \
+             how people mount them — stop working"
+        );
+
+        // --- the scope this deliberately does not widen -------------------
+        //
+        // A symlinked ANCESTOR. `symlink_metadata` on the root reports a
+        // directory, so no canonical name is taken and every literal component
+        // is innocent. `walk::deny_root` declares the same gap; closing it means
+        // canonicalizing unconditionally, and the next assertion is why that is
+        // not free.
+        assert_eq!(
+            deny_registration(&d, &pb("/tmp/x/sub"), None),
+            None,
+            "the symlinked-ancestor gap, open by decision and shared with the walker"
+        );
+        // macOS resolves /var/folders/... to /private/var/..., which the
+        // `/private/var` prefix rule denies. Passing a canonical name here for
+        // every root — rather than only for a root that IS a link — would refuse
+        // ordinary macOS roots for their platform's symlink layout.
+        assert_eq!(
+            deny_registration(
+                &d,
+                &pb("/var/folders/gz/T/corpus"),
+                Some(&pb("/private/var/folders/gz/T/corpus"))
+            ),
+            Some((
+                pb("/private/var/folders/gz/T/corpus"),
+                DenyReason::SystemPath
+            )),
+            "this is what unconditional canonicalization would do to every macOS temp root, \
+             and the reason the canonical name is read only when the root is itself a link"
+        );
+    }
     use shepherd_catalog::{AtimeMode, PathCasePolicy, PathNormPolicy};
     use shepherd_core::{FileStat, StubMode};
 

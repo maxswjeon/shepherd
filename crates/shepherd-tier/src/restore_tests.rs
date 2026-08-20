@@ -300,3 +300,112 @@ fn cleanup_removes_only_the_inode_this_attempt_created() {
         "the exact inode this attempt created must be removed"
     );
 }
+
+// --- verification is bound to the INODE, not to the name -------------------
+
+/// The window `create_new` opens and the verification used to read straight
+/// through: between the exclusive create and the read-back, the destination can
+/// stop naming the inode this attempt created.
+///
+/// Exercised against [`write_and_verify`] directly, because that is the only
+/// seam at which the swap can be made **deterministic**. Driving `restore_file`
+/// and hoping another thread lands its rename in the right microsecond would be
+/// a test that passes for timing reasons rather than for the property.
+///
+/// The replacement is built to survive a PATH-based verification: identical
+/// bytes, identical mtime. The only thing that distinguishes it is its **mode**
+/// — so a path-based `chmod` is visible as a change to somebody else's file,
+/// and a handle-based one is visible as a change to ours. All three assertions
+/// below fail against the pathname-bound version, and they fail for three
+/// different reasons.
+#[cfg(unix)]
+#[test]
+fn a_destination_swapped_after_the_create_is_named_rather_than_verified() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const OURS_BEFORE: u32 = 0o600;
+    const THEIRS: u32 = 0o604;
+    const MANIFEST: u32 = 0o640;
+
+    let dir = TempDir::new("displaced");
+    let chosen = dir.path("photo.raw");
+    let m = manifest_for(BYTES, MANIFEST);
+
+    // Exactly what `restore_file` does before it hands over: exclusive-create,
+    // then capture the inode from the HANDLE.
+    let f = std::fs::File::create_new(&chosen).expect("create");
+    std::fs::set_permissions(&chosen, std::fs::Permissions::from_mode(OURS_BEFORE))
+        .expect("seed our mode");
+    let created = inode_of(&f.metadata().expect("fstat"));
+    assert!(created.is_some(), "unix names inodes");
+
+    // The swap. Our inode is renamed aside — it stays alive and reachable, so
+    // the test can ask what happened to it — and a file somebody else made
+    // takes the name over.
+    let ours_moved = dir.path("ours.moved");
+    std::fs::rename(&chosen, &ours_moved).expect("move our inode aside");
+
+    // Built elsewhere and renamed in: an unlink-then-create at the same path
+    // lets ext4 hand back the inode number it just freed, and the test would
+    // then be asserting nothing.
+    let staging = dir.path("theirs.tmp");
+    std::fs::write(&staging, BYTES).expect("seed replacement");
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(THEIRS))
+        .expect("seed their mode");
+    let touch = std::fs::File::options()
+        .write(true)
+        .open(&staging)
+        .expect("open replacement");
+    touch
+        .set_modified(to_system_time(Timestamp::from_nanos(MTIME_NANOS)))
+        .expect("give the replacement the manifest's mtime");
+    drop(touch);
+    let theirs = inode_of(&std::fs::metadata(&staging).expect("stat")).expect("unix names inodes");
+    assert_ne!(
+        created,
+        Some(theirs),
+        "precondition: the replacement really is a different inode"
+    );
+    std::fs::rename(&staging, &chosen).expect("take the name over");
+
+    let err = write_and_verify(f, &chosen, BYTES, &m, created).expect_err(
+        "the destination no longer names the inode this attempt created, so the \
+         restore did not publish anything and must not report success",
+    );
+    assert!(
+        matches!(err, RestoreError::Displaced { .. }),
+        "the outcome must name the swap rather than some incidental failure: {err:?}"
+    );
+
+    // The replacement is somebody else's file. Nothing this restore did may
+    // have touched it — a pathname `chmod` would have set it to the manifest's
+    // mode, which is Shepherd editing a file it did not create.
+    let theirs_mode = std::fs::metadata(&chosen)
+        .expect("stat replacement")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        theirs_mode, THEIRS,
+        "the replacement's permissions were changed by a restore that never owned it"
+    );
+    assert_eq!(
+        std::fs::read(&chosen).expect("read replacement"),
+        BYTES,
+        "the replacement's bytes were changed"
+    );
+
+    // The accepting half, on the same run: the metadata went to OUR inode. If
+    // this reads `OURS_BEFORE` the chmod landed on the name instead of the
+    // handle, which is the defect from the other side.
+    let ours = read_back(&ours_moved).expect("our inode is still reachable");
+    assert_eq!(
+        ours.mode, MANIFEST,
+        "the manifest's mode must be applied through the held handle, to the \
+         inode this attempt created"
+    );
+    assert_eq!(
+        ours.blake3, m.core.blake3,
+        "our inode holds the restored bytes"
+    );
+}

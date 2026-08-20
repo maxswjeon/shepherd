@@ -23,6 +23,30 @@
 //! sets, re-reads, and verifies against the manifest — and its test runs
 //! against a real temp file rather than a fake.
 //!
+//! # Verification is bound to the INODE, not to the name
+//!
+//! `create_new` returning a handle proves the name was ours **at that syscall**.
+//! It proves nothing about the moment after. So every step that follows works
+//! through the handle rather than through the path: `fchmod` via
+//! [`std::fs::File::set_permissions`], `futimens` via `File::set_modified`, and
+//! a read-back that seeks the handle to zero and `fstat`s it
+//! ([`read_back_through`]). A pathname `chmod` in that window edits **whatever
+//! is at the name**, which on a replaced destination is a file this restore did
+//! not create; a pathname read-back then *verifies that same replacement*, so a
+//! restore that published nothing can report success — and will, if the
+//! replacement happens to match the manifest.
+//!
+//! Working through the handle makes the bytes and metadata claims true of the
+//! right inode, and it cannot make the last claim at all: that the inode is
+//! **reachable at the destination**. That one needs a name lookup, so
+//! [`still_names_the_created_inode`] is the final act before returning — a
+//! `(dev, ino)` comparison against the value captured from the handle at
+//! creation. Failing it is [`RestoreError::Displaced`]: an error, and the
+//! created inode is left wherever the replacer put it rather than chased. The
+//! error routes through the same [`discard_failed_attempt`] as every other
+//! failure, which stats the path, finds a foreign inode and **leaves it alone**
+//! — so the replacement survives a failure caused by its own arrival.
+//!
 //! # A failed attempt cleans up after itself, by INODE
 //!
 //! `create_new` succeeding is not the same fact as the restore succeeding.
@@ -85,6 +109,16 @@ pub enum RestoreError {
         path: String,
         breaches: Vec<FidelityBreach>,
     },
+
+    /// The destination stopped naming the inode this attempt created, some time
+    /// between the exclusive create and the final check. The bytes were written
+    /// and verified — through the handle — but they are not what the path
+    /// resolves to, so **nothing was published** and reporting success would
+    /// name a restore that did not happen.
+    #[error(
+        "{path} no longer names the inode this restore created — something replaced the          destination after the exclusive create, so nothing was published there"
+    )]
+    Displaced { path: String },
 }
 
 type Result<T> = std::result::Result<T, RestoreError>;
@@ -173,7 +207,7 @@ pub fn restore_file(
     // Every failure from here on goes through the cleanup. Nothing is returned
     // early: an error path that skipped it is exactly the defect this shape
     // exists to make unreachable.
-    match write_and_verify(f, &chosen, bytes, manifest) {
+    match write_and_verify(f, &chosen, bytes, manifest, created) {
         Ok(attrs) => Ok(RestoreOutcome { target, attrs }),
         Err(e) => {
             discard_failed_attempt(&chosen, created);
@@ -191,6 +225,7 @@ fn write_and_verify(
     chosen: &Path,
     bytes: &[u8],
     manifest: &FidelityManifest,
+    created: Option<CreatedInode>,
 ) -> Result<RestoredAttrs> {
     let io = |e: std::io::Error| RestoreError::Io {
         path: chosen.display().to_string(),
@@ -203,23 +238,118 @@ fn write_and_verify(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(chosen, std::fs::Permissions::from_mode(manifest.core.mode))
+        // `fchmod`, through the held handle — NOT `std::fs::set_permissions`,
+        // which takes a name and re-resolves it. `create_new` succeeding says
+        // the name was ours at the syscall and says nothing about now, so a
+        // pathname chmod here sets the mode of **whatever is at the name**,
+        // which on a replaced destination is a file this restore never created.
+        // `File::set_permissions` takes `&self` and is the same call without the
+        // re-resolution.
+        f.set_permissions(std::fs::Permissions::from_mode(manifest.core.mode))
             .map_err(io)?;
     }
 
     // Set mtime last: writing and chmod both touch it.
     f.set_modified(to_system_time(manifest.core.mtime))
         .map_err(io)?;
-    drop(f);
 
-    let attrs = read_back(chosen)?;
+    // Read back through the SAME handle, for the same reason. A pathname
+    // read-back verifies the bytes and metadata of whatever the name resolves
+    // to at that instant, so a replacement that happens to match the manifest
+    // makes a restore that published nothing report success.
+    let attrs = read_back_through(&mut f, chosen)?;
     if let Err(breaches) = verify_restore(manifest, &attrs) {
         return Err(RestoreError::FidelityBreached {
             path: chosen.display().to_string(),
             breaches,
         });
     }
+
+    // Last, and the only claim the handle cannot make on its own: the verified
+    // inode is what the destination NAMES. Everything above proves the bytes
+    // and metadata are right; this proves they are reachable at the path the
+    // caller will be told about. Without it a restore can be internally perfect
+    // and externally absent.
+    //
+    // It is a stat, so it is a TOCTOU in the same sense `discard_failed_attempt`
+    // is: a replacement landing after this check is reported as success. Stated
+    // rather than hidden — closing it needs an atomic publish primitive, which
+    // is the `renameat2` discussion in the module docs. What it does close is
+    // the whole interval from `create_new` to here, which spans the write, the
+    // fsync, both metadata calls and the read-back.
+    still_names_the_created_inode(chosen, created)?;
+
+    drop(f);
     Ok(attrs)
+}
+
+/// Read a restored file's attributes back **through the handle that created
+/// it**, rather than by re-resolving its name.
+///
+/// The [`read_back`] twin. That one is public and pathname-based because its
+/// callers — the fidelity report, the e2e round trip — genuinely want to ask
+/// "what is at this path"; this one is the verification step inside a restore,
+/// which must ask "what is in the file I made" and must not be satisfiable by a
+/// replacement that happens to match.
+fn read_back_through(f: &mut std::fs::File, chosen: &Path) -> Result<RestoredAttrs> {
+    use std::io::{Read, Seek, SeekFrom};
+    let io = |e: std::io::Error| RestoreError::Io {
+        path: chosen.display().to_string(),
+        detail: e.to_string(),
+    };
+
+    f.seek(SeekFrom::Start(0)).map_err(io)?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).map_err(io)?;
+
+    // `fstat`, so the mode and mtime describe the same inode as the bytes.
+    let md = f.metadata().map_err(io)?;
+    let mtime = md.modified().map_err(io)?;
+
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        md.permissions().mode() & 0o7777
+    };
+    #[cfg(not(unix))]
+    let mode = u32::from(md.permissions().readonly());
+
+    Ok(RestoredAttrs {
+        blake3: Blake3Hash::from_bytes(*blake3::hash(&bytes).as_bytes()),
+        size: bytes.len() as u64,
+        mtime: from_system_time(mtime),
+        mode,
+    })
+}
+
+/// Whether `chosen` still resolves to the inode this attempt created.
+///
+/// `None` for `created` is the same COVERAGE GAP [`discard_failed_attempt`]
+/// states: off unix nothing can name the inode, so nothing can check this.
+/// Refusing there would make restore — a non-destructive operation — fail on
+/// every Windows run, which is a worse answer than a warning. Phase 3 owns it.
+fn still_names_the_created_inode(chosen: &Path, created: Option<CreatedInode>) -> Result<()> {
+    let Some(created) = created else {
+        tracing::warn!(
+            path = %chosen.display(),
+            "this platform cannot name the inode this restore created, so it cannot be              confirmed that the destination still holds it"
+        );
+        return Ok(());
+    };
+    let displaced = || RestoreError::Displaced {
+        path: chosen.display().to_string(),
+    };
+    match std::fs::symlink_metadata(chosen) {
+        Ok(md) if inode_of(&md) == Some(created) => Ok(()),
+        // A different inode at the name, or no entry at all. Both mean the same
+        // thing to the caller: the restored inode is not published there.
+        Ok(_) => Err(displaced()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(displaced()),
+        Err(e) => Err(RestoreError::Io {
+            path: chosen.display().to_string(),
+            detail: e.to_string(),
+        }),
+    }
 }
 
 /// The exact inode one restore attempt created.

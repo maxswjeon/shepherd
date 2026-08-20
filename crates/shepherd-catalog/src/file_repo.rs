@@ -178,6 +178,150 @@ impl<'a> FileRepo<'a> {
         Ok(RootId::new(self.0.conn().last_insert_rowid()))
     }
 
+    /// Enroll `path` as a scan root, reviving a soft-removed one if that is what
+    /// is there.
+    ///
+    /// # Why this exists
+    ///
+    /// The default `root.remove` deliberately keeps the `scan_root` row and
+    /// every file row under it, because `file.root_id` cascades and a tiered
+    /// file's catalog row is the only address of its remote bytes. Nothing ever
+    /// set `enabled` back to 1, and `scan_root.path` is `NOT NULL UNIQUE` — so
+    /// a plain insert made the retained state permanently unreachable. The only
+    /// recovery was `--forget`, which destroys precisely what the retention was
+    /// protecting. This is the way back in.
+    ///
+    /// # The three outcomes, and why the third is a refusal
+    ///
+    /// * no row → an ordinary first enrollment;
+    /// * a **disabled** row → revived, catalog intact;
+    /// * an **enabled** row → [`CatalogError::AlreadyInState`]. That is a
+    ///   genuine duplicate, and it must stay refused: silently reactivating an
+    ///   already-live root would let a second `root.add` rewrite a running
+    ///   root's settings with no indication it had done so. `AlreadyInState`
+    ///   maps to `Precondition` at the transport, which a caller retrying after
+    ///   a crash can read as "already done" — the raw unique-constraint error it
+    ///   replaces mapped to `Io` and read as "storage broke".
+    ///
+    /// # What is rewritten on a revival, and what is not
+    ///
+    /// **Rewritten**: `stub_mode`, `hosted_optin`, `ignore_patterns_json`,
+    /// `volume_id`, `atime_mode`. The first three are user intent, stated afresh
+    /// in this request; keeping the stored copies would reproduce the
+    /// `ignore_patterns_json DEFAULT '[]'` failure this module already documents
+    /// — a user's exclusions silently not existing. The last two are facts about
+    /// the volume that may genuinely have changed across a remount.
+    ///
+    /// **NOT rewritten**: `path_case_policy` and `path_norm_policy`. Every
+    /// retained file row carries a `norm_key` *derived* from those two policies,
+    /// and `find_by_norm_key` is what watcher events match against. Swapping the
+    /// policies without recomputing every key makes those lookups miss, and a
+    /// miss reads as absence — which §4.9 PM-3 puts in discard-trigger territory.
+    /// So the stored pair wins and a disagreement with the fresh probe is
+    /// **reported** instead, via `kept_policies`. Recomputing the keys is the
+    /// real fix and it is a migration, not a review-round change.
+    ///
+    /// **NOT touched at all**: the `file` table. Not one row, not one column.
+    /// A re-enrollment establishes nothing about custody — it has not stat'd
+    /// anything — so folding retained rows back to `'local'` would revoke
+    /// custody on exactly the tiered files this retention exists to protect.
+    /// The next scan is what re-establishes what is on disk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enroll_root(
+        &mut self,
+        path: &str,
+        stub_mode: StubMode,
+        case_policy: PathCasePolicy,
+        norm_policy: PathNormPolicy,
+        atime_mode: AtimeMode,
+        volume_id: Option<&str>,
+        hosted_optin: bool,
+        ignore_patterns: &[String],
+        now: Timestamp,
+    ) -> Result<Enrollment> {
+        // One SELECT and one write, in one call, made atomic by the fact that
+        // every catalog write in the daemon goes through the single-threaded
+        // writer actor (`CatalogWriter`) — this whole function runs inside one
+        // of its closures. Splitting the lookup and the write across two
+        // `Session::cat` calls would put a real TOCTOU window between them.
+        let existing: Option<(i64, bool, String, String)> = self
+            .0
+            .conn()
+            .query_row(
+                "SELECT id, enabled, path_case_policy, path_norm_policy
+                 FROM scan_root WHERE path = ?1",
+                params![path],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+
+        let Some((id, enabled, stored_case, stored_norm)) = existing else {
+            return Ok(Enrollment::Created(self.insert_root(
+                path,
+                stub_mode,
+                case_policy,
+                norm_policy,
+                atime_mode,
+                volume_id,
+                hosted_optin,
+                ignore_patterns,
+                now,
+            )?));
+        };
+        if enabled {
+            return Err(CatalogError::AlreadyInState(format!(
+                "`{path}` is already registered as an enabled scan root (id {id})"
+            )));
+        }
+
+        let id = RootId::new(id);
+        let patterns_json = serde_json::to_string(ignore_patterns).map_err(|e| {
+            CatalogError::Invalid(format!("ignore patterns are not serializable as JSON: {e}"))
+        })?;
+        let stub = match stub_mode {
+            StubMode::Dehydrate => "dehydrate",
+            StubMode::Delete => "delete",
+        };
+        self.0.conn_mut().execute(
+            "UPDATE scan_root SET enabled = 1, stub_mode = ?2, hosted_optin = ?3,
+                 ignore_patterns_json = ?4, volume_id = ?5, atime_mode = ?6
+             WHERE id = ?1",
+            params![
+                id.get(),
+                stub,
+                hosted_optin as i64,
+                patterns_json,
+                volume_id,
+                atime_mode.as_str()
+            ],
+        )?;
+
+        let (retained_files, retained_custody): (i64, i64) = self.0.conn().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(state IN ('stub','remote')), 0)
+             FROM file WHERE root_id = ?1",
+            params![id.get()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+
+        let kept_policies = (stored_case != case_policy.as_str()
+            || stored_norm != norm_policy.as_str())
+        .then_some((stored_case, stored_norm));
+
+        tracing::info!(
+            root = %id,
+            path,
+            retained_files,
+            retained_custody,
+            "scan root re-enrolled: its catalog was retained by an earlier soft removal"
+        );
+        Ok(Enrollment::Reactivated {
+            id,
+            retained_files: retained_files as u64,
+            retained_custody: retained_custody as u64,
+            kept_policies,
+        })
+    }
+
     pub fn get_root(&self, id: RootId) -> Result<Option<ScanRoot>> {
         self.0
             .conn()
@@ -287,6 +431,39 @@ impl<'a> FileRepo<'a> {
     /// `'remote'`**, here or anywhere else, because tiering is Phase 2/3 work.
     /// That is what makes `WHERE state IN ('stub','remote')` a filter over a
     /// single-valued column, and it is not fixed by this statement.
+    ///
+    /// # Concurrent scans of one root
+    ///
+    /// The statement's trailing `WHERE excluded.last_seen_gen >=
+    /// file.last_seen_gen` exists because nothing serializes scans per root.
+    /// `Queue::claim_next_of` selects by priority and class with no root
+    /// exclusion, `scan.start` has no duplicate guard, `Queue::enqueue` has no
+    /// dedup — and each walk happens OUTSIDE the writer actor, so the actor can
+    /// take a later generation's batch first and an earlier generation's batch
+    /// after it. Unconditional, the list above then wrote a stale `size`,
+    /// `mtime`, `ctime` and `atime` over the fresh ones and lowered
+    /// `last_seen_gen`, the column every reconciliation reads.
+    ///
+    /// **`>=`, not `>`, and it is load-bearing.** The generation is the job id
+    /// (`scan_exec`), so a retried job re-runs under the SAME id; under `>`
+    /// every batch of that retry would be a silent no-op.
+    ///
+    /// **One `WHERE` over the whole statement, not a guard per column**, and
+    /// the digest is why. Per-column guards leave the `blake3` expression
+    /// reading a stale scan's `excluded.size`/`mtime`/`ctime`, which do not
+    /// match the row — so the `CASE` yields NULL, the `COALESCE` yields NULL,
+    /// and a valid digest is cleared by a write that was supposed to be
+    /// ignored. Skipping the statement is what keeps the guard reading only
+    /// metadata the row was actually compared against.
+    ///
+    /// **This does NOT make the deferred absence sweep safe**, and must not be
+    /// read as doing so. It stops a stale scan from OVERWRITING a fresher row;
+    /// it cannot stop an older generation from being a row's only sighting.
+    /// Jobs N < M, M claimed and walked first, file F created after M's walk:
+    /// N's later walk sees F and stamps gen N, this guard never fires because M
+    /// never upserts F at all, and M's sweep (`last_seen_gen < M`) then marks F
+    /// missing while it is on disk. Same-root scan exclusion is still the
+    /// prerequisite for that sweep.
     pub fn upsert_file(
         &mut self,
         root: &ScanRoot,
@@ -317,7 +494,8 @@ impl<'a> FileRepo<'a> {
                  -- row stamped on INSERT and never on UPDATE keeps its
                  -- first-ever generation and is swept as missing on the second
                  -- scan — the catalog declaring a file gone while it is on
-                 -- disk. Both writes or neither.
+                 -- disk. Both writes or neither, subject to the statement's
+                 -- trailing WHERE — see `# Concurrent scans of one root`.
                  last_seen_gen = excluded.last_seen_gen,
                  -- first_seen_at is NEVER overwritten: §4.12 makes it the
                  -- min-age floor source where mtime is untrusted or in the
@@ -365,7 +543,8 @@ impl<'a> FileRepo<'a> {
                      CASE WHEN excluded.size  = file.size
                            AND excluded.mtime = file.mtime
                            AND excluded.ctime = file.ctime
-                          THEN file.blake3 END)",
+                          THEN file.blake3 END)
+             WHERE excluded.last_seen_gen >= file.last_seen_gen",
             params![
                 root.id.get(),
                 stat.rel_path,
@@ -425,6 +604,32 @@ impl<'a> FileRepo<'a> {
         )?;
         Ok(())
     }
+}
+
+/// What [`FileRepo::enroll_root`] did.
+///
+/// A re-enrollment is not a first enrollment and the caller has to be able to
+/// tell — the root arrives with a catalog already attached, which is a different
+/// event to report and a different thing for a user to reason about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Enrollment {
+    /// This path had never been enrolled.
+    Created(RootId),
+    /// A soft-removed root revived, with the rows an earlier `root.remove`
+    /// deliberately kept.
+    Reactivated {
+        id: RootId,
+        /// File rows that came back with it.
+        retained_files: u64,
+        /// How many of those are `stub`/`remote` — the rows whose catalog entry
+        /// is the ONLY address of bytes that are no longer on local disk. This
+        /// is the number that makes the retention worth having.
+        retained_custody: u64,
+        /// `Some((case, norm))` when the freshly-probed identity policies
+        /// disagreed with the stored ones, carrying the **stored** pair, which
+        /// is the one that was kept. See `enroll_root` for why it wins.
+        kept_policies: Option<(String, String)>,
+    },
 }
 
 /// Which signal drove an access timestamp (§4.12 step 3).
@@ -519,6 +724,260 @@ mod tests {
             atime: None,
             blake3: None,
         }
+    }
+
+    /// A revival must not touch the `file` table at all.
+    ///
+    /// This is the assertion the wire cannot make. `state` is the column that
+    /// matters: a re-enrollment has stat'd nothing, so folding a retained
+    /// `'remote'` row back to `'local'` would revoke custody on exactly the
+    /// tiered file whose catalog row is the only address of its remote bytes —
+    /// the thing the soft-removal retention exists to protect. `first_seen_at`
+    /// and `last_seen_gen` are asserted alongside it because a revival that
+    /// "refreshed" the rows would reset the min-age floor (§4.12) and hand the
+    /// next sweep a generation the scan never stamped.
+    #[test]
+    fn re_enrolling_a_disabled_root_revives_it_without_touching_a_single_file_row() {
+        let (mut cat, root) = fixture();
+        for rel in ["a.txt", "b.txt"] {
+            FileRepo::new(&mut cat)
+                .upsert_file(&root, &stat(root.id, rel), 3, Timestamp::from_nanos(1))
+                .unwrap();
+        }
+        cat.conn_mut()
+            .execute(
+                "UPDATE file SET state = 'remote' WHERE rel_path = 'a.txt'",
+                [],
+            )
+            .unwrap();
+        let before: Vec<(String, String, i64, i64)> = rows(&mut cat);
+
+        // The soft removal.
+        cat.conn_mut()
+            .execute("UPDATE scan_root SET enabled = 0", [])
+            .unwrap();
+
+        let out = FileRepo::new(&mut cat)
+            .enroll_root(
+                "/data",
+                StubMode::Delete,
+                PathCasePolicy::Sensitive,
+                PathNormPolicy::Nfc,
+                AtimeMode::Relatime,
+                Some("uuid:abc"),
+                false,
+                &[],
+                Timestamp::from_nanos(9),
+            )
+            .unwrap();
+
+        assert_eq!(
+            out,
+            Enrollment::Reactivated {
+                id: root.id,
+                retained_files: 2,
+                retained_custody: 1,
+                kept_policies: None,
+            },
+            "the SAME row is revived, and the custody count is what makes the retention \
+             worth having"
+        );
+        let enabled: i64 = cat
+            .conn()
+            .query_row("SELECT enabled FROM scan_root", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(enabled, 1, "the root must actually be enabled again");
+
+        assert_eq!(
+            rows(&mut cat),
+            before,
+            "a re-enrollment stat'd nothing, so it may not rewrite a single file row — \
+             folding the retained 'remote' row back to 'local' revokes custody on a file \
+             whose bytes are not on this disk"
+        );
+    }
+
+    /// The recorded identity policies win, and the disagreement is reported
+    /// rather than applied.
+    ///
+    /// Every retained row's `norm_key` was derived from the STORED pair, and
+    /// `find_by_norm_key` is what watcher events match against. Writing the
+    /// freshly-probed pair without recomputing every key makes those lookups
+    /// miss — and §4.9 PM-3 puts a miss in discard-trigger territory.
+    #[test]
+    fn re_enrolling_keeps_the_recorded_identity_policies_and_reports_the_disagreement() {
+        let (mut cat, root) = fixture();
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &stat(root.id, "a.txt"), 1, Timestamp::from_nanos(1))
+            .unwrap();
+        let key_before: String = cat
+            .conn()
+            .query_row("SELECT norm_key FROM file", [], |r| r.get(0))
+            .unwrap();
+        cat.conn_mut()
+            .execute("UPDATE scan_root SET enabled = 0", [])
+            .unwrap();
+
+        // The volume now probes as case-insensitive, which it was not.
+        let out = FileRepo::new(&mut cat)
+            .enroll_root(
+                "/data",
+                StubMode::Delete,
+                PathCasePolicy::Insensitive,
+                PathNormPolicy::Nfd,
+                AtimeMode::Relatime,
+                Some("uuid:abc"),
+                false,
+                &[],
+                Timestamp::from_nanos(9),
+            )
+            .unwrap();
+
+        let Enrollment::Reactivated { kept_policies, .. } = out else {
+            panic!("expected a revival, got {out:?}");
+        };
+        assert_eq!(
+            kept_policies,
+            Some(("sensitive".to_string(), "nfc".to_string())),
+            "the disagreement must be reported, and it must report the pair that was KEPT"
+        );
+
+        let (case, norm): (String, String) = cat
+            .conn()
+            .query_row(
+                "SELECT path_case_policy, path_norm_policy FROM scan_root",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (case.as_str(), norm.as_str()),
+            ("sensitive", "nfc"),
+            "the RECORDED policies must survive: every retained norm_key was derived from \
+             them, and changing one without recomputing the keys makes watcher lookups miss"
+        );
+        assert_eq!(
+            cat.conn()
+                .query_row("SELECT norm_key FROM file", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            key_before,
+            "and the keys themselves are untouched, which is the point of keeping them"
+        );
+    }
+
+    /// User intent, stated afresh, is honoured afresh.
+    ///
+    /// The opposite — keeping the stored copies — is the exact shape of the
+    /// `ignore_patterns_json DEFAULT '[]'` failure `insert_root` documents: a
+    /// user's exclusions silently not being the ones they just asked for.
+    #[test]
+    fn re_enrolling_applies_the_settings_the_request_states() {
+        let (mut cat, _root) = fixture();
+        cat.conn_mut()
+            .execute("UPDATE scan_root SET enabled = 0", [])
+            .unwrap();
+
+        FileRepo::new(&mut cat)
+            .enroll_root(
+                "/data",
+                StubMode::Dehydrate,
+                PathCasePolicy::Sensitive,
+                PathNormPolicy::Nfc,
+                AtimeMode::Reliable,
+                Some("uuid:moved"),
+                true,
+                &["*.tmp".to_string()],
+                Timestamp::from_nanos(9),
+            )
+            .unwrap();
+
+        let (stub, optin, ignores, vol, at): (String, i64, String, String, String) = cat
+            .conn()
+            .query_row(
+                "SELECT stub_mode, hosted_optin, ignore_patterns_json, volume_id, atime_mode
+                 FROM scan_root",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(stub, "dehydrate");
+        assert_eq!(optin, 1, "consent is per-request and must not be stale");
+        assert_eq!(ignores, r#"["*.tmp"]"#, "AC-9's exclusions, as just stated");
+        assert_eq!(vol, "uuid:moved", "a remount can legitimately change this");
+        assert_eq!(at, "reliable");
+    }
+
+    /// An ENABLED root at the same path is a genuine duplicate and stays
+    /// refused. "Reactivate whatever you find" would let a second `root.add`
+    /// silently rewrite a live root's settings.
+    #[test]
+    fn enrolling_a_path_that_is_already_enabled_is_refused() {
+        let (mut cat, _root) = fixture();
+
+        let err = FileRepo::new(&mut cat)
+            .enroll_root(
+                "/data",
+                StubMode::Delete,
+                PathCasePolicy::Sensitive,
+                PathNormPolicy::Nfc,
+                AtimeMode::Relatime,
+                None,
+                false,
+                &[],
+                Timestamp::from_nanos(9),
+            )
+            .unwrap_err();
+
+        // The FACT, not `is_err()`: this variant is what `map_catalog_error`
+        // turns into `Precondition`, and it replaced a raw unique-constraint
+        // error that mapped to `Io` and read as "storage broke".
+        assert!(
+            matches!(err, CatalogError::AlreadyInState(ref m) if m.contains("/data")),
+            "expected AlreadyInState naming the path, got {err:?}"
+        );
+    }
+
+    /// The accepting direction: an unseen path is still an ordinary first
+    /// enrollment. A `enroll_root` that refused everything would pass the
+    /// refusal test above while making the daemon unable to register anything.
+    #[test]
+    fn enrolling_an_unseen_path_creates_it() {
+        let (mut cat, root) = fixture();
+
+        let out = FileRepo::new(&mut cat)
+            .enroll_root(
+                "/other",
+                StubMode::Delete,
+                PathCasePolicy::Sensitive,
+                PathNormPolicy::Nfc,
+                AtimeMode::Relatime,
+                None,
+                false,
+                &[],
+                Timestamp::from_nanos(9),
+            )
+            .unwrap();
+
+        let Enrollment::Created(id) = out else {
+            panic!("a path that was never enrolled must be Created, got {out:?}");
+        };
+        assert_ne!(id, root.id, "and it is a new row, not the existing one");
+        assert!(FileRepo::new(&mut cat).get_root(id).unwrap().is_some());
+    }
+
+    /// Every file row's identity and vintage, for the untouched-rows assertion.
+    fn rows(cat: &mut Catalog) -> Vec<(String, String, i64, i64)> {
+        let mut stmt = cat
+            .conn()
+            .prepare(
+                "SELECT rel_path, state, first_seen_at, last_seen_gen
+                 FROM file ORDER BY rel_path",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
     }
 
     fn fixture() -> (Catalog, ScanRoot) {
@@ -742,6 +1201,134 @@ mod tests {
             "a re-scan left the row at generation {first}. The next completed \
              scan sweeps `last_seen_gen < gen` to 'missing', so this file — \
              which the scan just saw on disk — would be marked missing"
+        );
+    }
+
+    /// Two scans of one root run concurrently, and the older one must not
+    /// overwrite the newer one's row.
+    ///
+    /// Nothing serializes scans per root — `Queue::claim_next_of` selects by
+    /// priority and class with no root exclusion, `scan.start` has no duplicate
+    /// guard and `Queue::enqueue` has no dedup — and both walks happen OUTSIDE
+    /// the writer actor. So the actor can receive a later generation's batch
+    /// first and an earlier generation's batch after it, carrying a filesystem
+    /// snapshot that is already stale.
+    ///
+    /// Unconditional, the `DO UPDATE` list then wrote the stale `size`, `mtime`,
+    /// `ctime` and `atime` over the fresh ones AND lowered `last_seen_gen`,
+    /// which is the column every reconciliation reads. A catalog that reports a
+    /// file's old size is wrong about the bytes a tier plan would upload.
+    #[test]
+    fn a_stale_scans_upsert_does_not_overwrite_a_newer_scans_row() {
+        let (mut cat, root) = fixture();
+
+        // Generation 9 — the later scan — lands first, with the current bytes.
+        let mut fresh = stat(root.id, "a.txt");
+        fresh.size = 4096;
+        fresh.mtime = Timestamp::from_nanos(9_000);
+        fresh.ctime = Timestamp::from_nanos(9_000);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &fresh, 9, Timestamp::from_nanos(9))
+            .unwrap();
+
+        // Generation 4 — the earlier scan, still holding the snapshot it took
+        // before the file grew — arrives afterwards.
+        let mut stale = stat(root.id, "a.txt");
+        stale.size = 10;
+        stale.mtime = Timestamp::from_nanos(4_000);
+        stale.ctime = Timestamp::from_nanos(4_000);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &stale, 4, Timestamp::from_nanos(10))
+            .unwrap();
+
+        let (size, mtime, seen_gen): (i64, i64, i64) = cat
+            .conn()
+            .query_row("SELECT size, mtime, last_seen_gen FROM file", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            size, 4096,
+            "an older scan's snapshot overwrote a newer one's size; the catalog now \
+             describes bytes that are not on disk"
+        );
+        assert_eq!(mtime, 9_000, "and its mtime with it");
+        assert_eq!(
+            seen_gen, 9,
+            "and it lowered last_seen_gen, which is what every reconciliation reads"
+        );
+    }
+
+    /// The accepting direction, and the one a "never update on conflict" fix
+    /// would silently break: an ordinary re-scan carries a HIGHER generation and
+    /// must still write everything it saw.
+    ///
+    /// Without this, the guard above passes as `DO NOTHING` — and a row that
+    /// never updates keeps its first-ever generation, which the reconciling
+    /// sweep reads as "not seen by this scan" and marks missing.
+    #[test]
+    fn a_newer_scans_upsert_still_applies_over_an_older_row() {
+        let (mut cat, root) = fixture();
+
+        let mut old = stat(root.id, "a.txt");
+        old.size = 10;
+        old.mtime = Timestamp::from_nanos(4_000);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &old, 4, Timestamp::from_nanos(4))
+            .unwrap();
+
+        let mut new = stat(root.id, "a.txt");
+        new.size = 4096;
+        new.mtime = Timestamp::from_nanos(9_000);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &new, 9, Timestamp::from_nanos(9))
+            .unwrap();
+
+        let (size, mtime, seen_gen): (i64, i64, i64) = cat
+            .conn()
+            .query_row("SELECT size, mtime, last_seen_gen FROM file", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(size, 4096, "the later scan's snapshot is the current one");
+        assert_eq!(mtime, 9_000);
+        assert_eq!(
+            seen_gen, 9,
+            "and the generation must advance, or the next sweep marks this file missing"
+        );
+    }
+
+    /// `>=`, not `>`, and it is load-bearing.
+    ///
+    /// The generation is the job id (`scan_exec`), so a job that is retried
+    /// re-runs under the SAME id. A guard written `>` would make every batch of
+    /// that retry a no-op: the rows the retry re-stats would keep whatever the
+    /// abandoned attempt left, and rows it inserts fresh would sit beside them
+    /// at the same generation with different vintages.
+    #[test]
+    fn a_retry_at_the_same_generation_still_applies() {
+        let (mut cat, root) = fixture();
+
+        let mut first = stat(root.id, "a.txt");
+        first.size = 10;
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &first, 5, Timestamp::from_nanos(1))
+            .unwrap();
+
+        let mut retry = stat(root.id, "a.txt");
+        retry.size = 4096;
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &retry, 5, Timestamp::from_nanos(2))
+            .unwrap();
+
+        let size: i64 = cat
+            .conn()
+            .query_row("SELECT size FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            size, 4096,
+            "a retried job re-runs under the same job id, so the same generation must \
+             still be allowed to write what it re-stat'd"
         );
     }
 

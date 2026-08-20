@@ -591,6 +591,158 @@ fn a_default_root_remove_keeps_the_catalog_and_forget_still_drops_it() {
     );
 }
 
+/// The way back in. Round 1 gave `root.remove` a soft path that keeps the
+/// `scan_root` row and every file under it; nobody wrote the re-enrollment that
+/// retention implies.
+///
+/// `scan_root.path` is `NOT NULL UNIQUE` and no production path ever set
+/// `enabled` back to 1, so adding the same path again hit the unique constraint
+/// and surfaced as a raw SQLite error. The user's only recovery was
+/// `--forget` — which destroys the custody rows the retention exists to
+/// protect, i.e. the one outcome the round-1 design was arranged against.
+///
+/// What re-enrollment must NOT do is as load-bearing as what it must: the file
+/// rows keep their `state`, because a tiered row's catalog entry is the only
+/// address of its remote bytes and re-enrollment establishes nothing about
+/// custody.
+#[test]
+fn a_soft_removed_root_can_be_re_enrolled_and_keeps_its_catalog() {
+    let d = Daemon::start("reenroll");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-reenroll");
+    write_file(&root_dir, "a.txt", "hello");
+    write_file(&root_dir, "nested/b.txt", "world");
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    scan_and_expect(&mut c, root_id, 2);
+
+    c.call("root.remove", serde_json::json!({"root_id": root_id}));
+
+    let again = c.call(
+        "root.add",
+        serde_json::json!({
+            "path": root_dir.to_str().unwrap(),
+            "stub_mode": "delete",
+            "ignore_patterns": ["*.tmp"],
+        }),
+    );
+
+    // The SAME row, not a second one. A re-enrollment that inserted a new row
+    // would leave every retained file row hanging off an id nothing enables.
+    assert_eq!(
+        again["root"]["root_id"],
+        serde_json::json!(root_id),
+        "re-enrollment must revive the existing row, or the retained catalog is orphaned: \
+         {again}"
+    );
+    assert_eq!(again["root"]["enabled"], serde_json::json!(true), "{again}");
+    assert_eq!(
+        again["root"]["file_count"],
+        serde_json::json!(2),
+        "the retained rows must still be reachable through the revived root: {again}"
+    );
+
+    // A re-enrollment is not a first enrollment, and the user must be able to
+    // tell: this root arrives with history attached.
+    let warnings: Vec<String> = again["warnings"]
+        .as_array()
+        .expect("root.add reports warnings")
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect();
+    let note = warnings
+        .iter()
+        .find(|w| w.contains("re-enrolled"))
+        .unwrap_or_else(|| {
+            panic!(
+                "a re-enrollment must say so — the user is looking at a root that already \
+                 has a catalog, which is a different event from a first enrollment: \
+                 {warnings:?}"
+            )
+        });
+    // Read out of the re-enrollment warning specifically, not out of the whole
+    // list: the unrelated D-12 feasibility warning already contains a "2", so
+    // a bare `any` over the list looking for a "2" would pass with the
+    // re-enrollment count missing entirely.
+    assert!(
+        note.contains("2 file row(s)") && note.contains("0 of them tiered"),
+        "it must say how much history came back, and how much of it is custody — that is \
+         the number that makes the retention worth having: {note}"
+    );
+
+    // Stated afresh, so honoured afresh. Silently keeping the old list is the
+    // exact shape of the `ignore_patterns_json DEFAULT '[]'` failure this crate
+    // already documents once.
+    assert_eq!(
+        again["root"]["ignore_patterns"],
+        serde_json::json!(["*.tmp"]),
+        "the request's patterns must be applied to the revived root: {again}"
+    );
+
+    assert_eq!(
+        c.call("status", serde_json::json!({}))["roots"],
+        serde_json::json!(1),
+        "one root, revived — not two"
+    );
+    assert_eq!(
+        c.call("root.list", serde_json::json!({}))["roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "and it is visible in the ordinary listing again"
+    );
+}
+
+/// The accepting direction's opposite, and the one "reactivate whatever you
+/// find" would break: an ENABLED root at the same path is a genuine duplicate.
+///
+/// Refused with `Precondition`, not the raw SQLite unique-constraint error the
+/// old plain insert produced. The request is well-formed and the path is real;
+/// what does not hold is the state the transition assumed, which is what
+/// `Precondition` names — and it is the code `map_catalog_error` already gives
+/// `AlreadyInState`.
+#[test]
+fn adding_a_root_that_is_already_enabled_is_still_refused() {
+    let d = Daemon::start("reenrolldup");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-dup");
+    std::fs::create_dir_all(&root_dir).unwrap();
+
+    c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let err = c.call_err(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+
+    assert_eq!(
+        err.kind(),
+        Some(shepherd_proto::ErrorCode::Precondition),
+        "a duplicate is a precondition failure, not a raw storage error: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains(root_dir.to_str().unwrap()),
+        "and it must name the path: {}",
+        err.message
+    );
+    assert_eq!(
+        c.call("status", serde_json::json!({}))["roots"],
+        serde_json::json!(1),
+        "and it must not have registered a second time"
+    );
+}
+
 #[test]
 fn adding_a_root_that_is_not_a_directory_is_refused_before_anything_is_written() {
     let d = Daemon::start("badroot");
@@ -784,6 +936,211 @@ fn a_substring_is_not_a_component_at_registration() {
         c.call("status", serde_json::json!({}))["roots"],
         serde_json::json!(3),
         "all three registered"
+    );
+}
+
+/// Round 3 stopped `root.add <repo>/.git`. It did not stop `root.add
+/// <repo>/.git/objects`, because the check passed only the FINAL component to
+/// `deny_dir` — and the final component there is `objects`, which is innocent.
+///
+/// The consequence is the same one the round-3 refusal exists to prevent, one
+/// directory deeper: `probe_path_policies` and `detect_with_write_probe` both
+/// create a file inside the root, so registration writes into a tree AC-7
+/// promises Shepherd never touches.
+///
+/// The mtime is what this pins, not emptiness. Both probes clean up after
+/// themselves, so `read_dir(...).count() == 0` passes with the trespass fully in
+/// place; a directory's mtime moves when an entry is created or removed and does
+/// not move back.
+#[test]
+fn a_root_under_a_denied_ancestor_is_refused_before_any_probe_writes_into_it() {
+    let d = Daemon::start("denyancestor");
+    let mut c = d.connect();
+
+    let inside = d.dir.join("repo").join(".git").join("objects");
+    std::fs::create_dir_all(&inside).unwrap();
+    let pinned = pin_dir_mtime(&inside);
+
+    let err = c.call_err(
+        "root.add",
+        serde_json::json!({"path": inside.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+
+    assert_eq!(
+        err.kind(),
+        Some(shepherd_proto::ErrorCode::Refused),
+        "{}",
+        err.message
+    );
+    assert_eq!(
+        dir_mtime(&inside),
+        pinned,
+        "a directory INSIDE a denied tree must not be written to either: the probes ran \
+         before the refusal, in a `.git` AC-7 promises Shepherd never touches"
+    );
+    // The ancestor is what was actually denied, and naming the path the user
+    // typed would leave them looking at `objects` for a rule that matched
+    // `.git` two components up.
+    let ancestor = d.dir.join("repo").join(".git");
+    assert!(
+        err.message.contains(ancestor.to_str().unwrap()),
+        "the refusal must name the denied ancestor, not the path that was typed: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("version-control"),
+        "and the rule that refused it: {}",
+        err.message
+    );
+    assert_eq!(
+        c.call("status", serde_json::json!({}))["roots"],
+        serde_json::json!(0),
+        "nor was the root registered"
+    );
+}
+
+/// The same trespass bought with an alias instead of a path.
+///
+/// An innocently-named symlink resolving into a denied tree passed the
+/// final-component check on the alias's own name — `deny_dir` was handed
+/// `backup`, never `.git` — and the probes then wrote through the link into the
+/// tree itself. The mtime pinned here is the TARGET's, because that is where
+/// the writes land.
+///
+/// Both depths are covered: an alias to the denied directory, and an alias to
+/// something under it. The second is the one a canonicalization that still only
+/// read the final component would miss.
+#[test]
+fn a_symlinked_root_resolving_into_a_denied_tree_is_refused_before_probing() {
+    let d = Daemon::start("denysymlink");
+    let mut c = d.connect();
+
+    let vcs = d.dir.join("vault").join(".git");
+    let under = vcs.join("objects");
+    std::fs::create_dir_all(&under).unwrap();
+
+    for (alias_name, target) in [("backup", &vcs), ("archive", &under)] {
+        let alias = d.dir.join(alias_name);
+        std::os::unix::fs::symlink(target, &alias).unwrap();
+        let pinned = pin_dir_mtime(target);
+
+        let err = c.call_err(
+            "root.add",
+            serde_json::json!({"path": alias.to_str().unwrap(), "stub_mode": "delete"}),
+        );
+
+        assert_eq!(
+            err.kind(),
+            Some(shepherd_proto::ErrorCode::Refused),
+            "`{alias_name}` resolves into a denied tree: {}",
+            err.message
+        );
+        assert_eq!(
+            dir_mtime(target),
+            pinned,
+            "`{alias_name}` is an alias for a denied tree and the probes wrote through it"
+        );
+    }
+
+    assert_eq!(
+        c.call("status", serde_json::json!({}))["roots"],
+        serde_json::json!(0),
+        "neither alias registered"
+    );
+}
+
+/// The accepting direction for the ancestor walk, and the one "refuse anything
+/// with a denied name anywhere above it" would break.
+///
+/// Round 1 established the component rule inside the deny list and round 3 at
+/// the registration boundary; walking every ancestor is a third place to get it
+/// wrong, and getting it wrong here refuses a whole subtree of the user's own
+/// data. `mygit/data` must register exactly as `mygit` does.
+#[test]
+fn an_innocent_ancestor_component_still_registers() {
+    let d = Daemon::start("denyancestoraccept");
+    let mut c = d.connect();
+
+    for parent in ["mygit", ".gitignore", "my_node_modules", "git"] {
+        let root = d.dir.join(parent).join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        let pinned = pin_dir_mtime(&root);
+
+        let added = c.call(
+            "root.add",
+            serde_json::json!({"path": root.to_str().unwrap(), "stub_mode": "delete"}),
+        );
+        assert_eq!(
+            added["root"]["path"],
+            serde_json::json!(root.to_str().unwrap()),
+            "`{parent}/data` is the user's own directory, not a deny-list entry: {added}"
+        );
+        assert_ne!(
+            dir_mtime(&root),
+            pinned,
+            "and it must still be PROBED — a refusal that returned early would look \
+             identical in the response"
+        );
+    }
+
+    assert_eq!(
+        c.call("status", serde_json::json!({}))["roots"],
+        serde_json::json!(4),
+        "all four registered"
+    );
+}
+
+/// The accepting direction for the canonicalization: "refuse every symlinked
+/// root" passes both refusal tests above while making an ordinary alias
+/// unusable, and aliases into large corpora are exactly how people mount them.
+#[test]
+fn a_symlink_to_an_ordinary_directory_still_registers_and_is_probed() {
+    let d = Daemon::start("denysymlinkaccept");
+    let mut c = d.connect();
+
+    // macOS puts the temp tree under `/var/folders/...`, and `/var` is itself a
+    // symlink to `private/var` — so the canonical name of anything built here
+    // begins `/private/var`, which is an absolute-prefix deny rule. This root IS
+    // a link, so `root.add` canonicalizes it and refuses it for the platform's
+    // symlink layout rather than for anything the test did.
+    //
+    // Skipped rather than worked around, because the accepting direction it
+    // covers is carried platform-independently by
+    // `dispatch::tests::the_registration_deny_decision_reads_every_component_of_both_names`,
+    // which asserts an ordinary alias resolves to `None` — and which also pins
+    // this very `/private/var` interaction as the reason the canonical name is
+    // read only for a root that is itself a link. What is lost here is only the
+    // live evidence that the probes ran THROUGH the link, and it is lost on one
+    // platform, not silently on all of them.
+    //
+    // The other three deny tests in this file are unaffected: the ancestor test
+    // matches `.git` on the literal path before any prefix rule is reached, and
+    // the symlink REFUSAL test asserts only that the call was refused and that
+    // the target was not written to — both of which hold whichever rule fires.
+    if std::fs::canonicalize(&d.dir).unwrap() != d.dir {
+        return;
+    }
+
+    let real = d.dir.join("corpus");
+    std::fs::create_dir_all(&real).unwrap();
+    let alias = d.dir.join("shortcut");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let pinned = pin_dir_mtime(&real);
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": alias.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    assert_eq!(
+        added["root"]["path"],
+        serde_json::json!(alias.to_str().unwrap()),
+        "the root is stored as the caller spelled it; canonicalization is for the deny \
+         decision only: {added}"
+    );
+    assert_ne!(
+        dir_mtime(&real),
+        pinned,
+        "and the probes must have run through the link"
     );
 }
 

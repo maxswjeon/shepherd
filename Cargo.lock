@@ -2641,6 +2641,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "aws-smithy-runtime-api",
  "blake3",
  "bytes",
  "serde",

@@ -26,7 +26,7 @@ pub mod session_store;
 pub mod upload;
 pub mod verify;
 
-pub use audit::{AuditLog, AuditRecord};
+pub use audit::{AuditLog, AuditRecord, DestroyPermit};
 pub use breaker::{
     BreakerLimits, BreakerRefusal, Candidate, Episode, EpisodeState, HoldScope, RateLedger,
     RateWindow, candidate_set_hash,

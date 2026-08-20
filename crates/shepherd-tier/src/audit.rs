@@ -22,10 +22,38 @@
 //! different points in the ordering, and [`AuditLog::is_halted`] is the
 //! persistent consequence rather than a log line — a halt that only existed in
 //! memory would evaporate at exactly the restart that most needs it.
+//!
+//! # The halt is GLOBAL, so reading a flag is not enough
+//!
+//! §4.10.4 says *subsequent* destruction halts — every destruction, not the
+//! ones that happen to check afterwards. A caller that reads [`AuditLog::is_halted`]
+//! and then, some milliseconds later, performs an irreversible syscall has not
+//! delivered that: another destruction can fail its append in the gap, and the
+//! first one crosses the unlink anyway. Per-file locking cannot help, because
+//! two destructions of two different files are exactly the case that is allowed
+//! to overlap.
+//!
+//! So admission and the append are coordinated rather than merely ordered.
+//! [`AuditLog::admit`] takes a process-wide gate, re-reads the halt **inside**
+//! it, and hands back a [`DestroyPermit`]; the permit is what the irreversible
+//! step runs under and what [`DestroyPermit::append`] consumes. No operation can
+//! be between its unlink and its append while another one is admitted, so a halt
+//! set by any append is seen by every destruction that has not already crossed.
+//!
+//! **What this costs, stated rather than hidden.** The irreversible step of every
+//! destruction is serialized against every other — for local destruction an
+//! `unlink` plus an fsync'd append, and for [`crate::destroy::execute_remote_discard`]
+//! a network DELETE. Remote discards therefore do not overlap. That is the price
+//! of the promise: the alternative is a global halt that is true of the flag and
+//! false of the behaviour. The rest of the destroy path — floors, staging,
+//! re-hash, the closing HEAD — stays fully concurrent, and it is where the time
+//! actually goes.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 use shepherd_core::{Blake3Hash, IntentId, Timestamp};
 
@@ -87,6 +115,47 @@ pub struct AuditLog {
     /// Set when a write failed. Persists for the process; recovery at startup
     /// re-derives it from unresolved intents.
     halted: AtomicBool,
+    /// Serializes [read the halt → irreversible step → append].
+    ///
+    /// Async because the remote branch's irreversible step is a network call
+    /// held across an await. Not a second source of truth for the halt: it makes
+    /// the ONE source of truth readable at a moment when acting on it is still
+    /// possible.
+    gate: AsyncMutex<()>,
+}
+
+/// Permission to perform one irreversible destruction.
+///
+/// Held from before the syscall until the record is written, which is what makes
+/// [`AuditLog::is_halted`] mean "no destruction will proceed" rather than "no
+/// destruction will start". Existence is the permission; [`Self::append`]
+/// consumes it, and dropping it without appending is the correct thing to do
+/// when the irreversible step did not happen after all.
+#[must_use = "the permit holds the destroy gate; drop it deliberately or spend \
+              it on the audit record"]
+pub struct DestroyPermit<'a> {
+    log: &'a AuditLog,
+    /// Released when the permit is dropped. Never read.
+    _gate: AsyncMutexGuard<'a, ()>,
+}
+
+impl std::fmt::Debug for DestroyPermit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DestroyPermit")
+            .field("log", &self.log.path)
+            .finish()
+    }
+}
+
+impl DestroyPermit<'_> {
+    /// Record the destruction this permit authorized, then release the gate.
+    ///
+    /// Takes `self` because a permit is good for exactly one destruction. A
+    /// second append under the same permit would be a second irreversible act
+    /// admitted by one reading of the halt.
+    pub fn append(self, record: &AuditRecord) -> Result<()> {
+        self.log.append(record)
+    }
 }
 
 impl AuditLog {
@@ -100,6 +169,7 @@ impl AuditLog {
         Ok(Self {
             path: path.to_path_buf(),
             halted: AtomicBool::new(false),
+            gate: AsyncMutex::new(()),
         })
     }
 
@@ -118,6 +188,28 @@ impl AuditLog {
             });
         }
         Ok(())
+    }
+
+    /// Admit one destruction through its irreversible step.
+    ///
+    /// Waits until no other destruction is between its syscall and its audit
+    /// append, then re-reads the halt. Refusing here is refusing *before*
+    /// anything irreversible, which is the whole reason the check is at this
+    /// point rather than only at the top of the caller.
+    ///
+    /// The cheap top-of-path [`Self::check_not_halted`] is still worth making:
+    /// it refuses before staging, so a halted log does not move a file into
+    /// staging and back out again for nothing. This one is the load-bearing
+    /// check.
+    pub async fn admit(&self) -> Result<DestroyPermit<'_>> {
+        let gate = self.gate.lock().await;
+        // INSIDE the gate. Read outside it, this is the same one-time check the
+        // caller already made, and the window is back.
+        self.check_not_halted()?;
+        Ok(DestroyPermit {
+            log: self,
+            _gate: gate,
+        })
     }
 
     /// Append and fsync.

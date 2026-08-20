@@ -199,18 +199,30 @@ pub async fn execute_local_destruction(
     match outcome {
         Ok(()) => {}
         Err(e) => {
-            match provider.restore_staged(staged) {
-                Ok(o) => tracing::warn!(?o, error = %e, "destruction aborted; file restored"),
-                Err(re) => tracing::error!(
-                    error = %e,
-                    restore_error = %re,
-                    "destruction aborted AND restore failed — the file is in staging and \
-                     needs recovery"
-                ),
-            }
+            restore_or_report(provider, staged, "destruction aborted", &e);
             return Err(e);
         }
     }
+
+    // --- the audit gate -----------------------------------------------------
+    //
+    // The halt at the top of this function was read before staging, and it is
+    // now stale: another destruction can have failed its append in the interval,
+    // and §4.10.4's halt is GLOBAL — it is a claim about every subsequent
+    // destruction, not only about the ones that start after it.
+    //
+    // `admit` re-reads it under a process-wide gate and holds that gate across
+    // the syscall and the append, so no destruction can be between those two
+    // while another is admitted. Refusing here is still a refusal *before*
+    // anything irreversible, so abort-forward-never applies exactly as it does
+    // above. See [`crate::audit`] for what the gate costs.
+    let permit = match audit.admit().await {
+        Ok(p) => p,
+        Err(e) => {
+            restore_or_report(provider, staged, "destruction halted at the audit gate", &e);
+            return Err(e.into());
+        }
+    };
 
     // --- step 6: the irreversible one ---------------------------------------
     //
@@ -222,20 +234,20 @@ pub async fn execute_local_destruction(
     // recovering in-process while we still hold the context is strictly better
     // than deferring to a pass that has to reconstruct it.
     if let Err(e) = provider.destroy_local(&staged, req.expected_hash) {
-        match provider.restore_staged(staged) {
-            Ok(o) => tracing::warn!(?o, error = %e, "unlink failed; file restored"),
-            Err(re) => tracing::error!(
-                error = %e,
-                restore_error = %re,
-                "unlink failed AND restore failed — the file is in staging and needs recovery"
-            ),
-        }
+        // The permit goes back before the restore: nothing irreversible
+        // happened, so there is no record owed and no reason to hold every
+        // other destruction while this one unwinds.
+        drop(permit);
+        restore_or_report(provider, staged, "unlink failed", &e);
         return Err(e.into());
     }
 
     // The audit write happens AFTER the syscall by construction, so it cannot
-    // refuse. A failure here halts subsequent destruction (§4.10.4).
-    audit.append(&AuditRecord {
+    // refuse. A failure here halts subsequent destruction (§4.10.4) — and
+    // because it happens under the permit, "subsequent" includes every
+    // destruction that has not yet been admitted, rather than only those that
+    // have not yet started.
+    permit.append(&AuditRecord {
         at: now,
         intent: req.intent,
         kind: "local",
@@ -248,6 +260,30 @@ pub async fn execute_local_destruction(
     })?;
 
     Ok(())
+}
+
+/// §4.10.4's abort-forward-never, at every point that has staged a file and then
+/// decided not to destroy it.
+///
+/// One function rather than three copies, because the decision it encodes — put
+/// the file back, and if that fails say loudly that the bytes are in staging —
+/// is one decision. Reports rather than returns: the caller already holds the
+/// real error, and replacing it with a restore failure would hide why the
+/// destruction stopped.
+fn restore_or_report(
+    provider: &dyn PlaceholderProvider,
+    staged: Staged,
+    why: &str,
+    error: &dyn std::fmt::Display,
+) {
+    match provider.restore_staged(staged) {
+        Ok(o) => tracing::warn!(?o, %error, "{why}; file restored"),
+        Err(re) => tracing::error!(
+            %error,
+            restore_error = %re,
+            "{why} AND restore failed — the file is in staging and needs recovery"
+        ),
+    }
 }
 
 /// Steps 3–5. Split out so every error path above restores the staged file.
@@ -362,11 +398,16 @@ pub async fn execute_remote_discard(
     attestation: &str,
     now: Timestamp,
 ) -> Result<()> {
-    audit.check_not_halted()?;
+    // Under the same gate as local destruction, and for the same reason: this
+    // path is irreversible too, and a halt that only stopped the branch that set
+    // it would not be the global halt §4.10.4 promises. The gate is therefore
+    // held across the provider DELETE — see [`crate::audit`] for what that
+    // costs.
+    let permit = audit.admit().await?;
 
     remote.remove_object(key, guard).await?;
 
-    audit.append(&AuditRecord {
+    permit.append(&AuditRecord {
         at: now,
         intent,
         kind: "remote",

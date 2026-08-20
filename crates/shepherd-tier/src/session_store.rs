@@ -479,6 +479,36 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
             upload_id: r.9.map(OpaqueToken::new),
             parts,
             manifest_blake3: hash_from(r.13),
+            // NOT PERSISTED, and the loss is symmetric: `transfer_session` has
+            // no `attestation_mode` column, so `save_blocking` has nothing to
+            // write and this has nothing to read. `None` is what the row
+            // genuinely says, not a placeholder for a value hiding elsewhere in
+            // it — the same distinction `checksum` above draws.
+            //
+            // What it would have said is which mechanism the driver probed at
+            // verify (§4.10.2's A or B), stamped onto the session by
+            // `TransferDriver::verify`. Reconstructing it here is not available:
+            // re-probing needs an adapter this function does not have, and
+            // defaulting to either mechanism is exactly the "silently landing on
+            // B while believing A" §4.10.2 forbids.
+            //
+            // It is **latent rather than live**, and that is a claim about
+            // today's consumers rather than a judgement that it does not matter.
+            // Nothing reads a reloaded session's copy: the destroy predicate
+            // takes its attestation from `revalidate::Location`, whose durable
+            // source is the catalog's `target.attestation_mode` — a separate
+            // column, probed at target registration, fail-closed at `'none'`
+            // (see `shepherd-daemon`'s `target_add`) — and the destroy audit
+            // record's `attestation` field is written from that same `Location`.
+            // The one assertion that does read it, `m2_e2e`'s, runs against
+            // `MemStore`, which keeps the whole struct in memory.
+            //
+            // So the first consumer that needs the verification claim to survive
+            // a restart makes this a `transfer_session` column plus both sides
+            // of the SQL, not a repair inside this function. Recorded here
+            // rather than closed, because a column added for no reader is a
+            // migration nobody can justify and a field hard-coded away is a gap
+            // nobody can find.
             attestation_mode: None,
             object_version: r.14.map(ObjectVersion::new),
         }))

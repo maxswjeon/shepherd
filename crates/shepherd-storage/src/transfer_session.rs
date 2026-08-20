@@ -30,16 +30,40 @@
 //! the same reason: a record written after its effect cannot describe a crash
 //! that happened in between, and the recovery code then has nothing to read.
 //!
-//! # On resume, the source is re-checked before its bytes are trusted
+//! # The source is proved three times, and each proof answers a different question
 //!
 //! `SourceIdentity` persists size, mtime, `fs_id` and the BLAKE3 the transfer
-//! was planned against. On resume the driver re-fingerprints the source and
-//! **aborts if it moved** — PM-1's modify-during-upload race would otherwise
-//! splice pre-crash parts and post-crash parts into a single object that never
-//! existed on disk. The cheap fingerprint is the early gate; the full remote
-//! BLAKE3 re-read in `Verifying` is the backstop that catches anything the
-//! fingerprint missed. Both are required: the fingerprint is fast but
-//! defeatable, the full read is authoritative but only affordable once.
+//! was planned against. PM-1's modify-during-upload race would otherwise splice
+//! pre-crash parts and post-crash parts into a single object that never existed
+//! on disk, so:
+//!
+//! 1. **The fingerprint**, before a single byte is read. Cheap, and it refuses
+//!    to read anything out of a file that has obviously moved. It is also the
+//!    weakest: it runs once, so an edit landing *between* two part reads sails
+//!    past it, and an in-place edit that restores the mtime leaves it nothing
+//!    to see at all.
+//! 2. **The read-stream hash**, in `TransferDriver::upload_pending`, before
+//!    `Completing`. Every part is read in ascending order into one hasher and
+//!    the result must equal the planned BLAKE3; a part being *skipped* is
+//!    instead matched against the [`crate::multipart::PartCheckpoint`]
+//!    `local_blake3` an earlier attempt recorded for it. Together those say the
+//!    bytes the provider holds are the planned bytes.
+//! 3. **The full remote BLAKE3 re-read** in `Verifying`. Authoritative, and the
+//!    only one that can speak for what the provider actually stored.
+//!
+//! The middle one is not redundant with the third, and the reason is the whole
+//! shape of this module: `Verifying` runs *after* `complete_multipart` has
+//! published the object under a content-addressed, **immutable** key. A key
+//! that cannot be rewritten cannot be repaired — the session sticks in
+//! `Verifying` and every retry rediscovers the same poisoned object. So the
+//! last moment a wrong object can still be *refused* rather than merely
+//! *detected* is before completion, and refusing there requires a local proof.
+//!
+//! What it costs is close to nothing. A fresh upload hashes the bytes it was
+//! already reading. A resume additionally re-reads the ranges it is skipping —
+//! one local pass, strictly cheaper than the full *remote* re-read step 3
+//! performs unconditionally. AC-2 is untouched either way: it measures parts
+//! re-**sent**, and no skipped part is re-sent.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -563,11 +587,37 @@ impl<'a> TransferDriver<'a> {
             self.store.save(session).await?;
         }
 
-        for part_no in recon.pending().collect::<Vec<_>>() {
-            let range = session
-                .plan
-                .range_of(part_no)
-                .expect("pending parts come from the plan");
+        // The source is proved twice, and the two proofs answer different
+        // questions. The fingerprint at the top of this function is the cheap
+        // gate: it refuses to read anything out of a file that has obviously
+        // moved. Everything below proves what was actually *read*.
+        //
+        // The second proof has to exist because the gate runs exactly once,
+        // before the first part is read, so an edit landing between two part
+        // reads sails past it. The spliced object is then caught only by the
+        // full remote BLAKE3 in `Verifying` — which runs *after*
+        // `complete_multipart` published it under a content-addressed,
+        // immutable key. That key cannot be rewritten, so the session sticks in
+        // `Verifying` and every future retry rediscovers the same poisoned
+        // object. The check must therefore be local, and must run before
+        // `Completing`.
+        //
+        // What it costs: every part is read in ascending order and fed to one
+        // hasher, so a fresh upload reads exactly the bytes it was already
+        // going to read — no amplification at all. A resume additionally
+        // re-reads the ranges it is skipping, one local pass, which is strictly
+        // cheaper than the full *remote* re-read `Verifying` already performs
+        // unconditionally. AC-2 is untouched: it measures parts re-*sent*, and
+        // no skipped part is re-sent.
+        //
+        // A hash of what was read, rather than a second `stat`, is also the
+        // more *accepting* of the two. An edit confined to a range that was
+        // already read and sent leaves the uploaded bytes exactly equal to the
+        // planned bytes; a post-read fingerprint would refuse that correct
+        // transfer, and this does not.
+        let plan = session.plan;
+        let mut read_back = blake3::Hasher::new();
+        for (part_no, range) in plan.ranges() {
             let body = self.source.read_range(range).await?;
             if body.len() as u64 != range.len {
                 return Err(StorageError::ContentMismatch {
@@ -577,6 +627,39 @@ impl<'a> TransferDriver<'a> {
                 });
             }
             let local_blake3 = Blake3Hash::from_bytes(*blake3::hash(&body).as_bytes());
+            read_back.update(&body);
+
+            if recon.action_of(part_no) == Some(PartAction::Skip) {
+                // This part's bytes are already on the provider, uploaded by an
+                // earlier attempt. The whole-file hash below proves the disk
+                // holds the planned content *now*; it cannot prove the earlier
+                // attempt read it from that content, because that attempt may
+                // have run against an in-place edit that was since reverted —
+                // and a fingerprint-preserving edit leaves the gate nothing to
+                // see. `PartCheckpoint::local_blake3` is the only record that
+                // can tell, which is what its doc comment says it is for.
+                //
+                // A checkpoint carrying no hash reads back as all zeroes and so
+                // fails here. That is deliberate: a part nothing can attribute
+                // must not be completed over, and refusing costs a re-upload
+                // while accepting costs an unreplaceable wrong object.
+                let recorded = session
+                    .parts
+                    .iter()
+                    .find(|p| p.part_no == part_no)
+                    .map(|p| p.local_blake3);
+                if recorded != Some(local_blake3) {
+                    return Err(StorageError::ContentMismatch {
+                        key: session.source.rel_path.clone(),
+                        expected: format!(
+                            "part {part_no} on the provider was read from blake3 {}",
+                            recorded.map_or_else(|| "<no checkpoint>".to_owned(), |h| h.to_hex())
+                        ),
+                        actual: format!("the source now holds blake3 {}", local_blake3.to_hex()),
+                    });
+                }
+                continue;
+            }
 
             let receipt = self
                 .adapter
@@ -596,6 +679,19 @@ impl<'a> TransferDriver<'a> {
 
             outcome.bytes_uploaded += range.len;
             outcome.parts_sent += 1;
+        }
+
+        // Everything the provider now holds was either read in the loop above
+        // or vouched for against its checkpoint there, so this settles whether
+        // the object about to be published is the planned one — before it is
+        // published, while refusing is still recoverable.
+        let read_back = Blake3Hash::from_bytes(*read_back.finalize().as_bytes());
+        if read_back != session.source.blake3 {
+            return Err(StorageError::ContentMismatch {
+                key: session.source.rel_path.clone(),
+                expected: format!("blake3 {}", session.source.blake3.to_hex()),
+                actual: format!("the parts as read hash to blake3 {}", read_back.to_hex()),
+            });
         }
         Ok(())
     }
