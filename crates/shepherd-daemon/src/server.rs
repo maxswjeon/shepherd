@@ -72,6 +72,55 @@ pub enum ServerError {
 fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
+    // `geteuid`, not `/proc/self`. `/proc` is Linux, this module is `cfg(unix)`,
+    // and a missing `/proc` made the lookup return `None` — which SKIPPED the
+    // ownership check entirely on macOS. Root binding inside another user's
+    // existing `0700` directory then passed both remaining tests, and that user
+    // could unlink the socket and answer privileged clients in its place. An
+    // authorization check that disables itself where it cannot read a Linux
+    // filesystem is worse than one that is absent, because the code reads as
+    // though it is present.
+    //
+    // SAFETY: `geteuid` is infallible per POSIX — no error return, no memory
+    // touched. Same call `secure_state_dir` already makes.
+    let me = unsafe { libc::geteuid() };
+
+    // Every ANCESTOR, not only the leaf — and BEFORE anything is created, so a
+    // path this refuses is left exactly as it was found.
+    //
+    // The leaf checks below describe the directory the pathname resolves to
+    // today. An ancestor a third party can REPLACE defeats all of them: swap
+    // `/srv/run` for a directory holding the attacker's socket and clients,
+    // which follow the CONFIGURED path, reach them while the leaf this
+    // validated is still ours and still `0700`.
+    //
+    // Round 29 refused any symlinked ancestor outright, which was both too
+    // strict and not the property: it made the daemon unstartable on macOS,
+    // where `$TMPDIR` and `/tmp` alike sit under `/var -> private/var`, while
+    // still permitting a world-writable ancestor that anyone could rename. Who
+    // OWNS a link never mattered as much as who can replace it — so both walks
+    // ask the one question that does, and a link only we or root can repoint is
+    // no weaker than a directory only we or root can rename.
+    //
+    // Two walks, because either alone has a hole: the configured path judges
+    // each symlink by the link itself, and the resolved path covers the
+    // directories ABOVE a link's target, which the first walk never names.
+    // `canonicalize` needs the path to exist, so it runs on the deepest
+    // existing ancestor; nothing below that exists to be substituted yet.
+    check_ancestry(dir, me)?;
+    let mut deepest = dir;
+    while std::fs::symlink_metadata(deepest).is_err() {
+        match deepest.parent() {
+            Some(p) => deepest = p,
+            None => break,
+        }
+    }
+    if let Ok(real) = deepest.canonicalize()
+        && real != deepest
+    {
+        check_ancestry(&real, me)?;
+    }
+
     // CREATE owner-only, or VERIFY — never seize.
     //
     // This used to `chmod 0700` whatever the socket's parent happened to be,
@@ -107,18 +156,6 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
     }
 
     let md = std::fs::metadata(dir).map_err(|e| format!("cannot stat {}: {e}", dir.display()))?;
-    // `geteuid`, not `/proc/self`. `/proc` is Linux, this module is `cfg(unix)`,
-    // and a missing `/proc` made the lookup return `None` — which SKIPPED the
-    // ownership check entirely on macOS. Root binding inside another user's
-    // existing `0700` directory then passed both remaining tests, and that user
-    // could unlink the socket and answer privileged clients in its place. An
-    // authorization check that disables itself where it cannot read a Linux
-    // filesystem is worse than one that is absent, because the code reads as
-    // though it is present.
-    //
-    // SAFETY: `geteuid` is infallible per POSIX — no error return, no memory
-    // touched. Same call `secure_state_dir` already makes.
-    let me = unsafe { libc::geteuid() };
     if md.uid() != me {
         return Err(format!(
             "{} is owned by uid {} and this daemon runs as {me}; the socket's directory must \
@@ -127,47 +164,6 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
             md.uid()
         ));
     }
-    // Every ANCESTOR, not only the leaf.
-    //
-    // The checks above describe the directory the pathname resolves to today.
-    // A symlinked ancestor another account controls — `/tmp/link` pointing at
-    // our own `0700` directory — passes all of them, and can then be retargeted
-    // at a directory holding the attacker's socket. Clients follow the
-    // CONFIGURED path, so they reach the attacker while the leaf this validated
-    // is still ours and still `0700`.
-    //
-    // Refused rather than resolved: `canonicalize` would validate the target
-    // and leave the same link free to move afterwards, which is the residual
-    // that makes this a check rather than a guarantee. The complete form is
-    // opening the directory and binding relative to that descriptor, which is
-    // the `openat` work in #3 — this refuses the arrangement that makes the
-    // window reachable by anyone but us.
-    let mut walked = std::path::PathBuf::new();
-    for part in dir.components() {
-        walked.push(part);
-        let Ok(link_md) = std::fs::symlink_metadata(&walked) else {
-            continue;
-        };
-        if link_md.file_type().is_symlink() {
-            return Err(format!(
-                "{} is a symbolic link on the way to the socket directory. Whoever controls \
-                 that link controls where clients connect — they can point it elsewhere after \
-                 this check and answer as the daemon — so a socket path is required to be \
-                 free of links",
-                walked.display()
-            ));
-        }
-        if link_md.uid() != me && link_md.uid() != 0 {
-            return Err(format!(
-                "{} is owned by uid {} on the way to the socket directory, and neither this \
-                 daemon ({me}) nor root. An account that can rename a component of this path \
-                 can move the socket out from under every client that follows it",
-                walked.display(),
-                link_md.uid()
-            ));
-        }
-    }
-
     let mode = md.permissions().mode() & 0o777;
     if mode != 0o700 {
         return Err(format!(
@@ -179,6 +175,69 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
              yourself",
             dir.display()
         ));
+    }
+    Ok(())
+}
+
+/// Refuse a path any account but this daemon or root could re-point.
+///
+/// Asked of every component, of both the configured path and the path it
+/// resolves to. Two conditions, and the second is what lets the first stay
+/// narrow:
+///
+/// * **Owner** — a component owned by a third party is one they can replace,
+///   whatever it currently points at. `symlink_metadata` deliberately does not
+///   follow: for a symlink the question is who owns the LINK, since that is
+///   what gets repointed.
+/// * **Writability** — a directory anyone may write is one anyone may rename
+///   entries in, so ownership of the entry stops mattering. The sticky bit is
+///   the exception and the reason `/tmp` and `/var/folders` are usable at all:
+///   with it set, only an entry's owner may remove or rename it.
+///
+/// WORLD-writable, deliberately, and not group-writable. `o+w` is the
+/// unambiguous one: it names every account on the machine. `g+w` names a set
+/// the operator chose, and on the dominant Linux layout — a per-user primary
+/// group under umask 002 — that set is the owner alone, which is why an
+/// ordinary `$HOME` tree is `0775` all the way down. Refusing that would have
+/// traded a rule that made the daemon unstartable on macOS for one that makes
+/// it unstartable on Ubuntu, and this check caught exactly that in CI. Whether
+/// a given group has other members is not answerable from a `stat` — primary
+/// memberships never appear in `gr_mem` — so the residual is left to the
+/// operator and to #3's `openat`, rather than guessed at.
+///
+/// The residual is unchanged and is issue #3's `openat` work: a component we
+/// ourselves own can still move between this check and the bind. Nobody else
+/// can move it, which is what this buys.
+fn check_ancestry(path: &Path, me: u32) -> std::result::Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut walked = std::path::PathBuf::new();
+    for part in path.components() {
+        walked.push(part);
+        // A component that does not exist yet cannot be the one in the way,
+        // and will be created `0700` by us.
+        let Ok(md) = std::fs::symlink_metadata(&walked) else {
+            continue;
+        };
+        if md.uid() != me && md.uid() != 0 {
+            return Err(format!(
+                "{} is owned by uid {} on the way to the socket directory, and neither this \
+                 daemon ({me}) nor root. An account that can replace a component of this path \
+                 can move the socket out from under every client that follows it",
+                walked.display(),
+                md.uid()
+            ));
+        }
+        let mode = md.mode() & 0o7777;
+        if md.is_dir() && mode & 0o002 != 0 && mode & 0o1000 == 0 {
+            return Err(format!(
+                "{} is mode {mode:04o} on the way to the socket directory: world-writable and \
+                 not sticky, so any account may rename what is inside it and put their own \
+                 socket at this path. Either set the sticky bit on it, as `/tmp` has, or point \
+                 `SHEPHERD_SOCKET` somewhere only this daemon and root can write",
+                walked.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -1575,6 +1634,86 @@ mod tests {
     /// made them pass — locking every other user and service out of `/run` or
     /// `/tmp`. A directory this daemon did not create is checked, not seized.
     #[cfg(unix)]
+    /// A symlink on the way in is judged by who can REPLACE it, not by being
+    /// a symlink.
+    ///
+    /// Round 29 refused any symlinked ancestor outright. That is unsatisfiable
+    /// on macOS — `$TMPDIR` and `/tmp` both sit under `/var -> private/var`, so
+    /// the daemon could not start and eight unrelated tests failed there while
+    /// passing on Linux, which is how the rule's real cost surfaced. A link
+    /// only this daemon or root can repoint is no weaker than a directory only
+    /// this daemon or root can rename, and refusing it buys nothing.
+    ///
+    /// The link is deliberately pointed at a SIBLING, so the canonical path
+    /// differs from the configured one and both walks have to run: the first
+    /// judges the link itself, the second the directories above its target.
+    #[test]
+    fn a_symlinked_ancestor_this_daemon_owns_is_accepted() {
+        let base = tmp_socket("anc").parent().unwrap().to_path_buf();
+        let real = base.join("real");
+        mkdir_owner_only(&real);
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+
+        let path = base.join("link").join("s").join("daemon.sock");
+        let bound = bind(&path, &base.join("d.lock"))
+            .expect("a link this daemon owns must not block startup");
+        assert!(
+            real.join("s").join("daemon.sock").exists(),
+            "and the socket lands on the link's target"
+        );
+        drop(bound);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An ancestor anyone may write is refused unless it is sticky — and the
+    /// refusal creates nothing.
+    ///
+    /// This is the hole the old symlink rule left open while it was busy
+    /// refusing `/var`: ownership of a component stops mattering once the
+    /// directory holding it is writable by others, because renaming an entry
+    /// needs write permission on the directory, not on the entry. The sticky
+    /// bit is the exception, and the reason `/tmp` is usable at all.
+    ///
+    /// The `0775` case is the other half of the test and not an afterthought:
+    /// the first draft of this rule refused group-writable too, which is the
+    /// mode an ordinary Ubuntu `$HOME` carries, and it took every e2e test in
+    /// the workspace down with it. A group is a set the operator chose; the
+    /// world is not.
+    #[test]
+    fn a_world_writable_ancestor_is_refused_unless_sticky() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tmp_socket("wr").parent().unwrap().to_path_buf();
+        let open = base.join("open");
+        mkdir_owner_only(&open);
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let path = open.join("s").join("daemon.sock");
+        let err = bind(&path, &base.join("d.lock"))
+            .expect_err("a directory anyone may rename inside must not host the socket");
+        assert!(
+            err.to_string().contains("not sticky"),
+            "the refusal must name what is wrong with it: {err}"
+        );
+        assert!(
+            !open.join("s").exists(),
+            "and a refused path must be left exactly as it was found"
+        );
+
+        // THE ACCEPTING DIRECTIONS: the mode `/tmp` carries, and the mode an
+        // ordinary home directory carries.
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let bound = bind(&path, &base.join("d.lock")).expect("sticky is what `/tmp` has");
+        drop(bound);
+        let _ = std::fs::remove_dir_all(open.join("s"));
+
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let bound = bind(&path, &base.join("d.lock"))
+            .expect("group-writable is what an ordinary $HOME carries");
+        drop(bound);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn an_existing_shared_directory_is_refused_rather_than_chmodded() {
         use std::os::unix::fs::PermissionsExt;
@@ -1701,9 +1840,11 @@ mod tests {
         // A directory whose mode this daemon cannot set at all. Running as
         // root makes every chmod succeed, so the assertion is skipped there —
         // and the accepting half above still ran.
-        let euid = std::fs::metadata("/proc/self")
-            .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
-            .unwrap_or(0);
+        // SAFETY: infallible per POSIX. `/proc/self` was the old spelling and
+        // it does not exist on macOS, where `unwrap_or(0)` then read as root
+        // and SKIPPED the refusing half of this test — the same self-disabling
+        // check this file removed from `secure_socket_dir`.
+        let euid = unsafe { libc::geteuid() };
         if euid == 0 {
             return;
         }
