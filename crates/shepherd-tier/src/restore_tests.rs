@@ -199,6 +199,39 @@ fn timestamps_round_trip_through_system_time_including_before_the_epoch() {
     }
 }
 
+/// A DANGLING symlink at the original path is an occupied path.
+///
+/// `Path::exists` follows the link, so a dangling one answered "nothing is
+/// here" and the restore chose the original path — after which `create_new`
+/// correctly refused, because a directory entry very much was there. The
+/// restore failed, and every retry failed identically, instead of landing
+/// beside the occupant the way every other occupied path does.
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_is_an_occupied_path() {
+    let dir = TempDir::new("dangling");
+    let target = dir.path("photo.raw");
+    std::os::unix::fs::symlink(dir.path("nothing-here.raw"), &target).unwrap();
+    assert!(
+        !target.exists() && std::fs::symlink_metadata(&target).is_ok(),
+        "the fixture must be a dangling link, or this tests nothing"
+    );
+
+    let m = manifest_for(BYTES, 0o644);
+    let outcome = restore_file(&target, BYTES, &m).expect("the restore must land somewhere");
+
+    assert!(
+        outcome.needs_conflict_alert(),
+        "an occupied path is a conflict, and the user is owed the alert: {outcome:?}"
+    );
+    assert_ne!(outcome.path(), target.to_string_lossy());
+    assert!(
+        std::fs::symlink_metadata(&target).unwrap().is_symlink(),
+        "and the occupant is untouched — restore never replaces"
+    );
+    assert_eq!(std::fs::read(outcome.path()).unwrap(), BYTES);
+}
+
 // --- a failed attempt leaves nothing behind --------------------------------
 
 /// `create_new` succeeding is not the same fact as the restore succeeding.

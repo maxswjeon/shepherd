@@ -494,7 +494,21 @@ pub async fn verify_full_content(
     size: u64,
     chunk: u64,
 ) -> StorageResult<()> {
-    debug_assert!(chunk > 0, "chunk size must be positive");
+    // A RUNTIME refusal, not a `debug_assert!`. The assertion is compiled out
+    // of a release build, and a zero chunk there is not a wrong answer but an
+    // infinite one: every iteration requests a zero-length range, `offset`
+    // never advances, and an adapter that accepts the empty range leaves the
+    // transfer spinning in verification, calling the provider forever. A
+    // verification that cannot terminate is worse than one that refuses.
+    if chunk == 0 {
+        return Err(StorageError::Provider {
+            provider: adapter.capabilities().provider,
+            op: "verify_full_content".into(),
+            detail: "the verification chunk size is zero; a zero-length range never advances \
+                     the offset, so verification would never terminate"
+                .into(),
+        });
+    }
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0u64;
     while offset < size {
@@ -523,6 +537,36 @@ pub async fn verify_full_content(
 
 #[cfg(test)]
 mod tests {
+
+    /// A zero chunk is refused before the loop, not asserted away.
+    ///
+    /// `debug_assert!` is compiled out of a release build, and there the
+    /// failure is not a wrong answer but an infinite one: a zero-length range
+    /// never advances `offset`, so an adapter that accepts the empty range
+    /// leaves verification spinning and calling the provider forever.
+    #[test]
+    fn a_zero_verification_chunk_is_refused_rather_than_spinning() {
+        let adapter = crate::testing::MemAdapter::content_addressed();
+        let key = ObjectKey::new("objects/aa/bb/cc");
+        adapter.put_raw(&key, bytes::Bytes::from_static(b"hello"));
+        let hash = Blake3Hash::from_bytes(*blake3::hash(b"hello").as_bytes());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // The accepting direction first, or "refuse everything" would pass.
+        rt.block_on(verify_full_content(&adapter, &key, hash, 5, 4))
+            .expect("an ordinary chunk verifies");
+
+        let err = rt
+            .block_on(verify_full_content(&adapter, &key, hash, 5, 0))
+            .expect_err("a zero chunk cannot terminate and must not be attempted");
+        assert!(
+            matches!(&err, StorageError::Provider { op, .. } if op == "verify_full_content"),
+            "{err:?}"
+        );
+    }
     use super::*;
 
     #[test]

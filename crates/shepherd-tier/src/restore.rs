@@ -175,7 +175,17 @@ pub fn restore_file(
     manifest: &FidelityManifest,
 ) -> Result<RestoreOutcome> {
     let original_s = original.to_string_lossy().to_string();
-    let target = choose_restore_path(&original_s, &|p| Path::new(p).exists());
+    // `symlink_metadata`, not `exists`. `exists` FOLLOWS the link, so a
+    // DANGLING symlink at the original path answers "nothing is here" — and
+    // then `create_new` correctly refuses, because a directory entry very much
+    // is there. The restore fails, and every retry fails identically, instead
+    // of landing beside the occupant the way every other occupied path does.
+    //
+    // The question this predicate is asked is "is the NAME taken", and a name
+    // is taken by any directory entry whatever it points at.
+    let target = choose_restore_path(&original_s, &|p| {
+        std::fs::symlink_metadata(Path::new(p)).is_ok()
+    });
     let chosen = PathBuf::from(match &target {
         RestoreTarget::Original(p) => p.clone(),
         RestoreTarget::Conflict { chosen, .. } => chosen.clone(),
@@ -320,8 +330,17 @@ fn write_and_verify(
 /// filesystem call across a crate boundary to save four lines would put a
 /// dependency edge where there is no shared concept — the two callers agree on
 /// `fsync(2)`, not on a Shepherd idea.
+#[cfg(unix)]
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
+}
+
+/// POSIX-only, and a no-op elsewhere rather than an error: opening a directory
+/// as a file is not something the Windows API permits, so the durability this
+/// buys on unix is not expressible there. Windows durability is Phase 3's.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Read a restored file's attributes back **through the handle that created

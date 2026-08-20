@@ -72,6 +72,21 @@ pub enum SecretError {
 
 pub type Result<T> = std::result::Result<T, SecretError>;
 
+/// fsync a directory, so a rename into it survives a crash.
+///
+/// POSIX-only, and a no-op elsewhere rather than an error: opening a directory
+/// as a file is not something the Windows API permits, so the durability this
+/// buys on unix is not expressible there.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// A name for a secret. Safe to store in the catalog and to send over IPC.
 ///
 /// Constrained to `[a-z0-9._/-]` so it can be embedded in an environment
@@ -341,6 +356,22 @@ impl KeyfileStore {
         })?;
         write_private(&tmp, &json).map_err(io)?;
         std::fs::rename(&tmp, &self.path).map_err(io)?;
+
+        // The RENAME, made durable. `write_private` fsyncs the temp file, which
+        // makes its contents survive and says nothing about the directory entry
+        // that replaces the old name with it. A power loss here has three
+        // shapes and all of them are wrong for a credential store: a first
+        // write disappears, an update reverts to the previous credential, and a
+        // deleted secret comes back.
+        //
+        // The last is the one that decides it. `delete` goes through here too,
+        // so without this a secret the user removed can reappear after a crash
+        // — a credential outliving its own revocation.
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            sync_dir(parent).map_err(io)?;
+        }
         Ok(())
     }
 }

@@ -158,6 +158,23 @@ impl DestroyPermit<'_> {
     }
 }
 
+/// fsync a directory, so an entry created in it survives a crash.
+///
+/// POSIX-only, and a no-op elsewhere rather than an error: opening a directory
+/// as a file is not something the Windows API permits, so the durability this
+/// buys on unix simply is not expressible there. Silently doing nothing is the
+/// honest translation — Windows durability is Phase 3's, along with the rest of
+/// the platform.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 impl AuditLog {
     /// Open the log, creating the file and **durably publishing its name**
     /// before any destruction can be admitted.
@@ -188,9 +205,7 @@ impl AuditLog {
             .open(path)
             .map_err(|e| io(path, e))?;
         if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)
-                .and_then(|d| d.sync_all())
-                .map_err(|e| io(parent, e))?;
+            sync_dir(parent).map_err(|e| io(parent, e))?;
         }
         Ok(Self {
             path: path.to_path_buf(),
