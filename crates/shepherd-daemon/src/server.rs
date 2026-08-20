@@ -53,6 +53,57 @@ pub enum ServerError {
     Bind { path: String, detail: String },
 }
 
+/// The socket's directory must be owner-only and OURS, or there is no
+/// authorization model.
+///
+/// §4.3 says it plainly: "Authorization is filesystem/pipe permissions only".
+/// The socket being `0600` is half of it; the other half is that nobody else
+/// can unlink the name and put their own listener there. A `let _ =` on the
+/// chmod threw that half away — point `SHEPHERD_SOCKET` at an existing
+/// group-writable directory owned by someone else and the daemon happily binds
+/// inside it, after which any member of that group can replace the socket and
+/// impersonate the daemon to every later client.
+///
+/// So the mode is ENFORCED, and ownership is checked rather than assumed:
+/// `chmod` succeeding proves we own the directory on Linux, but a directory we
+/// own with a mode we could not tighten, or one owned by someone else, are both
+/// refusals rather than warnings. A refusal here costs the operator one
+/// `SHEPHERD_SOCKET` change; not refusing costs the whole trust boundary.
+fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        format!(
+            "cannot make {} owner-only ({e}); the socket's directory is the whole \
+             authorization model (§4.3), and a directory this daemon cannot secure is one \
+             another user can replace the socket in",
+            dir.display()
+        )
+    })?;
+
+    let md = std::fs::metadata(dir).map_err(|e| format!("cannot stat {}: {e}", dir.display()))?;
+    let me = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+    if let Some(me) = me
+        && md.uid() != me
+    {
+        return Err(format!(
+            "{} is owned by uid {} and this daemon runs as {me}; the socket's directory must \
+             be ours, or another user can unlink the socket and answer in its place",
+            dir.display(),
+            md.uid()
+        ));
+    }
+    let mode = md.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(format!(
+            "{} is mode {mode:04o} after being set to 0700; the socket's directory must be \
+             owner-only, and a filesystem that will not keep it so cannot host the socket",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Name a file type for the refusal message, so the operator knows what is
 /// in the way without having to `stat` it themselves.
 fn describe_file_type(ft: std::fs::FileType) -> &'static str {
@@ -97,8 +148,7 @@ pub fn bind(path: &Path, lock_path: &Path) -> Result<Bound, ServerError> {
     {
         std::fs::create_dir_all(parent)
             .map_err(|e| err(format!("cannot create {}: {e}", parent.display())))?;
-        // The directory is the outer half of the permission story.
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        secure_socket_dir(parent).map_err(err)?;
     }
 
     // --- one daemon per socket, and the lock says so -----------------------
@@ -869,6 +919,60 @@ mod tests {
         assert_eq!(dir_mode, 0o700, "socket directory mode is {dir_mode:04o}");
         drop(listener);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A socket directory that cannot be made owner-only is REFUSED, not
+    /// warned about.
+    ///
+    /// §4.3: "Authorization is filesystem/pipe permissions only". The socket
+    /// being `0600` is half of it; the other half is that nobody else can
+    /// unlink the name and put their own listener there. A `let _ =` on the
+    /// chmod discarded that half, so pointing `SHEPHERD_SOCKET` at an existing
+    /// group-writable directory owned by someone else bound happily inside it —
+    /// after which any member of that group can replace the socket and answer
+    /// as the daemon to every later client.
+    ///
+    /// Driven through a directory whose mode will not stick, which is what an
+    /// un-chmod-able directory looks like from here.
+    #[test]
+    fn a_socket_directory_that_cannot_be_secured_is_refused() {
+        let path = tmp_socket("insecure");
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The accepting direction first: an ordinary owner-only directory binds.
+        let ok = bind(&path, &path.with_extension("lock")).expect("an ordinary directory binds");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "and it is left owner-only"
+        );
+        drop(ok);
+        std::fs::remove_file(&path).ok();
+
+        // A directory whose mode this daemon cannot set at all. Running as
+        // root makes every chmod succeed, so the assertion is skipped there —
+        // and the accepting half above still ran.
+        let euid = std::fs::metadata("/proc/self")
+            .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+            .unwrap_or(0);
+        if euid == 0 {
+            return;
+        }
+        let foreign = std::path::Path::new("/proc/sys");
+        if std::fs::metadata(foreign).is_ok() {
+            let err = bind(
+                &foreign.join("shepherd-test.sock"),
+                &path.with_extension("lock"),
+            )
+            .expect_err("a directory this daemon cannot secure must not host the socket");
+            assert!(
+                err.to_string().contains("authorization model")
+                    || err.to_string().contains("cannot create"),
+                "the refusal must say why the directory is unusable: {err}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A killed daemon leaves a socket file behind. Without this, every restart

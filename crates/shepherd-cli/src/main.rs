@@ -66,16 +66,42 @@ fn main() -> ExitCode {
     let matches = build_cli().get_matches();
     let json = matches.get_flag("json");
 
+    // A streaming command's `--json` output is NDJSON — one compact JSON value
+    // per line — and its closing envelope has to be one too. Pretty-printing it
+    // spanned several lines, so a consumer reading the documented stream
+    // line-by-line parsed every event correctly and then failed on the first
+    // line of the summary.
+    //
+    // Only the streaming commands, rather than making every `--json` output
+    // compact: a one-shot `shepctl status --json` is read by people as often as
+    // by scripts, and the pretty form is the reason it is legible. The
+    // difference is a property of the OUTPUT SHAPE — a stream versus a
+    // document — not a preference.
+    let style = match resolve_method(&matches) {
+        Some((MethodKind::EventsSubscribe, _)) => JsonStyle::Ndjson,
+        _ => JsonStyle::Document,
+    };
+
     match run(&matches) {
         Ok(data) => {
-            emit(&CliEnvelope::ok(data), json);
+            emit(&CliEnvelope::ok(data), json, style);
             ExitCode::from(EXIT_OK)
         }
         Err(failure) => {
-            emit(&CliEnvelope::failed(failure.error.clone()), json);
+            emit(&CliEnvelope::failed(failure.error.clone()), json, style);
             ExitCode::from(failure.exit)
         }
     }
+}
+
+/// How `--json` output is shaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonStyle {
+    /// One document, pretty-printed, for a command that answers once.
+    Document,
+    /// One compact value per line, for a command that streams — the closing
+    /// envelope included, or the stream is not NDJSON.
+    Ndjson,
 }
 
 struct Failure {
@@ -348,11 +374,15 @@ fn rpc_failure(e: &client::ClientError) -> Failure {
     }
 }
 
-fn emit(envelope: &CliEnvelope, json: bool) {
+fn emit(envelope: &CliEnvelope, json: bool, style: JsonStyle) {
     if json {
+        let rendered = match style {
+            JsonStyle::Document => serde_json::to_string_pretty(envelope),
+            JsonStyle::Ndjson => serde_json::to_string(envelope),
+        };
         println!(
             "{}",
-            serde_json::to_string_pretty(envelope)
+            rendered
                 .unwrap_or_else(|e| format!("{{\"schema_version\":1,\"ok\":false,\"error\":{{\"code\":\"internal_error\",\"message\":\"{e}\"}}}}"))
         );
         return;

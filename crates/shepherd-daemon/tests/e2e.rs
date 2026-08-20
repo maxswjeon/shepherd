@@ -2480,6 +2480,74 @@ fn a_resuming_subscription_is_answered_before_the_frames_it_replays() {
     );
 }
 
+/// `events subscribe --json` is NDJSON to the last line.
+///
+/// The events were compact, one per line, and the closing envelope was
+/// pretty-printed — so a consumer reading the documented stream line-by-line
+/// parsed every event correctly and then failed on the first line of the
+/// summary. The envelope is part of the stream, not a document appended to it.
+#[test]
+fn the_subscription_json_stream_is_ndjson_including_its_envelope() {
+    let d = Daemon::start("ndjson");
+    let mut c = d.connect();
+    seed_some_events(&d, &mut c, "ndjson");
+    drop(c);
+
+    let mut cmd = Command::new(shepctl());
+    cmd.arg("--socket")
+        .arg(&d.socket)
+        .args(["events", "subscribe", "--json", "--resume-from", "0"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("run shepctl");
+
+    let stdout = child.stdout.take().expect("piped");
+    let reader = BufReader::new(stdout);
+    let collected = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&collected);
+    let pump = std::thread::spawn(move || {
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            sink.lock().unwrap().push(line);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if collected
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("\"seq\""))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = std::process::Command::new("kill")
+        .arg(d.child.id().to_string())
+        .status();
+    let _ = child.wait();
+    pump.join().expect("stdout pump");
+
+    let lines = collected.lock().unwrap().clone();
+    assert!(!lines.is_empty(), "the stream rendered nothing");
+    for (i, line) in lines.iter().enumerate() {
+        serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|e| {
+            panic!(
+                "line {i} of an NDJSON stream is not one JSON value ({e}): {line:?}\n\
+                 full output: {lines:?}"
+            )
+        });
+    }
+    assert!(
+        lines
+            .last()
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .is_some_and(|v| v.get("schema_version").is_some()),
+        "the last line must be the closing envelope: {lines:?}"
+    );
+}
+
 /// `snapshot_required` reaches the user BEFORE the first event, not after the
 /// last one.
 ///
@@ -2633,21 +2701,28 @@ fn subscribe_until_eof(d: &Daemon, extra: &[&str]) -> (serde_json::Value, Vec<se
         "end of stream is how this command ends; it is not a failure. lines: {lines:?}"
     );
 
-    // Event lines are single-line JSON objects; the closing envelope is
-    // pretty-printed, so it is everything from the first line that is a bare `{`.
+    // NDJSON, all the way through: one compact JSON value per line, the closing
+    // envelope included. It used to be pretty-printed, which meant a consumer
+    // reading the documented stream line-by-line parsed every event and then
+    // failed on the first line of the summary — so this helper parsed it by
+    // looking for a bare `{`, encoding the very shape that was wrong.
+    //
+    // The envelope is the value carrying `schema_version`; everything before it
+    // is an event or a warning record.
     let mut events = Vec::new();
-    let mut envelope_from = lines.len();
-    for (i, line) in lines.iter().enumerate() {
-        if line == "{" {
-            envelope_from = i;
-            break;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+    let mut envelope = None;
+    for line in &lines {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            panic!("every line of `--json` output must be one JSON value: {line:?}");
+        };
+        if v.get("schema_version").is_some() {
+            envelope = Some(v);
+        } else {
             events.push(v);
         }
     }
-    let envelope: serde_json::Value = serde_json::from_str(&lines[envelope_from..].join("\n"))
-        .unwrap_or_else(|e| panic!("the closing envelope is not JSON ({e}): {lines:?}"));
+    let envelope =
+        envelope.unwrap_or_else(|| panic!("no closing envelope in the stream: {lines:?}"));
     (envelope, events)
 }
 

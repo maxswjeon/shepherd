@@ -1153,11 +1153,15 @@ async fn a_destroy_already_admitted_does_not_unlink_after_another_one_halts_the_
     let c = custodian(AttestationMode::Version, f.hash);
     let (second, second_id, second_fs_id) = sibling(&f, "second.bin");
 
-    // Every append now fails at `open`: the same mechanism
+    // Every append now fails: the same mechanism
     // `audit::tests::a_failed_write_halts_destruction` uses. `AuditLog::open`
-    // creates the parent directory and not the file, so the name is free.
-    std::fs::create_dir(f.tmp.0.join("audit").join("destroy.jsonl"))
-        .expect("block the audit log with a directory at its path");
+    // creates the file and fsyncs its parent, so the file is REPLACED by a
+    // directory here rather than the name being left free — an audit log that
+    // becomes unwritable after the daemon started, which is the case that can
+    // still surprise an admitted destruction.
+    let log_path = f.tmp.0.join("audit").join("destroy.jsonl");
+    std::fs::remove_file(&log_path).expect("the log was created at open");
+    std::fs::create_dir(&log_path).expect("block the audit log with a directory at its path");
 
     let req2 = LocalDestroyRequest {
         path: &second,

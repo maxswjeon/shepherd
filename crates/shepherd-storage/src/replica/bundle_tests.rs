@@ -100,33 +100,69 @@ fn a_custody_tombstone_yields_to_a_live_assertion_it_does_not_dominate() {
     // Tombstoned on every branch, asserted live on none: gone.
     assert!(merge_custody(std::slice::from_ref(&dead)).is_empty());
 
-    // Concurrent — the SAME clock, which is the only concurrency a
-    // `(writer_epoch, seq)` clock can express — and the tie goes to `live`.
-    // This is the case that separates the custody reducer from the
-    // durable-config one: there, delete wins; here, honouring a tombstone
-    // costs the only surviving address of a file whose original may already be
+    // A tombstone from a DIFFERENT epoch retires nothing. `writer_epoch`
+    // increments on every daemon start, so a writer restarted from a stale
+    // predecessor publishes a higher-epoch tombstone without ever having
+    // observed this branch — and its live assertion may be the only one there
+    // is. This is also the case that separates the custody reducer from the
+    // durable-config one: there, delete wins; here, honouring a tombstone costs
+    // the only surviving address of a file whose original may already be
     // destroyed, while keeping a duplicate costs nothing.
-    let concurrent_live = custody("docs/a.txt", 1, 1, clock(9, 9), false);
-    let merged = merge_custody(&[dead.clone(), concurrent_live.clone()]);
-    assert_eq!(
-        merged.len(),
-        1,
-        "a live assertion the tombstone does not dominate must defeat it"
-    );
-    assert_eq!(merged[0].key, concurrent_live.key);
-    assert!(!merged[0].tombstone);
-
-    // A NEWER live assertion is a genuine re-assertion and survives too.
-    let reasserted = custody("docs/a.txt", 1, 1, clock(10, 1), false);
-    let merged = merge_custody(&[dead.clone(), reasserted]);
-    assert_eq!(merged.len(), 1);
-    assert!(!merged[0].tombstone);
+    for other_branch in [
+        // Genuinely concurrent: the same clock.
+        custody("docs/a.txt", 1, 1, clock(9, 9), false),
+        // A lower epoch — the tombstone's writer counted higher, which says
+        // nothing about whether it saw this.
+        custody("docs/a.txt", 1, 1, clock(1, 5), false),
+        // A higher epoch — a re-assertion, and equally unretired.
+        custody("docs/a.txt", 1, 1, clock(10, 1), false),
+    ] {
+        let merged = merge_custody(&[dead.clone(), other_branch.clone()]);
+        assert_eq!(
+            merged.len(),
+            1,
+            "a tombstone from another epoch retired a live assertion it never observed: \
+             {other_branch:?}"
+        );
+        assert!(!merged[0].tombstone);
+    }
 
     // Distinct target: unaffected by the other target's tombstone.
     let other_target = custody("docs/a.txt", 1, 2, clock(1, 5), false);
     let merged = merge_custody(&[dead, other_target]);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].target, TargetId::new(2));
+}
+
+/// A tombstone published by a RESTARTED writer does not retire a sibling
+/// branch's only live assertion.
+///
+/// `LogicalClock` is a counter, not a causal clock, and these records arrive
+/// flattened across every valid fork branch — so a higher `(epoch, seq)` says
+/// only that some writer counted higher. A writer resuming from a stale
+/// predecessor does exactly that without having observed the sibling branch,
+/// and reading it as domination filtered out a custody record nothing had
+/// retired: the only address of bytes whose original may already be gone.
+#[test]
+fn a_restarted_writers_tombstone_does_not_retire_another_branch() {
+    // Branch A: the only live assertion, from the run that made it.
+    let live = custody("docs/a.txt", 1, 1, clock(4, 12), false);
+    // Branch B: a later run, resumed from a predecessor that never carried A,
+    // retiring what IT believed the record to be.
+    let tombstone = custody("docs/a.txt", 1, 1, clock(7, 1), true);
+
+    let merged = merge_custody(&[tombstone.clone(), live.clone()]);
+    assert_eq!(
+        merged.len(),
+        1,
+        "the surviving branch's custody record was filtered out by a tombstone that never \
+         observed it"
+    );
+    assert_eq!(merged[0].clock, live.clock);
+    assert!(!merged[0].tombstone);
+
+    // Order-independent, as a merge must be.
+    assert_eq!(merge_custody(&[live, tombstone]).len(), 1);
 }
 
 /// A live record retired later by the SAME writer stays retired.

@@ -200,22 +200,39 @@ pub fn bundle_class_of(class: CustodyClass) -> Option<BundleClass> {
 /// greater than a live assertion's — concurrent with it, or older than it — is
 /// ignored, and a tie goes to `live`.
 ///
-/// # Sequential retirement is not concurrency, and used to be treated as it
+/// # Three wrong rules, and why this is the one that is left
 ///
-/// An earlier version ignored tombstones **entirely**: it filtered them out
-/// before grouping, so a live record survived any tombstone at all. That is
-/// correct against a concurrent branch and wrong against the writer's own
-/// history — live at `(1, 1)` followed by a tombstone at `(1, 2)` is an
-/// ordinary retirement, and dropping the tombstone resurrected a discarded
-/// remote location during disaster recovery, which is a location that no longer
-/// holds the object.
+/// The first version kept a separate tombstone set and subtracted it at the
+/// end, which quietly implemented *delete-wins* — the custody reducer with the
+/// durable-config reducer's rule, and the one direction that can drop the only
+/// remaining address of a destroyed file.
 ///
-/// The version before THAT kept a separate tombstone set and subtracted it at
-/// the end, which quietly implemented *delete-wins* — the custody reducer with
-/// the durable-config reducer's rule, and the one direction that can drop the
-/// only remaining address of a destroyed file. Domination is the rule that is
-/// neither: it honours the writer's own ordering and refuses to let one
-/// branch's delete erase another's assertion.
+/// The second ignored tombstones **entirely**, filtering them out before
+/// grouping. Correct against a concurrent branch, wrong against the writer's
+/// own history: live at `(1, 1)` then a tombstone at `(1, 2)` is an ordinary
+/// retirement, and resurrecting it hands a recovering user a remote location
+/// that no longer holds the object.
+///
+/// The third compared clocks numerically and called the larger one dominant.
+/// That reads a COUNTER as a causal clock. These records arrive flattened
+/// across every valid fork branch, and a writer restarted from a stale
+/// predecessor publishes a tombstone with a higher `writer_epoch` without ever
+/// having seen the sibling branch — whose live assertion may be the only one
+/// there is. The numeric comparison then filtered it out.
+///
+/// What is left is the comparison the clock can actually justify: same
+/// `writer_epoch`, higher `seq` — one writer's own ordering, on one branch.
+///
+/// # What that costs, and why it is the right cost
+///
+/// A retirement that crosses a restart is not honoured, so a stale custody
+/// record can survive a merge. That is the safe direction and the one this
+/// whole file is arranged around: a duplicate custody record costs a wasted
+/// lookup, and a dropped one costs the only address of bytes whose original may
+/// already be destroyed. Honouring cross-branch retirement needs branch
+/// ancestry carried into the reduction — the pointer chain has it, this
+/// signature does not — and that is a merge contract for whoever wires the
+/// publisher, not something to infer from a counter.
 pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
     let mut by_key: BTreeMap<(CustodyKey, i64), Vec<&CustodyRecord>> = BTreeMap::new();
     for r in records {
@@ -227,20 +244,32 @@ pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
 
     let mut live: Vec<CustodyRecord> = Vec::new();
     for (_, group) in by_key {
-        // The newest tombstone for this key, if any. Only it can retire
-        // anything: a tombstone older than another tombstone retires a strict
-        // subset of what that one does.
-        let newest_tomb = group.iter().filter(|r| r.tombstone).map(|r| r.clock).max();
+        // A live assertion survives unless some tombstone PROVABLY FOLLOWS it.
+        //
+        // "Provably" is doing the work. `LogicalClock` is a counter, not a
+        // causal clock, and these records arrive flattened across every valid
+        // fork branch — so `t.clock > l.clock` says only that some writer
+        // counted higher, which a restarted writer resuming from a stale
+        // predecessor does without having observed the sibling branch at all.
+        // Reading that as domination let such a tombstone filter out the only
+        // live assertion of a record it never retired.
+        //
+        // Within ONE `writer_epoch` the ordering is that writer's own, and a
+        // higher `seq` really is later on the same branch. That is the whole
+        // set of comparisons this clock can justify, so it is the whole set
+        // applied.
+        let retired = |l: &CustodyRecord| {
+            group.iter().any(|t| {
+                t.tombstone
+                    && t.clock.writer_epoch == l.clock.writer_epoch
+                    && t.clock.seq > l.clock.seq
+            })
+        };
 
-        // Among the live assertions this tombstone does NOT dominate, the
-        // best-attested one. `>=` on the tombstone side would make a tie go to
-        // the delete, which is the direction this reducer exists to refuse.
         let survivor = group
             .iter()
             .filter(|r| !r.tombstone)
-            // `>=`, i.e. "not dominated": a tie goes to `live`, which is this
-            // reducer's stated asymmetry.
-            .filter(|r| newest_tomb.is_none_or(|t| r.clock >= t))
+            .filter(|r| !retired(r))
             .max_by_key(|r| r.clock);
 
         if let Some(s) = survivor {

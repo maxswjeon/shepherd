@@ -822,10 +822,20 @@ async fn a_resume_refuses_to_complete_over_parts_an_earlier_attempt_mis_uploaded
          planned parts 3-4. Published {:?}",
         rig.adapter.object(&rig.key)
     );
+    // Not merely "before `Completing`" — FINISHED. The mismatch is terminal, so
+    // the session is abandoned and its provider-side parts released; leaving it
+    // in `Uploading` was the state a session accrues storage in forever,
+    // because replanning the edited file picks a different content-addressed
+    // key and nothing revisits this one.
     assert_eq!(
         resumed.state,
-        TransferState::Uploading,
-        "the resume must fail before `Completing`"
+        TransferState::Aborted(AbortOutcome::Clean),
+        "a terminal mismatch inside the part loop must abandon its session too"
+    );
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        0,
+        "and the abandonment has to reach the provider"
     );
     assert!(
         matches!(err, StorageError::ContentMismatch { .. }),

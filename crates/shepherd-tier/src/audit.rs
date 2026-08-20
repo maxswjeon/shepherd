@@ -159,12 +159,38 @@ impl DestroyPermit<'_> {
 }
 
 impl AuditLog {
+    /// Open the log, creating the file and **durably publishing its name**
+    /// before any destruction can be admitted.
+    ///
+    /// The file is created here rather than by the first `append`, and its
+    /// parent directory is fsynced. `sync_all` on a freshly created file makes
+    /// its CONTENTS durable and says nothing about the directory entry that
+    /// names it, so on a filesystem where a new entry needs its parent fsynced
+    /// a power loss after the first append could lose the audit path and the
+    /// record with it — after an irreversible deletion had already completed.
+    /// That is precisely the outcome this file exists to prevent, arriving
+    /// through the one write it cannot retry.
+    ///
+    /// Done at `open` and not at `append`: the cost is one `fsync` per daemon
+    /// start rather than a branch on the hot path, and `open` happens before
+    /// anything can be destroyed, which is the ordering the guarantee needs.
     pub fn open(path: &Path) -> Result<Self> {
+        let io = |p: &Path, e: std::io::Error| AuditError::Write {
+            path: p.display().to_string(),
+            detail: e.to_string(),
+        };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| AuditError::Write {
-                path: parent.display().to_string(),
-                detail: e.to_string(),
-            })?;
+            std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| io(path, e))?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| io(parent, e))?;
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -333,14 +359,48 @@ mod tests {
     /// A failed audit write halts destruction. The file is already gone by this
     /// point, so refusing this one is not available — stopping the *next* one
     /// is the only protection left.
+    /// The log's NAME is durable before any destruction can be admitted.
+    ///
+    /// `sync_all` on a freshly created file makes its contents durable and says
+    /// nothing about the directory entry naming it. On a filesystem where a new
+    /// entry needs its parent fsynced, a power loss after the first append
+    /// could therefore lose the audit path and the record with it — after an
+    /// irreversible deletion had already completed, through the one write this
+    /// module cannot retry.
+    #[test]
+    fn opening_the_log_creates_and_publishes_it() {
+        let t = Tmp::new("publish");
+        let p = t.0.join("nested").join("destroy.jsonl");
+        assert!(!p.exists());
+
+        let log = AuditLog::open(&p).unwrap();
+
+        assert!(
+            p.exists(),
+            "the log file must exist before anything can be destroyed, not after the first \
+             record is appended to it"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+
+        // And it is a working log, not merely a created file.
+        log.append(&record(1)).unwrap();
+        assert_eq!(log.read_all().len(), 1);
+    }
+
     #[test]
     fn a_failed_write_halts_destruction() {
         let t = Tmp::new("halt");
-        // A directory where the log file should be: opening it for append fails.
         let p = t.0.join("blocked.jsonl");
-        std::fs::create_dir(&p).unwrap();
 
+        // Opened normally FIRST — `open` now creates the file and fsyncs its
+        // parent, so a directory sitting at the path is refused there rather
+        // than at the first append, which is the better failure and not the one
+        // under test. The log is then replaced by a directory, so the next
+        // append fails on a log that had opened cleanly: an audit file that
+        // becomes unwritable after the daemon started.
         let log = AuditLog::open(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
         assert!(!log.is_halted());
         assert!(log.append(&record(1)).is_err());
         assert!(

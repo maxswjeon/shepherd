@@ -682,11 +682,18 @@ impl<'a> TransferDriver<'a> {
         for (part_no, range) in plan.ranges() {
             let body = self.source.read_range(range).await?;
             if body.len() as u64 != range.len {
-                return Err(StorageError::ContentMismatch {
+                // Through `abandon`, like every other terminal mismatch: the
+                // source was truncated under us, `ContentMismatch` is
+                // explicitly non-retryable, and replanning the shortened file
+                // picks a different content-addressed key — so nothing ever
+                // revisits this session and its uploaded parts accrue storage
+                // until the bucket's lifecycle rules notice.
+                let err = StorageError::ContentMismatch {
                     key: session.source.rel_path.clone(),
                     expected: format!("{} bytes at {}", range.len, range.offset),
                     actual: format!("{} bytes", body.len()),
-                });
+                };
+                return Err(self.abandon(session, err).await);
             }
             let local_blake3 = Blake3Hash::from_bytes(*blake3::hash(&body).as_bytes());
             read_back.update(&body);
@@ -711,14 +718,17 @@ impl<'a> TransferDriver<'a> {
                     .find(|p| p.part_no == part_no)
                     .map(|p| p.local_blake3);
                 if recorded != Some(local_blake3) {
-                    return Err(StorageError::ContentMismatch {
+                    // Terminal, so abandoned rather than returned. See the
+                    // truncation branch above and `abandon`.
+                    let err = StorageError::ContentMismatch {
                         key: session.source.rel_path.clone(),
                         expected: format!(
                             "part {part_no} on the provider was read from blake3 {}",
                             recorded.map_or_else(|| "<no checkpoint>".to_owned(), |h| h.to_hex())
                         ),
                         actual: format!("the source now holds blake3 {}", local_blake3.to_hex()),
-                    });
+                    };
+                    return Err(self.abandon(session, err).await);
                 }
                 continue;
             }
