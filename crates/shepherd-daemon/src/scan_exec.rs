@@ -200,18 +200,13 @@ impl Executor for ScanExecutor {
         // about at `root.add` — and no platform outside Linux can answer at
         // all until Phase 3, so demanding an answer here would refuse every
         // scan on macOS and Windows.
-        if let Some(enrolled) = root.volume_id.as_deref()
-            && let Some(current) = shepherd_catalog::volume::current_volume_id(&path)
-            && current != enrolled
-        {
-            return Err(format!(
-                "root {root_id} at {} was enrolled on volume `{enrolled}` and the filesystem \
-                 mounted there now is `{current}`. Scanning would pair this volume's inode \
-                 numbers with the enrolled volume's id, producing `fs_id` values that look \
-                 valid and name files on neither. Re-point the root, or resynchronise it if \
-                 the volume really was replaced",
-                root.path
-            ));
+        if let Some(reason) = volume_refusal(
+            rid,
+            &root.path,
+            root.volume_id.as_deref(),
+            shepherd_catalog::volume::current_volume_id(&path).as_deref(),
+        ) {
+            return Err(reason);
         }
 
         self.publish(root_id, 0, 0, Some(root.path.clone()), false);
@@ -506,6 +501,38 @@ fn summarise_skips(skips: &[Skip]) -> String {
     )
 }
 
+/// Whether the filesystem mounted at a root disagrees with the one it was
+/// enrolled on.
+///
+/// Separated from the probe so the DECISION is testable without a filesystem.
+/// Asking the OS for a volume id is environment-dependent — a machine with no
+/// `/dev/disk/by-uuid`, an overlay root, or any platform whose implementation
+/// is Phase 3's all answer `None` — and a test that depended on the answer
+/// would assert this rule only on the machines that happen to have one.
+///
+/// `None` from either side is not a disagreement. A root enrolled without a
+/// stable identity has nothing to disagree with — that case is warned about at
+/// `root.add` — and demanding an answer the platform cannot give would refuse
+/// every scan on macOS and Windows.
+fn volume_refusal(
+    root_id: RootId,
+    path: &str,
+    enrolled: Option<&str>,
+    current: Option<&str>,
+) -> Option<String> {
+    let (enrolled, current) = (enrolled?, current?);
+    if enrolled == current {
+        return None;
+    }
+    Some(format!(
+        "root {root_id} at {path} was enrolled on volume `{enrolled}` and the filesystem \
+         mounted there now is `{current}`. Scanning would pair this volume's inode numbers \
+         with the enrolled volume's id, producing `fs_id` values that look valid and name \
+         files on neither. Re-point the root, or resynchronise it if the volume really was \
+         replaced"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +554,47 @@ mod tests {
             )
             .unwrap();
         (cat, id)
+    }
+
+    /// A volume swapped under a root is a refusal; everything else is not.
+    ///
+    /// The harm is quiet: a removable disk replaced at the same mount point, or
+    /// a registered symlink retargeted, walks perfectly happily and
+    /// `upsert_file` pairs the NEW volume's inode numbers with the OLD volume
+    /// id. Those `fs_id` values are well-formed and name files on neither
+    /// volume.
+    ///
+    /// All four combinations, because three of them must NOT refuse and each
+    /// is a different reason: identical identities are the ordinary case; a
+    /// root with no recorded identity has nothing to disagree with; and a
+    /// platform that cannot answer must not have every scan refused for it.
+    #[test]
+    fn a_volume_that_disagrees_with_the_enrolled_one_refuses_the_scan() {
+        let id = RootId::new(7);
+
+        let refusal = volume_refusal(id, "/data", Some("uuid:aaa"), Some("uuid:bbb"))
+            .expect("a different filesystem at the same path must refuse");
+        assert!(
+            refusal.contains("uuid:aaa") && refusal.contains("uuid:bbb"),
+            "the refusal must name both identities: {refusal}"
+        );
+
+        assert_eq!(
+            volume_refusal(id, "/data", Some("uuid:aaa"), Some("uuid:aaa")),
+            None,
+            "the same volume is the ordinary case and must scan"
+        );
+        assert_eq!(
+            volume_refusal(id, "/data", None, Some("uuid:bbb")),
+            None,
+            "a root enrolled without a stable identity has nothing to disagree \
+             with; that case is warned about at `root.add`"
+        );
+        assert_eq!(
+            volume_refusal(id, "/data", Some("uuid:aaa"), None),
+            None,
+            "a platform that cannot answer must not have every scan refused"
+        );
     }
 
     /// The ordinary path, asserted so the refusal below cannot be satisfied by

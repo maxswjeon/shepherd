@@ -975,7 +975,31 @@ mod tests {
         if let Some(parent) = lock_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        super::bind(path, super::lock_state_dir(lock_path)?)
+        super::bind(path, take_state_lock(lock_path)?)
+    }
+
+    /// The state lock, waited for past this binary's fork window.
+    ///
+    /// Production takes this lock once, at start-up, and holds it for the
+    /// daemon's life. These tests bind repeatedly against one lock path and
+    /// release in between, which puts them on the same footing as
+    /// [`bind_once_released`]: an `flock` lives on the open file description,
+    /// `fork` duplicates every description into the child until it `exec`s, and
+    /// this binary's service tests shell out on other threads. A lock released
+    /// here can still be alive in somebody else's half-spawned child.
+    ///
+    /// One second, not five: the window was measured at 3.6ms, and the tests
+    /// that want the refusal call [`super::lock_state_dir`] directly rather
+    /// than waiting this out.
+    fn take_state_lock(lock_path: &Path) -> Result<std::fs::File, ServerError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match super::lock_state_dir(lock_path) {
+                Ok(f) => return Ok(f),
+                Err(e) if std::time::Instant::now() >= deadline => return Err(e),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
     }
 
     /// `bind`, retried until the fork window a TEST BINARY opens has closed.
@@ -1239,9 +1263,11 @@ mod tests {
 
         // And it is what `bind` consumes: released with the holder, so an
         // ordinary restart is not blocked by the previous run's file.
+        //
+        // Through the waiter, for the fork window `take_state_lock` documents.
         first.unlock().expect("release");
         drop(first);
-        let again = super::lock_state_dir(&lock_path).expect("released");
+        let again = take_state_lock(&lock_path).expect("released");
         let bound = super::bind(&path, again).expect("bind under the held lock");
         drop(bound);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
@@ -1451,7 +1477,10 @@ mod tests {
             .expect("open the lock the way `bind` does");
         other_daemon.try_lock().expect("and hold it");
 
-        let err = bind(&path, &path.with_extension("lock")).expect_err(
+        // `super::lock_state_dir`, not the waiting shim: this test WANTS the
+        // refusal, and waiting a second for a lock somebody is deliberately
+        // holding would only make it slow.
+        let err = super::lock_state_dir(&path.with_extension("lock")).expect_err(
             "a second daemon bound a socket that was still stale for both of them; the first \
              is now unreachable while both drive the same catalog",
         );

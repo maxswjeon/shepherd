@@ -151,6 +151,27 @@ impl Daemon {
         serde_json::from_str(&raw).expect("config_json is json")
     }
 
+    /// What the daemon recorded as a root's volume identity, if any.
+    ///
+    /// `None` means this machine has no stable identity for that path — no
+    /// `/dev/disk/by-uuid` entry, an overlay or tmpfs source, or a platform
+    /// whose implementation is Phase 3's. Tests that turn on the identity check
+    /// have to read this rather than assume it, or they assert the rule only on
+    /// the machines that happen to have one.
+    fn stored_root_volume(&self, root_id: i64) -> Option<String> {
+        let conn = rusqlite::Connection::open_with_flags(
+            self.dir.join("state").join("catalog.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open the daemon's catalog read-only");
+        conn.query_row(
+            "SELECT volume_id FROM scan_root WHERE id = ?1",
+            [root_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .expect("the root row exists")
+    }
+
     /// Rewrite a root's stored `volume_id`, standing in for the disk under it
     /// having been swapped.
     ///
@@ -914,14 +935,31 @@ fn a_root_whose_volume_changed_refuses_to_scan() {
 
     // The disk is swapped: same path, different filesystem.
     d.forge_root_volume(root_id, "uuid:00000000-0000-0000-0000-000000000000");
-
     c.call("scan.start", serde_json::json!({"root_id": root_id}));
-    let status = wait_for_scan_error(&mut c, root_id);
-    let err = status["last_error"].as_str().unwrap_or_default();
-    assert!(
-        err.contains("was enrolled on volume") && err.contains("mounted there now"),
-        "a scan across a volume swap must refuse and say so: {status}"
-    );
+
+    // WHICH branch this asserts depends on what the machine can answer, and
+    // both are real properties. A runner with no stable identity for the path
+    // — no `/dev/disk/by-uuid`, an overlay root, or macOS, where the
+    // implementation is Phase 3's — records `NULL` and has nothing to compare,
+    // so the scan must still WORK. Asserting the refusal there would be
+    // asserting the environment, not the rule; asserting nothing would be a
+    // green nobody earned. The comparison itself is pinned without a
+    // filesystem by `scan_exec`'s `volume_refusal` unit test.
+    if d.stored_root_volume(root_id).is_some() {
+        let status = wait_for_scan_error(&mut c, root_id);
+        let err = status["last_error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("was enrolled on volume") && err.contains("mounted there now"),
+            "a scan across a volume swap must refuse and say so: {status}"
+        );
+    } else {
+        let status = wait_for_scan(&mut c, root_id);
+        assert!(
+            status["last_error"].is_null(),
+            "this machine records no volume identity for the root, so the forged \
+             one cannot disagree with anything and the scan must proceed: {status}"
+        );
+    }
 }
 
 #[test]
