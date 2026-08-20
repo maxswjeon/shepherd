@@ -684,6 +684,19 @@ impl MemSource {
         self.gone.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// The file SHRANK under the reader: reads return what is left, not an
+    /// error.
+    ///
+    /// A truncation is not a missing file and not an I/O fault. It is a source
+    /// that no longer holds the bytes the plan was built from, and the driver
+    /// has a branch for exactly that — reachable only if the read comes back
+    /// short rather than as `UnexpectedEof`.
+    pub fn truncate_to(&self, len: usize) {
+        let mut i = self.inner.lock().expect("poisoned");
+        let shorter = i.0.slice(..len.min(i.0.len()));
+        i.0 = shorter;
+    }
+
     /// Gone to the READS but not to the fingerprint gate.
     ///
     /// The gate runs once, before the first part; a deletion landing after it

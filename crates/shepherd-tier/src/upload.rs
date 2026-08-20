@@ -203,9 +203,31 @@ impl SourceReader for FileSource {
         let mut f = std::fs::File::open(&self.path).map_err(|e| self.read_error("open", &e))?;
         f.seek(SeekFrom::Start(range.offset))
             .map_err(|e| self.read_error("seek", &e))?;
-        let mut buf = vec![0u8; usize::try_from(range.len).unwrap_or(0)];
-        f.read_exact(&mut buf)
-            .map_err(|e| self.read_error("read", &e))?;
+        // A LOOP over `read`, not `read_exact`, so a source that shrank comes
+        // back SHORT instead of as an error.
+        //
+        // `read_exact` reports a concurrent truncation as `UnexpectedEof`,
+        // which is an ordinary retryable I/O error by kind — so the driver
+        // returned it directly and never reached the abandonment, and on a
+        // final attempt the multipart session stayed allocated. Worse, the
+        // driver's own short-body branch, which exists to abandon exactly this,
+        // was unreachable: `read_exact` never returns a short buffer.
+        //
+        // Returning the short read puts the decision in the one place that
+        // already makes it correctly, rather than teaching this function a
+        // second copy of the same rule.
+        let want = usize::try_from(range.len).unwrap_or(0);
+        let mut buf = vec![0u8; want];
+        let mut filled = 0;
+        while filled < want {
+            match f.read(&mut buf[filled..]) {
+                Ok(0) => break, // the file ends here; the caller decides
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.read_error("read", &e)),
+            }
+        }
+        buf.truncate(filled);
         Ok(Bytes::from(buf))
     }
 }

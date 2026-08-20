@@ -146,16 +146,30 @@ pub fn evaluate_discard_batch(
         .unwrap_or_default();
     let breaker = derived_breaker_state(&breaker_refusals);
 
+    // A proof belongs to this batch only if it names this batch's FILE, TARGET
+    // and ROOT. `file` alone was not enough: a proof for `(file, target B)`
+    // carries B's deferral and B's confirmation, and `discard_permitted` is
+    // perfectly happy with it — it checks the deferral against the PROOF's own
+    // target, which agrees. The charge then goes to episode target A, whose
+    // deferral may be missing or still running.
+    //
+    // The root is bound for the same reason and was the same hole: `RootGates`
+    // carries the root it describes, so a proof could vouch for a root that is
+    // available and in sync while the episode's own is neither.
+    let belongs = |p: &DiscardInputs<'_>, c: &Candidate| {
+        p.file == c.file && p.target == episode.target && p.gates.root == episode.root
+    };
+
     let mut policy = Vec::new();
     for candidate in &episode.candidates {
-        if !proofs.iter().any(|p| p.file == candidate.file) {
+        if !proofs.iter().any(|p| belongs(p, candidate)) {
             policy.push(DiscardRefusal::CandidateUnproven {
                 file: candidate.file,
             });
         }
     }
     for proof in proofs {
-        if !episode.candidates.iter().any(|c| c.file == proof.file) {
+        if !episode.candidates.iter().any(|c| belongs(proof, c)) {
             policy.push(DiscardRefusal::ProofForAnotherCandidate { file: proof.file });
             continue;
         }

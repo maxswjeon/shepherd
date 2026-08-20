@@ -740,6 +740,94 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
     );
 }
 
+/// A proof must name this batch's TARGET and ROOT, not just its file.
+///
+/// The membership check compared `FileId` alone, so a proof for
+/// `(file, target B)` authorized a candidate in an episode that deletes from
+/// target A. B's deferral is expired and B's confirmation is present, and
+/// `discard_permitted` agrees with all of it — it checks the deferral against
+/// the PROOF's target, which matches. The charge then goes to A, whose own
+/// deferral may be missing or still running.
+///
+/// The root is the same hole pointed at a different field: `RootGates` carries
+/// the root it describes, so a proof could vouch for a root that is available
+/// and in sync while the episode's own is neither.
+#[tokio::test]
+async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
+    let now = t(20);
+    let e = episode_with(1, now);
+    let lim = limits(10);
+    let at = clock(20);
+
+    // A deferral for the SAME file on another target: expired, valid, and
+    // entirely about somebody else's target.
+    let other_target = TargetId::new(999);
+    let elsewhere = Deferral::open(
+        FileId::new(1),
+        other_target,
+        DeferralKind::Remote,
+        14,
+        &clock(0),
+    );
+
+    let wrong_target = vec![DiscardInputs {
+        file: FileId::new(1),
+        target: other_target,
+        deferral: Some(&elsewhere),
+        ..inputs(&at, None, Some(PermanentDeleteConfirmation::WindowsCfApi))
+    }];
+    let ledger = MemLedger::new();
+    let refusals = reserve_discard(&wrong_target, &e, &ledger.snapshot(), &lim, now, &ledger)
+        .await
+        .expect_err("target B's proof does not authorize a deletion from target A");
+    assert!(
+        refusals.policy.iter().any(|r| matches!(
+            r,
+            DiscardRefusal::CandidateUnproven { file } if *file == FileId::new(1)
+        )),
+        "the candidate is unproved, whatever target B's deferral says: {refusals:?}"
+    );
+
+    // Same shape, wrong ROOT.
+    let ds = deferrals_for(&e);
+    let wrong_root = vec![DiscardInputs {
+        gates: RootGates {
+            root: RootId::new(998),
+            resync_required: false,
+            available: true,
+        },
+        ..proofs_for(
+            &e,
+            &at,
+            &ds,
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        )
+        .remove(0)
+    }];
+    let ledger = MemLedger::new();
+    reserve_discard(&wrong_root, &e, &ledger.snapshot(), &lim, now, &ledger)
+        .await
+        .expect_err("gates describing another root do not vouch for this one");
+
+    // THE ACCEPTING DIRECTION: the right file, target and root still reserve.
+    let ledger = MemLedger::new();
+    let _ = reserve_discard(
+        &proofs_for(
+            &e,
+            &at,
+            &ds,
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        ),
+        &e,
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+    )
+    .await
+    .expect("a proof bound to this episode authorizes it");
+}
+
 /// The rolling window's entire purpose: repeated sub-threshold episodes must
 /// accumulate against one budget. Pre-fix, episode two saw the same unused
 /// window episode one had seen.

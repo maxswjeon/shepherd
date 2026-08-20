@@ -477,6 +477,50 @@ async fn a_source_deleted_mid_read_abandons_its_provider_session() {
     assert_eq!(rig.adapter.live_upload_count(), 0);
 }
 
+/// The source is TRUNCATED mid-read, and the session is still reaped.
+///
+/// `read_exact` reported a concurrent truncation as `UnexpectedEof`, an
+/// ordinary retryable I/O kind — so the driver returned before `abandon` and,
+/// on a final attempt, left the transfer `Uploading` with its parts allocated.
+/// The driver's own short-body branch exists to abandon exactly this and was
+/// unreachable, because `read_exact` never returns a short buffer.
+///
+/// So the read returns what is left and the branch decides. This test is what
+/// makes that branch reachable at all.
+#[tokio::test]
+async fn a_source_truncated_mid_read_abandons_its_provider_session() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+
+    rig.store.die_at_save(4);
+    rig.driver().run(&mut s).await.expect_err("must die");
+    rig.store.revive();
+    let mut resumed = rig.reload().await;
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        1,
+        "precondition: there is a session to leak"
+    );
+
+    // Shorter, but still present and still fingerprinting — the fingerprint is
+    // taken from the source itself, so the gate sees the new length and the
+    // PLAN does not. The read is where the disagreement shows up.
+    rig.source.truncate_to(BODY / 2);
+
+    let err = rig
+        .driver()
+        .run(&mut resumed)
+        .await
+        .expect_err("a source that shrank cannot satisfy the plan");
+    assert!(!err.is_retryable(), "a truncation is terminal: {err:?}");
+    assert_eq!(
+        resumed.state,
+        TransferState::Aborted(AbortOutcome::Clean),
+        "the short read must reach the abandonment branch"
+    );
+    assert_eq!(rig.adapter.live_upload_count(), 0);
+}
+
 /// PM-1 — the user edits the file while it is being uploaded.
 #[tokio::test]
 async fn a_source_that_changes_between_attempts_aborts_rather_than_splicing() {
