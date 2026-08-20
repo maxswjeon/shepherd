@@ -287,7 +287,7 @@ macro_rules! methods {
             /// becomes a type.
             pub fn from_parts(name: &str, params: &serde_json::Value) -> Result<Method, RpcError> {
                 match name {
-                    $($name => serde_json::from_value::<$req>(params.clone())
+                    $($name => <$req as serde::Deserialize>::deserialize(params)
                         .map(Method::$variant)
                         .map_err(|e| {
                             RpcError::new(
@@ -337,7 +337,7 @@ macro_rules! methods {
                 value: &serde_json::Value,
             ) -> Result<MethodResult, RpcError> {
                 match kind {
-                    $(MethodKind::$variant => serde_json::from_value::<$res>(value.clone())
+                    $(MethodKind::$variant => <$res as serde::Deserialize>::deserialize(value)
                         .map(MethodResult::$variant)
                         .map_err(|e| {
                             RpcError::new(

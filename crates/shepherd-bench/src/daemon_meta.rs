@@ -1009,7 +1009,7 @@ pub fn bench_daemon(a: &Args) -> Result<(), String> {
     }
     let bin = a
         .daemon_bin
-        .clone()
+        .as_deref()
         .ok_or("bench-meta-daemon needs --daemon-bin <path to shepherdd>")?;
     if !bin.exists() {
         return Err(format!("{} does not exist", bin.display()));
@@ -1020,9 +1020,9 @@ pub fn bench_daemon(a: &Args) -> Result<(), String> {
     // them would corrupt both numbers (bench-contract.toml [query_trace]).
     let trace = generate::load_trace(&c)?;
     let lexical: Vec<(String, String)> = trace
-        .iter()
+        .into_iter()
         .filter(|(class, _, _)| c.query_trace.lexical_classes.contains(class))
-        .map(|(class, q, _)| (class.clone(), q.clone()))
+        .map(|(class, q, _)| (class, q))
         .collect();
     let need = c.statistics.runs * c.statistics.queries_per_run;
     if lexical.len() < need {
@@ -1126,7 +1126,7 @@ pub fn bench_daemon(a: &Args) -> Result<(), String> {
             crate::drop_page_cache()
                 .map_err(|e| format!("{e}\n(refusing to report run {run} as cold)"))?;
         }
-        let (daemon, ready) = Daemon::start(&bin, &state, &socket)?;
+        let (daemon, ready) = Daemon::start(bin, &state, &socket)?;
         start_secs.push(ready.as_secs_f64());
         cpus_allowed = daemon.cpus_allowed();
 
@@ -1302,8 +1302,8 @@ pub fn bench_daemon(a: &Args) -> Result<(), String> {
             "mean_hits_per_query": total_hits as f64 / need as f64,
             "zero_hit_queries": zero_hit,
             "by_class": by_class
-                .iter()
-                .map(|(k, v)| (k.clone(), v.report()))
+                .into_iter()
+                .map(|(k, v)| (k, v.report()))
                 .collect::<serde_json::Map<_, _>>(),
             "machine": crate::probe_machine(&c.reference_machine.pin_to_cores),
             "scaled_run_reason": a.scaled_run_reason,

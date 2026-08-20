@@ -190,27 +190,39 @@ fn handshake(
         )
     })?;
 
-    if frame.method != HELLO_METHOD {
+    // Taken apart once. Each part then has exactly one owner, so the id and
+    // the params reach the arms that consume them by move — every arm below
+    // either returns or is the last reader of what it names.
+    let RpcRequest {
+        id, method, params, ..
+    } = frame;
+
+    if method != HELLO_METHOD {
         return Err(RpcResponse::failed(
-            Some(frame.id),
+            Some(id),
             RpcError::new(
                 ErrorCode::InvalidRequest,
                 format!(
-                    "every connection must open with `{HELLO_METHOD}`; got `{}`. \
+                    "every connection must open with `{HELLO_METHOD}`; got `{method}`. \
                      Until the handshake completes the protocol minor is unknown, so no \
-                     method can be safely served.",
-                    frame.method
+                     method can be safely served."
                 ),
             ),
         ));
     }
 
-    let hello: Hello = serde_json::from_value(frame.params.clone()).map_err(|e| {
-        RpcResponse::failed(
-            Some(frame.id.clone()),
-            RpcError::new(ErrorCode::InvalidParams, format!("`hello`: {e}")),
-        )
-    })?;
+    // `match` rather than `map_err`: a closure would have to *borrow* `id`,
+    // which the success path below still owns, and borrowing it there is the
+    // only reason it used to be cloned.
+    let hello: Hello = match serde_json::from_value(params) {
+        Ok(h) => h,
+        Err(e) => {
+            return Err(RpcResponse::failed(
+                Some(id),
+                RpcError::new(ErrorCode::InvalidParams, format!("`hello`: {e}")),
+            ));
+        }
+    };
 
     match negotiate(&hello, PROTO_VERSION, &daemon.capabilities) {
         Ok(negotiated) => {
@@ -224,10 +236,10 @@ fn handshake(
                 negotiated: negotiated.clone(),
             };
             let value = serde_json::to_value(result).expect("HelloResult is serializable");
-            Ok((RpcResponse::ok(frame.id, value), negotiated))
+            Ok((RpcResponse::ok(id, value), negotiated))
         }
         Err(mismatch) => Err(RpcResponse::failed(
-            Some(frame.id),
+            Some(id),
             RpcError::new(ErrorCode::VersionMismatch, mismatch.to_string()).with_data(
                 serde_json::to_value(&mismatch).expect("VersionMismatch is serializable"),
             ),
@@ -254,25 +266,30 @@ fn serve_one(
             ));
         }
     };
-    let id = frame.id.clone();
+    // Taken apart once, on the per-request path: exactly one arm below answers,
+    // and each moves the id into its own reply rather than every request paying
+    // for a copy of one so the later arms can still see it.
+    let RpcRequest {
+        id, method, params, ..
+    } = frame;
 
     // A method above the negotiated minor is reported as absent, not as
     // forbidden: from the caller's side "you are too old to see it" and "it
     // does not exist" are the same condition, and distinguishing them leaks the
     // newer surface to a client that cannot use it.
-    if let Some(kind) = MethodKind::from_name(&frame.method)
+    if let Some(kind) = MethodKind::from_name(&method)
         && !kind.available_at(session.negotiated.minor)
     {
         return Some(RpcResponse::failed(
             Some(id),
             RpcError::new(
                 ErrorCode::MethodNotFound,
-                format!("no method named `{}`", frame.method),
+                format!("no method named `{method}`"),
             ),
         ));
     }
 
-    let call = match Method::from_parts(&frame.method, &frame.params) {
+    let call = match Method::from_parts(&method, &params) {
         Ok(c) => c,
         Err(e) => return Some(RpcResponse::failed(Some(id), e)),
     };
@@ -280,9 +297,15 @@ fn serve_one(
     // `events.subscribe` is the one method whose effect outlives the reply: it
     // installs a pump on this connection. Handled here rather than in
     // `dispatch` because only the connection owns its socket.
-    if let Method::EventsSubscribe(req) = &call {
-        return subscribe_on_connection(req.clone(), session, writer, id);
-    }
+    //
+    // Matched by value: the subscribe arm consumes the request, and the rest of
+    // the table is handed straight back to `dispatch` untouched.
+    let call = match call {
+        Method::EventsSubscribe(req) => {
+            return subscribe_on_connection(req, session, writer, id);
+        }
+        other => other,
+    };
 
     Some(match session.dispatch(call) {
         Ok(result) => match result.to_value() {
@@ -335,8 +358,13 @@ fn subscribe_on_connection(
         req.resume_epoch.as_deref(),
     );
 
-    let response = match serde_json::to_value(&result) {
-        Ok(v) => RpcResponse::ok(id.clone(), v),
+    // Serialized before the spawn, deliberately — a result that cannot be
+    // encoded must not leave a pump thread behind. Only the *value* is built
+    // here; the reply frame that owns the id is assembled after the spawn, so
+    // the two failure arms below can still answer with that id and it never
+    // has to be copied for them.
+    let value = match serde_json::to_value(&result) {
+        Ok(v) => v,
         Err(e) => {
             return Some(RpcResponse::failed(
                 Some(id),
@@ -366,6 +394,10 @@ fn subscribe_on_connection(
         ));
     }
 
+    // The pump is parked on `go_rx` and nothing has reached the socket yet, so
+    // building the frame here rather than above changes only who owns the id —
+    // step 2 of the ordering in the doc comment still happens next.
+    let response = RpcResponse::ok(id, value);
     if write_frame(writer, &response).is_err() {
         return None;
     }

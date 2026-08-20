@@ -166,10 +166,10 @@ impl Executor for ScanExecutor {
                 .skipped
                 .iter()
                 .find_map(|s| match s {
-                    Skip::Unreadable { path: p, detail } if *p == path => Some(detail.clone()),
+                    Skip::Unreadable { path: p, detail } if *p == path => Some(detail.as_str()),
                     _ => None,
                 })
-                .unwrap_or_else(|| "no directory under it could be read".to_string());
+                .unwrap_or("no directory under it could be read");
             return Err(format!(
                 "root {root_id} at {} could not be read ({why}); refusing to treat an \
                  unreadable root as an empty one — a scan that observed nothing must not \
@@ -215,9 +215,40 @@ impl Executor for ScanExecutor {
         // its own; the reconciliation that reads it is a separate decision.
         let generation = ctx.id().get();
 
-        for chunk in output.files.chunks(UPSERT_BATCH) {
-            let batch: Vec<shepherd_core::FileStat> = chunk.to_vec();
-            let root_for_batch = root.clone();
+        // `into_iter`, not `chunks`: every `FileStat` the walk produced is
+        // moved into exactly one batch and from there into the writer actor.
+        // Copying each chunk out of a borrowed slice instead would re-allocate
+        // every `rel_path` on the way to the catalog — 10M `String`s on the
+        // Phase 0d corpus, none of which outlives its batch, because `output`
+        // is not read again after this loop.
+        //
+        // **The partial move of `output.files` is deliberate**, and it reads as
+        // wrong at a glance, so: every other read of `output` completes above.
+        // `output.dirs_visited` and `output.skipped` are read by the
+        // unreadable-root guard, `summarise_skips(&output.skipped)` borrows a
+        // *different* field of this same struct — a borrow that ends on its own
+        // line — and `output.files.len()` is read by the `"walk complete"` log
+        // just above. Nothing reads `output` after this point, which is what
+        // makes moving one field out of it legal and what would have to be
+        // rechecked before adding a read below.
+        //
+        // NOTE: this is the scale path, and it is not measured. The multi-batch
+        // behaviour is exercised functionally by the scan e2e tests, but the
+        // 10M-file case belongs to `the_m1_demo_holds_at_a_million_files`, which
+        // is `#[ignore]`d behind `SHEPHERD_M1_CORPUS` — a corpus this box no
+        // longer has. The allocation claim above is reasoning, not a benchmark.
+        let root = Arc::new(root);
+        let mut remaining = output.files.into_iter();
+        loop {
+            let batch: Vec<shepherd_core::FileStat> =
+                remaining.by_ref().take(UPSERT_BATCH).collect();
+            if batch.is_empty() {
+                break;
+            }
+            // One refcount bump per batch, not a copy of the root: `ScanRoot`
+            // is immutable for the whole scan and every batch reads the same
+            // one, but the writer closure is `'static` and so cannot borrow it.
+            let root_for_batch = Arc::clone(&root);
             let n = batch.len();
             let bytes: u64 = batch.iter().map(|f| f.size).sum();
             let last_path = batch.last().map(|f| f.rel_path.clone());

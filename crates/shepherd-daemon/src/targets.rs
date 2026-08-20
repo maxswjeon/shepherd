@@ -138,7 +138,7 @@ impl S3TargetConfig {
                 ));
             }
         }
-        let cfg: S3TargetConfig = serde_json::from_value(config.clone()).map_err(|e| {
+        let cfg: S3TargetConfig = Self::deserialize(config).map_err(|e| {
             RpcError::new(
                 ErrorCode::Invalid,
                 format!("`config` is not a valid s3 target configuration: {e}"),
@@ -161,7 +161,7 @@ impl S3TargetConfig {
     /// config that this build cannot fully understand is a loud failure rather
     /// than a silently narrowed one.
     pub fn parse_stored(config: &serde_json::Value) -> Result<Self, RpcError> {
-        serde_json::from_value(config.clone()).map_err(|e| {
+        Self::deserialize(config).map_err(|e| {
             RpcError::new(
                 ErrorCode::Invalid,
                 format!("stored target config is not readable by this build: {e}"),

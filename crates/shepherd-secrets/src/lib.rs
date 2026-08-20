@@ -314,10 +314,14 @@ impl Backend for KeyfileStore {
     }
 
     fn get(&self, key: &SecretRef) -> Result<Option<Secret>> {
-        Ok(self
-            .load()?
-            .get(key.as_str())
-            .map(|v| Secret::new(v.clone())))
+        // `remove` rather than `get`, so the plaintext is *moved* into the
+        // `Secret` instead of copied beside it. Cloning left two buffers for one
+        // credential and only the `Secret` got [`Secret::drop`]'s overwrite; the
+        // map's own `String` went back to the allocator intact. The map is a
+        // transient built by `load` and is never written back, so removing from
+        // it cannot affect the file.
+        let mut map = self.load()?;
+        Ok(map.remove(key.as_str()).map(Secret::new))
     }
 
     fn put(&mut self, key: &SecretRef, secret: &Secret) -> Result<()> {

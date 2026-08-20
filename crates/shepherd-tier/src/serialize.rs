@@ -97,9 +97,16 @@ impl FileLocks {
     async fn lock_in(map: &LockMap, id: &str) -> OwnedMutexGuard<()> {
         let lock = {
             let mut m = map.lock().expect("lock map poisoned");
-            m.entry(id.to_string())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
+            let entry = m
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())));
+            // `Arc::clone`, spelled out. Written as a trailing `.clone()` this
+            // read like "copy the mutex", which is the one reading that must
+            // never be true here: a copied `AsyncMutex` would give each caller
+            // its own lock and silently turn this whole map into a no-op. What
+            // is copied is the refcount; every caller for `id` gets a handle to
+            // the *same* mutex, which is the entire point.
+            Arc::clone(entry)
         };
         lock.lock_owned().await
     }

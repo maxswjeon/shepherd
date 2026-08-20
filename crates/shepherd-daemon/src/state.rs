@@ -128,7 +128,9 @@ impl Daemon {
             .index
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.index.clone().ok_or_else(|| {
+        // `Arc::clone`, not a copy of the index: one refcount bump per
+        // metadata search, so the arena is never duplicated to answer one.
+        guard.index.as_ref().map(Arc::clone).ok_or_else(|| {
             RpcError::new(
                 ErrorCode::Precondition,
                 "the metadata index has not been built; the daemon could not read the \

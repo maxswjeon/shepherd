@@ -229,10 +229,15 @@ impl PointerRecord {
 
     /// Verify the record is internally consistent and well-formed.
     pub fn validate(&self) -> Result<(), ChainError> {
-        let name = self.key().pointer_name();
+        // Lazy, because it is only ever an error message. Computed eagerly this
+        // allocated a `RecordKey` (cloning `uuid`) plus a `format!` for every
+        // record on the success path, and `resolve_chain` calls this once per
+        // record over a listing that grows without bound while GC is off
+        // (D-10).
+        let name = || self.key().pointer_name();
         if self.schema_version > POINTER_SCHEMA_VERSION {
             return Err(ChainError::Malformed {
-                key: name,
+                key: name(),
                 detail: format!(
                     "schema_version {} is newer than this build understands ({POINTER_SCHEMA_VERSION})",
                     self.schema_version
@@ -251,7 +256,7 @@ impl PointerRecord {
                 && Blake3Hash::from_hex(h).is_none()
             {
                 return Err(ChainError::Malformed {
-                    key: name,
+                    key: name(),
                     detail: format!("{field} is not 64 hex characters"),
                 });
             }
@@ -259,7 +264,7 @@ impl PointerRecord {
         let expect = self.compute_self_hash()?;
         match Blake3Hash::from_hex(&self.self_blake3) {
             Some(got) if got == expect => Ok(()),
-            _ => Err(ChainError::SelfHashMismatch { key: name }),
+            _ => Err(ChainError::SelfHashMismatch { key: name() }),
         }
     }
 
@@ -641,43 +646,51 @@ pub fn resolve_chain(bodies: &[(String, PointerRecord)]) -> ChainResolution {
         }
     }
 
-    // Index by self hash. A duplicate self hash is a byte-identical duplicate
-    // record, which is harmless — the same record listed twice.
-    let mut by_hash: BTreeMap<String, &PointerRecord> = BTreeMap::new();
-    for r in &valid {
-        by_hash.insert(r.self_blake3.clone(), r);
-    }
+    // Everything that *borrows* `valid` is scoped to this block, so the borrows
+    // are all dead before the ordering pass below takes `valid` mutably. That
+    // scope is what pays for the borrowed keys: these three questions are asked
+    // of one set of hashes, and answering them used to cost three owned copies
+    // of every hash in the listing. Only the answers escape, and both of those
+    // are empty or near-empty in the healthy case.
+    let (has_fork, missing, tips) = {
+        // Index by self hash. A duplicate self hash is a byte-identical
+        // duplicate record, which is harmless — the same record listed twice.
+        let by_hash: BTreeSet<&str> = valid.iter().map(|r| r.self_blake3.as_str()).collect();
 
-    // Fork: more than one record claiming the same predecessor (including more
-    // than one genesis).
-    let mut children: BTreeMap<Option<String>, Vec<&PointerRecord>> = BTreeMap::new();
-    for r in &valid {
-        children
-            .entry(r.prev_ptr_blake3.clone())
-            .or_default()
-            .push(r);
-    }
-    let has_fork = children.values().any(|v| v.len() > 1);
+        // Fork: more than one record claiming the same predecessor (including
+        // more than one genesis).
+        let mut children: BTreeMap<Option<&str>, Vec<&PointerRecord>> = BTreeMap::new();
+        for r in &valid {
+            children
+                .entry(r.prev_ptr_blake3.as_deref())
+                .or_default()
+                .push(r);
+        }
+        let has_fork = children.values().any(|v| v.len() > 1);
 
-    // Gap: a referenced predecessor nothing in the listing provides.
-    let missing: BTreeSet<String> = valid
-        .iter()
-        .filter_map(|r| r.prev_ptr_blake3.clone())
-        .filter(|h| !by_hash.contains_key(h))
-        .collect();
+        // Every `Some` key is a predecessor some record referenced. Read off
+        // `children` rather than recomputed from `valid`: they are the same set
+        // by construction, and one source of truth for "referenced" cannot
+        // drift from the fork test that shares it.
+        let referenced: BTreeSet<&str> = children.keys().copied().flatten().collect();
 
-    // Tips: records that are nobody's predecessor. Collected as owned hashes so
-    // the ordering pass below can take `valid` mutably.
-    let referenced: BTreeSet<String> = valid
-        .iter()
-        .filter_map(|r| r.prev_ptr_blake3.clone())
-        .collect();
-    let mut tips: Vec<String> = valid
-        .iter()
-        .filter(|r| !referenced.contains(&r.self_blake3))
-        .map(|r| r.self_blake3.clone())
-        .collect();
-    tips.sort();
+        // Gap: a referenced predecessor nothing in the listing provides.
+        let missing: BTreeSet<String> = referenced
+            .iter()
+            .filter(|h| !by_hash.contains(*h))
+            .map(|h| (*h).to_owned())
+            .collect();
+
+        // Tips: records that are nobody's predecessor.
+        let mut tips: Vec<String> = valid
+            .iter()
+            .filter(|r| !referenced.contains(r.self_blake3.as_str()))
+            .map(|r| r.self_blake3.clone())
+            .collect();
+        tips.sort();
+
+        (has_fork, missing, tips)
+    };
 
     // Deterministic order for replay, independent of listing order — SMB and
     // NFS directory reads carry no ordering guarantee at all.

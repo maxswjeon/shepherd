@@ -190,6 +190,16 @@ impl Pool {
         let stop = Arc::new(AtomicBool::new(false));
         let threads = (0..size)
             .map(|n| {
+                // The mixed idiom below is deliberate and load-bearing to read
+                // correctly. `registry` and `stop` are `Arc`s, so `Arc::clone`
+                // says "refcount bump" at the call site. `CatalogWriter` is NOT
+                // an `Arc` — it is a `Sender<Msg>` newtype (see its definition:
+                // "cloning the handle does not clone the connection"), so
+                // `Arc::clone(&writer)` does not compile.
+                //
+                // Two independent `.clone()` audits both read this loop as an
+                // inconsistency to harmonise. It is not. If you are here to make
+                // these three lines match, check the type first.
                 let writer = writer.clone();
                 let registry = Arc::clone(&registry);
                 let stop = Arc::clone(&stop);

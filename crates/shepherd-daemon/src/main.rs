@@ -190,7 +190,9 @@ fn cmd_run() -> Result<(), String> {
         .map_err(|e| format!("cannot open {}: {e}", paths.catalog().display()))?;
     let actor = CatalogActor::start(catalog, Some(paths.catalog()));
     let hub = EventHub::new_for_run(EVENT_BUFFER);
-    let daemon = Daemon::new(actor, hub, paths.clone());
+    // Moved in: `Daemon` owns `Paths` for the process lifetime, and the
+    // start-up path below reads the daemon's copy rather than keeping a second.
+    let daemon = Daemon::new(actor, hub, paths);
 
     // Before any worker runs: a job left `running` by a crash must be resolved
     // while nothing else is claiming, and a `destroy` job must be quarantined
@@ -215,10 +217,10 @@ fn cmd_run() -> Result<(), String> {
                                                `search` will be refused until a restart"),
     }
 
-    let listener = server::bind(&paths.socket).map_err(|e| e.to_string())?;
+    let listener = server::bind(&daemon.paths.socket).map_err(|e| e.to_string())?;
     tracing::info!(
-        socket = %paths.socket.display(),
-        catalog = %paths.catalog().display(),
+        socket = %daemon.paths.socket.display(),
+        catalog = %daemon.paths.catalog().display(),
         proto = %shepherd_proto::PROTO_VERSION,
         "shepherdd listening"
     );
@@ -237,7 +239,7 @@ fn cmd_run() -> Result<(), String> {
 
     tracing::info!("shutting down");
     pool.shutdown();
-    let _ = std::fs::remove_file(&paths.socket);
+    let _ = std::fs::remove_file(&daemon.paths.socket);
     Ok(())
 }
 

@@ -335,9 +335,12 @@ impl ShepherdApi for Session {
             ));
         }
 
-        let path_string = req.path.clone();
+        // Moved, not copied: every read of `req` — the validation above, and
+        // `IgnoreSet::new` on the line before — has already happened, so these
+        // are the request's last owners on their way into the writer closure.
+        let path_string = req.path;
         let hosted_optin = req.hosted_optin;
-        let ignore_patterns = req.ignore_patterns.clone();
+        let ignore_patterns = req.ignore_patterns;
         let now = self.now();
         // PHASE 2, HERE: run D-12's enrollment feasibility probe and persist its
         // verdict, in this closure, immediately after `insert_root` returns.
@@ -581,19 +584,25 @@ impl ShepherdApi for Session {
         };
 
         let matched = index.search(&req.query, cap.max(1));
-        let candidates = matched.ids.clone();
-        let filters = req.filters.clone();
-        let mut hits = self.cat(move |cat| hydrate(cat, &candidates, &filters))?;
 
         // The index already ordered by `file_id`; hydration reorders by
         // whatever SQLite felt like. Restoring index order is what keeps paging
         // stable across two calls that differ only in `offset`.
+        //
+        // Built here, from the borrow, so the ids themselves can then be
+        // *moved* into the `'static` hydration closure rather than copied into
+        // it — the only reason this used to need a second `Vec` was that the
+        // rank map was built after the closure had taken the first one.
         let rank: std::collections::HashMap<i64, usize> = matched
             .ids
             .iter()
             .enumerate()
             .map(|(i, id)| (*id, i))
             .collect();
+
+        let candidates = matched.ids;
+        let filters = req.filters;
+        let mut hits = self.cat(move |cat| hydrate(cat, &candidates, &filters))?;
         hits.sort_by_key(|h| rank.get(&h.file_id).copied().unwrap_or(usize::MAX));
 
         let total = hits.len() as u64;
@@ -711,7 +720,9 @@ impl ShepherdApi for Session {
         })?;
 
         let id = {
-            let (n, cref) = (name.clone(), req.credentials_ref.clone());
+            // `name` is cloned because `TargetSummary` below still needs it;
+            // `credentials_ref` is not read again, so it moves.
+            let (n, cref) = (name.clone(), req.credentials_ref);
             self.cat(move |c| {
                 TargetRepo::new(c).insert(
                     &n,

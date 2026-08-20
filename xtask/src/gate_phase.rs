@@ -419,10 +419,10 @@ impl PhaseReport {
 /// and `0ab` has no position in one. The join is declared in the map's
 /// `[alias]` table rather than guessed from the string, so `--phase 0ab` runs
 /// exactly the phases someone wrote down.
-fn resolve_phase(map: &AcMap, requested: &str) -> Vec<String> {
+fn resolve_phase<'a>(map: &'a AcMap, requested: &'a str) -> Vec<&'a str> {
     match map.alias.get(requested) {
-        Some(list) => list.clone(),
-        None => vec![requested.to_string()],
+        Some(list) => list.iter().map(String::as_str).collect(),
+        None => vec![requested],
     }
 }
 
@@ -445,7 +445,7 @@ pub fn run(
         .ac
         .iter()
         .chain(map.guard.iter())
-        .filter(|e| phases.contains(&e.owning_gate))
+        .filter(|e| phases.contains(&e.owning_gate.as_str()))
         .collect();
 
     if owned.is_empty() {
@@ -476,7 +476,7 @@ pub fn run(
                                 cov.command,
                                 cov.phases
                                     .iter()
-                                    .filter(|p| !phases.contains(p))
+                                    .filter(|p| !phases.contains(&p.as_str()))
                                     .cloned()
                                     .collect::<Vec<_>>()
                                     .join(", ")
@@ -512,12 +512,17 @@ pub fn run(
 
     let mut results = Vec::new();
     // One test binary can back several ACs; run each distinct check once.
-    let mut cache: BTreeMap<(String, String, bool, bool), CheckOutcome> = BTreeMap::new();
+    let mut cache: BTreeMap<(&str, &str, bool, bool), CheckOutcome> = BTreeMap::new();
 
     for entry in owned {
         let mut outcomes = Vec::new();
         for ev in &entry.evidence {
-            let key = (ev.package.clone(), ev.test.clone(), ev.ignored, ev.release);
+            let key = (
+                ev.package.as_str(),
+                ev.test.as_str(),
+                ev.ignored,
+                ev.release,
+            );
             let outcome = match cache.get(&key) {
                 Some(o) => clone_outcome(o),
                 None => {

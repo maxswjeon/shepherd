@@ -242,10 +242,13 @@ pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
 /// meaningful, so a delete followed by a re-create in the same epoch correctly
 /// yields the re-created entity.
 pub fn merge_durable_config(records: &[DurableConfigRecord]) -> Vec<DurableConfigRecord> {
-    let mut by_entity: BTreeMap<(ConfigKind, String), Vec<&DurableConfigRecord>> = BTreeMap::new();
+    // The key borrows for the same reason the values already do: nothing here
+    // outlives `records`. `&str` orders identically to `String`, so the group
+    // order — and therefore the order of `out` — is unchanged.
+    let mut by_entity: BTreeMap<(ConfigKind, &str), Vec<&DurableConfigRecord>> = BTreeMap::new();
     for r in records {
         by_entity
-            .entry((r.kind, r.entity_id.clone()))
+            .entry((r.kind, r.entity_id.as_str()))
             .or_default()
             .push(r);
     }

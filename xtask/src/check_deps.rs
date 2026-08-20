@@ -670,8 +670,8 @@ fn rule4(root: &Path, policy: &Policy) -> Result<RuleResult, String> {
                 .rule4
                 .symbols
                 .first()
-                .map(|s| s.sole_caller.clone())
-                .unwrap_or_else(|| "<no symbols configured>".into()),
+                .map(|s| s.sole_caller.as_str())
+                .unwrap_or("<no symbols configured>"),
             policy
                 .rule4
                 .symbols

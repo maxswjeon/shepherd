@@ -839,16 +839,16 @@ fn reconcile(map: &AcMap, rows: &[PlanRow]) -> Report {
         .collect();
 
     // --- 1. every gate command §9 names must resolve and be runnable --------
-    let mut covered_phases: BTreeMap<String, String> = BTreeMap::new();
+    let mut covered_phases: BTreeMap<&str, &str> = BTreeMap::new();
     let mut coverage = Vec::new();
 
     for row in rows {
-        let phases: Vec<String> = match map.alias.get(&row.gate_id) {
-            Some(list) => list.clone(),
-            None => vec![row.gate_id.clone()],
+        let phases: Vec<&str> = match map.alias.get(&row.gate_id) {
+            Some(list) => list.iter().map(String::as_str).collect(),
+            None => vec![row.gate_id.as_str()],
         };
         let mut resolved = Vec::new();
-        for p in &phases {
+        for &p in &phases {
             if !map.phase_order.iter().any(|x| x == p) {
                 violations.push(format!(
                     "§9 row `{}` names `{}`, which resolves to phase `{p}` — not in \
@@ -858,14 +858,14 @@ fn reconcile(map: &AcMap, rows: &[PlanRow]) -> Report {
                 ));
                 continue;
             }
-            if let Some(prev) = covered_phases.insert(p.clone(), row.label.clone()) {
+            if let Some(prev) = covered_phases.insert(p, row.label.as_str()) {
                 violations.push(format!(
                     "phase `{p}` is gated by two §9 rows (`{prev}` and `{}`) — exactly one gate \
                      must own a phase or its evidence is ambiguous",
                     row.label
                 ));
             }
-            let owned = owned_by_phase.get(p.as_str()).map(Vec::len).unwrap_or(0);
+            let owned = owned_by_phase.get(p).map(Vec::len).unwrap_or(0);
             if owned == 0 {
                 violations.push(format!(
                     "§9 row `{}` names `{}`, but NO acceptance criterion or guard in \
@@ -875,7 +875,7 @@ fn reconcile(map: &AcMap, rows: &[PlanRow]) -> Report {
                     row.label, row.command
                 ));
             }
-            resolved.push(p.clone());
+            resolved.push(p.to_string());
         }
 
         let spec = map.phase.iter().find(|p| p.gate == row.gate_id);

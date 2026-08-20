@@ -81,7 +81,7 @@ impl Registry {
             .counters
             .read()
             .ok()
-            .and_then(|m| m.get(name).cloned())
+            .and_then(|m| m.get(name).map(Arc::clone))
         {
             return c;
         }
@@ -90,7 +90,9 @@ impl Registry {
             .counters
             .write()
             .expect("metrics registry lock poisoned");
-        m.entry(name.to_string()).or_default().clone()
+        // `Arc::clone`: the registry keeps the counter and hands out handles
+        // to the same one — a copy here would be a metric nobody can see.
+        Arc::clone(m.entry(name.to_string()).or_default())
     }
 
     /// Get or create the gauge named `name`.
@@ -100,7 +102,7 @@ impl Registry {
             .gauges
             .read()
             .ok()
-            .and_then(|m| m.get(name).cloned())
+            .and_then(|m| m.get(name).map(Arc::clone))
         {
             return g;
         }
@@ -109,7 +111,7 @@ impl Registry {
             .gauges
             .write()
             .expect("metrics registry lock poisoned");
-        m.entry(name.to_string()).or_default().clone()
+        Arc::clone(m.entry(name.to_string()).or_default())
     }
 
     pub fn snapshot(&self) -> Snapshot {

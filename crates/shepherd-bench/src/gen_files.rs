@@ -358,15 +358,17 @@ fn colliding_indices(seed: u64, organic: u64, dir_space: u64) -> std::collection
         .into_par_iter()
         .map(|i| path_hash(&organic_path(seed, i, dir_space).0))
         .collect();
-    let mut sorted = hashes.clone();
-    sorted.par_sort_unstable();
+    // Sorted in place. The original order is never read again, so duplicating
+    // the vector bought nothing and cost a second copy of it — 80 MB at ten
+    // million files, on top of the 80 MB already held.
+    hashes.par_sort_unstable();
     let mut dup: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for w in sorted.windows(2) {
+    for w in hashes.windows(2) {
         if w[0] == w[1] {
             dup.insert(w[0]);
         }
     }
-    hashes.clear();
+    drop(hashes);
     if dup.is_empty() {
         return std::collections::HashSet::new();
     }
@@ -524,7 +526,7 @@ pub fn gen_files(a: &Args) -> Result<(), String> {
         // vocabulary repeats, so a name query can legitimately return many.
         if k < 3 {
             samples.push(Sample {
-                rel_path: rel.clone(),
+                rel_path: rel,
                 size: n,
             });
         }

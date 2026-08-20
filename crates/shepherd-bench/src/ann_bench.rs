@@ -105,15 +105,15 @@ fn shard_path(fixtures: &Path, prec: &str, i: u64) -> PathBuf {
 /// machine that could not hold the whole f32 index in the heap at once.
 pub fn build(a: &Args) -> Result<(), String> {
     let c = Contract::load(&a.contract)?;
-    let prec = a.target.clone().ok_or("build-ann needs f32|f16|i8")?;
-    let opts = options(c.fixture.dimensions, &prec)?;
+    let prec = a.target.as_deref().ok_or("build-ann needs f32|f16|i8")?;
+    let opts = options(c.fixture.dimensions, prec)?;
     let total = a.rows_override.unwrap_or(c.fixture.vectors);
     let per_shard = c.fixture.vectors_per_shard.min(total);
     let shards = total.div_ceil(per_shard);
 
     // Projected from the smoke run's measured bytes-per-vector at 384 dims:
     // f32 ~1678 B, f16 ~944 B, i8 ~524 B (vectors plus HNSW links).
-    let projected_gib = match prec.as_str() {
+    let projected_gib = match prec {
         "f32" => 1678.0,
         "f16" => 944.0,
         _ => 524.0,
@@ -130,7 +130,7 @@ pub fn build(a: &Args) -> Result<(), String> {
         c.disk_guard.abort_below_free_gib,
         projected_gib,
     )?;
-    let dir = shard_dir(&a.fixtures, &prec);
+    let dir = shard_dir(&a.fixtures, prec);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
@@ -168,7 +168,7 @@ pub fn build(a: &Args) -> Result<(), String> {
                 index.add(i, &v).map_err(|e| e.to_string())
             })?;
 
-        let p = shard_path(&a.fixtures, &prec, s);
+        let p = shard_path(&a.fixtures, prec, s);
         index
             .save(p.to_str().ok_or("non-UTF8 path")?)
             .map_err(|e| e.to_string())?;
@@ -343,8 +343,8 @@ fn query_vectors(c: &Contract) -> Result<Vec<Vec<f32>>, String> {
 
 pub fn bench(a: &Args) -> Result<(), String> {
     let c = Contract::load(&a.contract)?;
-    let prec = a.target.clone().ok_or("bench-ann needs f32|f16|i8")?;
-    let opts = options(c.fixture.dimensions, &prec)?;
+    let prec = a.target.as_deref().ok_or("bench-ann needs f32|f16|i8")?;
+    let opts = options(c.fixture.dimensions, prec)?;
     let queries = query_vectors(&c)?;
     if queries.len() < c.statistics.queries_per_run {
         return Err(format!(
@@ -354,7 +354,7 @@ pub fn bench(a: &Args) -> Result<(), String> {
         ));
     }
 
-    let on_disk = crate::path_bytes(&shard_dir(&a.fixtures, &prec));
+    let on_disk = crate::path_bytes(&shard_dir(&a.fixtures, prec));
     let k = c.execution.top_k;
     let queries = Arc::new(queries);
     let mut run_stats = Vec::new();
@@ -378,7 +378,7 @@ pub fn bench(a: &Args) -> Result<(), String> {
                 format!("{e}\n(precision {prec}: refusing to report this run as cold)")
             })?;
         }
-        let (s_open, open_seconds) = Shards::open(&a.fixtures, &prec, &opts, k)?;
+        let (s_open, open_seconds) = Shards::open(&a.fixtures, prec, &opts, k)?;
         let shards = Arc::new(s_open);
         open_secs.push(open_seconds);
         rss_after_open = crate::vm_rss_bytes();
@@ -514,12 +514,12 @@ pub fn bench(a: &Args) -> Result<(), String> {
 /// is precisely the check that would not catch a bad i8 index.
 pub fn recall(a: &Args) -> Result<(), String> {
     let c = Contract::load(&a.contract)?;
-    let prec = a.target.clone().ok_or("recall-ann needs f32|f16|i8")?;
-    let opts = options(c.fixture.dimensions, &prec)?;
+    let prec = a.target.as_deref().ok_or("recall-ann needs f32|f16|i8")?;
+    let opts = options(c.fixture.dimensions, prec)?;
     let dims = c.fixture.dimensions;
     let per_shard = c.fixture.vectors_per_shard;
 
-    let path = shard_path(&a.fixtures, &prec, 0);
+    let path = shard_path(&a.fixtures, prec, 0);
     let index = Index::new(&opts).map_err(|e| e.to_string())?;
     index
         .view(path.to_str().ok_or("non-UTF8 path")?)
@@ -633,8 +633,7 @@ pub fn recall(a: &Args) -> Result<(), String> {
     let at_bench_ef = rows
         .iter()
         .find(|r| r["expansion_search"] == c.execution.top_k)
-        .cloned()
-        .unwrap_or_else(|| rows[0].clone());
+        .unwrap_or(&rows[0]);
     let recall = at_bench_ef["recall_at_10"].as_f64().unwrap_or(0.0);
     let floor = c.bars.ann_recall_at_10_floor;
     eprintln!(

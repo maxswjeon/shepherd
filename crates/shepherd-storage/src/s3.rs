@@ -139,13 +139,28 @@ fn to_sdk_algorithm(a: ChecksumAlgorithm) -> aws_sdk_s3::types::ChecksumAlgorith
 
 impl S3Adapter {
     pub async fn new(cfg: S3Config) -> StorageResult<Self> {
+        // Destructured rather than read field-by-field. `new` takes `cfg` by
+        // value and is the last owner of it, so every field can be moved; the
+        // borrow-then-clone shape this replaced was copying strings it was
+        // about to drop. It matters most for `credentials`: cloning left a
+        // second copy of the secret access key on the heap for the whole of
+        // `new`, including across the `load().await`.
+        let S3Config {
+            bucket,
+            endpoint_url,
+            region,
+            force_path_style,
+            credentials,
+            multipart_checksum,
+        } = cfg;
+
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(
-            aws_config::Region::new(cfg.region.clone().unwrap_or_else(|| "us-east-1".into())),
+            aws_config::Region::new(region.unwrap_or_else(|| "us-east-1".into())),
         );
-        if let Some(c) = &cfg.credentials {
+        if let Some(c) = credentials {
             loader = loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
-                c.access_key_id.clone(),
-                c.secret_access_key.clone(),
+                c.access_key_id,
+                c.secret_access_key,
                 None,
                 None,
                 "shepherd-static",
@@ -153,16 +168,15 @@ impl S3Adapter {
         }
         let shared = loader.load().await;
 
-        let mut b =
-            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style);
-        if let Some(url) = &cfg.endpoint_url {
-            b = b.endpoint_url(url.clone());
+        let mut b = aws_sdk_s3::config::Builder::from(&shared).force_path_style(force_path_style);
+        if let Some(url) = endpoint_url {
+            b = b.endpoint_url(url);
         }
 
         Ok(Self {
             client: aws_sdk_s3::Client::from_conf(b.build()),
-            bucket: cfg.bucket,
-            multipart_checksum: cfg.multipart_checksum,
+            bucket,
+            multipart_checksum,
             caps: AdapterCapabilities {
                 provider: "s3",
                 // S3 has offered `If-None-Match: *` on PUT and
@@ -283,7 +297,10 @@ impl StorageAdapter for S3Adapter {
             .put_object()
             .bucket(&self.bucket)
             .key(key.as_str())
-            .body(ByteStream::from(body.to_vec()));
+            // `from(body)`, not `from(body.to_vec())`. `Bytes` is refcounted and
+            // `impl From<Bytes> for ByteStream` is documented as *the* retryable
+            // constructor, so the copy the `to_vec` made bought nothing.
+            .body(ByteStream::from(body));
         if precondition == CreatePrecondition::IfAbsent {
             req = req.if_none_match("*");
         }
@@ -342,7 +359,11 @@ impl StorageAdapter for S3Adapter {
             .key(key.as_str())
             .upload_id(upload_id.as_opaque())
             .part_number(i32::try_from(part_no).unwrap_or(i32::MAX))
-            .body(ByteStream::from(body.to_vec()));
+            // See `create`. This is the hot one: `to_vec` here deep-copied the
+            // whole part body — 16 MiB at the default part size — on every part
+            // AND on every SDK-internal retry of it, which is precisely what
+            // taking `Bytes` was supposed to avoid.
+            .body(ByteStream::from(body));
         // The part checksum algorithm MUST match the one the session was
         // created with. Verified against MinIO, which accepts the session and
         // then rejects the first part:
@@ -389,8 +410,10 @@ impl StorageAdapter for S3Adapter {
                 .bucket(&self.bucket)
                 .key(key.as_str())
                 .upload_id(upload_id.as_opaque());
-            if let Some(m) = &marker {
-                req = req.part_number_marker(m.clone());
+            // `take`: the marker is consumed by exactly this request, and the
+            // truncated branch below always writes the next one back.
+            if let Some(m) = marker.take() {
+                req = req.part_number_marker(m);
             }
             let page = req
                 .send()
@@ -511,11 +534,13 @@ impl StorageAdapter for S3Adapter {
                 .list_multipart_uploads()
                 .bucket(&self.bucket)
                 .prefix(prefix);
-            if let Some(k) = &key_marker {
-                req = req.key_marker(k.clone());
+            // `take`, as in `list_parts`: consumed by this request, and the
+            // truncated branch below writes both markers back unconditionally.
+            if let Some(k) = key_marker.take() {
+                req = req.key_marker(k);
             }
-            if let Some(i) = &id_marker {
-                req = req.upload_id_marker(i.clone());
+            if let Some(i) = id_marker.take() {
+                req = req.upload_id_marker(i);
             }
             let page = req
                 .send()
@@ -996,10 +1021,10 @@ impl ChecksumRoundTrip for S3RoundTrip {
         let adapter = S3Adapter::new(cfg).await.map_err(|e| classify("new", e))?;
 
         let key = probe_key(alg, &probe_nonce());
-        let object = key.as_key().clone();
+        let object = key.as_key();
 
         let upload = adapter
-            .create_multipart(&object)
+            .create_multipart(object)
             .await
             .map_err(|e| classify("create_multipart", e))?;
 
@@ -1010,10 +1035,10 @@ impl ChecksumRoundTrip for S3RoundTrip {
         let mut receipts = Vec::new();
         for part_no in 1..=2u32 {
             let body = Bytes::from(vec![part_no as u8; S3_MIN_PART as usize]);
-            match adapter.upload_part(&object, &upload, part_no, body).await {
+            match adapter.upload_part(object, &upload, part_no, body).await {
                 Ok(r) => receipts.push(r),
                 Err(e) => {
-                    let _ = adapter.abort_multipart(&object, &upload).await;
+                    let _ = adapter.abort_multipart(object, &upload).await;
                     return Err(classify("upload_part", e));
                 }
             }
@@ -1031,18 +1056,18 @@ impl ChecksumRoundTrip for S3RoundTrip {
         // is Shepherd's own namespace, so that motivation does not transfer.
         if let Err(e) = adapter
             .complete_multipart(
-                &object,
+                object,
                 &upload,
                 &receipts,
                 CreatePrecondition::Unconditional,
             )
             .await
         {
-            let _ = adapter.abort_multipart(&object, &upload).await;
+            let _ = adapter.abort_multipart(object, &upload).await;
             return Err(classify("complete_multipart", e));
         }
 
-        let head = adapter.head(&object).await.map_err(|e| classify("head", e));
+        let head = adapter.head(object).await.map_err(|e| classify("head", e));
         // Clean up whatever the outcome, and — because the key is this
         // invocation's alone — only this probe's own object. A failure to
         // delete is not a probe failure: it leaves one 10 MiB control object

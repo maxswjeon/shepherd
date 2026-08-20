@@ -249,7 +249,12 @@ pub async fn upload_item(
                 // driver compares it against must be produced by one procedure,
                 // or the guard compares two different notions of identity and
                 // refuses every upload.
-                fs_id: fp.fs_id.clone(),
+                // Moved out of `fp`, whose last use this is. Still the
+                // *fingerprint's* `fs_id` and deliberately not `item`'s — see
+                // `SourceIdentity::fs_id`: the session's identity comes from
+                // the statted file, while `acquire_both`'s lock key stays the
+                // caller's catalog `fs_id`. Two identities, two purposes.
+                fs_id: fp.fs_id,
                 blake3: item.blake3,
             };
             let s = TransferSession::plan(

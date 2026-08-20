@@ -386,9 +386,11 @@ impl RunSet {
             v[v.len() / 2]
         };
         let p95s: Vec<f64> = runs.iter().map(|r| r.p95_ms).collect();
-        let accepted = median(p95s.clone());
+        // Spread first, then hand the vector to `median`, which sorts what it
+        // is given: taking min/max up front means the copy is not needed.
         let lo = p95s.iter().cloned().fold(f64::INFINITY, f64::min);
         let hi = p95s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let accepted = median(p95s);
         let drift = if accepted > 0.0 {
             (hi - lo) / accepted * 100.0
         } else {
