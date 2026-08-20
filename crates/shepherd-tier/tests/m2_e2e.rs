@@ -169,7 +169,14 @@ struct Corpus {
 
 impl Corpus {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("shepherd-m2-{}-{tag}", std::process::id()));
+        // `CARGO_TARGET_TMPDIR`, not `std::env::temp_dir()`: this corpus is handed
+        // to `walk` with `DenyList::builtin()`, and on macOS `$TMPDIR` is
+        // `/var/folders/…` whose canonical form is `/private/var/…` — denied as
+        // a `SystemPath`, correctly. A fixture inside a denied system tree
+        // makes the walk answer about the runner's temp directory rather than
+        // about the corpus.
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("shepherd-m2-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("Photos/2024")).unwrap();
         std::fs::create_dir_all(dir.join("Photos/2024/raw-backups")).unwrap();

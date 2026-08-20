@@ -62,7 +62,11 @@ use shepherd_tier::{AuditLog, FileLocks, LocalDestroyRequest, execute_local_dest
 struct Tmp(PathBuf);
 impl Tmp {
     fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("shepherd-ac6-{}-{tag}", std::process::id()));
+        // `CARGO_TARGET_TMPDIR` for the same reason `m2_e2e` uses it: this
+        // fixture is walked with `DenyList::builtin()`, and macOS's `$TMPDIR`
+        // canonicalizes into `/private/var`, which that list denies.
+        let d = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("shepherd-ac6-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         Tmp(d)
