@@ -276,6 +276,43 @@ pub struct NewIntent<'a> {
     pub episode_id: Option<i64>,
 }
 
+/// Proof that an intent reached `prepared` **durably**, before anything
+/// irreversible was attempted.
+///
+/// A bare [`IntentId`] is an integer anyone can invent, and
+/// `shepherd_tier::execute_local_destruction` took one — so its stated ordering
+/// guarantee ("the intent is fsync'd BEFORE the syscall") rested on every
+/// caller having remembered to do that, with nothing in the type system or at
+/// run time able to tell a journal-backed id from a fabricated one. A crash
+/// between the unlink and the audit append would then leave no intent to
+/// reconstruct the forensic record from, which is the one thing §4.10.4's
+/// ordering exists to guarantee.
+///
+/// Only [`IntentJournal::prepare`] can mint one, and it returns after the
+/// transaction commits — an fsync under `synchronous = FULL`. Passing it by
+/// value into the destroy path makes "an intent was durably prepared for this"
+/// a precondition the caller cannot skip rather than a comment it can ignore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedIntent(IntentId);
+
+impl PreparedIntent {
+    pub fn id(&self) -> IntentId {
+        self.0
+    }
+
+    /// Mint one WITHOUT a journal. Tests only, and it is `#[cfg(test)]`-free on
+    /// purpose so integration tests in other crates can reach it — the name is
+    /// the guard.
+    ///
+    /// Every use of this is a test that is not exercising the journal, which is
+    /// exactly what the finding behind [`PreparedIntent`] objected to. Prefer
+    /// `IntentJournal::prepare` wherever a `Catalog` is at hand.
+    #[doc(hidden)]
+    pub fn fabricated_for_tests(id: IntentId) -> Self {
+        Self(id)
+    }
+}
+
 pub struct IntentJournal<'a>(pub &'a mut Catalog);
 
 impl<'a> IntentJournal<'a> {
@@ -290,7 +327,7 @@ impl<'a> IntentJournal<'a> {
     /// means by "fsync'd BEFORE the syscall". A caller that treats a returned
     /// id as permission to destroy is relying on that, so the pragma is
     /// asserted at open rather than merely set.
-    pub fn prepare(&mut self, new: &NewIntent<'_>, now: Timestamp) -> Result<IntentId> {
+    pub fn prepare(&mut self, new: &NewIntent<'_>, now: Timestamp) -> Result<PreparedIntent> {
         let tx = self.0.conn_mut().transaction()?;
         tx.execute(
             "INSERT INTO destroy_intent
@@ -314,7 +351,7 @@ impl<'a> IntentJournal<'a> {
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
-        Ok(IntentId::new(id))
+        Ok(PreparedIntent(IntentId::new(id)))
     }
 
     /// Advance an intent's state along §4.4's lifecycle.
@@ -477,7 +514,8 @@ mod tests {
         use IntentState::*;
         let id = IntentJournal::new(c)
             .prepare(&new_intent(path), Timestamp::from_nanos(1))
-            .unwrap();
+            .unwrap()
+            .id();
         let route: &[IntentState] = match target {
             Prepared => &[],
             Aborted => &[Aborted],
@@ -514,7 +552,8 @@ mod tests {
         let mut c = Catalog::open_in_memory().unwrap();
         let id = IntentJournal::new(&mut c)
             .prepare(&new_intent("/data/a.raw"), Timestamp::from_nanos(1))
-            .unwrap();
+            .unwrap()
+            .id();
         let got = IntentJournal::new(&mut c).get(id).unwrap().unwrap();
         assert_eq!(got.state, IntentState::Prepared);
         assert_eq!(got.path, "/data/a.raw");
@@ -540,13 +579,16 @@ mod tests {
         let t = Timestamp::from_nanos(1);
         let a = IntentJournal::new(&mut c)
             .prepare(&new_intent("/a"), t)
-            .unwrap();
+            .unwrap()
+            .id();
         let b = IntentJournal::new(&mut c)
             .prepare(&new_intent("/b"), t)
-            .unwrap();
+            .unwrap()
+            .id();
         let d = IntentJournal::new(&mut c)
             .prepare(&new_intent("/d"), t)
-            .unwrap();
+            .unwrap()
+            .id();
 
         IntentJournal::new(&mut c)
             .transition(b, IntentState::SyscallIssued)
@@ -654,7 +696,8 @@ mod tests {
         let mut c = Catalog::open_in_memory().unwrap();
         let id = IntentJournal::new(&mut c)
             .prepare(&new_intent("/data/a.raw"), Timestamp::from_nanos(1))
-            .unwrap();
+            .unwrap()
+            .id();
 
         let err = IntentJournal::new(&mut c)
             .transition(id, IntentState::CatalogCommitted)
@@ -716,7 +759,8 @@ mod tests {
         let mut c = Catalog::open_in_memory().unwrap();
         let id = IntentJournal::new(&mut c)
             .prepare(&new_intent("/data/a.raw"), Timestamp::from_nanos(1))
-            .unwrap();
+            .unwrap()
+            .id();
         for step in [
             IntentState::SyscallIssued,
             IntentState::OutcomeKnown,
@@ -869,7 +913,8 @@ mod tests {
         // genuine lifecycle violation.
         let other = IntentJournal::new(&mut c)
             .prepare(&new_intent("/data/b.raw"), Timestamp::from_nanos(1))
-            .unwrap();
+            .unwrap()
+            .id();
         let err = IntentJournal::new(&mut c)
             .transition(other, IntentState::CatalogCommitted)
             .expect_err("prepared -> catalog-committed is illegal");
@@ -906,7 +951,8 @@ mod tests {
         let t = Timestamp::from_nanos(1);
         let id = IntentJournal::new(&mut c)
             .prepare(&new_intent("/a"), t)
-            .unwrap();
+            .unwrap()
+            .id();
         IntentJournal::new(&mut c)
             .transition(id, IntentState::Aborted)
             .unwrap();
@@ -927,7 +973,8 @@ mod tests {
         n.kind = IntentKind::Remote;
         let id = IntentJournal::new(&mut c)
             .prepare(&n, Timestamp::from_nanos(1))
-            .unwrap();
+            .unwrap()
+            .id();
         assert_eq!(
             IntentJournal::new(&mut c).get(id).unwrap().unwrap().kind,
             IntentKind::Remote

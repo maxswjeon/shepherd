@@ -168,7 +168,9 @@ fn fixture(tag: &str, mode: AttestationMode) -> Fixture {
 impl Fixture {
     fn request<'a>(&'a self, custodian: &'a Location) -> LocalDestroyRequest<'a> {
         LocalDestroyRequest {
-            intent: IntentId::new(1),
+            intent: shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(
+                1,
+            )),
             path: &self.path,
             root: &self.root,
             expected_hash: self.hash,
@@ -741,7 +743,7 @@ async fn remote_discard_deletes_and_audits_through_the_same_apparatus() {
         shepherd_storage::adapter::VersionGuard::Version(shepherd_core::ObjectVersion::new("v9"));
 
     execute_remote_discard(
-        IntentId::new(7),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(7)),
         &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
         &f.key,
         &guard,
@@ -768,7 +770,7 @@ async fn remote_discard_refuses_while_the_audit_log_is_halted() {
         shepherd_storage::adapter::VersionGuard::Version(shepherd_core::ObjectVersion::new("v9"));
 
     let err = execute_remote_discard(
-        IntentId::new(8),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(8)),
         &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
         &f.key,
         &guard,
@@ -920,7 +922,7 @@ async fn a_lost_delete_acknowledgement_is_still_audited() {
     let remote = AmbiguousDelete::new(true, true);
 
     execute_remote_discard(
-        IntentId::new(11),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(11)),
         &remote,
         &f.key,
         &v9(),
@@ -956,7 +958,7 @@ async fn a_delete_that_never_landed_is_neither_audited_nor_halting() {
     let remote = AmbiguousDelete::new(false, true);
 
     let err = execute_remote_discard(
-        IntentId::new(12),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(12)),
         &remote,
         &f.key,
         &v9(),
@@ -986,7 +988,7 @@ async fn an_unresolvable_delete_halts_subsequent_destruction() {
     let remote = AmbiguousDelete::new(true, false);
 
     let err = execute_remote_discard(
-        IntentId::new(13),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(13)),
         &remote,
         &f.key,
         &v9(),
@@ -1023,7 +1025,7 @@ async fn a_head_that_answers_with_another_version_is_not_a_resolution() {
     let remote = AmbiguousDelete::replaced("v10");
 
     let err = execute_remote_discard(
-        IntentId::new(14),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(14)),
         &remote,
         &f.key,
         &v9(),
@@ -1058,7 +1060,7 @@ async fn a_refused_precondition_neither_records_nor_halts() {
     let remote = AmbiguousDelete::refused();
 
     let err = execute_remote_discard(
-        IntentId::new(15),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(15)),
         &remote,
         &f.key,
         &v9(),

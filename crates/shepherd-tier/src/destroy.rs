@@ -45,8 +45,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use shepherd_catalog::file_repo::ScanRoot;
+use shepherd_catalog::intent::PreparedIntent;
 use shepherd_core::ObjectKey;
-use shepherd_core::{Blake3Hash, FsId, IntentId, Timestamp};
+use shepherd_core::{Blake3Hash, FsId, Timestamp};
 use shepherd_placeholder::provider::{PlaceholderProvider, Staged};
 use shepherd_scan::floors::{self, FloorContext, FloorInput, FloorPolicy};
 use shepherd_storage::adapter::{ObjectMeta, StorageAdapter, StorageError, VersionGuard};
@@ -97,7 +98,18 @@ pub type Result<T> = std::result::Result<T, DestroyError>;
 
 /// Everything the destroy path needs about one file.
 pub struct LocalDestroyRequest<'a> {
-    pub intent: IntentId,
+    /// Proof that an intent reached `prepared` DURABLY before anything
+    /// irreversible was attempted.
+    ///
+    /// A bare [`IntentId`] is an integer any caller can invent, and this
+    /// function's stated ordering — "the intent is fsync'd before the syscall"
+    /// — rested entirely on every caller having remembered to do that, with
+    /// nothing able to tell a journal-backed id from a fabricated one. A crash
+    /// between the unlink and the audit append would then leave no intent to
+    /// reconstruct the forensic record from, which is the guarantee §4.10.4
+    /// exists to make. `PreparedIntent` can only be minted by
+    /// `IntentJournal::prepare`, which returns after the commit.
+    pub intent: PreparedIntent,
     pub path: &'a Path,
     pub root: &'a ScanRoot,
     /// The hash proven against the remote copy.
@@ -260,7 +272,7 @@ pub async fn execute_local_destruction(
             tracing::error!(%detail, "destruction is irreversible but not durable");
             permit.append(&AuditRecord {
                 at: now,
-                intent: req.intent,
+                intent: req.intent.id(),
                 kind: "local",
                 path: req.path.display().to_string(),
                 size: req.expected_size,
@@ -288,7 +300,7 @@ pub async fn execute_local_destruction(
     // have not yet started.
     permit.append(&AuditRecord {
         at: now,
-        intent: req.intent,
+        intent: req.intent.id(),
         kind: "local",
         path: req.path.display().to_string(),
         size: req.expected_size,
@@ -437,7 +449,7 @@ impl RemoteGate for &dyn StorageAdapter {
 /// destruction, and a second call site would be a second place for that to be
 /// forgotten.
 pub async fn execute_remote_discard(
-    intent: IntentId,
+    intent: PreparedIntent,
     remote: &impl RemoteGate,
     key: &ObjectKey,
     guard: &VersionGuard,
@@ -477,7 +489,7 @@ pub async fn execute_remote_discard(
 
     permit.append(&AuditRecord {
         at: now,
-        intent,
+        intent: intent.id(),
         kind: "remote",
         path: key.as_str().to_owned(),
         size: 0,
@@ -526,7 +538,7 @@ pub async fn execute_remote_discard(
 #[allow(clippy::too_many_arguments)]
 async fn resolve_ambiguous_delete(
     err: DestroyError,
-    intent: IntentId,
+    intent: PreparedIntent,
     remote: &impl RemoteGate,
     key: &ObjectKey,
     guard: &VersionGuard,
@@ -598,7 +610,7 @@ async fn resolve_ambiguous_delete(
     );
     permit.append(&AuditRecord {
         at: now,
-        intent,
+        intent: intent.id(),
         kind: "remote",
         path: key.as_str().to_owned(),
         size: 0,

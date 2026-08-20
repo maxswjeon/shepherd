@@ -107,10 +107,20 @@ fn systemd_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
-        if c == '\\' || c == '"' {
-            out.push('\\');
+        match c {
+            // Command-line quoting: a quoted string escapes these two.
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(c);
+            }
+            // SPECIFIER expansion is a separate pass and quoting does not stop
+            // it. systemd rewrites `%b` to the boot id, `%h` to the home
+            // directory and so on INSIDE the quoted string, so an executable
+            // under `/tmp/a%b/shepherdd` became a different command and the
+            // unit failed verification as non-executable. `%%` is the literal.
+            '%' => out.push_str("%%"),
+            other => out.push(other),
         }
-        out.push(c);
     }
     out.push('"');
     out
@@ -270,6 +280,16 @@ mod tests {
         assert!(
             t.contains(r#"ExecStart="/tmp/we\"ird\\path/shepherdd" run"#),
             "{t}"
+        );
+
+        // A `%` is a SPECIFIER, and quoting does not stop systemd expanding
+        // it: `/tmp/a%b/shepherdd` became the boot id and the unit failed
+        // verification as non-executable. `%%` is the literal.
+        let t = unit_text(Path::new("/tmp/a%b/shepherdd"));
+        assert!(t.contains(r#"ExecStart="/tmp/a%%b/shepherdd" run"#), "{t}");
+        assert!(
+            !t.contains("/tmp/a%b/shepherdd"),
+            "the unexpanded form must not survive into the unit: {t}"
         );
     }
 

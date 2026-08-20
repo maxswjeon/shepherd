@@ -31,8 +31,9 @@
 //! discard branch to run through the same intent + audit apparatus as local
 //! destruction, and a second call site would be a second place to forget it.
 
+use shepherd_catalog::intent::PreparedIntent;
 use shepherd_catalog::job_repo::JobClass;
-use shepherd_core::{IntentId, ObjectKey, RootId, TargetId, Timestamp};
+use shepherd_core::{ObjectKey, RootId, TargetId, Timestamp};
 use shepherd_placeholder::mock::StubState;
 use shepherd_rules::delete_policy::{
     BreakerState, DiscardDecision, DiscardInputs, PermanentDeleteConfirmation, discard_permitted,
@@ -422,7 +423,7 @@ const SENTINEL: TargetId = TargetId::new(0);
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_discard(
     charge: &mut DiscardCharge,
-    intent: IntentId,
+    intent: PreparedIntent,
     remote: &impl RemoteGate,
     candidate: &Candidate,
     target: TargetId,

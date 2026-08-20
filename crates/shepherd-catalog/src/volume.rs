@@ -129,23 +129,37 @@ mod linux {
     }
 
     /// mountinfo escapes space, tab, newline and backslash as `\040` etc.
+    ///
+    /// Decoded into BYTES and converted to UTF-8 once at the end. Pushing each
+    /// byte as its own `char` is a latin-1 decode: every byte above 0x7F became
+    /// its own scalar, so a mount point containing `é` (`0xC3 0xA9`) came back
+    /// as `Ã©`. That entry then matches no registered path, `entry_for` falls
+    /// back to a parent filesystem, and the root is assigned the WRONG
+    /// volume's UUID — which is the value `fs_id` pairs with an inode, so
+    /// catalog locking and replacement detection end up keyed on another
+    /// filesystem's identity.
+    ///
+    /// Lossy only at the very end, and only for a mount point that is not valid
+    /// UTF-8 at all — a real possibility on Linux, where a mount point is
+    /// bytes. Such an entry cannot match a `str` path anyway, so a lossy
+    /// rendering costs nothing that was reachable.
     fn unescape_octal(s: &str) -> String {
         let b = s.as_bytes();
-        let mut out = String::with_capacity(s.len());
+        let mut out: Vec<u8> = Vec::with_capacity(b.len());
         let mut i = 0;
         while i < b.len() {
             if b[i] == b'\\'
                 && i + 3 < b.len()
                 && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8)
             {
-                out.push(v as char);
+                out.push(v);
                 i += 4;
                 continue;
             }
-            out.push(b[i] as char);
+            out.push(b[i]);
             i += 1;
         }
-        out
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     /// The mount entry governing `path`: the longest mount point that is a
@@ -241,7 +255,17 @@ mod linux {
     fn uuid_for_source(source: &str) -> Option<String> {
         let target = std::fs::canonicalize(source).ok()?;
         for e in std::fs::read_dir("/dev/disk/by-uuid").ok()?.flatten() {
-            if std::fs::canonicalize(e.path()).ok()? == target {
+            // A dangling link SKIPS, it does not abandon the search. `?` here
+            // returned `None` for the whole directory the moment one entry
+            // could not be resolved — routine during removable-device churn —
+            // so a valid UUID link later in the listing was never reached.
+            // Root registration then stored no volume id at all, and every file
+            // under that root lost the stable identity that upload and
+            // destruction lock on.
+            let Ok(resolved) = std::fs::canonicalize(e.path()) else {
+                continue;
+            };
+            if resolved == target {
                 return Some(e.file_name().to_string_lossy().to_string());
             }
         }
@@ -567,6 +591,36 @@ mod remount_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::linux::*;
+
+    /// A mount point with a non-ASCII character survives mountinfo decoding.
+    ///
+    /// The escape decoder pushed each BYTE as its own `char`, which is a
+    /// latin-1 decode: `é` (`0xC3 0xA9`) came back as `Ã©`. That entry then
+    /// matches no registered path, `entry_for` falls back to a parent
+    /// filesystem, and the root is assigned the WRONG volume's UUID — the value
+    /// `fs_id` pairs with an inode, so catalog locking and replacement
+    /// detection end up keyed on another filesystem's identity.
+    #[test]
+    fn a_non_ascii_mount_point_is_decoded_as_utf8() {
+        // `/mnt/café photos` — the space is octal-escaped by mountinfo, the
+        // `é` is not.
+        let text = "\
+36 35 98:0 / /mnt/café\\040photos rw,relatime shared:1 - ext4 /dev/sda1 rw
+";
+        let entries = parse_mountinfo(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].mount_point, "/mnt/café photos",
+            "the escape decode must not turn UTF-8 into latin-1"
+        );
+
+        // And the entry is therefore FINDABLE, which is the consequence that
+        // matters: an unmatched entry sends `entry_for` to a parent filesystem
+        // and the root gets another volume's UUID.
+        let found = entry_for(&entries, "/mnt/café photos/a.raw")
+            .expect("the mount entry must match the path it governs");
+        assert_eq!(found.source, "/dev/sda1");
+    }
 
     /// Fixture lines, not the live mount table: a test that reads /proc passes
     /// or fails according to the machine it runs on, which is not a test.

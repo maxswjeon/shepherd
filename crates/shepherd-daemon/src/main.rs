@@ -224,7 +224,14 @@ fn cmd_run() -> Result<(), String> {
                                                `search` will be refused until a restart"),
     }
 
-    let listener = server::bind(&daemon.paths.socket).map_err(|e| e.to_string())?;
+    // The lock lives in the STATE directory: two daemons on one catalog is the
+    // harm, and a lock beside the socket would be an ordinary file in whatever
+    // directory `SHEPHERD_SOCKET` names — which can be inside a scan root.
+    let bound = server::bind(
+        &daemon.paths.socket,
+        &daemon.paths.state_dir.join("daemon.lock"),
+    )
+    .map_err(|e| e.to_string())?;
     tracing::info!(
         socket = %daemon.paths.socket.display(),
         catalog = %daemon.paths.catalog().display(),
@@ -242,7 +249,10 @@ fn cmd_run() -> Result<(), String> {
     let pool = Pool::start(daemon.writer.clone(), registry, POOL_SIZE);
 
     let stop = shutdown_flag();
-    server::serve(listener, Arc::clone(&daemon), Arc::clone(&stop));
+    // `bound` is held to the end of `run`, which is what keeps the startup lock
+    // held for the daemon's life: dropping it before `serve` returns would let
+    // a second daemon take the socket out from under this one.
+    server::serve(bound.listener, Arc::clone(&daemon), Arc::clone(&stop));
 
     tracing::info!("shutting down");
     pool.shutdown();

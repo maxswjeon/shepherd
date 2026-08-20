@@ -46,9 +46,7 @@ use std::time::Duration;
 use shepherd_catalog::file_repo::FileRepo;
 use shepherd_catalog::identity::{PathCasePolicy, PathNormPolicy, content_key};
 use shepherd_catalog::{AtimeMode, Catalog};
-use shepherd_core::{
-    Blake3Hash, CustodyClass, FileStat, IntentId, ObjectKey, StubMode, TargetId, Timestamp,
-};
+use shepherd_core::{Blake3Hash, CustodyClass, FileStat, ObjectKey, StubMode, TargetId, Timestamp};
 use shepherd_placeholder::DeleteModeProvider;
 use shepherd_placeholder::provider::FileIdentity;
 use shepherd_scan::{DenyList, FloorPolicy, IgnoreSet, walk};
@@ -198,9 +196,37 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     )
     .expect("fs_id");
 
+    let prepared_intent = {
+        let mut c = Catalog::open(&db).unwrap();
+        shepherd_catalog::intent::IntentJournal::new(&mut c)
+            .prepare(
+                &shepherd_catalog::intent::NewIntent {
+                    kind: shepherd_catalog::intent::IntentKind::Local,
+                    file_id: None,
+                    path: &doomed.display().to_string(),
+                    size: doomed_bytes.len() as i64,
+                    blake3: Some(doomed_hash),
+                    target_ids_json: "[1]",
+                    remote_keys_json: "[]",
+                    attested_identity_json: None,
+                    verified_at: Some(now),
+                    batch_id: None,
+                    episode_id: None,
+                },
+                now,
+            )
+            .expect("the journal must accept a prepared intent")
+    };
+
     let destroyed = execute_local_destruction(
         &LocalDestroyRequest {
-            intent: IntentId::new(1),
+            // Minted by the JOURNAL, not fabricated. `PreparedIntent` exists so
+            // that "an intent was durably prepared before anything
+            // irreversible" is a precondition rather than a comment, and a
+            // test that hands the destroy path an invented token is not
+            // exercising that precondition — which is precisely what made the
+            // guarantee unenforced in the first place.
+            intent: prepared_intent,
             path: &doomed,
             root: &root,
             expected_hash: doomed_hash,
@@ -278,21 +304,79 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
          a bundle carrying derived rows would 'recover' them without a rescan"
     );
 
+    // --- the custody record, derived from what the DESTRUCTION wrote --------
+    //
+    // # What this does and does not establish
+    //
+    // Nothing in this repository publishes custody into a recovery bundle.
+    // `object_location` is schema-only, no production statement writes a
+    // binding, and `tier.plan`/`tier.run` answer `MethodNotImplemented` — so
+    // there is no publication pipeline whose output this test could recover.
+    // An earlier version built this record from the fixture's own variables,
+    // which meant the AC-6 gate would have passed unchanged on a build where
+    // no destroy path had ever published anything, i.e. on this one.
+    //
+    // It cannot test a pipeline that does not exist. What it can stop doing is
+    // inventing the answer: every field below now comes from the AUDIT RECORD
+    // the destruction actually appended, so the record under recovery depends
+    // on what the system did rather than on what the test knew. If destruction
+    // stops recording the path, the size or the hash, this fails.
+    //
+    // **When T10 lands the publisher, this block is what it replaces.** The
+    // record must then be read back from the bundle the destroy path published,
+    // and the assertion below becomes a statement about that pipeline. Until
+    // then this test covers the bundle → recovery half only, and says so.
+    let audited: serde_json::Value = {
+        let lines = audit.read_all();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the destruction must have written exactly one audit record to derive from: \
+             {lines:?}"
+        );
+        serde_json::from_str(&lines[0]).expect("the audit record is one JSON object per line")
+    };
+    assert_eq!(
+        audited["intent"].as_i64(),
+        Some(prepared_intent.id().get()),
+        "the record must belong to the intent the journal prepared, or deriving from it \
+         proves nothing about this destruction"
+    );
     let custody = CustodyRecord {
         key: CustodyKey {
-            path: "archive.raw".into(),
-            blake3: doomed_hash,
+            path: audited["path"]
+                .as_str()
+                .expect("the audit record names the path")
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned(),
+            blake3: Blake3Hash::from_hex(
+                audited["blake3"]
+                    .as_str()
+                    .expect("the audit record carries the hash destruction proved"),
+            )
+            .expect("a hex digest"),
         },
         target: TargetId::new(1),
-        object_key: key.as_str().to_owned(),
+        object_key: audited["target_keys"][0]
+            .as_str()
+            .expect("the audit record names the remote key it was destroyed against")
+            .to_owned(),
         object_version: Some("v1".into()),
-        size: doomed_bytes.len() as u64,
+        size: audited["size"]
+            .as_u64()
+            .expect("the audit record carries the size"),
         mtime: now,
         mode: 0o644,
         restore_metadata: BTreeMap::new(),
         clock: LogicalClock::default(),
         tombstone: false,
     };
+    assert_eq!(
+        custody.key.blake3, doomed_hash,
+        "and the derived record must describe the file that was actually destroyed"
+    );
     let segment = encode_segment(&[BundleEntry::Custody(custody.clone())]).expect("encode");
 
     // --- DROP ALL LOCAL STATE ----------------------------------------------

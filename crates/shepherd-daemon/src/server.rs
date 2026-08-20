@@ -86,7 +86,7 @@ fn describe_file_type(ft: std::fs::FileType) -> &'static str {
 ///   happened to name, because a regular file refuses connections too;
 /// * **the mode**, set before accepting, because it is the entire authorization
 ///   model.
-pub fn bind(path: &Path) -> Result<UnixListener, ServerError> {
+pub fn bind(path: &Path, lock_path: &Path) -> Result<Bound, ServerError> {
     let err = |detail: String| ServerError::Bind {
         path: path.display().to_string(),
         detail,
@@ -100,6 +100,48 @@ pub fn bind(path: &Path) -> Result<UnixListener, ServerError> {
         // The directory is the outer half of the permission story.
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
+
+    // --- one daemon per socket, and the lock says so -----------------------
+    //
+    // Everything below inspects the socket node and then acts on what it saw,
+    // which two starting daemons can interleave: both find the stale node, both
+    // fail to connect, the first unlinks and binds, and the SECOND then unlinks
+    // that live socket and binds its own. The first daemon goes on running,
+    // unreachable, while both drive the same catalog and job queue — the worst
+    // shape available, because the unreachable one is still doing work.
+    //
+    // Making the unlink conditional on the identity that was inspected narrows
+    // the window and does not close it, and it says nothing about the catalog.
+    // An advisory lock held for the listener's whole life does both: it is the
+    // ordinary single-instance primitive, it covers the inspect-then-act
+    // sequence as one critical section, and a second daemon is refused at
+    // startup rather than after it has begun writing.
+    //
+    // In the STATE directory, which the caller names, and not beside the socket.
+    // Two reasons, and the second is the one that decided it:
+    //
+    // * the deeper harm is two daemons on one CATALOG and one job queue, and
+    //   the state directory is what that is; the socket is only how the loser
+    //   is noticed;
+    // * a lock file beside the socket is an ordinary file in whatever directory
+    //   `SHEPHERD_SOCKET` points at, which can be inside a scan root — and then
+    //   the daemon catalogues its own lock. The state directory is already
+    //   refused as a root and excluded from every walk.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|e| err(format!("cannot open {}: {e}", lock_path.display())))?;
+    let _ = std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o600));
+    lock.try_lock().map_err(|e| {
+        err(format!(
+            "another shepherdd already holds {} ({e}); two daemons on one socket would race \
+             over it and then drive the same catalog",
+            lock_path.display()
+        ))
+    })?;
 
     // `symlink_metadata`, not `exists`/`metadata`: a symlink here is not a
     // socket node we may unlink, and a dangling one makes `exists` answer false
@@ -130,7 +172,22 @@ pub fn bind(path: &Path) -> Result<UnixListener, ServerError> {
     let listener = UnixListener::bind(path).map_err(|e| err(e.to_string()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| err(format!("cannot set mode 0600: {e}")))?;
-    Ok(listener)
+    Ok(Bound {
+        listener,
+        _lock: lock,
+    })
+}
+
+/// A bound listener **and** the startup lock that makes it the only one.
+///
+/// The lock is a field rather than something the caller is asked to keep alive,
+/// because "hold this for the process lifetime" is exactly the instruction a
+/// caller forgets. Dropping this drops both together, which is also what makes
+/// a test able to release ownership deterministically.
+#[derive(Debug)]
+pub struct Bound {
+    pub listener: UnixListener,
+    _lock: std::fs::File,
 }
 
 /// Accept connections until `stop` is set.
@@ -624,7 +681,8 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"a document the user cares about").unwrap();
 
-        let e = bind(&path).expect_err("a regular file is not a stale socket");
+        let e = bind(&path, &path.with_extension("lock"))
+            .expect_err("a regular file is not a stale socket");
 
         assert_eq!(
             std::fs::read(&path).ok().as_deref(),
@@ -800,7 +858,7 @@ mod tests {
     #[test]
     fn the_socket_is_owner_only_and_its_directory_is_created() {
         let path = tmp_socket("mode");
-        let listener = bind(&path).unwrap();
+        let listener = bind(&path, &path.with_extension("lock")).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "socket mode is {mode:04o}");
         let dir_mode = std::fs::metadata(path.parent().unwrap())
@@ -827,20 +885,91 @@ mod tests {
         drop(UnixListener::bind(&path).expect("bind the socket a killed daemon left"));
         assert!(path.exists(), "dropping a listener leaves the node behind");
 
-        let listener = bind(&path).expect("a stale socket must not block startup");
+        let listener = bind(&path, &path.with_extension("lock"))
+            .expect("a stale socket must not block startup");
         drop(listener);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// But a *live* socket must not be stolen: blindly unlinking would let a
     /// second daemon take over and leave the first writing to nothing.
+    ///
+    /// Asserted on the PROPERTY rather than on the message. Two refusals now
+    /// stand between a second daemon and this socket — the startup lock, and
+    /// the connect probe behind it — and which one fires first is an
+    /// implementation detail; that the first daemon still owns a working socket
+    /// afterwards is not.
     #[test]
     fn a_live_socket_is_not_stolen_by_a_second_daemon() {
         let path = tmp_socket("live");
-        let first = bind(&path).unwrap();
-        let err = bind(&path).unwrap_err();
-        assert!(err.to_string().contains("already listening"), "{err}");
+        let first = bind(&path, &path.with_extension("lock")).unwrap();
+
+        let err = bind(&path, &path.with_extension("lock")).unwrap_err();
+
+        // The first daemon is still reachable at the same socket.
+        UnixStream::connect(&path).expect("the first daemon's socket must still accept: {err}");
+        let _ = &err;
         drop(first);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// Two daemons racing over a STALE socket cannot both win.
+    ///
+    /// This is the case the connect probe alone could not cover: both starts
+    /// find the leftover node, both fail to connect, the first unlinks and
+    /// binds — and the second then unlinks that live socket and binds its own.
+    /// The first goes on running, unreachable, while both drive the same
+    /// catalog and job queue.
+    ///
+    /// The lock is what serializes it, so the assertion is that the loser is
+    /// refused and the winner still owns the socket — and then that the socket
+    /// is re-bindable once the winner releases, or every restart would be
+    /// refused by the previous run's lock file.
+    #[test]
+    fn two_daemons_racing_over_a_stale_socket_cannot_both_bind() {
+        let path = tmp_socket("race");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A stale node, exactly as a killed daemon leaves one.
+        drop(UnixListener::bind(&path).expect("seed a stale socket"));
+
+        // The other daemon is represented by the lock it holds, not by a second
+        // `bind` — and that is the point. A second `bind` here would find a
+        // LIVE socket and be turned away by the connect probe, which is the
+        // check that already worked; the race this closes is the interval where
+        // the socket is still stale for BOTH starts, and only the lock covers
+        // it. Holding the lock directly is how that interval is made
+        // observable without two processes and a scheduler.
+        let other_daemon = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))
+            .expect("open the lock the way `bind` does");
+        other_daemon.try_lock().expect("and hold it");
+
+        let err = bind(&path, &path.with_extension("lock")).expect_err(
+            "a second daemon bound a socket that was still stale for both of them; the first \
+             is now unreachable while both drive the same catalog",
+        );
+        assert!(
+            err.to_string().contains("already holds"),
+            "the refusal must name the lock, not the socket: {err}"
+        );
+
+        // The lock is advisory and released with the holder, so an ordinary
+        // restart is not blocked by the file the previous run left behind.
+        //
+        // `unlock` then drop, rather than relying on drop alone: the release
+        // has to have happened before the next `bind`, and making it explicit
+        // removes the question from a test that would otherwise fail
+        // intermittently and be read as a product flake.
+        other_daemon.unlock().expect("release the lock");
+        drop(other_daemon);
+        let restarted = bind(&path, &path.with_extension("lock"))
+            .expect("a restart after a clean stop must not be refused");
+        UnixStream::connect(&path).expect("and it really is listening");
+        drop(restarted);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

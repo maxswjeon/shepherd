@@ -246,8 +246,17 @@ impl DenyList {
                 a == b
             }
         };
+        // BYTES, not a string slice. `hay[hay.len() - tail.len()..]` panics when
+        // that offset is not a UTF-8 boundary — `€€` against `.app` is four
+        // bytes into a three-byte scalar — so an ordinary filename on a
+        // case-insensitive root killed the scan worker and left its job stuck
+        // in `running`. Every suffix on the list is ASCII, and
+        // `eq_ignore_ascii_case` is defined on `[u8]`, so comparing the tail
+        // bytes asks the same question without needing the offset to be a
+        // boundary at all.
         let ends_with = |hay: &str, tail: &str| {
             if self.case_insensitive {
+                let (hay, tail) = (hay.as_bytes(), tail.as_bytes());
                 hay.len() >= tail.len() && hay[hay.len() - tail.len()..].eq_ignore_ascii_case(tail)
             } else {
                 hay.ends_with(tail)
@@ -414,6 +423,38 @@ mod tests {
         );
         // And a component that IS the suffix is still not a bundle.
         assert_eq!(insensitive.deny_dir(".APP", &p("/x/.APP")), None);
+    }
+
+    /// A non-ASCII directory name must not panic the case-insensitive matcher.
+    ///
+    /// The suffix comparison sliced the name at `len - suffix.len()`, which is
+    /// not a UTF-8 boundary for a name like `€€` tested against `.app` — four
+    /// bytes into a three-byte scalar. That panics, and the panic lands in the
+    /// scan worker, which leaves its job stuck in `running`. An ordinary
+    /// filename should not be able to do that.
+    #[test]
+    fn a_non_ascii_name_does_not_panic_the_case_insensitive_matcher() {
+        let d = DenyList::builtin().case_insensitive(true);
+
+        // Names whose byte length lands mid-scalar for at least one suffix.
+        for name in ["€€", "€", "café", "日本語", "a€", "€.app", "ünïcödé"] {
+            let path = p(&format!("/home/u/{name}"));
+            // The assertion is that this RETURNS. Panicking is the bug.
+            let _ = d.deny_dir(name, &path);
+        }
+
+        // And it still answers correctly for the case it exists to catch.
+        assert_eq!(
+            d.deny_dir("Photos.APP", &p("/x/Photos.APP")),
+            Some(DenyReason::Bundle)
+        );
+        // A multi-byte name that genuinely ends with a bundle suffix folds too.
+        assert_eq!(
+            d.deny_dir("café.APP", &p("/x/café.APP")),
+            Some(DenyReason::Bundle)
+        );
+        // And one that does not is left alone.
+        assert_eq!(d.deny_dir("€€", &p("/x/€€")), None);
     }
 
     /// The lesson this codebase has now learned three times: match on

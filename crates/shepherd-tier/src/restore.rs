@@ -293,8 +293,35 @@ fn write_and_verify(
     // fsync, both metadata calls and the read-back.
     still_names_the_created_inode(chosen, created)?;
 
+    // The NAME, made durable. Both `sync_all` calls above are about the inode —
+    // its bytes and then its metadata — and on a filesystem where a newly
+    // created directory entry needs its parent fsynced, neither of them makes
+    // the entry that POINTS at that inode survive a power loss. A restore could
+    // therefore report success, and the pathname it reported be gone after a
+    // reboot with the bytes still sitting in an unreferenced inode.
+    //
+    // After the inode-and-name check, deliberately: syncing before it would
+    // make durable a name this function had not yet established was ours.
+    if let Some(parent) = chosen.parent() {
+        sync_dir(parent).map_err(|e| RestoreError::Io {
+            path: parent.display().to_string(),
+            detail: format!("the restored name is not durable: {e}"),
+        })?;
+    }
+
     drop(f);
     Ok(attrs)
+}
+
+/// fsync a directory, so an entry created in it survives a crash.
+///
+/// A four-line local rather than a shared utility: `shepherd-placeholder` has
+/// the same primitive for the staging rename, and exporting a generic
+/// filesystem call across a crate boundary to save four lines would put a
+/// dependency edge where there is no shared concept — the two callers agree on
+/// `fsync(2)`, not on a Shepherd idea.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Read a restored file's attributes back **through the handle that created

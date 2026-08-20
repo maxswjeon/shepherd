@@ -80,12 +80,35 @@ impl DeleteModeProvider {
         root.join(STAGING_DIR_NAME)
     }
 
+    /// Create the staging directory if it is not there, and make the
+    /// **registered root's own directory entry for it** durable.
+    ///
+    /// The root sync is the easy one to miss. Staging a nested file syncs the
+    /// staging directory (the new entry) and the file's source parent (the
+    /// removed one) — and on a first destruction under this root, the entry
+    /// naming `.shepherd-staging` itself lives in a THIRD directory, the
+    /// registered root, which neither of those is. A power loss then persists
+    /// the nested source removal while losing the staging directory entry, and
+    /// the file's only local bytes go with it.
+    ///
+    /// Synced here rather than in the caller so it happens BEFORE the rename
+    /// that depends on it, which is the ordering that makes it worth anything.
     fn ensure_staging(root: &Path) -> Result<PathBuf> {
         let dir = Self::staging_dir(root);
+        let existed = dir.exists();
         std::fs::create_dir_all(&dir).map_err(|e| ProviderError::Io {
             path: dir.display().to_string(),
             detail: e.to_string(),
         })?;
+        if !existed && let Err(e) = sync_dir(root) {
+            return Err(ProviderError::Io {
+                path: root.display().to_string(),
+                detail: format!(
+                    "the staging directory was created and the root that names it could not \
+                     be made durable: {e}"
+                ),
+            });
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -359,39 +382,14 @@ impl PlaceholderProvider for DeleteModeProvider {
                     // directory and `list_staged` is exactly what lists it. So
                     // the error says WHERE, loudly, which is the same contract
                     // `restore_or_report` keeps on the other rollback path.
-                    match rename_noreplace(&staged, path) {
-                        Ok(true) => {
-                            return Err(ProviderError::Io {
-                                path: dir.display().to_string(),
-                                detail: format!(
-                                    "staging rename is not durable ({e}); the file was put \
-                                     back at {}",
-                                    path.display()
-                                ),
-                            });
-                        }
-                        rolled_back => {
-                            tracing::error!(
-                                original = %path.display(),
-                                staged = %staged.display(),
-                                sync_error = %e,
-                                rollback = ?rolled_back,
-                                "STAGED AND STRANDED: the staging rename could not be made \
-                                 durable and could not be undone. The file's only local copy \
-                                 is in the staging directory and is NOT at its original \
-                                 path; startup recovery lists it, and a human should not \
-                                 have to wait for that"
-                            );
-                            return Err(ProviderError::StagedAndStranded {
-                                original: path.display().to_string(),
-                                staged: staged.display().to_string(),
-                                detail: format!(
-                                    "the staging rename could not be made durable ({e}) and \
-                                     the file could not be moved back"
-                                ),
-                            });
-                        }
-                    }
+                    return Err(unwind_staging(
+                        path,
+                        &staged,
+                        ProviderError::Io {
+                            path: dir.display().to_string(),
+                            detail: format!("staging rename is not durable: {e}"),
+                        },
+                    ));
                 }
             }
             Ok(false) => {
@@ -415,7 +413,18 @@ impl PlaceholderProvider for DeleteModeProvider {
         // Step 3: identity read back from the HELD handle. `rename` does not
         // invalidate descriptors, so this is the same open file — which is the
         // property that makes the staging design identity-bound.
-        let identity = identity_of(&handle)?;
+        //
+        // A failure here is post-rename, so it gets the post-rename treatment
+        // rather than a bare `?`. The original name is already gone — durably,
+        // by the syncs above — and this function returns no `Staged`, so the
+        // caller has nothing to hand `restore_staged`. An `fstat` that fails
+        // after an I/O fault or a removable volume disappearing would otherwise
+        // leave the user's file absent from its original path with the caller
+        // told only that a stat failed.
+        let identity = match identity_of(&handle) {
+            Ok(id) => id,
+            Err(e) => return Err(unwind_staging(path, &staged, e)),
+        };
 
         Ok(Staged {
             original: path.to_path_buf(),
@@ -559,6 +568,49 @@ fn conflict_name(original: &Path) -> PathBuf {
 /// filesystem afterwards, so the call itself is what gets asserted on.
 #[cfg(test)]
 pub(crate) static SYNCED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Put a staged file back, and say what happened either way.
+///
+/// Every failure AFTER the rename has to come through here. The original name
+/// is already gone, and `stage_for_destruction` returns no [`Staged`] on a
+/// failure path — so the caller has nothing to hand
+/// [`PlaceholderProvider::restore_staged`], and a discarded rollback leaves the
+/// user's only local copy somewhere they did not put it while the caller is
+/// told only about whatever failed second.
+///
+/// The rollback is a `RENAME_NOREPLACE`, so it refuses when the original name
+/// was reoccupied while the file was staged. That case is
+/// [`ProviderError::StagedAndStranded`], which names both paths: `list_staged`
+/// is what finds the bytes and startup recovery is what calls it, but a human
+/// should not have to wait for a restart to learn where their file went.
+fn unwind_staging(original: &Path, staged: &Path, cause: ProviderError) -> ProviderError {
+    match rename_noreplace(staged, original) {
+        Ok(true) => match cause {
+            ProviderError::Io { path, detail } => ProviderError::Io {
+                path,
+                detail: format!("{detail}; the file was put back at {}", original.display()),
+            },
+            other => other,
+        },
+        rolled_back => {
+            tracing::error!(
+                original = %original.display(),
+                staged = %staged.display(),
+                cause = %cause,
+                rollback = ?rolled_back,
+                "STAGED AND STRANDED: staging could not be completed and could not be undone. \
+                 The file's only local copy is in the staging directory and is NOT at its \
+                 original path; startup recovery lists it, and a human should not have to \
+                 wait for that"
+            );
+            ProviderError::StagedAndStranded {
+                original: original.display().to_string(),
+                staged: staged.display().to_string(),
+                detail: format!("{cause}, and the file could not be moved back"),
+            }
+        }
+    }
+}
 
 /// Distinguishes one feasibility probe's fixtures from another's in the same
 /// process. See [`DeleteModeProvider::probe_feasibility`].
@@ -1015,6 +1067,51 @@ mod tests {
             std::fs::read(&f).unwrap(),
             b"something the user made",
             "and the user's new file is untouched — the rollback must never replace"
+        );
+    }
+
+    /// Creating the staging directory syncs the REGISTERED ROOT that names it.
+    ///
+    /// Staging a nested file syncs two directories — the staging directory
+    /// gains an entry, the file's source parent loses one — and on the first
+    /// destruction under a root there is a THIRD: the entry naming
+    /// `.shepherd-staging` itself, which lives in the registered root and is
+    /// neither of those. A power loss then persists the nested source removal
+    /// while losing the staging directory entry, and the file's only local
+    /// bytes go with it.
+    #[test]
+    fn creating_the_staging_directory_syncs_the_registered_root() {
+        let t = Tmp::new("rootsync");
+        let nested = t.0.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let f = nested.join("only-copy.bin");
+        std::fs::write(&f, b"the only local copy").unwrap();
+        assert!(
+            !DeleteModeProvider::staging_dir(&t.0).exists(),
+            "the staging directory must be created BY this staging, or the sync under test \
+             is skipped as an existing one"
+        );
+
+        let syncs_of = |d: &PathBuf| {
+            SYNCED_DIRS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == d)
+                .count()
+        };
+        let before = syncs_of(&t.0);
+
+        let Some(_staged) =
+            staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&t.0, &f))
+        else {
+            return;
+        };
+
+        assert!(
+            syncs_of(&t.0) > before,
+            "the registered root was not fsync'd, so the entry naming the new staging \
+             directory may not survive the crash the source removal will"
         );
     }
 
