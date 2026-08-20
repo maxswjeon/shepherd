@@ -355,19 +355,49 @@ pub fn merge_durable_config(branches: &[Vec<DurableConfigRecord>]) -> Vec<Durabl
 
     let mut out = Vec::new();
     for (_, group) in by_entity {
-        let Some(winner) = group.iter().max_by_key(|seen| seen.record.clock) else {
+        // Each branch is reduced to its FRONTIER — its latest record for this
+        // entity — before anything is compared across branches.
+        //
+        // Reducing first is what makes the delete-wins test ask the right
+        // question. A branch that deleted the entity and then re-created it has
+        // a live frontier and a *superseded* tombstone in its own history; that
+        // tombstone is no more current there than a stale edit would be.
+        // Comparing raw records let it face a winner from a sibling branch,
+        // share no branch with it, and be called concurrent — so recovery
+        // dropped an entity whose branches both ended on "alive".
+        let branch_ids: BTreeSet<usize> = group
+            .iter()
+            .flat_map(|seen| seen.branches.iter().copied())
+            .collect();
+        let frontiers: Vec<&Seen<'_>> = branch_ids
+            .iter()
+            .filter_map(|b| {
+                group
+                    .iter()
+                    .filter(|seen| seen.branches.contains(b))
+                    .max_by_key(|seen| seen.record.clock)
+            })
+            .collect();
+
+        let Some(winner) = frontiers
+            .iter()
+            .copied()
+            .max_by_key(|seen| seen.record.clock)
+        else {
             continue;
         };
         if winner.record.tombstone {
             continue;
         }
-        let concurrent_delete = group.iter().any(|seen| {
+        let concurrent_delete = frontiers.iter().any(|seen| {
             if !seen.record.tombstone {
                 return false;
             }
             // Dominated — in the winner's past — only if some ONE branch holds
-            // both, and this one comes earlier on it. Anything else is
-            // concurrent, and a concurrent delete wins.
+            // both, and this one comes earlier on it. `branches` is where the
+            // record APPEARS, not where it is a frontier: a branch that has
+            // simply not advanced past the tombstone still shares the winner's
+            // ancestry, and that is history rather than a conflict.
             let shares_a_branch = seen
                 .branches
                 .intersection(&winner.branches)

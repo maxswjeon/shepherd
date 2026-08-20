@@ -25,6 +25,7 @@ fn clock(days: i64) -> ClockReading {
         wall: t(days),
         monotonic_nanos: u64::try_from(days * DAY).unwrap(),
         boot_id: "b1".into(),
+        provenance: ClockProvenance::NtpSynced,
     }
 }
 
@@ -173,7 +174,6 @@ fn both_gates_passing_permits_the_discard() {
         DeferralKind::Remote,
         14,
         &opened,
-        ClockProvenance::NtpSynced,
     );
     let e = ready_episode(t(20));
     assert_eq!(
@@ -203,7 +203,6 @@ fn caller_supplied_breaker_booleans_are_overwritten_not_trusted() {
         DeferralKind::Remote,
         14,
         &opened,
-        ClockProvenance::NtpSynced,
     );
     let e = ready_episode(t(20));
 
@@ -239,7 +238,6 @@ fn an_unconfirmed_episode_blocks_even_when_the_policy_is_satisfied() {
         DeferralKind::Remote,
         14,
         &opened,
-        ClockProvenance::NtpSynced,
     );
     // Enumerated but never confirmed.
     let mut e = Episode::open(RootId::new(1), TargetId::new(1), t(20));
@@ -283,7 +281,6 @@ fn a_running_deferral_blocks_even_when_the_breaker_is_happy() {
         DeferralKind::Remote,
         14,
         &opened,
-        ClockProvenance::NtpSynced,
     );
     let e = ready_episode(t(3));
 
@@ -325,7 +322,6 @@ fn a_trashed_file_is_refused_end_to_end() {
         DeferralKind::Remote,
         14,
         &opened,
-        ClockProvenance::NtpSynced,
     );
     let e = ready_episode(t(20));
 
@@ -541,7 +537,6 @@ fn deferral() -> Deferral {
         DeferralKind::Remote,
         14,
         &clock(0),
-        ClockProvenance::NtpSynced,
     )
 }
 

@@ -14,6 +14,7 @@ fn boot(id: &str, wall_days: i64, mono_days: i64) -> ClockReading {
         wall: Timestamp::from_nanos(wall_days * DAY),
         monotonic_nanos: u64::try_from(mono_days * DAY).unwrap(),
         boot_id: id.into(),
+        provenance: ClockProvenance::NtpSynced,
     }
 }
 
@@ -24,7 +25,6 @@ fn deferral_at(now: &ClockReading, days: u32) -> Deferral {
         DeferralKind::Remote,
         days,
         now,
-        ClockProvenance::NtpSynced,
     )
 }
 
@@ -137,6 +137,77 @@ fn an_undelete_before_expiry_cancels_and_destroys_nothing() {
     assert!(!discard_permitted(&inputs(&long_after, Some(&d), Some(14))).is_permitted());
 }
 
+/// A cross-boot window may only be ended by a clock somebody can vouch for.
+///
+/// Across a reboot the monotonic reading is meaningless and the wall clock is
+/// the only judge, so an RTC that comes up AHEAD of real time reports the
+/// deadline passed the instant the daemon starts — and on the `discard` path
+/// that is an irreversible deletion of the last copy inside a window the user
+/// still had. The backwards-jump check cannot see it: a clock wrongly ahead
+/// looks exactly like time having passed.
+#[test]
+fn a_cross_boot_window_holds_until_the_wall_clock_is_trustworthy() {
+    let start = boot("b1", 0, 0);
+    let d = deferral_at(&start, 14);
+
+    // Rebooted, and the RTC came up a year ahead of the deferral with nothing
+    // having synchronised it yet.
+    let mut untrusted = boot("b2", 365, 0);
+    untrusted.provenance = ClockProvenance::Local;
+    assert_eq!(
+        d.status(&untrusted),
+        DeferralStatus::HeldClockUntrusted {
+            stored: ClockProvenance::NtpSynced,
+            current: ClockProvenance::Local,
+        },
+        "an unsynchronised RTC that reads a year ahead must not end the window"
+    );
+
+    // `Unknown` is nobody having asked, which is not better than `Local`.
+    let mut never_asked = boot("b2", 365, 0);
+    never_asked.provenance = ClockProvenance::Unknown;
+    assert!(!d.status(&never_asked).is_expired());
+
+    // THE ACCEPTING DIRECTION. Once the clock is synchronised the same reading
+    // expires it — without this, "hold forever" would pass.
+    let trusted = boot("b2", 365, 0);
+    assert_eq!(trusted.provenance, ClockProvenance::NtpSynced);
+    assert_eq!(d.status(&trusted), DeferralStatus::Expired);
+
+    // And a trusted clock still inside the window is Pending, not held: the
+    // refusal must be about trust, not about refusing everything cross-boot.
+    assert!(matches!(
+        d.status(&boot("b2", 7, 0)),
+        DeferralStatus::Pending { .. }
+    ));
+}
+
+/// The deadline is only as good as the clock that WROTE it, so an untrusted
+/// reading at creation holds too.
+///
+/// A `deferred_at` recorded by a slow clock makes `wall_clock_deadline` too
+/// early, and the window is shortened by exactly that error. It is the same
+/// hazard as the current reading, pointed the other way.
+#[test]
+fn a_window_opened_on_an_untrusted_clock_also_holds() {
+    let mut opened = boot("b1", 0, 0);
+    opened.provenance = ClockProvenance::Local;
+    let d = deferral_at(&opened, 14);
+    assert_eq!(d.clock_provenance, ClockProvenance::Local);
+
+    assert_eq!(
+        d.status(&boot("b2", 365, 0)),
+        DeferralStatus::HeldClockUntrusted {
+            stored: ClockProvenance::Local,
+            current: ClockProvenance::NtpSynced,
+        }
+    );
+
+    // Within the SAME boot none of this applies: the monotonic deadline is
+    // authoritative and owes nothing to the wall clock's provenance.
+    assert_eq!(d.status(&boot("b1", 0, 20)), DeferralStatus::Expired);
+}
+
 #[test]
 fn within_one_boot_the_monotonic_deadline_governs_and_ignores_wall_clock_jumps() {
     let start = boot("b1", 0, 0);
@@ -147,6 +218,7 @@ fn within_one_boot_the_monotonic_deadline_governs_and_ignores_wall_clock_jumps()
         wall: Timestamp::from_nanos(365 * DAY),
         monotonic_nanos: u64::try_from(DAY).unwrap(),
         boot_id: "b1".into(),
+        provenance: ClockProvenance::NtpSynced,
     };
     assert!(
         matches!(d.status(&jumped), DeferralStatus::Pending { .. }),
@@ -348,14 +420,7 @@ fn deferral_keyed(
     now: &ClockReading,
     days: u32,
 ) -> Deferral {
-    Deferral::open(
-        FileId::new(file),
-        TargetId::new(target),
-        kind,
-        days,
-        now,
-        ClockProvenance::NtpSynced,
-    )
+    Deferral::open(FileId::new(file), TargetId::new(target), kind, days, now)
 }
 
 /// `file` is load-bearing on its own.

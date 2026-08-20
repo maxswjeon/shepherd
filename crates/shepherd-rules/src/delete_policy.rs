@@ -112,13 +112,22 @@ pub enum PermanentDeleteConfirmation {
     OperatorExplicit { at: Timestamp },
 }
 
-/// A clock reading, taken together so the three fields are consistent.
+/// A clock reading, taken together so the fields are consistent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClockReading {
     pub wall: Timestamp,
     /// Monotonic nanoseconds since boot. Meaningful only within `boot_id`.
     pub monotonic_nanos: u64,
     pub boot_id: String,
+    /// How trustworthy `wall` is **right now**.
+    ///
+    /// Part of the reading rather than a separate argument because it is a
+    /// property of this sample: the same machine answers differently ten
+    /// seconds before and ten seconds after `chronyd` steps the clock, and a
+    /// caller holding a reading must not have to remember which side of that it
+    /// took. [`Deferral::status`] refuses to expire a cross-boot window on an
+    /// untrusted one.
+    pub provenance: ClockProvenance,
 }
 
 /// The durable deferral record (§4.4's `deferral` table).
@@ -147,13 +156,15 @@ pub struct Deferral {
 
 impl Deferral {
     /// Open a deferral window of `window_days` from `now`.
+    /// `provenance` comes from `now` rather than from a separate argument:
+    /// two ways to say how good the clock was are two chances to disagree, and
+    /// [`Deferral::status`] compares them.
     pub fn open(
         file: FileId,
         target: TargetId,
         kind: DeferralKind,
         window_days: u32,
         now: &ClockReading,
-        provenance: ClockProvenance,
     ) -> Self {
         let span = i64::from(window_days).saturating_mul(NANOS_PER_DAY);
         Self {
@@ -167,7 +178,7 @@ impl Deferral {
                 .monotonic_nanos
                 .saturating_add(u64::try_from(span).unwrap_or(u64::MAX)),
             boot_id: now.boot_id.clone(),
-            clock_provenance: provenance,
+            clock_provenance: now.provenance,
             confirmed_permanent_at: None,
             cancelled_at: None,
         }
@@ -190,6 +201,28 @@ pub enum DeferralStatus {
     /// cost asymmetry is total: holding too long delays a deletion, shortening
     /// destroys a file the user could still have recovered.
     HeldClockWentBackwards { by_nanos: i64 },
+    /// A cross-boot window whose wall clock nobody can vouch for.
+    ///
+    /// Across a reboot the monotonic reading is meaningless and the wall clock
+    /// is the only judge — so the window can only be ended by a clock that is
+    /// actually right. An RTC that comes up ahead of real time (a dead battery,
+    /// a dual-boot machine that wrote local time into it, a VM restored from a
+    /// snapshot) reports the deadline passed the instant the daemon starts, and
+    /// on the `discard` path that is an irreversible deletion of the last copy
+    /// during a window the user still had.
+    ///
+    /// FORWARD jumps are the ones that matter here and the backwards check
+    /// cannot see them: `HeldClockWentBackwards` fires when time appears to
+    /// have gone the wrong way, and a clock that is wrongly ahead looks exactly
+    /// like time having passed.
+    ///
+    /// Both provenances are reported because either can shorten the window: the
+    /// reading that CREATED the deadline (too early a `deferred_at` makes the
+    /// deadline too early) and the reading now being compared against it.
+    HeldClockUntrusted {
+        stored: ClockProvenance,
+        current: ClockProvenance,
+    },
 }
 
 impl DeferralStatus {
@@ -226,7 +259,24 @@ impl Deferral {
         }
 
         // Different boot: the stored monotonic reading is meaningless. Wall
-        // clock governs — but first, refuse to shorten on a backwards clock.
+        // clock governs — so the window may only be ended by wall-clock
+        // readings that can actually be vouched for. Checked BEFORE the
+        // comparison, not after, because the comparison is the thing that could
+        // manufacture an expiry.
+        //
+        // Only `NtpSynced` counts. `Local` is the RTC as it came up and
+        // `Unknown` is nobody having asked, and both of those are the very
+        // states in which a machine reports a time it has no basis for.
+        if self.clock_provenance != ClockProvenance::NtpSynced
+            || now.provenance != ClockProvenance::NtpSynced
+        {
+            return DeferralStatus::HeldClockUntrusted {
+                stored: self.clock_provenance,
+                current: now.provenance,
+            };
+        }
+
+        // And refuse to shorten on a backwards clock.
         let drift = now.wall.as_nanos() - self.deferred_at.as_nanos();
         if drift < 0 {
             return DeferralStatus::HeldClockWentBackwards { by_nanos: -drift };
@@ -318,6 +368,12 @@ pub enum DiscardRefusal {
     ClockWentBackwards {
         by_nanos: i64,
     },
+    /// A cross-boot window whose wall clock is not trustworthy enough to end
+    /// it. See [`DeferralStatus::HeldClockUntrusted`].
+    ClockUntrusted {
+        stored: ClockProvenance,
+        current: ClockProvenance,
+    },
     ResyncRequired,
     RootUnavailable,
     BreakerOpen,
@@ -407,6 +463,9 @@ pub fn discard_permitted(inputs: &DiscardInputs<'_>) -> DiscardDecision {
                 }
                 DeferralStatus::HeldClockWentBackwards { by_nanos } => {
                     refusals.push(DiscardRefusal::ClockWentBackwards { by_nanos });
+                }
+                DeferralStatus::HeldClockUntrusted { stored, current } => {
+                    refusals.push(DiscardRefusal::ClockUntrusted { stored, current });
                 }
             },
         }

@@ -45,6 +45,54 @@ fn manifest_for(bytes: &[u8], mode: u32) -> FidelityManifest {
     })
 }
 
+/// The restored file is never readable by anyone else, not even for the
+/// instant between its creation and the manifest's chmod.
+///
+/// `File::create_new` asks for `0666` and an ordinary `022` umask trims that to
+/// `0644`, so a private file used to be published world-readable for the whole
+/// of `write_and_verify` — every byte written and fsynced — before its real
+/// mode was applied. Any account able to traverse the directory could open it
+/// in that window and keep the descriptor afterwards, and a later chmod does
+/// not close a file somebody already holds open.
+///
+/// Asserted on the CREATE, because the window is what the finding is about and
+/// the finished file's mode says nothing about it. `mode & 0o077 == 0` rather
+/// than `== 0o600`: the umask may only remove bits, so a stricter umask is
+/// still a pass and the property is "nobody else, ever".
+#[test]
+#[cfg(unix)]
+fn a_restored_file_is_owner_only_from_its_first_instant() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("perm-window");
+    let path = dir.path("secret.bin");
+    let f = crate::restore::create_owner_only(&path).expect("create");
+    drop(f);
+
+    let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "the file was published as {mode:04o} before its mode was applied; \
+         another account could open it inside that window"
+    );
+
+    // And the manifest still governs the FINAL mode, including a deliberately
+    // permissive one — the tightening must not become a policy of its own.
+    let target = dir.path("public.bin");
+    let m = manifest_for(BYTES, 0o644);
+    restore_file(&target, BYTES, &m).expect("restore");
+    assert_eq!(
+        std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+        "a 0644 manifest must still produce 0644"
+    );
+}
+
 #[test]
 fn a_restore_reproduces_bytes_mtime_and_mode_on_a_real_filesystem() {
     let dir = TempDir::new("happy");

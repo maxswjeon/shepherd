@@ -216,7 +216,16 @@ pub fn restore_file(
     // O_EXCL, not exists()-then-create. The gap between a check and a create is
     // a window in which the user's own new file can appear, and overwriting it
     // would be Shepherd destroying data by writing.
-    let f = std::fs::File::create_new(&chosen).map_err(|e| {
+    //
+    // Owner-only AT CREATION, not afterwards. `File::create_new` asks for 0666
+    // and the umask trims it to 0644 on an ordinary login, so a private file
+    // was published world-readable for the whole of `write_and_verify` — every
+    // byte written and fsynced — before the manifest's mode was applied. Any
+    // account that can traverse the directory could open it inside that window
+    // and keep the descriptor afterwards; a chmod does not close a file
+    // somebody already has open. Restoring a `0600` file has to mean it was
+    // never readable, not that it stopped being readable.
+    let f = create_owner_only(&chosen).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             RestoreError::AlreadyExists {
                 path: chosen.display().to_string(),
@@ -246,6 +255,34 @@ pub fn restore_file(
             Err(e)
         }
     }
+}
+
+/// Exclusive-create a file that is owner-only from its first instant.
+///
+/// The mode is a request, not a guarantee: the umask can only REMOVE bits, so
+/// the result is `0600` or tighter, never looser. The manifest's real mode is
+/// applied later — this is only about what is true in between.
+#[cfg(unix)]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // `.read(true)` as well: `File::create_new` opens read-WRITE, and the
+    // verification reads every byte back through this same handle. Dropping it
+    // turns the read-back into `EBADF`, which is a restore that fails rather
+    // than one that lies — but a failure all the same.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Windows has no umask and no mode bits to leak through one; the inherited
+/// ACL is the directory's, which is the platform's own answer to this question.
+/// Phase 3 owns Windows ACL fidelity, with the rest of the platform.
+#[cfg(not(unix))]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create_new(path)
 }
 
 /// Everything between the exclusive create and a verified restore.

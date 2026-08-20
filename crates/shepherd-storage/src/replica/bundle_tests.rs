@@ -259,6 +259,43 @@ fn a_numerically_higher_record_on_a_sibling_branch_does_not_beat_a_delete() {
     );
 }
 
+/// A tombstone its OWN branch has moved past is history, not a conflict.
+///
+/// Branch B deleted the rule and then re-created it; branch A carries an
+/// unrelated live record with a numerically higher clock. Both branches END on
+/// "alive", so there is nothing to resolve — but comparing raw records instead
+/// of branch frontiers made B's superseded tombstone face A's winner, find no
+/// shared branch, and win as a concurrent delete. Recovery then omitted a rule,
+/// target or setting that was active on every branch.
+#[test]
+fn a_tombstone_its_own_branch_re_created_past_does_not_delete() {
+    let live_on_a = config("rule-1", 1, clock(5, 10), false);
+    let deleted_on_b = config("rule-1", 0, clock(3, 40), true);
+    let recreated_on_b = config("rule-1", 2, clock(3, 41), false);
+
+    let merged = merge_durable_config(&[
+        vec![live_on_a.clone()],
+        vec![deleted_on_b.clone(), recreated_on_b.clone()],
+    ]);
+    assert_eq!(
+        merged.len(),
+        1,
+        "both branches end on a live record; the delete is B's own history"
+    );
+    assert_eq!(
+        merged[0].body, live_on_a.body,
+        "and last-writer-wins still picks the higher clock between two live \
+         frontiers"
+    );
+
+    // The discriminating pair: strip the re-creation and the very same
+    // tombstone becomes B's frontier, concurrent with A, and wins.
+    assert!(
+        merge_durable_config(&[vec![live_on_a], vec![deleted_on_b]]).is_empty(),
+        "a tombstone that IS its branch's frontier must still delete"
+    );
+}
+
 /// History before a fork point belongs to every branch that descends from it,
 /// so a pre-fork tombstone stays in the winner's past.
 ///
