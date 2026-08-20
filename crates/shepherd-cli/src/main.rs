@@ -226,6 +226,16 @@ fn stream_events(
     )
     .map_err(|e| rpc_failure(&e))?;
 
+    // Read out before `sub.result` is consumed below: the dropped-subscription
+    // hint needs it to tell the client what to resume WITH, and a cursor
+    // without its epoch is one the daemon now refuses.
+    let epoch = sub
+        .result
+        .get("epoch")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<epoch>")
+        .to_owned();
+
     let mut summary = serde_json::Map::new();
     if let serde_json::Value::Object(map) = sub.result {
         summary.extend(map);
@@ -263,8 +273,17 @@ fn stream_events(
                 ),
             )
             .with_hint(match sub.last_seq {
+                // The EPOCH is part of the cursor, not an optional extra. A
+                // sequence number means nothing without the run that issued it
+                // — numbering restarts at 1 every time the daemon starts — and
+                // the daemon now treats a cursor without one as stale, which is
+                // the honest answer rather than a replay against unrelated
+                // numbers. A hint that named only `--resume-from` was teaching
+                // the shape that gets refused.
                 Some(seq) => format!(
-                    "resume with `--resume-from {seq}`; if the daemon answers \
+                    "resume with `--resume-from {seq} --resume-epoch {epoch}`; the epoch is \
+                     required — a cursor without it is treated as stale, because sequence \
+                     numbers restart at 1 on every daemon start. If the daemon answers \
                      `snapshot_required` rather than `resumed`, re-read state through the \
                      ordinary methods before trusting the stream"
                 ),

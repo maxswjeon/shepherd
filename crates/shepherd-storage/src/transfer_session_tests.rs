@@ -372,6 +372,64 @@ async fn a_target_that_never_keeps_a_session_fails_closed() {
     );
 }
 
+/// The source is DELETED mid-transfer, not edited — and the provider session
+/// still has to be reaped.
+///
+/// A missing source used to be classified transient, so the fingerprint gate
+/// returned it directly: the queue spent its whole attempt budget on a file
+/// that was never coming back, marked the job failed, and left the transfer
+/// `Uploading` with its multipart parts allocated. Nothing revisits a key whose
+/// source no longer exists, so those parts accrued storage until the bucket's
+/// own lifecycle rules noticed — if it had any.
+///
+/// Distinct from the edited-source test below: that one has a fingerprint to
+/// compare and fails on the comparison. This one never gets a fingerprint at
+/// all, which is the path that bypassed `abandon`.
+#[tokio::test]
+async fn a_source_deleted_between_attempts_abandons_its_provider_session() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+
+    rig.store.die_at_save(4);
+    rig.driver().run(&mut s).await.expect_err("must die");
+
+    // The user deletes the file while the daemon is down.
+    rig.source.vanish();
+
+    rig.store.revive();
+    let mut resumed = rig.reload().await;
+    // Precondition: there really is a session at the provider to leak.
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        1,
+        "this test is about reaping a live session; without one it proves nothing"
+    );
+
+    let err = rig
+        .driver()
+        .run(&mut resumed)
+        .await
+        .expect_err("a source that is gone cannot be uploaded");
+    assert!(
+        matches!(err, StorageError::NotFound { .. }),
+        "a deleted source must be terminal, not a transient the queue retries \
+         five times: {err:?}"
+    );
+    assert!(!err.is_retryable());
+
+    assert_eq!(
+        resumed.state,
+        TransferState::Aborted(AbortOutcome::Clean),
+        "the session must be abandoned where the failure is detected; nothing \
+         later revisits a key whose source no longer exists"
+    );
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        0,
+        "and the abandonment has to reach the provider"
+    );
+}
+
 /// PM-1 — the user edits the file while it is being uploaded.
 #[tokio::test]
 async fn a_source_that_changes_between_attempts_aborts_rather_than_splicing() {

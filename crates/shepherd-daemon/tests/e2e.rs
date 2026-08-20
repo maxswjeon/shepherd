@@ -2473,6 +2473,57 @@ fn seed_some_events(d: &Daemon, c: &mut Client, tag: &str) -> i64 {
     root_id
 }
 
+/// A cursor without the epoch that issued it is **stale**, not current.
+///
+/// Sequence numbers restart at 1 on every daemon start, so a bare
+/// `resume_from` names a different event in every run. Treating a missing
+/// epoch as agreement replayed the client against this run's unrelated
+/// numbering and told it `resumed` — so it believed it had caught up on
+/// history it had never seen. `snapshot_required` is the honest answer, and it
+/// is the one a client can act on.
+#[test]
+fn a_resume_cursor_without_its_epoch_is_refused_as_stale() {
+    let d = Daemon::start("resume-noepoch");
+    let mut c = d.connect();
+    seed_some_events(&d, &mut c, "resume-noepoch");
+
+    let mut sub = d.connect();
+    let bare = sub.call("events.subscribe", serde_json::json!({"resume_from": 0}));
+    assert_eq!(
+        bare["resume"]["outcome"],
+        serde_json::json!("snapshot_required"),
+        "a cursor with no epoch must not be honoured: {bare}"
+    );
+    assert_eq!(
+        bare["resume"]["reason"],
+        serde_json::json!("epoch_changed"),
+        "{bare}"
+    );
+
+    // THE ACCEPTING DIRECTION, so "refuse every resume" cannot pass: the same
+    // cursor WITH this run's epoch resumes.
+    let epoch = bare["epoch"].as_str().expect("epoch").to_owned();
+    let mut ok = d.connect();
+    let good = ok.call(
+        "events.subscribe",
+        serde_json::json!({"resume_from": 0, "resume_epoch": epoch}),
+    );
+    assert_eq!(
+        good["resume"]["outcome"],
+        serde_json::json!("resumed"),
+        "{good}"
+    );
+
+    // And no cursor at all is a fresh subscription, not a stale one.
+    let mut fresh = d.connect();
+    let none = fresh.call("events.subscribe", serde_json::json!({}));
+    assert_ne!(
+        none["resume"]["outcome"],
+        serde_json::json!("snapshot_required"),
+        "asking for no history is not the same as asking for unusable history: {none}"
+    );
+}
+
 /// `events.subscribe` must put its own response on the socket before it writes
 /// a single notification.
 ///
@@ -2492,8 +2543,24 @@ fn a_resuming_subscription_is_answered_before_the_frames_it_replays() {
     seed_some_events(&d, &mut c, "resumeorder");
 
     // A fresh connection, so nothing else is in flight on it.
+    //
+    // The epoch travels WITH the cursor. A sequence number alone names nothing
+    // — numbering restarts at 1 on every daemon start — so the daemon treats a
+    // cursor without one as stale, and this test would otherwise be asserting
+    // `resumed` against the shape that is now correctly refused.
+    let epoch = {
+        let mut probe = d.connect();
+        let r = probe.call("events.subscribe", serde_json::json!({}));
+        r["epoch"]
+            .as_str()
+            .expect("the result names its epoch")
+            .to_owned()
+    };
     let mut sub = d.connect();
-    let first = sub.raw("events.subscribe", serde_json::json!({"resume_from": 0}));
+    let first = sub.raw(
+        "events.subscribe",
+        serde_json::json!({"resume_from": 0, "resume_epoch": epoch}),
+    );
 
     assert!(
         first.get("method").is_none(),
@@ -2833,9 +2900,19 @@ fn shepctl_events_subscribe_renders_the_events_it_subscribed_to() {
     let d = Daemon::start("subrender");
     let mut c = d.connect();
     seed_some_events(&d, &mut c, "subrender");
+
+    // The epoch travels with the cursor, and passing it here is the point as
+    // much as a fixture detail: a bare `--resume-from` is refused as stale, so
+    // this is also the end-to-end check that `--resume-epoch` reaches the
+    // daemon and that the hint on the dropped-subscription path names a flag
+    // that exists.
+    let epoch = c.call("events.subscribe", serde_json::json!({}))["epoch"]
+        .as_str()
+        .expect("the result names its epoch")
+        .to_owned();
     drop(c);
 
-    let (env, events) = subscribe_until_eof(&d, &["--resume-from", "0"]);
+    let (env, events) = subscribe_until_eof(&d, &["--resume-from", "0", "--resume-epoch", &epoch]);
 
     assert_eq!(env["ok"], serde_json::json!(true), "{env}");
     assert!(

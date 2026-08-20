@@ -120,9 +120,31 @@ impl FileSource {
 #[async_trait::async_trait]
 impl SourceReader for FileSource {
     async fn fingerprint(&self) -> StorageResult<SourceFingerprint> {
-        let md = std::fs::metadata(&self.path).map_err(|e| StorageError::Transient {
-            op: "stat source".into(),
-            detail: e.to_string(),
+        // A missing source is TERMINAL, everything else transient.
+        //
+        // Classifying `NotFound` as transient meant a deleted source produced a
+        // retryable error, the queue spent its whole attempt budget on a file
+        // that was never coming back, and the multipart session stayed
+        // `Uploading` with its parts allocated at the provider — with the
+        // source gone, nothing later revisits that key to reap them.
+        //
+        // The ambiguity is real and worth naming: an unmounted volume answers
+        // `ENOENT` for the same path. Failing the job is the right response to
+        // both — nothing is destroyed by an upload that does not happen, the
+        // failure is visible, and a rescan re-enqueues the work when the volume
+        // returns. PM-3's root-availability gate is the layer that should stop
+        // the job being claimed at all in that case; that wiring is Phase 2's.
+        let md = std::fs::metadata(&self.path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound {
+                    key: self.path.display().to_string(),
+                }
+            } else {
+                StorageError::Transient {
+                    op: "stat source".into(),
+                    detail: e.to_string(),
+                }
+            }
         })?;
         let mtime = md
             .modified()

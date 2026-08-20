@@ -556,6 +556,28 @@ fn discard_failed_attempt(chosen: &Path, created: Option<CreatedInode>) {
                     "a failed restore could not be cleaned up; the path is occupied by \
                      partial or invalid data and a retry will treat it as a conflict"
                 );
+                return;
+            }
+            // The unlink is not finished until the directory that named the
+            // entry is durable. `write_and_verify` has already fsynced this
+            // file and its metadata, so a power cut here rolls back only the
+            // removal — resurrecting the partial or fidelity-invalid file at
+            // the original path. The next restore then finds Shepherd's own
+            // failed output, calls it a user conflict, and lands the file
+            // somewhere else under a `(restored N)` name.
+            //
+            // Reported, not returned, for the same reason as everything else
+            // here: the caller already has the real error and must not have it
+            // replaced by a cleanup failure.
+            if let Some(parent) = chosen.parent()
+                && let Err(e) = sync_dir(parent)
+            {
+                tracing::error!(
+                    path = %chosen.display(),
+                    error = %e,
+                    "a failed restore was unlinked but its directory could not be synced; \
+                     a power loss now can bring the failed output back at this path"
+                );
             }
         }
         Ok(_) => tracing::warn!(

@@ -633,12 +633,17 @@ impl TransferSessionStore for MemStore {
 #[derive(Debug)]
 pub struct MemSource {
     inner: Mutex<(Bytes, Timestamp)>,
+    /// The source was deleted. `fingerprint` then fails TERMINALLY, which is
+    /// the distinction that matters: a source that is merely unreadable this
+    /// second is worth retrying, and one that is gone is not.
+    gone: std::sync::atomic::AtomicBool,
 }
 
 impl MemSource {
     pub fn new(body: impl Into<Bytes>) -> Self {
         Self {
             inner: Mutex::new((body.into(), Timestamp::from_nanos(1_000))),
+            gone: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -655,6 +660,11 @@ impl MemSource {
         let mut i = self.inner.lock().expect("poisoned");
         i.0 = body.into();
         i.1 = Timestamp::from_nanos(i.1.as_nanos() + 1);
+    }
+
+    /// The user deleted the file. Every later `fingerprint` fails terminally.
+    pub fn vanish(&self) {
+        self.gone.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// PM-1's sharper form: an in-place edit the cheap fingerprint cannot see.
@@ -680,6 +690,11 @@ impl MemSource {
 #[async_trait::async_trait]
 impl SourceReader for MemSource {
     async fn fingerprint(&self) -> StorageResult<SourceFingerprint> {
+        if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StorageError::NotFound {
+                key: "the source file".into(),
+            });
+        }
         let i = self.inner.lock().expect("poisoned");
         Ok(SourceFingerprint {
             size: i.0.len() as u64,

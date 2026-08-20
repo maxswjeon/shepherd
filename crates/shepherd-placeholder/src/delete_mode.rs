@@ -94,6 +94,15 @@ impl DeleteModeProvider {
     /// Synced here rather than in the caller so it happens BEFORE the rename
     /// that depends on it, which is the ordering that makes it worth anything.
     fn ensure_staging(root: &Path) -> Result<PathBuf> {
+        // The ROOT first, because the staging directory's own mode and owner
+        // say nothing about who may rename its ENTRY. Renaming
+        // `.shepherd-staging` needs write permission on the directory that
+        // names it, not on the directory itself — so an account that can write
+        // the root can move ours aside, drop a symlink in its place, and every
+        // pathname-resolved staging operation after that lands wherever the
+        // symlink points. The checks below verify a directory; this verifies
+        // that the name still means it.
+        secure_staging_parent(root)?;
         let dir = Self::staging_dir(root);
         // Checked BEFORE `create_dir_all`, which answers `EEXIST` for anything
         // already at the path — a bare "File exists" tells an operator nothing
@@ -600,6 +609,83 @@ fn not_a_directory(dir: &Path) -> ProviderError {
 /// than a symlink into one, and the owner is checked. Refusing costs the user a
 /// destruction that does not happen and says why; not refusing costs an audit
 /// record that describes the wrong file.
+/// Refuse a root whose staging entry another account could rename.
+///
+/// # Why the staging directory's own permissions are not enough
+///
+/// `secure_staging` proves the *directory* is ours and owner-only. It cannot
+/// prove the NAME still resolves to it: rename and unlink are governed by the
+/// containing directory, so an account with write permission on the registered
+/// root can move `.shepherd-staging` aside and leave a symlink where it was —
+/// after the check, and after the directory was verified. Every later staging
+/// operation resolves that pathname again, so the rename, the sync and the
+/// unlink all land inside the attacker's tree, and the audit record names an
+/// inode that was never the one destroyed.
+///
+/// # Refusing rather than pinning
+///
+/// The complete fix is a pinned directory handle — open the verified directory
+/// `O_DIRECTORY|O_NOFOLLOW` and drive `renameat2`, `unlinkat` and `fsync`
+/// relative to that fd, so no pathname is ever resolved twice. That is a change
+/// to every staging primitive in this module and to `list_staged`, and it is
+/// the right eventual shape.
+///
+/// Until then this removes the *widest* form of the precondition: a root any
+/// account on the machine can write. Refusing costs a destruction that does not
+/// happen and says why.
+///
+/// # What this deliberately does NOT refuse, and why
+///
+/// **Group-writable roots.** The obvious rule — refuse `0o022` — refuses almost
+/// every Linux home directory. A `002` umask is the default wherever each user
+/// has a private group of their own (Debian and Ubuntu's `USERGROUPS_ENAB`,
+/// among others), so ordinary directories are `0775` and the group with write
+/// permission has exactly one member: the user. Refusing those would take a
+/// safety check and turn it into "delete-mode does not work here", which is how
+/// checks get switched off. Telling the safe case from the dangerous one means
+/// resolving the group's membership, and that is a real answer rather than a
+/// mode test.
+///
+/// **A hostile process running as the same user.** Out of scope by design —
+/// this module's docs already say staging is not a boundary against the same
+/// UID, and only the handle form would make it one.
+///
+/// The sticky bit is honoured because it is this rule already: on a sticky
+/// directory only an entry's owner may rename or remove it, which is what
+/// `/tmp` relies on. A world-writable sticky root is therefore fine.
+#[cfg(unix)]
+fn secure_staging_parent(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let md = std::fs::symlink_metadata(root).map_err(|e| ProviderError::Io {
+        path: root.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    let mode = md.permissions().mode();
+    let world_writable = mode & 0o002 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if world_writable && !sticky {
+        return Err(ProviderError::Io {
+            path: root.display().to_string(),
+            detail: format!(
+                "the registered root is mode {:04o} and not sticky, so ANY account on this \
+                 machine can rename `{STAGING_DIR_NAME}` and leave a symlink in its place — \
+                 after which staging would move the file into a directory Shepherd never \
+                 verified and the audit record would describe an inode that was not \
+                 destroyed. Staging is refused until the root is not world-writable, or is \
+                 sticky, which already restricts rename to the entry's owner",
+                mode & 0o7777
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_staging_parent(_root: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
 fn secure_staging(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1235,6 +1321,55 @@ mod tests {
             "the registered root was not fsync'd, so the entry naming the new staging \
              directory may not survive the crash the source removal will"
         );
+    }
+
+    /// A world-writable root is refused before anything is staged in it.
+    ///
+    /// `secure_staging` proves the staging DIRECTORY is ours and owner-only. It
+    /// cannot prove the name still resolves to it: rename is governed by the
+    /// containing directory, so on a world-writable root any account can move
+    /// `.shepherd-staging` aside and leave a symlink where it was, after the
+    /// check has passed. Every later staging operation resolves that pathname
+    /// again and lands in the attacker's tree.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_writable_root_cannot_host_staging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = Tmp::new("worldwritable");
+        let root = t.0.clone();
+        let file = t.file("a.raw", b"payload");
+
+        // The accepting direction first, so this cannot pass by refusing
+        // everything: an ordinary root stages.
+        let p = DeleteModeProvider;
+        let staged = p
+            .stage_for_destruction(&root, &file)
+            .expect("ordinary root stages");
+        p.restore_staged(staged).expect("put it back");
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o777,
+            "the fixture itself has to be world-writable, or this asserts nothing"
+        );
+
+        let err = p
+            .stage_for_destruction(&root, &file)
+            .expect_err("a root anybody can write must not host staging");
+        assert!(
+            err.to_string().contains("world-writable") || err.to_string().contains("0777"),
+            "the refusal must name the reason: {err}"
+        );
+
+        // Sticky is the exception, and it is the same rule: only an entry's
+        // owner may rename it, which is what /tmp relies on.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let staged = p
+            .stage_for_destruction(&root, &file)
+            .expect("a sticky world-writable root already restricts rename to the owner");
+        p.restore_staged(staged).expect("put it back");
     }
 
     /// A staging directory this daemon cannot secure is REFUSED.

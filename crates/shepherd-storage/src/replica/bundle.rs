@@ -280,6 +280,36 @@ pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
     live
 }
 
+/// One durable-config record, and the segment that published it.
+///
+/// The `origin` is what makes shared history *provable*. An earlier version of
+/// [`merge_durable_config`] collapsed records across branches by value
+/// equality, on the reasoning that a byte-identical record must be one record
+/// seen from two descendants of a fork. It need not be: two sibling writers can
+/// independently emit the same delete at the same logical clock, and calling
+/// that shared ancestry made a concurrent tombstone look dominated — so a rule
+/// one branch had deleted came back.
+///
+/// Identity, not resemblance. `origin` is the publishing pointer's
+/// `self_blake3`, which is a content hash of the pointer record, so two
+/// branches carrying the same origin really did descend through the same
+/// publication and two that merely agree in value did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRecord {
+    pub record: DurableConfigRecord,
+    /// `PointerRecord::self_blake3` of the pointer whose segment carried it.
+    pub origin: String,
+}
+
+impl BranchRecord {
+    pub fn new(record: DurableConfigRecord, origin: impl Into<String>) -> Self {
+        Self {
+            record,
+            origin: origin.into(),
+        }
+    }
+}
+
 /// Merge durable-config records across the branches of a chain.
 ///
 /// **Last-writer-wins by `(writer_epoch, seq)` per entity id, with delete-wins
@@ -328,7 +358,7 @@ pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
 ///
 /// Records sharing the winner's exact clock remain concurrent with it — a
 /// genuine two-writer collision — and delete-wins remains the answer.
-pub fn merge_durable_config(branches: &[Vec<DurableConfigRecord>]) -> Vec<DurableConfigRecord> {
+pub fn merge_durable_config(branches: &[Vec<BranchRecord>]) -> Vec<DurableConfigRecord> {
     // Each entity's records, each tagged with the set of branches carrying it.
     // The key borrows for the same reason the values do: nothing here outlives
     // `branches`. `&str` orders identically to `String`, so the group order —
@@ -336,17 +366,27 @@ pub fn merge_durable_config(branches: &[Vec<DurableConfigRecord>]) -> Vec<Durabl
     let mut by_entity: BTreeMap<(ConfigKind, &str), Vec<Seen<'_>>> = BTreeMap::new();
     for (b, branch) in branches.iter().enumerate() {
         for r in branch {
-            let group = by_entity.entry((r.kind, r.entity_id.as_str())).or_default();
-            // The same record published before a fork appears in every
-            // descendant branch. It is ONE record seen from several branches,
-            // not several records, and collapsing it here is what lets the
-            // shared-branch test below mean "causally related".
-            match group.iter_mut().find(|seen| seen.record == r) {
+            let group = by_entity
+                .entry((r.record.kind, r.record.entity_id.as_str()))
+                .or_default();
+            // A publication made before a fork appears in every descendant
+            // branch. It is ONE record seen from several branches, and
+            // collapsing it is what lets the shared-branch test below mean
+            // "causally related".
+            //
+            // Collapsed on ORIGIN, never on value. Two sibling writers can emit
+            // byte-identical records at the same clock without either having
+            // seen the other, and treating that as shared ancestry let a
+            // concurrent tombstone be called dominated — resurrecting a rule
+            // one branch had deleted. Equal values are evidence of nothing; the
+            // same publication is evidence of descent.
+            match group.iter_mut().find(|seen| seen.origin == r.origin) {
                 Some(seen) => {
                     seen.branches.insert(b);
                 }
                 None => group.push(Seen {
-                    record: r,
+                    record: &r.record,
+                    origin: r.origin.as_str(),
                     branches: BTreeSet::from([b]),
                 }),
             }
@@ -413,9 +453,11 @@ pub fn merge_durable_config(branches: &[Vec<DurableConfigRecord>]) -> Vec<Durabl
     out
 }
 
-/// One record and the branches it was seen on.
+/// One publication, and the branches it was seen on.
 struct Seen<'a> {
     record: &'a DurableConfigRecord,
+    /// The publishing pointer's `self_blake3`; the key this is collapsed on.
+    origin: &'a str,
     branches: BTreeSet<usize>,
 }
 

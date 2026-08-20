@@ -15,8 +15,8 @@ pub mod bundle;
 pub mod chain;
 
 pub use bundle::{
-    BUNDLE_SCHEMA_VERSION, BootstrapRecord, BundleClass, BundleEntry, ConfigKind, CustodyKey,
-    CustodyRecord, DurableConfigRecord, LogicalClock, bootstrap_key, bundle_class_of,
+    BUNDLE_SCHEMA_VERSION, BootstrapRecord, BranchRecord, BundleClass, BundleEntry, ConfigKind,
+    CustodyKey, CustodyRecord, DurableConfigRecord, LogicalClock, bootstrap_key, bundle_class_of,
     decode_segment, encode_segment, merge_custody, merge_durable_config,
 };
 pub use chain::{

@@ -187,11 +187,18 @@ fn a_custody_record_retired_later_by_the_same_writer_stays_retired() {
     assert!(merge_custody(&[retired, live]).is_empty());
 }
 
+/// A record as one branch carries it: the value plus the publication it came
+/// through. Distinct `origin`s are distinct publications even when the records
+/// are byte-identical.
+fn pub_of(r: &DurableConfigRecord, origin: &str) -> BranchRecord {
+    BranchRecord::new(r.clone(), origin)
+}
+
 #[test]
 fn durable_config_is_last_writer_wins_within_one_epoch() {
     let old = config("rule-1", 1, clock(3, 10), false);
     let new = config("rule-1", 2, clock(3, 11), false);
-    let merged = merge_durable_config(&[vec![new.clone(), old]]);
+    let merged = merge_durable_config(&[vec![pub_of(&new, "p2"), pub_of(&old, "p1")]]);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].body, new.body);
 }
@@ -202,7 +209,7 @@ fn a_delete_then_recreate_in_one_epoch_yields_the_recreated_entity() {
     // undelete is legitimate and must not be swallowed by delete-wins.
     let deleted = config("rule-1", 0, clock(4, 7), true);
     let recreated = config("rule-1", 9, clock(4, 8), false);
-    let merged = merge_durable_config(&[vec![deleted, recreated.clone()]]);
+    let merged = merge_durable_config(&[vec![pub_of(&deleted, "p1"), pub_of(&recreated, "p2")]]);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].body, recreated.body);
 }
@@ -221,7 +228,8 @@ fn delete_wins_over_a_concurrent_edit_on_another_branch() {
     let edited = config("rule-1", 5, clock(9, 100), false);
     let deleted = config("rule-1", 0, clock(9, 100), true);
     assert!(
-        merge_durable_config(&[vec![edited], vec![deleted]]).is_empty(),
+        merge_durable_config(&[vec![pub_of(&edited, "pa")], vec![pub_of(&deleted, "pb")]])
+            .is_empty(),
         "a concurrent delete must win"
     );
 }
@@ -246,8 +254,8 @@ fn a_numerically_higher_record_on_a_sibling_branch_does_not_beat_a_delete() {
 
     assert!(
         merge_durable_config(&[
-            vec![stale_writer_republished.clone()],
-            vec![deleted_elsewhere.clone()],
+            vec![pub_of(&stale_writer_republished, "pa")],
+            vec![pub_of(&deleted_elsewhere, "pb")],
         ])
         .is_empty(),
         "the branches share no ancestry, so the delete is concurrent and wins"
@@ -255,7 +263,11 @@ fn a_numerically_higher_record_on_a_sibling_branch_does_not_beat_a_delete() {
 
     // Order of the branches must not matter.
     assert!(
-        merge_durable_config(&[vec![deleted_elsewhere], vec![stale_writer_republished]]).is_empty()
+        merge_durable_config(&[
+            vec![pub_of(&deleted_elsewhere, "pb")],
+            vec![pub_of(&stale_writer_republished, "pa")],
+        ])
+        .is_empty()
     );
 }
 
@@ -274,8 +286,8 @@ fn a_tombstone_its_own_branch_re_created_past_does_not_delete() {
     let recreated_on_b = config("rule-1", 2, clock(3, 41), false);
 
     let merged = merge_durable_config(&[
-        vec![live_on_a.clone()],
-        vec![deleted_on_b.clone(), recreated_on_b.clone()],
+        vec![pub_of(&live_on_a, "pa")],
+        vec![pub_of(&deleted_on_b, "pb1"), pub_of(&recreated_on_b, "pb2")],
     ]);
     assert_eq!(
         merged.len(),
@@ -291,9 +303,57 @@ fn a_tombstone_its_own_branch_re_created_past_does_not_delete() {
     // The discriminating pair: strip the re-creation and the very same
     // tombstone becomes B's frontier, concurrent with A, and wins.
     assert!(
-        merge_durable_config(&[vec![live_on_a], vec![deleted_on_b]]).is_empty(),
+        merge_durable_config(&[
+            vec![pub_of(&live_on_a, "pa")],
+            vec![pub_of(&deleted_on_b, "pb1")]
+        ])
+        .is_empty(),
         "a tombstone that IS its branch's frontier must still delete"
     );
+}
+
+/// Two writers that independently emit the SAME record have not seen each
+/// other, and value equality cannot tell that from shared history.
+///
+/// Both branches delete the rule at the same clock; A then re-creates it. The
+/// two tombstones are byte-identical, so collapsing on value merged them into
+/// one `Seen` that appeared on both branches — and B's frontier, a concurrent
+/// delete, then looked as though it shared branch A with the re-creation and
+/// was called dominated. The rule came back on a branch that never re-created
+/// it.
+///
+/// Distinct `origin`s are what say "two publications". Same value, same clock,
+/// different pointers.
+#[test]
+fn identical_records_from_sibling_writers_are_not_shared_history() {
+    let deleted = config("rule-1", 0, clock(4, 1), true);
+    let recreated_on_a = config("rule-1", 7, clock(4, 2), false);
+
+    let merged = merge_durable_config(&[
+        vec![pub_of(&deleted, "pa1"), pub_of(&recreated_on_a, "pa2")],
+        // B emitted its own delete — same bytes, same clock, its own pointer.
+        vec![pub_of(&deleted, "pb1")],
+    ]);
+    assert!(
+        merged.is_empty(),
+        "B's delete is concurrent with A's re-creation; equal bytes are not \
+         evidence that B ever saw A. Got {merged:?}"
+    );
+
+    // THE DISCRIMINATOR. Give the tombstone one shared origin — now it really
+    // is one publication both branches descend through — and the re-creation
+    // dominates it, as `a_tombstone_from_before_the_fork_is_still_in_the_winners_past`
+    // requires.
+    let merged = merge_durable_config(&[
+        vec![pub_of(&deleted, "shared"), pub_of(&recreated_on_a, "pa2")],
+        vec![pub_of(&deleted, "shared")],
+    ]);
+    assert_eq!(
+        merged.len(),
+        1,
+        "the same publication on both branches IS shared history: {merged:?}"
+    );
+    assert_eq!(merged[0].body, recreated_on_a.body);
 }
 
 /// History before a fork point belongs to every branch that descends from it,
@@ -309,13 +369,16 @@ fn a_tombstone_from_before_the_fork_is_still_in_the_winners_past() {
     // Both branches carry the shared prefix; one of them went on to edit.
     let edited_on_a = config("rule-1", 9, clock(2, 5), false);
 
+    // The shared prefix carries the SAME origins on both branches, because it
+    // is the same publication seen from two descendants — which is exactly the
+    // thing value equality could not prove.
     let merged = merge_durable_config(&[
         vec![
-            deleted_early.clone(),
-            recreated.clone(),
-            edited_on_a.clone(),
+            pub_of(&deleted_early, "p1"),
+            pub_of(&recreated, "p2"),
+            pub_of(&edited_on_a, "p3"),
         ],
-        vec![deleted_early, recreated],
+        vec![pub_of(&deleted_early, "p1"), pub_of(&recreated, "p2")],
     ]);
     assert_eq!(
         merged.len(),
@@ -340,7 +403,7 @@ fn a_delete_then_recreate_across_a_restart_yields_the_recreated_entity() {
     let deleted = config("rule-1", 0, clock(2, 7), true);
     let recreated = config("rule-1", 9, clock(3, 1), false);
 
-    let merged = merge_durable_config(&[vec![deleted.clone(), recreated.clone()]]);
+    let merged = merge_durable_config(&[vec![pub_of(&deleted, "p1"), pub_of(&recreated, "p2")]]);
     assert_eq!(
         merged.len(),
         1,
@@ -352,14 +415,19 @@ fn a_delete_then_recreate_across_a_restart_yields_the_recreated_entity() {
     // by a delete in epoch 3 is equally sequential.
     let created = config("rule-1", 9, clock(2, 7), false);
     let then_deleted = config("rule-1", 0, clock(3, 1), true);
-    assert!(merge_durable_config(&[vec![created, then_deleted]]).is_empty());
+    assert!(
+        merge_durable_config(&[vec![pub_of(&created, "p1"), pub_of(&then_deleted, "p2")]])
+            .is_empty()
+    );
 }
 
 #[test]
 fn a_tombstone_as_outright_winner_deletes() {
     let edited = config("rule-1", 5, clock(2, 1), false);
     let deleted = config("rule-1", 0, clock(2, 2), true);
-    assert!(merge_durable_config(&[vec![edited, deleted]]).is_empty());
+    assert!(
+        merge_durable_config(&[vec![pub_of(&edited, "p1"), pub_of(&deleted, "p2")]]).is_empty()
+    );
 }
 
 #[test]
@@ -369,7 +437,10 @@ fn distinct_entities_and_kinds_do_not_interfere() {
     let mut b = config("rule-1", 2, clock(1, 1), false);
     b.kind = ConfigKind::DeletePolicy; // same id, different kind
     let c = config("rule-2", 3, clock(1, 1), false);
-    assert_eq!(merge_durable_config(&[vec![a, b, c]]).len(), 3);
+    assert_eq!(
+        merge_durable_config(&[vec![pub_of(&a, "p1"), pub_of(&b, "p1"), pub_of(&c, "p1")]]).len(),
+        3
+    );
 }
 
 #[test]

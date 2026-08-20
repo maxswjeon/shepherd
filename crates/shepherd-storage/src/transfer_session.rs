@@ -469,8 +469,27 @@ impl<'a> TransferDriver<'a> {
     /// a no-op — and again at the top of `upload_pending`, where a session very
     /// much does exist and a source edited between attempts would otherwise
     /// leave it filled and forgotten.
+    ///
+    /// A source that **cannot be read at all** takes the same path as one that
+    /// changed, and only when the failure is terminal. Both are "this transfer
+    /// will never complete", and both leave a session to reap; a transient stat
+    /// failure is neither, so it propagates and the session survives for the
+    /// retry.
     async fn assert_source_unchanged(&self, session: &mut TransferSession) -> StorageResult<()> {
-        let now = self.source.fingerprint().await?;
+        let now = match self.source.fingerprint().await {
+            Ok(f) => f,
+            // Transient: the next attempt may well succeed, and the parts
+            // already uploaded are worth keeping. Propagates untouched.
+            Err(e) if e.is_retryable() => return Err(e),
+            // TERMINAL — the source is gone or permanently unreadable, so no
+            // later attempt can ever finish this transfer. Abandoned here,
+            // while the session id is still in hand: returning the error
+            // directly let the queue burn its attempts and mark the job failed
+            // while the transfer stayed `Uploading` and its multipart parts
+            // stayed allocated at the provider, with nothing that would revisit
+            // the key to reap them.
+            Err(e) => return Err(self.abandon(session, e).await),
+        };
         if now != session.source.fingerprint() {
             let err = StorageError::ContentMismatch {
                 key: session.remote_key.as_str().to_owned(),

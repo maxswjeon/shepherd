@@ -241,7 +241,20 @@ impl EventHub {
 
         // A cursor from another run names a different event under the same
         // number, so it is rejected before the buffer is even consulted.
-        let stale_epoch = client_epoch.is_some_and(|e| e != self.epoch);
+        //
+        // A cursor with NO epoch is stale too, and that is the case that
+        // actually bit. `is_some_and` treated a missing epoch as agreement, so
+        // the commonest shape — a client that kept a sequence number and
+        // reconnected with `--resume-from <seq>` and nothing else — was
+        // replayed against THIS run's numbering, which restarts at 1. The
+        // client was told `Resumed` and silently skipped whatever the new run
+        // had already published under those numbers, when the honest answer was
+        // `SnapshotRequired`.
+        //
+        // An epoch is what makes a cursor meaningful, so a cursor without one
+        // cannot be honoured. Sending no cursor at all is still fine — that is
+        // a fresh subscription and says so.
+        let stale_epoch = resume_from.is_some() && client_epoch != Some(self.epoch.as_str());
         let (resume, replay) = if stale_epoch {
             (
                 ResumeOutcome::SnapshotRequired {
