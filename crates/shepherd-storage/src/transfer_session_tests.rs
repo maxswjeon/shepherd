@@ -430,6 +430,53 @@ async fn a_source_deleted_between_attempts_abandons_its_provider_session() {
     );
 }
 
+/// The source is deleted BETWEEN the fingerprint gate and a part read.
+///
+/// The gate runs once, before the first part. A deletion landing after it is
+/// first observed in `read_range` — and on a job's final attempt there is no
+/// later fingerprint call to reach `abandon` through, so the error returned
+/// directly and the session stayed `Uploading` with its parts allocated.
+///
+/// Distinct from `a_source_deleted_between_attempts_abandons_its_provider_session`,
+/// which never gets past the gate. This one passes the gate and dies mid-read,
+/// which is the path that had no abandonment.
+#[tokio::test]
+async fn a_source_deleted_mid_read_abandons_its_provider_session() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+
+    // Let the transfer get as far as having a live provider session.
+    rig.store.die_at_save(4);
+    rig.driver().run(&mut s).await.expect_err("must die");
+    rig.store.revive();
+    let mut resumed = rig.reload().await;
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        1,
+        "precondition: there is a session to leak"
+    );
+
+    // Past the gate, then gone: the fingerprint still answers, the reads do
+    // not. That is exactly the window the gate cannot cover.
+    rig.source.vanish_after_fingerprint();
+
+    let err = rig
+        .driver()
+        .run(&mut resumed)
+        .await
+        .expect_err("a source that vanishes mid-read cannot be uploaded");
+    assert!(
+        matches!(err, StorageError::NotFound { .. }),
+        "a deleted source must be terminal wherever it is first seen: {err:?}"
+    );
+    assert_eq!(
+        resumed.state,
+        TransferState::Aborted(AbortOutcome::Clean),
+        "the read path is the last place this can be caught on a final attempt"
+    );
+    assert_eq!(rig.adapter.live_upload_count(), 0);
+}
+
 /// PM-1 — the user edits the file while it is being uploaded.
 #[tokio::test]
 async fn a_source_that_changes_between_attempts_aborts_rather_than_splicing() {

@@ -498,6 +498,68 @@ async fn published_pair(adapter: &MemAdapter) -> (PointerRecord, PointerRecord) 
     (first, second)
 }
 
+/// A segment the provider stored WRONG must not get a pointer.
+///
+/// "Segment-then-pointer" is a claim about what the pointer means: that the
+/// bytes it hashes are on the target. A create the adapter acknowledged is not
+/// that claim — a truncated write, a proxy that lost the tail, a 200 over a
+/// partial body all leave the pointer hashing the LOCAL bytes with nobody
+/// having read the stored ones. And the pointer is immutable and durable, so a
+/// later `verify_segments` can only mark the chain invalid; the recovery data
+/// that segment carried is gone while the artifact says otherwise.
+///
+/// Modelled by letting the create land and then corrupting the object before
+/// the pointer is written, which is what an acknowledged-but-wrong write looks
+/// like from here.
+#[tokio::test]
+async fn a_segment_that_did_not_store_correctly_publishes_no_pointer() {
+    let adapter = MemAdapter::content_addressed();
+    let alloc = FakeAllocator::at_epoch(3);
+    let writer = ChainWriter::new(&adapter, &alloc, TargetId::new(1));
+
+    // The accepting direction, and the fixture for the key below.
+    let good = writer
+        .publish(
+            SegmentKind::Delta,
+            Bytes::from_static(b"the real bytes"),
+            None,
+            Blake3Hash::from_bytes([1; 32]),
+        )
+        .await
+        .expect("an intact segment publishes");
+
+    // Now a provider that acknowledges the create and stores something else.
+    adapter.set_faults(crate::testing::Faults {
+        truncate_on_create: true,
+        ..Default::default()
+    });
+
+    let before = read_chain(&adapter).await.expect("read").records.len();
+    let err = writer
+        .publish(
+            SegmentKind::Delta,
+            Bytes::from_static(b"the real bytes"),
+            Some(good.compute_self_hash().expect("hash")),
+            Blake3Hash::from_bytes([2; 32]),
+        )
+        .await;
+
+    assert!(
+        matches!(
+            err,
+            Err(ChainError::Storage(StorageError::ContentMismatch { .. }))
+        ),
+        "a segment that did not store correctly must fail before its pointer \
+         exists, got {err:?}"
+    );
+    assert_eq!(
+        read_chain(&adapter).await.expect("read").records.len(),
+        before,
+        "no pointer may name bytes nobody verified; an orphaned segment is the \
+         harmless direction this contract already allows"
+    );
+}
+
 /// **The accepting direction.** A guard hard-wired to refuse would pass all
 /// three refusal tests below while making every replica permanently
 /// custody-ineligible — which is the failure mode that voids tiering rather

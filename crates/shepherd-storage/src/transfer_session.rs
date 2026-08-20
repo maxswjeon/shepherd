@@ -699,7 +699,20 @@ impl<'a> TransferDriver<'a> {
         let plan = session.plan;
         let mut read_back = blake3::Hasher::new();
         for (part_no, range) in plan.ranges() {
-            let body = self.source.read_range(range).await?;
+            let body = match self.source.read_range(range).await {
+                Ok(b) => b,
+                // Transient: another attempt may read it. The parts already
+                // uploaded are worth keeping, so the session survives.
+                Err(e) if e.is_retryable() => return Err(e),
+                // TERMINAL — the source went away between the fingerprint gate
+                // above and this read, and no later attempt can finish the
+                // transfer. This is the ONLY place that observes it on a final
+                // attempt: there is no subsequent fingerprint call to reach
+                // `abandon` through, so returning the error directly left the
+                // session `Uploading` with its multipart parts allocated and
+                // nothing that would ever revisit the key to reap them.
+                Err(e) => return Err(self.abandon(session, e).await),
+            };
             if body.len() as u64 != range.len {
                 // Through `abandon`, like every other terminal mismatch: the
                 // source was truncated under us, `ContentMismatch` is

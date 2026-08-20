@@ -374,6 +374,21 @@ pub enum DiscardRefusal {
         stored: ClockProvenance,
         current: ClockProvenance,
     },
+    /// A candidate in the batch has no policy proof of its own, or its proof
+    /// was refused.
+    ///
+    /// A charge covers every candidate in an episode, so every candidate needs
+    /// its own confirmation, its own expired deferral and its own root gates.
+    /// One file's proof authorizing the batch is the whole finding.
+    CandidateUnproven {
+        file: FileId,
+    },
+    /// A proof was supplied for a file this episode does not contain. Refused
+    /// rather than ignored: a proof set that does not match the batch is not a
+    /// proof of the batch.
+    ProofForAnotherCandidate {
+        file: FileId,
+    },
     ResyncRequired,
     RootUnavailable,
     BreakerOpen,

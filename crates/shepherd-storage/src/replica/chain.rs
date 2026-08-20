@@ -339,6 +339,7 @@ impl<'a> ChainWriter<'a> {
     ) -> Result<PointerRecord, ChainError> {
         let key = self.allocator.allocate(self.target).await?;
         let segment_blake3 = Blake3Hash::from_bytes(*blake3::hash(&segment).as_bytes());
+        let len = segment.len() as u64;
         let segment_key = key.segment_key(kind);
 
         let precondition = if self.adapter.capabilities().conditional_create {
@@ -350,6 +351,31 @@ impl<'a> ChainWriter<'a> {
         self.adapter
             .create(segment_key.as_key(), segment, precondition)
             .await?;
+
+        // READ IT BACK before publishing the pointer that names it.
+        //
+        // "Segment-then-pointer" is a claim about what the pointer means: that
+        // the bytes it hashes are on the target. A create the adapter
+        // acknowledged is not that claim — a truncated write, a proxy that
+        // buffered and lost the tail, a provider that returned 200 for a
+        // partial body all end here with the pointer publishing a hash of the
+        // LOCAL bytes and no one having looked at the stored ones.
+        //
+        // Failing after that is not recoverable in the way an ordinary failure
+        // is: the pointer is immutable and durable, so `verify_segments` can
+        // only mark the chain invalid afterwards. The recovery data that
+        // segment carried — durable config, custody records — is gone, and the
+        // artifact says otherwise. Failing HERE leaves an orphaned segment and
+        // no pointer, which is the harmless direction this function's contract
+        // already names.
+        crate::adapter::verify_full_content(
+            self.adapter,
+            segment_key.as_key(),
+            segment_blake3,
+            len,
+            SEGMENT_VERIFY_CHUNK,
+        )
+        .await?;
 
         let record = PointerRecord {
             epoch: key.epoch,

@@ -46,6 +46,48 @@ fn stranger() -> Candidate {
     candidate(99)
 }
 
+/// A deferral per candidate. `reserve_discard` charges for every candidate, so
+/// every candidate needs its own expired window — one file's deferral no longer
+/// authorizes its neighbours, which is the whole point of the batch proof.
+fn deferrals_for(e: &Episode) -> Vec<Deferral> {
+    e.candidates
+        .iter()
+        .map(|c| {
+            Deferral::open(
+                c.file,
+                TargetId::new(1),
+                DeferralKind::Remote,
+                14,
+                &clock(0),
+            )
+        })
+        .collect()
+}
+
+/// One proof per candidate the episode holds — what `reserve_discard` requires
+/// now that a charge covering N files needs N proofs.
+///
+/// `deferrals` is matched by file, so a candidate with none in the slice gets
+/// `None` and is refused. Pass `&[]` to prove nothing.
+fn proofs_for<'a>(
+    e: &Episode,
+    now: &'a ClockReading,
+    deferrals: &'a [Deferral],
+    confirmation: Option<PermanentDeleteConfirmation>,
+) -> Vec<DiscardInputs<'a>> {
+    e.candidates
+        .iter()
+        .map(|c| DiscardInputs {
+            file: c.file,
+            ..inputs(
+                now,
+                deferrals.iter().find(|d| d.file == c.file),
+                confirmation.clone(),
+            )
+        })
+        .collect()
+}
+
 fn inputs<'a>(
     now: &'a ClockReading,
     deferral: Option<&'a Deferral>,
@@ -559,13 +601,14 @@ async fn an_executed_episode_charges_the_window_exactly_once_per_object() {
     let ledger = MemLedger::new();
     let e = episode_with(3, now);
     let remote = Remote::new("charged", 3);
-    let d = deferral();
+    let ds = deferrals_for(&e);
     let lim = limits(10);
 
     let mut charge = reserve_discard(
-        inputs(
+        &proofs_for(
+            &e,
             &clock(20),
-            Some(&d),
+            &ds,
             Some(PermanentDeleteConfirmation::WindowsCfApi),
         ),
         &e,
@@ -597,6 +640,106 @@ async fn an_executed_episode_charges_the_window_exactly_once_per_object() {
     assert_eq!(charge.remaining(), 0);
 }
 
+/// **One file's proof cannot authorize its neighbours.**
+///
+/// A charge covers every candidate in the episode, and the reservation used to
+/// evaluate exactly ONE `DiscardInputs` before spending for all of them. A
+/// three-candidate episode was therefore authorized by file 1's deferral alone:
+/// files 2 and 3 could be discarded with no permanent-delete confirmation, an
+/// unexpired window, or a root that was unavailable or needed resync — every
+/// conjunct §4.10.5 states, checked once and applied to files it never looked
+/// at.
+#[tokio::test]
+async fn a_batch_needs_a_policy_proof_for_every_candidate() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let e = episode_with(3, now);
+    let lim = limits(10);
+    let all = deferrals_for(&e);
+
+    // The accepting direction first, so this cannot pass by refusing
+    // everything: proofs for all three reserve.
+    let _ = reserve_discard(
+        &proofs_for(
+            &e,
+            &clock(20),
+            &all,
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        ),
+        &e,
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+    )
+    .await
+    .expect("every candidate is proved");
+
+    // Exactly the shape that shipped: one deferral, for file 1, and a batch of
+    // three. It must not reserve, and the refusal must NAME the files that
+    // were never proved.
+    let only_first: Vec<_> = all.iter().take(1).cloned().collect();
+    let refusals = reserve_discard(
+        &proofs_for(
+            &e,
+            &clock(20),
+            &only_first,
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        ),
+        &e,
+        &MemLedger::new().snapshot(),
+        &lim,
+        now,
+        &MemLedger::new(),
+    )
+    .await
+    .expect_err("file 1's deferral does not authorize files 2 and 3");
+    let unproven: Vec<FileId> = refusals
+        .policy
+        .iter()
+        .filter_map(|r| match r {
+            DiscardRefusal::CandidateUnproven { file } => Some(*file),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        unproven.contains(&FileId::new(2)) && unproven.contains(&FileId::new(3)),
+        "the refusal must name the unproved candidates: {refusals:?}"
+    );
+
+    // And a proof set that does not MATCH the batch is not a proof of it: a
+    // proof for a file this episode never enumerated is refused rather than
+    // quietly ignored.
+    let at = clock(20);
+    let mut extra = proofs_for(
+        &e,
+        &at,
+        &all,
+        Some(PermanentDeleteConfirmation::WindowsCfApi),
+    );
+    extra.push(DiscardInputs {
+        file: FileId::new(404),
+        ..inputs(&at, None, Some(PermanentDeleteConfirmation::WindowsCfApi))
+    });
+    let refusals = reserve_discard(
+        &extra,
+        &e,
+        &MemLedger::new().snapshot(),
+        &lim,
+        now,
+        &MemLedger::new(),
+    )
+    .await
+    .expect_err("a proof for a file outside the episode is refused");
+    assert!(
+        refusals.policy.iter().any(|r| matches!(
+            r,
+            DiscardRefusal::ProofForAnotherCandidate { file } if *file == FileId::new(404)
+        )),
+        "{refusals:?}"
+    );
+}
+
 /// The rolling window's entire purpose: repeated sub-threshold episodes must
 /// accumulate against one budget. Pre-fix, episode two saw the same unused
 /// window episode one had seen.
@@ -604,16 +747,18 @@ async fn an_executed_episode_charges_the_window_exactly_once_per_object() {
 async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
     let now = t(20);
     let ledger = MemLedger::new();
-    let d = deferral();
+    let e = episode_with(2, now);
+    let ds = deferrals_for(&e);
     let lim = limits(3); // two episodes of 2 are individually fine, jointly not
 
     let first = reserve_discard(
-        inputs(
+        &proofs_for(
+            &e,
             &clock(20),
-            Some(&d),
+            &ds,
             Some(PermanentDeleteConfirmation::WindowsCfApi),
         ),
-        &episode_with(2, now),
+        &e,
         &ledger.snapshot(),
         &lim,
         now,
@@ -624,12 +769,13 @@ async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
     assert_eq!(first.reserved(), 2);
 
     let refusals = reserve_discard(
-        inputs(
+        &proofs_for(
+            &e,
             &clock(20),
-            Some(&d),
+            &ds,
             Some(PermanentDeleteConfirmation::WindowsCfApi),
         ),
-        &episode_with(2, now),
+        &e,
         &ledger.snapshot(),
         &lim,
         now,
@@ -685,13 +831,16 @@ async fn two_episodes_evaluating_against_one_snapshot_cannot_both_reserve() {
             "{label}: the snapshot check must pass for both racers"
         );
 
+        let racer = episode_with(2, now);
+        let ds = deferrals_for(&racer);
         let got = reserve_discard(
-            inputs(
+            &proofs_for(
+                &racer,
                 &clock(20),
-                Some(&d),
+                &ds,
                 Some(PermanentDeleteConfirmation::WindowsCfApi),
             ),
-            &episode_with(2, now),
+            &racer,
             &snapshot,
             &lim,
             now,
@@ -727,18 +876,20 @@ async fn two_episodes_evaluating_against_one_snapshot_cannot_both_reserve() {
 async fn an_object_outside_the_confirmed_set_refuses_before_anything_is_deleted() {
     let now = t(20);
     let ledger = MemLedger::new();
-    let d = deferral();
     let lim = limits(10);
     let remote = Remote::new("exhausted", 2);
+    let one = episode_with(1, now);
+    let ds = deferrals_for(&one);
 
     // Confirmed for one object; the episode tries to delete two.
     let mut charge = reserve_discard(
-        inputs(
+        &proofs_for(
+            &one,
             &clock(20),
-            Some(&d),
+            &ds,
             Some(PermanentDeleteConfirmation::WindowsCfApi),
         ),
-        &episode_with(1, now),
+        &one,
         &ledger.snapshot(),
         &lim,
         now,
@@ -782,14 +933,16 @@ async fn an_object_outside_the_confirmed_set_refuses_before_anything_is_deleted(
 
 /// A helper: a confirmed charge over `count` candidates, with budget to spare.
 async fn charge_for(ledger: &MemLedger, count: usize, now: Timestamp) -> DiscardCharge {
-    let d = deferral();
+    let e = episode_with(count, now);
+    let ds = deferrals_for(&e);
     reserve_discard(
-        inputs(
+        &proofs_for(
+            &e,
             &clock(20),
-            Some(&d),
+            &ds,
             Some(PermanentDeleteConfirmation::WindowsCfApi),
         ),
-        &episode_with(count, now),
+        &e,
         &ledger.snapshot(),
         &limits(10),
         now,
@@ -1011,7 +1164,6 @@ async fn an_unhashed_candidate_is_refused_rather_than_naming_a_key_from_nothing(
     let now = t(20);
     let ledger = MemLedger::new();
     let remote = Remote::new("unhashed", 1);
-    let d = deferral();
 
     // An episode whose confirmed set genuinely contains the unhashed candidate,
     // so membership passes and only the missing hash is left to refuse it.
@@ -1024,10 +1176,12 @@ async fn an_unhashed_candidate_is_refused_rather_than_naming_a_key_from_nothing(
     e.enumerate(vec![unhashed.clone()]);
     e.confirm("operator", now, HOUR);
 
+    let ds = deferrals_for(&e);
     let mut charge = reserve_discard(
-        inputs(
+        &proofs_for(
+            &e,
             &clock(20),
-            Some(&d),
+            &ds,
             Some(PermanentDeleteConfirmation::WindowsCfApi),
         ),
         &e,

@@ -64,6 +64,26 @@ pub struct FileSource {
 }
 
 impl FileSource {
+    /// Classify an I/O failure while reading the source.
+    ///
+    /// `NotFound` is TERMINAL — the file is gone, so no retry can finish this
+    /// transfer and the driver must reap its provider session rather than let
+    /// the queue burn its budget. Everything else is transient: a permission
+    /// change, a full page cache, a flaky disk are all worth another attempt,
+    /// and the parts already uploaded are worth keeping for it.
+    fn read_error(&self, op: &str, e: &std::io::Error) -> StorageError {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StorageError::NotFound {
+                key: self.path.display().to_string(),
+            }
+        } else {
+            StorageError::Transient {
+                op: format!("{op} source"),
+                detail: e.to_string(),
+            }
+        }
+    }
+
     /// `fs_id` is the catalog's identity for this file, `<volume-id>:<inode>`
     /// as produced by `shepherd_catalog::volume::fs_id`.
     ///
@@ -174,21 +194,18 @@ impl SourceReader for FileSource {
 
     async fn read_range(&self, range: ByteRange) -> StorageResult<Bytes> {
         use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(&self.path).map_err(|e| StorageError::Transient {
-            op: "open source".into(),
-            detail: e.to_string(),
-        })?;
+        // Same classification as `fingerprint`, and for the same reason: a
+        // source that is GONE is terminal, so the driver can abandon its
+        // provider session instead of the queue retrying a file that is never
+        // coming back. This is the path that sees a deletion landing AFTER the
+        // fingerprint gate — on a final attempt there is no later fingerprint
+        // call to reach `abandon` through, so it has to be reachable from here.
+        let mut f = std::fs::File::open(&self.path).map_err(|e| self.read_error("open", &e))?;
         f.seek(SeekFrom::Start(range.offset))
-            .map_err(|e| StorageError::Transient {
-                op: "seek source".into(),
-                detail: e.to_string(),
-            })?;
+            .map_err(|e| self.read_error("seek", &e))?;
         let mut buf = vec![0u8; usize::try_from(range.len).unwrap_or(0)];
         f.read_exact(&mut buf)
-            .map_err(|e| StorageError::Transient {
-                op: "read source".into(),
-                detail: e.to_string(),
-            })?;
+            .map_err(|e| self.read_error("read", &e))?;
         Ok(Bytes::from(buf))
     }
 }

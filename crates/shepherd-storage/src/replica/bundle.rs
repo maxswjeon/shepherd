@@ -280,32 +280,40 @@ pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
     live
 }
 
-/// One durable-config record, and the segment that published it.
+/// One segment's durable-config entries, as one branch carries them.
 ///
-/// The `origin` is what makes shared history *provable*. An earlier version of
-/// [`merge_durable_config`] collapsed records across branches by value
-/// equality, on the reasoning that a byte-identical record must be one record
-/// seen from two descendants of a fork. It need not be: two sibling writers can
-/// independently emit the same delete at the same logical clock, and calling
-/// that shared ancestry made a concurrent tombstone look dominated — so a rule
-/// one branch had deleted came back.
+/// # Why a publication rather than a record
 ///
-/// Identity, not resemblance. `origin` is the publishing pointer's
-/// `self_blake3`, which is a content hash of the pointer record, so two
-/// branches carrying the same origin really did descend through the same
-/// publication and two that merely agree in value did not.
+/// This type has now been the subject of three corrections, and each one was a
+/// different way of GUESSING which records are the same record. It took a flat
+/// list and inferred causality from clock ordering, which is not causality
+/// across branches. It took branches and inferred shared history from value
+/// equality, which two sibling writers can produce independently. It took a
+/// per-record `origin` and inferred record identity from the publishing
+/// pointer's hash, which collapses several entries a single segment carried for
+/// one entity — a batched edit and its tombstone became just the edit, and a
+/// destructive rule came back alive.
+///
+/// So it stops guessing. A branch is a sequence of publications; a publication
+/// is a pointer and the ordered entries its segment held. A record's identity
+/// is `(publication id, position)`, which is not an inference at all — the same
+/// publication seen from two descendants of a fork carries the same entries in
+/// the same order, so equal identities really are one record, and unequal ones
+/// really are two.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchRecord {
-    pub record: DurableConfigRecord,
-    /// `PointerRecord::self_blake3` of the pointer whose segment carried it.
-    pub origin: String,
+pub struct Publication {
+    /// The publishing pointer's `self_blake3` — a content hash of the pointer,
+    /// so two branches naming it really did descend through this publication.
+    pub id: String,
+    /// The segment's durable-config entries, in the order it held them.
+    pub records: Vec<DurableConfigRecord>,
 }
 
-impl BranchRecord {
-    pub fn new(record: DurableConfigRecord, origin: impl Into<String>) -> Self {
+impl Publication {
+    pub fn new(id: impl Into<String>, records: Vec<DurableConfigRecord>) -> Self {
         Self {
-            record,
-            origin: origin.into(),
+            id: id.into(),
+            records,
         }
     }
 }
@@ -358,37 +366,36 @@ impl BranchRecord {
 ///
 /// Records sharing the winner's exact clock remain concurrent with it — a
 /// genuine two-writer collision — and delete-wins remains the answer.
-pub fn merge_durable_config(branches: &[Vec<BranchRecord>]) -> Vec<DurableConfigRecord> {
+pub fn merge_durable_config(branches: &[Vec<Publication>]) -> Vec<DurableConfigRecord> {
     // Each entity's records, each tagged with the set of branches carrying it.
     // The key borrows for the same reason the values do: nothing here outlives
     // `branches`. `&str` orders identically to `String`, so the group order —
     // and therefore the order of `out` — is unchanged.
     let mut by_entity: BTreeMap<(ConfigKind, &str), Vec<Seen<'_>>> = BTreeMap::new();
     for (b, branch) in branches.iter().enumerate() {
-        for r in branch {
-            let group = by_entity
-                .entry((r.record.kind, r.record.entity_id.as_str()))
-                .or_default();
-            // A publication made before a fork appears in every descendant
-            // branch. It is ONE record seen from several branches, and
-            // collapsing it is what lets the shared-branch test below mean
-            // "causally related".
-            //
-            // Collapsed on ORIGIN, never on value. Two sibling writers can emit
-            // byte-identical records at the same clock without either having
-            // seen the other, and treating that as shared ancestry let a
-            // concurrent tombstone be called dominated — resurrecting a rule
-            // one branch had deleted. Equal values are evidence of nothing; the
-            // same publication is evidence of descent.
-            match group.iter_mut().find(|seen| seen.origin == r.origin) {
-                Some(seen) => {
-                    seen.branches.insert(b);
+        for publication in branch {
+            for (position, r) in publication.records.iter().enumerate() {
+                let group = by_entity.entry((r.kind, r.entity_id.as_str())).or_default();
+                // A publication made before a fork appears in every descendant
+                // branch, and collapsing it is what lets the shared-branch test
+                // below mean "causally related".
+                //
+                // The key is `(publication, position)`, which is an identity
+                // rather than a guess. The pointer hash ALONE was not: one
+                // segment can carry several entries for one entity — a batched
+                // edit and the tombstone that follows it — and collapsing on
+                // the pointer kept only the first, so the rule came back alive.
+                let key = (publication.id.as_str(), position);
+                match group.iter_mut().find(|seen| seen.id == key) {
+                    Some(seen) => {
+                        seen.branches.insert(b);
+                    }
+                    None => group.push(Seen {
+                        record: r,
+                        id: key,
+                        branches: BTreeSet::from([b]),
+                    }),
                 }
-                None => group.push(Seen {
-                    record: &r.record,
-                    origin: r.origin.as_str(),
-                    branches: BTreeSet::from([b]),
-                }),
             }
         }
     }
@@ -453,11 +460,13 @@ pub fn merge_durable_config(branches: &[Vec<BranchRecord>]) -> Vec<DurableConfig
     out
 }
 
-/// One publication, and the branches it was seen on.
+/// One record, and the branches it was seen on.
 struct Seen<'a> {
     record: &'a DurableConfigRecord,
-    /// The publishing pointer's `self_blake3`; the key this is collapsed on.
-    origin: &'a str,
+    /// `(publication id, position in that publication)` — the identity this is
+    /// collapsed on. See [`Publication`] for why it is not the record's value
+    /// and not the pointer hash alone.
+    id: (&'a str, usize),
     branches: BTreeSet<usize>,
 }
 

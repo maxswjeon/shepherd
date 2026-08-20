@@ -187,11 +187,10 @@ fn a_custody_record_retired_later_by_the_same_writer_stays_retired() {
     assert!(merge_custody(&[retired, live]).is_empty());
 }
 
-/// A record as one branch carries it: the value plus the publication it came
-/// through. Distinct `origin`s are distinct publications even when the records
-/// are byte-identical.
-fn pub_of(r: &DurableConfigRecord, origin: &str) -> BranchRecord {
-    BranchRecord::new(r.clone(), origin)
+/// One publication carrying one record. Distinct ids are distinct
+/// publications even when the records are byte-identical.
+fn pub_of(r: &DurableConfigRecord, id: &str) -> Publication {
+    Publication::new(id, vec![r.clone()])
 }
 
 #[test]
@@ -354,6 +353,52 @@ fn identical_records_from_sibling_writers_are_not_shared_history() {
         "the same publication on both branches IS shared history: {merged:?}"
     );
     assert_eq!(merged[0].body, recreated_on_a.body);
+}
+
+/// One segment can carry several entries for one entity, and they are several
+/// records.
+///
+/// A batched edit followed by its tombstone shares the publishing pointer, so
+/// keying identity on that pointer alone collapsed them and kept only the
+/// first: the tombstone vanished and a destructive rule was recovered alive.
+/// Reversed, a re-creation batched after a delete was the one suppressed.
+///
+/// The identity is `(publication, position)`, so entries from one segment stay
+/// distinct while the same segment seen from two branches stays one.
+#[test]
+fn several_entries_in_one_segment_are_several_records() {
+    let edited = config("rule-1", 5, clock(2, 1), false);
+    let then_deleted = config("rule-1", 0, clock(2, 2), true);
+
+    // One publication, two entries, in that order.
+    let batched = Publication::new("p1", vec![edited.clone(), then_deleted.clone()]);
+    assert!(
+        merge_durable_config(&[vec![batched]]).is_empty(),
+        "the tombstone batched behind the edit was dropped, and the rule came \
+         back alive"
+    );
+
+    // The other order, which the same defect suppressed rather than resurrected.
+    let recreated = config("rule-1", 9, clock(2, 3), false);
+    let batched = Publication::new(
+        "p1",
+        vec![config("rule-1", 0, clock(2, 2), true), recreated.clone()],
+    );
+    let merged = merge_durable_config(&[vec![batched]]);
+    assert_eq!(
+        merged.len(),
+        1,
+        "a re-creation batched after a delete must survive: {merged:?}"
+    );
+    assert_eq!(merged[0].body, recreated.body);
+
+    // And the same publication seen from two branches is still ONE history:
+    // both entries collapse per branch, not per occurrence.
+    let shared = Publication::new("p1", vec![edited, config("rule-1", 0, clock(2, 2), true)]);
+    assert!(
+        merge_durable_config(&[vec![shared.clone()], vec![shared]]).is_empty(),
+        "two descendants of one publication do not make its entries concurrent"
+    );
 }
 
 /// History before a fork point belongs to every branch that descends from it,

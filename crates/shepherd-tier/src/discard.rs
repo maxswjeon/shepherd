@@ -36,7 +36,8 @@ use shepherd_catalog::job_repo::JobClass;
 use shepherd_core::{ObjectKey, RootId, TargetId, Timestamp};
 use shepherd_placeholder::mock::StubState;
 use shepherd_rules::delete_policy::{
-    BreakerState, DiscardDecision, DiscardInputs, PermanentDeleteConfirmation, discard_permitted,
+    BreakerState, DiscardDecision, DiscardInputs, DiscardRefusal, PermanentDeleteConfirmation,
+    discard_permitted,
 };
 use shepherd_storage::adapter::VersionGuard;
 
@@ -111,8 +112,29 @@ impl DiscardRefusals {
 /// `inputs.breaker` is **overwritten** from `episode.may_execute`, deliberately:
 /// a caller cannot assert the breaker is charged, because the breaker decides
 /// that.
-pub fn evaluate_discard(
-    mut inputs: DiscardInputs<'_>,
+/// Every candidate in the batch, proved separately.
+///
+/// # One proof cannot authorize N deletions
+///
+/// [`reserve_discard`] charges `episode.candidates.len()` units and hands back
+/// a charge covering the whole set, so what it spends must be what was proved.
+/// It used to evaluate ONE [`DiscardInputs`] — one file, one confirmation, one
+/// deferral, one root-gate snapshot — and then charge for every candidate.
+/// A three-candidate episode was therefore authorized by file 1's deferral
+/// alone, and files 2 and 3 could be deleted with no permanent-delete
+/// confirmation, an unexpired window, or a root that was unavailable or needed
+/// resync. Every conjunct §4.10.5 states was checked exactly once and applied
+/// to files it had never looked at.
+///
+/// So the proof set has to COVER the batch and nothing else: one proof per
+/// candidate, no candidate unproved, no proof for a file the episode does not
+/// contain. A mismatch is refused rather than intersected — a proof set that
+/// does not match the batch is not a proof of the batch.
+///
+/// The breaker half is genuinely per-episode and is computed once; only the
+/// policy half is per candidate.
+pub fn evaluate_discard_batch(
+    proofs: &[DiscardInputs<'_>],
     episode: &Episode,
     window: &RateWindow,
     limits: &BreakerLimits,
@@ -122,11 +144,46 @@ pub fn evaluate_discard(
         .may_execute(window, limits, now)
         .err()
         .unwrap_or_default();
+    let breaker = derived_breaker_state(&breaker_refusals);
 
-    // Derived, never supplied. `charged` is false if the rate window or the
-    // per-episode cap refused; `candidate_set_bound` is false if the set was
-    // never enumerated or the confirmation no longer matches it.
-    inputs.breaker = BreakerState {
+    let mut policy = Vec::new();
+    for candidate in &episode.candidates {
+        if !proofs.iter().any(|p| p.file == candidate.file) {
+            policy.push(DiscardRefusal::CandidateUnproven {
+                file: candidate.file,
+            });
+        }
+    }
+    for proof in proofs {
+        if !episode.candidates.iter().any(|c| c.file == proof.file) {
+            policy.push(DiscardRefusal::ProofForAnotherCandidate { file: proof.file });
+            continue;
+        }
+        let mut one = proof.clone();
+        one.breaker = breaker;
+        if let DiscardDecision::Refused(r) = discard_permitted(&one) {
+            // Named first, so an operator reading the list knows WHICH file
+            // failed before reading why.
+            policy.push(DiscardRefusal::CandidateUnproven { file: proof.file });
+            policy.extend(r);
+        }
+    }
+
+    let refusals = DiscardRefusals {
+        policy,
+        breaker: breaker_refusals,
+    };
+    if refusals.policy.is_empty() && refusals.breaker.is_empty() {
+        Ok(())
+    } else {
+        Err(refusals)
+    }
+}
+
+/// The breaker half of the inputs, derived from the episode rather than
+/// supplied. Shared by the single and batch entry points so they cannot drift.
+fn derived_breaker_state(breaker_refusals: &[BreakerRefusal]) -> BreakerState {
+    BreakerState {
         charged: !breaker_refusals.iter().any(|r| {
             matches!(
                 r,
@@ -142,7 +199,25 @@ pub fn evaluate_discard(
                     | BreakerRefusal::ConfirmationExpired { .. }
             )
         }),
-    };
+    }
+}
+
+pub fn evaluate_discard(
+    mut inputs: DiscardInputs<'_>,
+    episode: &Episode,
+    window: &RateWindow,
+    limits: &BreakerLimits,
+    now: Timestamp,
+) -> Result<(), DiscardRefusals> {
+    let breaker_refusals = episode
+        .may_execute(window, limits, now)
+        .err()
+        .unwrap_or_default();
+
+    // Derived, never supplied. `charged` is false if the rate window or the
+    // per-episode cap refused; `candidate_set_bound` is false if the set was
+    // never enumerated or the confirmation no longer matches it.
+    inputs.breaker = derived_breaker_state(&breaker_refusals);
 
     let policy_refusals = match discard_permitted(&inputs) {
         DiscardDecision::Permitted => Vec::new(),
@@ -332,14 +407,14 @@ impl DiscardCharge {
 /// released by the window rolling forward, which is the same mechanism that
 /// releases every other charge.
 pub async fn reserve_discard(
-    inputs: DiscardInputs<'_>,
+    proofs: &[DiscardInputs<'_>],
     episode: &Episode,
     window: &RateWindow,
     limits: &BreakerLimits,
     now: Timestamp,
     ledger: &impl RateLedger,
 ) -> Result<DiscardCharge, DiscardRefusals> {
-    evaluate_discard(inputs, episode, window, limits, now)?;
+    evaluate_discard_batch(proofs, episode, window, limits, now)?;
 
     let count = u32::try_from(episode.candidates.len()).unwrap_or(u32::MAX);
     ledger

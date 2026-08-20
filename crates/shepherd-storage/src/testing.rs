@@ -34,6 +34,14 @@ use crate::transfer_session::{
 pub struct Faults {
     /// Fail `upload_part` for this part number, once.
     pub fail_part_once: Option<u32>,
+    /// Acknowledge `create` and then store something ELSE.
+    ///
+    /// A truncated write, a proxy that lost the tail, a provider returning 200
+    /// over a partial body: from the caller's side all of them are a create
+    /// that succeeded and an object that is wrong. The only way to find out is
+    /// to read it back.
+    pub truncate_on_create: bool,
+
     /// Fail every `head` for this key with a transient transport error.
     ///
     /// A *transport* failure, not a missing object: the read paths have to tell
@@ -280,6 +288,11 @@ impl StorageAdapter for MemAdapter {
             .versioned
             .then(|| ObjectVersion::new(format!("v{}", body.len())));
         let etag = Self::issue_token(&mut inner, "etag");
+        let body = if inner.faults.truncate_on_create && !body.is_empty() {
+            body.slice(..body.len() - 1)
+        } else {
+            body
+        };
         inner
             .objects
             .insert(key.as_str().to_owned(), (body, version.clone()));
@@ -637,6 +650,9 @@ pub struct MemSource {
     /// the distinction that matters: a source that is merely unreadable this
     /// second is worth retrying, and one that is gone is not.
     gone: std::sync::atomic::AtomicBool,
+    /// Deleted after the fingerprint gate: `fingerprint` still answers, reads
+    /// do not.
+    gone_to_reads: std::sync::atomic::AtomicBool,
 }
 
 impl MemSource {
@@ -644,6 +660,7 @@ impl MemSource {
         Self {
             inner: Mutex::new((body.into(), Timestamp::from_nanos(1_000))),
             gone: std::sync::atomic::AtomicBool::new(false),
+            gone_to_reads: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -665,6 +682,16 @@ impl MemSource {
     /// The user deleted the file. Every later `fingerprint` fails terminally.
     pub fn vanish(&self) {
         self.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Gone to the READS but not to the fingerprint gate.
+    ///
+    /// The gate runs once, before the first part; a deletion landing after it
+    /// is first seen by `read_range`. Modelled rather than raced, so the
+    /// window is reproducible.
+    pub fn vanish_after_fingerprint(&self) {
+        self.gone_to_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// PM-1's sharper form: an in-place edit the cheap fingerprint cannot see.
@@ -704,6 +731,13 @@ impl SourceReader for MemSource {
     }
 
     async fn read_range(&self, range: ByteRange) -> StorageResult<Bytes> {
+        if self.gone.load(std::sync::atomic::Ordering::SeqCst)
+            || self.gone_to_reads.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::NotFound {
+                key: "the source file".into(),
+            });
+        }
         let i = self.inner.lock().expect("poisoned");
         let start = usize::try_from(range.offset)
             .unwrap_or(usize::MAX)
