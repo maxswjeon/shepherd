@@ -151,6 +151,24 @@ impl Daemon {
         serde_json::from_str(&raw).expect("config_json is json")
     }
 
+    /// Rewrite a root's stored `volume_id`, standing in for the disk under it
+    /// having been swapped.
+    ///
+    /// Written directly because there is no IPC method that changes it — which
+    /// is the point: enrollment records the identity once and nothing may edit
+    /// it afterwards, so a disagreement can only mean the filesystem moved.
+    fn forge_root_volume(&self, root_id: i64, volume: &str) {
+        let conn = rusqlite::Connection::open(self.dir.join("state").join("catalog.db"))
+            .expect("open the daemon's catalog");
+        let n = conn
+            .execute(
+                "UPDATE scan_root SET volume_id = ?2 WHERE id = ?1",
+                rusqlite::params![root_id, volume],
+            )
+            .expect("update the root's volume id");
+        assert_eq!(n, 1, "the fixture must have changed exactly one root row");
+    }
+
     /// How many targets the daemon has committed.
     fn target_count(&self) -> i64 {
         let conn = rusqlite::Connection::open_with_flags(
@@ -791,6 +809,121 @@ fn a_daemon_whose_crash_recovery_fails_refuses_to_start() {
 /// The daemon is started with its socket outside the state directory so the
 /// registered root can be the *enclosing* directory: that is the real shape of
 /// the problem, a state directory nested inside a scanned tree.
+/// Forgetting a root's catalog rows must take them out of the search index.
+///
+/// The cascade drops the file rows; the index is an in-memory arena built from
+/// them, and nothing rebuilt it — the only other call sites are start-up and a
+/// completed scan. The forgotten ids stayed in the arena and went on consuming
+/// the capped, file-id-ordered candidate prefix that `hydrate` then drops, so a
+/// search whose matches had early ids came back short or empty while later
+/// files that still matched were never reached.
+///
+/// The cap is what makes it visible, so the test uses one: root A's files are
+/// enrolled first and therefore hold the low ids, and the limit is exactly
+/// their count. Before the fix, every slot in the page is spent on rows that no
+/// longer exist and the answer is empty.
+#[test]
+fn forgetting_a_root_takes_its_rows_out_of_the_search_index() {
+    let d = Daemon::start("forgetindex");
+    let mut c = d.connect();
+
+    let a = d.dir.join("a");
+    let b = d.dir.join("b");
+    for i in 0..3 {
+        write_file(&a, &format!("report-{i}.txt"), "x");
+        write_file(&b, &format!("report-{i}.txt"), "y");
+    }
+
+    let mut enroll = |p: &std::path::Path| {
+        let added = c.call(
+            "root.add",
+            serde_json::json!({"path": p.to_str().unwrap(), "stub_mode": "delete"}),
+        );
+        let id = added["root"]["root_id"].as_i64().unwrap();
+        c.call("scan.start", serde_json::json!({"root_id": id}));
+        // Per-root, not the global count `scan_and_expect` checks: the second
+        // enrollment lands on top of the first.
+        let scan = wait_for_scan(&mut c, id);
+        assert!(scan["last_error"].is_null(), "the scan failed: {scan}");
+        assert_eq!(scan["files_seen"], serde_json::json!(3), "{scan}");
+        id
+    };
+    let a_id = enroll(&a);
+    let _b_id = enroll(&b);
+
+    // Both roots' files match, and A's were indexed first.
+    let all = c.call(
+        "search",
+        serde_json::json!({"query": "report", "limit": 50}),
+    );
+    assert_eq!(
+        all["hits"].as_array().map(Vec::len),
+        Some(6),
+        "precondition: every file matches: {all}"
+    );
+
+    c.call(
+        "root.remove",
+        serde_json::json!({"root_id": a_id, "forget_catalog": true}),
+    );
+
+    // A page exactly the size of the forgotten set. Every slot would be spent
+    // on A's stale ids if they were still in the arena.
+    let after = c.call("search", serde_json::json!({"query": "report", "limit": 3}));
+    assert_eq!(
+        after["hits"].as_array().map(Vec::len),
+        Some(3),
+        "the forgotten root's ids still hold the head of the candidate list, so \
+         a full page of live matches came back short: {after}"
+    );
+    for hit in after["hits"].as_array().unwrap() {
+        let path = hit["path"].as_str().unwrap_or_default();
+        assert!(
+            !path.starts_with(a.to_str().unwrap()),
+            "a forgotten root's file is still searchable: {hit}"
+        );
+    }
+}
+
+/// A root whose volume was replaced under it must NOT be scanned.
+///
+/// `availability` is a catalog flag somebody set at some point; it says nothing
+/// about which filesystem is mounted at the path today. A removable disk
+/// swapped at the same mount point — or a registered symlink retargeted at
+/// another volume — walks perfectly happily, and `upsert_file` then pairs the
+/// NEW volume's inode numbers with the OLD volume id. The `fs_id` values that
+/// come out are well-formed and false: they name files that exist on neither
+/// volume, and the path rows they update are treated as though they still
+/// described the enrolled filesystem.
+#[test]
+fn a_root_whose_volume_changed_refuses_to_scan() {
+    let d = Daemon::start("volswap");
+    let mut c = d.connect();
+    write_file(&d.dir, "docs/a.txt", "hello");
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": d.dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+
+    // The accepting direction first, so the refusal below cannot be satisfied
+    // by a scan path that has simply stopped working.
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    scan_and_expect(&mut c, root_id, 1);
+
+    // The disk is swapped: same path, different filesystem.
+    d.forge_root_volume(root_id, "uuid:00000000-0000-0000-0000-000000000000");
+
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    let status = wait_for_scan_error(&mut c, root_id);
+    let err = status["last_error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("was enrolled on volume") && err.contains("mounted there now"),
+        "a scan across a volume swap must refuse and say so: {status}"
+    );
+}
+
 #[test]
 fn a_scan_does_not_catalogue_the_daemons_own_state_directory() {
     let d = Daemon::start_with_socket_outside_the_state_dir("scan-statedir");

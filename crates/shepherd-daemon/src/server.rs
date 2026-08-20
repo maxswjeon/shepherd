@@ -123,6 +123,46 @@ fn describe_file_type(ft: std::fs::FileType) -> &'static str {
     }
 }
 
+/// Take the state directory's singleton lock.
+///
+/// # Before the catalog is opened, not after
+///
+/// This used to happen inside [`bind`], which runs at the END of start-up —
+/// after the catalog is open and after crash recovery has already rewritten
+/// job rows. A second `shepherdd` started while the first had a live scan
+/// therefore read that legitimate `running` row as crash-stranded and requeued
+/// it, and only then reached `bind` and lost the lock. The first daemon's
+/// workers could claim a second copy of a job whose executor was still
+/// running: two concurrent scans of one root, and one attempts budget spent
+/// twice.
+///
+/// So the lock is what the caller takes FIRST, and everything touching the
+/// shared catalog happens underneath it. `bind` receives the held file rather
+/// than a path, which makes the ordering a type rather than a convention —
+/// there is no way to bind without having taken it.
+pub fn lock_state_dir(lock_path: &Path) -> Result<std::fs::File, ServerError> {
+    let err = |detail: String| ServerError::Bind {
+        path: lock_path.display().to_string(),
+        detail,
+    };
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|e| err(format!("cannot open {}: {e}", lock_path.display())))?;
+    let _ = std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o600));
+    lock.try_lock().map_err(|e| {
+        err(format!(
+            "another shepherdd already holds {} ({e}); two daemons on one catalog would \
+             recover each other's live jobs and then race over the socket",
+            lock_path.display()
+        ))
+    })?;
+    Ok(lock)
+}
+
 /// Bind the listener, creating the directory and clearing a stale socket.
 ///
 /// Three things that each cause a confusing failure if skipped:
@@ -137,7 +177,7 @@ fn describe_file_type(ft: std::fs::FileType) -> &'static str {
 ///   happened to name, because a regular file refuses connections too;
 /// * **the mode**, set before accepting, because it is the entire authorization
 ///   model.
-pub fn bind(path: &Path, lock_path: &Path) -> Result<Bound, ServerError> {
+pub fn bind(path: &Path, state_lock: std::fs::File) -> Result<Bound, ServerError> {
     let err = |detail: String| ServerError::Bind {
         path: path.display().to_string(),
         detail,
@@ -217,21 +257,10 @@ pub fn bind(path: &Path, lock_path: &Path) -> Result<Bound, ServerError> {
         ))
     })?;
 
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)
-        .map_err(|e| err(format!("cannot open {}: {e}", lock_path.display())))?;
-    let _ = std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o600));
-    lock.try_lock().map_err(|e| {
-        err(format!(
-            "another shepherdd already holds {} ({e}); two daemons on one socket would race \
-             over it and then drive the same catalog",
-            lock_path.display()
-        ))
-    })?;
+    // The state lock is taken by the CALLER, before the catalog is opened —
+    // see [`lock_state_dir`]. It arrives here already held and is moved into
+    // `Bound` so the listener keeps it for the daemon's life.
+    let lock = state_lock;
 
     // `symlink_metadata`, not `exists`/`metadata`: a symlink here is not a
     // socket node we may unlink, and a dangling one makes `exists` answer false
@@ -933,6 +962,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `bind`, taking the state lock the way `cmd_run` does.
+    ///
+    /// Production takes the lock first and hands the held file to `bind`, so
+    /// the ordering cannot be got wrong; these tests are about the socket half
+    /// and say so in one place rather than at every call.
+    fn bind(path: &Path, lock_path: &Path) -> Result<Bound, ServerError> {
+        // `secure_state_dir` has already made the state directory in
+        // production, which is why `lock_state_dir` does not create it. Here
+        // the lock usually sits in the socket's own directory, which `bind`
+        // creates — so the fixture stands in for that step.
+        if let Some(parent) = lock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        super::bind(path, super::lock_state_dir(lock_path)?)
+    }
+
     /// `bind`, retried until the fork window a TEST BINARY opens has closed.
     ///
     /// Not a weakened assertion and not a product concern — it is a fact about
@@ -1165,6 +1210,41 @@ mod tests {
             second.contains("still"),
             "the socket is still usable: {second:?}"
         );
+    }
+
+    /// The state lock is takeable before anything else, and refuses a second
+    /// holder.
+    ///
+    /// This is the half a test can reach. The ORDERING — that the lock is held
+    /// before the catalog is opened and before crash recovery runs — is
+    /// enforced by the signature rather than by a test: `bind` takes an
+    /// already-held `File`, so there is no way to reach a listener without
+    /// having taken the lock first, and `cmd_run` has nowhere else to take it.
+    /// Proving the recovery race itself needs two daemons and a live scan job,
+    /// which is a fixture this suite cannot hold steady.
+    #[cfg(unix)]
+    #[test]
+    fn the_state_lock_is_exclusive_and_precedes_binding() {
+        let path = tmp_socket("statelock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lock_path = path.with_extension("lock");
+
+        let first = super::lock_state_dir(&lock_path).expect("the first daemon takes it");
+        let err = super::lock_state_dir(&lock_path)
+            .expect_err("a second daemon must not open the same catalog");
+        assert!(
+            err.to_string().contains("already holds"),
+            "the refusal must name the lock: {err}"
+        );
+
+        // And it is what `bind` consumes: released with the holder, so an
+        // ordinary restart is not blocked by the previous run's file.
+        first.unlock().expect("release");
+        drop(first);
+        let again = super::lock_state_dir(&lock_path).expect("released");
+        let bound = super::bind(&path, again).expect("bind under the held lock");
+        drop(bound);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// The whole authorization model, asserted.

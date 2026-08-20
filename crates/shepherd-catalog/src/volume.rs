@@ -341,6 +341,24 @@ mod linux {
     }
 }
 
+/// The best stable identity available for `path`, or `None` if there is none.
+///
+/// The UUID where the filesystem has one; the labelled `src:` fallback where
+/// the source names the volume itself; nothing otherwise — including on every
+/// platform whose implementation is Phase 3's.
+///
+/// One function because two callers must not disagree about what a root's
+/// identity IS. Enrollment stores this; the scan compares against it, and a
+/// scan deriving the value a second way would refuse or admit roots on nothing
+/// but the difference between two spellings of the same intent.
+pub fn current_volume_id(path: &Path) -> Option<String> {
+    match volume_id(path) {
+        Ok(id) => Some(id),
+        Err(VolumeError::NoStableId { .. }) => volume_id_fallback(path).ok(),
+        Err(_) => None,
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::volume_id_fallback;
 

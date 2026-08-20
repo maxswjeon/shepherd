@@ -166,17 +166,70 @@ fn a_hit_in_a_directory_component_does_not_satisfy_a_name_query() {
     assert_eq!(find(&ix, "summary"), vec![5]);
 }
 
+/// **ORACLE CHANGED, and the change is a trade rather than a correction.**
+///
+/// This used to assert that `\` delimits a name on every host. It cannot: on
+/// Unix `\` is an ordinary character in a filename, so that rule mis-scoped
+/// real local files — a name query for `foo` in `foo\bar.txt` found the bytes
+/// and then rejected the hit because a "separator" followed it, and the file
+/// became unfindable. An empty result looks exactly like having nothing, which
+/// is the one failure search cannot afford.
+///
+/// The cost lands here instead: a Windows-written path restored onto a Unix
+/// host has no boundary this recognises, so `subdir` matches in name scope and
+/// returns a row the user did not mean. A visible extra hit, not an invisible
+/// missing one — and the direction is chosen deliberately.
+///
+/// Both halves are asserted per platform, so neither is quietly lost.
 #[test]
-fn a_windows_separator_delimits_a_name_exactly_as_a_unix_one_does() {
+fn component_boundaries_follow_the_host_platform() {
     let ix = corpus();
-    // `rel_path` keeps the separators the OS gave it, so a catalog written on
-    // Windows holds `\`. Row 9 is `win\subdir\delta.txt`.
+    // Row 9 is `win\subdir\delta.txt`; its last component is `delta.txt`
+    // wherever the boundary rule comes down.
     assert_eq!(find(&ix, "delta"), vec![9]);
-    // `subdir` is a directory component of row 9 — a name query must miss it.
-    // A `/`-only implementation sees one long filename and wrongly returns it.
-    assert_eq!(find(&ix, "subdir"), Vec::<i64>::new());
-    // Under path scope it is reachable.
+    // And it is reachable by path on either platform.
     assert_eq!(find(&ix, "subdir\\"), vec![9]);
+
+    if cfg!(windows) {
+        assert_eq!(
+            find(&ix, "subdir"),
+            Vec::<i64>::new(),
+            "on Windows `\\` is a separator, so `subdir` is a directory \
+             component and a name query must miss it"
+        );
+    } else {
+        assert_eq!(
+            find(&ix, "subdir"),
+            vec![9],
+            "on Unix `\\` is part of the filename, so this whole row IS one \
+             component — over-matching a foreign path is the price of finding \
+             local files whose names contain a backslash"
+        );
+    }
+}
+
+/// The Unix half of the same rule, on a file a user can actually create.
+///
+/// `foo\bar.txt` is a legal Unix filename. Treating its backslash as a
+/// boundary made a name query for `foo` reject the hit and one for `bar` match
+/// as though the suffix were its own component — the file could not be found
+/// by its own leading characters.
+#[test]
+#[cfg(unix)]
+fn a_backslash_in_a_unix_filename_is_part_of_the_name() {
+    let mut b = MetaIndexBuilder::new();
+    b.push(1, "notes/foo\\bar.txt").unwrap();
+    let ix = b.build().unwrap();
+
+    assert_eq!(
+        find(&ix, "foo"),
+        vec![1],
+        "the leading characters of a real filename must find it"
+    );
+    assert_eq!(find(&ix, "bar"), vec![1]);
+    // And the directory component is still a directory component: `/` is a
+    // separator on every platform.
+    assert_eq!(find(&ix, "notes"), Vec::<i64>::new());
 }
 
 #[test]

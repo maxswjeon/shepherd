@@ -57,7 +57,7 @@ pub struct FileSource {
     volume_id: String,
     /// The identity the caller planned against. Read **only** on platforms
     /// where `shepherd_catalog::volume::fs_id` cannot run — see
-    /// [`FileSource::current_fs_id`]. Kept unconditionally so the two builds do
+    /// [`FileSource::fs_id_of`]. Kept unconditionally so the two builds do
     /// not have two different structs.
     #[cfg_attr(unix, allow(dead_code))]
     planned_fs_id: FsId,
@@ -107,23 +107,35 @@ impl FileSource {
         }
     }
 
-    /// The identity of the file **currently** at [`Self::path`].
+    /// The identity of the file the fingerprint just statted.
     ///
-    /// Goes through `shepherd_catalog::volume::fs_id` rather than assembling a
-    /// second identity here, for the reason
+    /// Built from **that** stat's inode rather than taking a second one.
+    /// `volume::fs_id` re-stats the path, and the two stats can straddle an
+    /// unlink: the fingerprint succeeds, the identity lookup does not, and its
+    /// `VolumeError::Stat` — `NotFound` underneath — used to be mapped
+    /// unconditionally to `Transient`. On a job's final attempt the queue then
+    /// failed without anything reaching `abandon`, leaving an `Uploading`
+    /// session and its multipart parts allocated.
+    ///
+    /// One stat has no window to straddle, so the classification problem does
+    /// not arise. It also cannot disagree with itself about which file it saw,
+    /// which the two-stat form could.
+    ///
+    /// Still routed through `shepherd_catalog::volume`, via `fs_id_from_ino`,
+    /// rather than formatting `<volume>:<ino>` here — for the reason
     /// [`crate::destroy::LocalDestroyRequest::fs_id`] spells out at length: a
-    /// locally synthesized `<dev>:<ino>` compiles, compares, and protects
-    /// nothing, because it never equals the value the rest of the system uses
-    /// for the same file.
-    fn current_fs_id(&self) -> StorageResult<FsId> {
+    /// locally synthesized identity compiles, compares, and protects nothing,
+    /// because it never equals the value the rest of the system uses for the
+    /// same file.
+    fn fs_id_of(&self, md: &std::fs::Metadata) -> StorageResult<FsId> {
         #[cfg(unix)]
         {
-            shepherd_catalog::volume::fs_id(&self.path, &self.volume_id).map_err(|e| {
-                StorageError::Transient {
-                    op: "identify source".into(),
-                    detail: e.to_string(),
-                }
-            })
+            use std::os::unix::fs::MetadataExt;
+            let _ = &md;
+            Ok(shepherd_catalog::volume::fs_id_from_ino(
+                &self.volume_id,
+                md.ino(),
+            ))
         }
         // A COVERAGE GAP, stated rather than papered over. `volume::fs_id` is
         // `cfg(unix)`; on Windows it returns `Unsupported`, so no caller there
@@ -132,6 +144,7 @@ impl FileSource {
         // Phase 3 owns `FILE_ID_INFO` + volume serial — see `volume.rs`.
         #[cfg(not(unix))]
         {
+            let _ = md;
             Ok(self.planned_fs_id.clone())
         }
     }
@@ -188,7 +201,7 @@ impl SourceReader for FileSource {
         Ok(SourceFingerprint {
             size: md.len(),
             mtime,
-            fs_id: self.current_fs_id()?,
+            fs_id: self.fs_id_of(&md)?,
         })
     }
 

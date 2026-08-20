@@ -194,16 +194,43 @@ impl Scope {
     }
 }
 
-/// Both separators, always.
+/// Both separators — for reading the QUERY.
 ///
 /// `rel_path` is stored "with separators left exactly as the OS gave them"
 /// (`shepherd_scan::walk`), so a catalog written on Windows holds `\` and one
-/// written on Linux holds `/`. Accepting only the host's separator would make a
-/// catalog restored across platforms silently unsearchable by path — the
-/// catalog's own `split_name` already takes both, and this agrees with it.
+/// written on Linux holds `/`. A user who types either is asking about paths,
+/// whichever platform they are on, and classifying the query generously costs
+/// nothing: the worst outcome is a path-scope search where a name-scope one
+/// would have done, which searches MORE.
+///
+/// Deciding where a component ENDS is a different question with a different
+/// answer — see [`is_component_boundary`].
 #[inline]
 fn is_separator(b: u8) -> bool {
     b == b'/' || b == b'\\'
+}
+
+/// The host's separator, for deciding where a filename component ends.
+///
+/// **`\` is an ordinary character in a Unix filename.** A real file named
+/// `foo\bar.txt` was mis-scoped by treating it as a boundary: a name-scope
+/// query for `foo` found the bytes and then rejected the hit because a
+/// "separator" followed it, and one for `bar` matched as though the suffix were
+/// its own final component. A file the user has cannot be found, which is the
+/// failure mode search cannot afford — an empty result looks exactly like
+/// having nothing.
+///
+/// The cost is at the other end and is the cheaper one: a Windows-written path
+/// restored onto a Unix host has no boundary this recognises, so a name-scope
+/// query can match an inner directory component and return a row the user did
+/// not mean. That is a visible extra hit, not an invisible missing one.
+#[inline]
+fn is_component_boundary(b: u8) -> bool {
+    if cfg!(windows) {
+        b == b'/' || b == b'\\'
+    } else {
+        b == b'/'
+    }
 }
 
 /// The result of a search.
@@ -498,7 +525,10 @@ impl MetaIndex {
                 Scope::Path => true,
                 // In `Name` scope the hit must be in the last component: no
                 // separator may follow it inside this entry.
-                Scope::Name => memchr::memchr2(b'/', b'\\', &self.bytes[abs..entry_end]).is_none(),
+                Scope::Name => !self.bytes[abs..entry_end]
+                    .iter()
+                    .copied()
+                    .any(is_component_boundary),
             };
             if !qualifies {
                 continue;

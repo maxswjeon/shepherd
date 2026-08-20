@@ -183,6 +183,37 @@ impl Executor for ScanExecutor {
         let ignores = IgnoreSet::new(&path, &patterns)
             .map_err(|e| format!("root {root_id} has an unusable ignore pattern: {e}"))?;
 
+        // The volume this root was ENROLLED on, re-asked now.
+        //
+        // `availability` is a catalog flag somebody set at some point; it says
+        // nothing about which filesystem is mounted at this path today. A
+        // removable disk swapped at the same mount point — or a registered
+        // symlink retargeted at another volume — walks perfectly happily, and
+        // `upsert_file` then pairs the NEW volume's inode numbers with the OLD
+        // volume id. The resulting `fs_id` values are well-formed and false:
+        // they name files that do not exist on the volume they claim, and the
+        // path rows they update are treated as though they still described the
+        // enrolled filesystem.
+        //
+        // Compared only when BOTH identities exist. A root enrolled without a
+        // stable identity has nothing to disagree with — that case is warned
+        // about at `root.add` — and no platform outside Linux can answer at
+        // all until Phase 3, so demanding an answer here would refuse every
+        // scan on macOS and Windows.
+        if let Some(enrolled) = root.volume_id.as_deref()
+            && let Some(current) = shepherd_catalog::volume::current_volume_id(&path)
+            && current != enrolled
+        {
+            return Err(format!(
+                "root {root_id} at {} was enrolled on volume `{enrolled}` and the filesystem \
+                 mounted there now is `{current}`. Scanning would pair this volume's inode \
+                 numbers with the enrolled volume's id, producing `fs_id` values that look \
+                 valid and name files on neither. Re-point the root, or resynchronise it if \
+                 the volume really was replaced",
+                root.path
+            ));
+        }
+
         self.publish(root_id, 0, 0, Some(root.path.clone()), false);
 
         // --- walk ---------------------------------------------------------

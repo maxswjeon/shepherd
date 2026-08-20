@@ -380,13 +380,7 @@ impl ShepherdApi for Session {
         // refusing would make enrollment fail on platforms and deployments
         // where nothing is wrong beyond the identity being weak. The operator
         // is told what they lose instead.
-        let volume = match shepherd_catalog::volume::volume_id(&path) {
-            Ok(id) => Some(id),
-            Err(shepherd_catalog::volume::VolumeError::NoStableId { .. }) => {
-                shepherd_catalog::volume::volume_id_fallback(&path).ok()
-            }
-            Err(_) => None,
-        };
+        let volume = shepherd_catalog::volume::current_volume_id(&path);
 
         let mut warnings = Vec::new();
 
@@ -721,11 +715,45 @@ impl ShepherdApi for Session {
                      Restore them first, or pass --force if you accept that."
                 ),
             )),
-            RootRemoval::Done { dropped, custody } => Ok(RootRemoveResult {
-                root_id: req.root_id,
-                catalog_rows_dropped: dropped,
-                custody_rows_dropped: if forget { custody } else { 0 },
-            }),
+            RootRemoval::Done { dropped, custody } => {
+                // The cascade took this root's file rows with it, and the
+                // metadata index is an in-memory arena built from those rows.
+                // Nothing else rebuilds it — the only other call sites are
+                // start-up and a completed scan — so the forgotten ids stayed
+                // in it and went on consuming the capped, file-id-ordered
+                // candidate prefix that `hydrate` then drops. A search whose
+                // matches happened to have early ids came back short or empty
+                // while later files that still matched were never reached.
+                //
+                // Only when rows were actually forgotten: a `--forget`-less
+                // removal leaves every file row in place, and rebuilding an
+                // arena that cannot have changed would cost seconds on a large
+                // catalog for nothing.
+                if forget && dropped > 0 {
+                    match self.daemon.rebuild_index() {
+                        Ok(entries) => tracing::info!(
+                            entries,
+                            root = req.root_id,
+                            "metadata index rebuilt after forgetting a root"
+                        ),
+                        // Not fatal, and not silent. The removal itself
+                        // committed; refusing it now would report a failure for
+                        // work that is done. `search` reports a stale or absent
+                        // index on its own terms — see `Daemon::index`.
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            root = req.root_id,
+                            "the metadata index could not be rebuilt after forgetting a \
+                             root; `search` may return short pages until the next scan"
+                        ),
+                    }
+                }
+                Ok(RootRemoveResult {
+                    root_id: req.root_id,
+                    catalog_rows_dropped: dropped,
+                    custody_rows_dropped: if forget { custody } else { 0 },
+                })
+            }
         }
     }
 

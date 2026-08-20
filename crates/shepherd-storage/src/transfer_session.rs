@@ -556,9 +556,21 @@ impl<'a> TransferDriver<'a> {
                 }
 
                 TransferState::Initiating => {
-                    self.assert_source_unchanged(session).await?;
-                    // Persisted `Initiating` already; safe to touch the provider.
+                    // REAP FIRST, then check the source. `Initiating` is
+                    // already persisted, so the provider is safe to touch here
+                    // — and window 1's orphan is precisely a session this
+                    // process does not know the id of.
+                    //
+                    // The other order lost it. A crash between
+                    // `create_multipart` and persisting the id leaves an
+                    // untracked upload at the key; if the source then vanished,
+                    // `assert_source_unchanged` abandoned the transfer,
+                    // `finish_abort` had no id to abort, and `adopt_or_reap` —
+                    // the only thing that could have found the orphan — was
+                    // never reached. The upload stayed allocated with nothing
+                    // left that would ever look for it.
                     self.adopt_or_reap(session).await?;
+                    self.assert_source_unchanged(session).await?;
                     let id = self.adapter.create_multipart(&session.remote_key).await?;
                     session.upload_id = Some(id);
                     self.advance(session, TransferState::Uploading).await?;

@@ -258,6 +258,20 @@ fn cmd_run() -> Result<(), String> {
     // stays readable.
     secure_state_dir(&paths.state_dir)?;
 
+    // THE SINGLETON LOCK, before the catalog is opened.
+    //
+    // It used to be taken inside `server::bind` at the end of start-up, which
+    // is after crash recovery has already rewritten job rows. A second
+    // `shepherdd` started while this one had a live scan read that legitimate
+    // `running` row as crash-stranded, requeued it, and only then reached
+    // `bind` and lost the lock — leaving the first daemon's workers free to
+    // claim a second copy of a job whose executor was still running.
+    //
+    // Everything below this line touches the shared catalog, so everything
+    // below this line is underneath the lock.
+    let state_lock =
+        server::lock_state_dir(&paths.state_dir.join("daemon.lock")).map_err(|e| e.to_string())?;
+
     let catalog = shepherd_catalog::Catalog::open(&paths.catalog())
         .map_err(|e| format!("cannot open {}: {e}", paths.catalog().display()))?;
     let actor = CatalogActor::start(catalog, Some(paths.catalog()));
@@ -296,14 +310,9 @@ fn cmd_run() -> Result<(), String> {
                                                `search` will be refused until a restart"),
     }
 
-    // The lock lives in the STATE directory: two daemons on one catalog is the
-    // harm, and a lock beside the socket would be an ordinary file in whatever
-    // directory `SHEPHERD_SOCKET` names — which can be inside a scan root.
-    let bound = server::bind(
-        &daemon.paths.socket,
-        &daemon.paths.state_dir.join("daemon.lock"),
-    )
-    .map_err(|e| e.to_string())?;
+    // The state lock taken at the top is handed over here, which is what keeps
+    // it held for the daemon's life: `Bound` owns it from now on.
+    let bound = server::bind(&daemon.paths.socket, state_lock).map_err(|e| e.to_string())?;
     tracing::info!(
         socket = %daemon.paths.socket.display(),
         catalog = %daemon.paths.catalog().display(),

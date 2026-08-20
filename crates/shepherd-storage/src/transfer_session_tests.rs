@@ -521,6 +521,52 @@ async fn a_source_truncated_mid_read_abandons_its_provider_session() {
     assert_eq!(rig.adapter.live_upload_count(), 0);
 }
 
+/// Window 1's orphan is reaped even when the source is gone by the time we
+/// look.
+///
+/// A crash between `create_multipart` and persisting the upload id leaves an
+/// untracked session at the key. If the source disappears before the restart,
+/// the source check used to run first: the transfer was abandoned, `finish_abort`
+/// had no id to abort, and `adopt_or_reap` — the only thing that could have
+/// found the orphan — was never reached. The provider kept an allocated upload
+/// that nothing would ever look for again.
+#[tokio::test]
+async fn an_orphan_from_window_one_is_reaped_even_if_the_source_vanished() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+    s.state = TransferState::Initiating;
+    rig.store.save(&s).await.expect("seed");
+
+    // The orphan: an upload at this key that no session names.
+    let orphan = rig
+        .adapter
+        .create_multipart(&rig.key)
+        .await
+        .expect("orphan upload");
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        1,
+        "precondition: an untracked upload exists at the key"
+    );
+    assert!(s.upload_id.is_none(), "and this session does not name it");
+    let _ = orphan;
+
+    // ...and the file is gone by the time the daemon comes back.
+    rig.source.vanish();
+
+    let err = rig
+        .driver()
+        .run(&mut s)
+        .await
+        .expect_err("a source that is gone cannot be uploaded");
+    assert!(matches!(err, StorageError::NotFound { .. }), "{err:?}");
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        0,
+        "the orphan outlived the only pass that could have found it"
+    );
+}
+
 /// PM-1 — the user edits the file while it is being uploaded.
 #[tokio::test]
 async fn a_source_that_changes_between_attempts_aborts_rather_than_splicing() {
