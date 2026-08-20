@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 use shepherd_catalog::atime::AtimeMode;
-use shepherd_core::{Blake3Hash, FileId, TargetId, Timestamp};
+use shepherd_core::{Blake3Hash, FileId, FileStat, InodeSighting, TargetId, Timestamp};
 
 use crate::delete_policy::DeleteAction;
 
@@ -138,10 +138,58 @@ pub fn preview_hash(body: &RuleBody) -> Blake3Hash {
     }
 }
 
+/// What a file WAS when the preview was taken.
+///
+/// # A catalog row id is not a file
+///
+/// `FileRepo::upsert_file` conflicts on `(root_id, rel_path)`, so a file
+/// deleted and replaced at the same path keeps the SAME `FileId`. Preview and
+/// run therefore compared equal for two different files, and if the
+/// replacement happened to match the rule through the same signal, the drift
+/// check passed and a destructive action ran against a file the operator had
+/// never previewed. AC-14's "the dry run enumerates exactly the real run's
+/// set" is a claim about files; the row id is a claim about rows.
+///
+/// # Why these four fields
+///
+/// `ino` is the filesystem's own answer and settles it outright where the
+/// platform gives one — but it is [`InodeSighting::Unknown`] where it does not,
+/// and a truncate-and-rewrite keeps it. The other three are the metadata
+/// version: `ctime` moves on any content or metadata change, and `size` and
+/// `mtime` catch the rewrite cases a coarse `ctime` clock could round away.
+/// Together they are the strongest statement available without re-hashing the
+/// file, which a dry run must not do.
+///
+/// A file that was merely *touched* between preview and run therefore drifts.
+/// That is the intended direction: the operator authorized an action against
+/// the files they were shown, and a re-preview is cheap where an unwanted
+/// destruction is not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileIdentity {
+    pub ino: InodeSighting,
+    pub size: u64,
+    pub mtime: Timestamp,
+    pub ctime: Timestamp,
+}
+
+impl FileIdentity {
+    /// Read it off the stat the matcher already had.
+    pub fn of(stat: &FileStat) -> Self {
+        Self {
+            ino: stat.ino,
+            size: stat.size,
+            mtime: stat.mtime,
+            ctime: stat.ctime,
+        }
+    }
+}
+
 /// One file the dry-run matched, and the signal that drove it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewedMatch {
     pub file: FileId,
+    /// The file itself, not just the row that names it. See [`FileIdentity`].
+    pub identity: FileIdentity,
     /// Which signal drove this match, or `None` when **no timestamp did**.
     ///
     /// AC-14 requires the preview to state what drove each match, and this was

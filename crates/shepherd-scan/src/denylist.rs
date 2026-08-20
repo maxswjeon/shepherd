@@ -280,12 +280,12 @@ impl DenyList {
         }
         let norm = abs.to_string_lossy().replace('\\', "/");
         for (prefix, why) in &self.abs_prefixes {
-            if path_has_prefix(&norm, prefix) {
+            if path_has_prefix(&norm, prefix, self.case_insensitive) {
                 return Some(*why);
             }
         }
         for prefix in &self.extra_paths {
-            if path_has_prefix(&norm, prefix) {
+            if path_has_prefix(&norm, prefix, self.case_insensitive) {
                 return Some(DenyReason::ShepherdInternal);
             }
         }
@@ -305,7 +305,7 @@ impl DenyList {
         if self
             .extra_paths
             .iter()
-            .any(|prefix| path_has_prefix(&norm, prefix))
+            .any(|prefix| path_has_prefix(&norm, prefix, self.case_insensitive))
         {
             return Some(DenyReason::ShepherdInternal);
         }
@@ -321,7 +321,25 @@ impl DenyList {
 /// Prefix comparison that respects component boundaries.
 ///
 /// `/proc` must match `/proc/1/fd` but not `/proctor/notes.txt`.
-fn path_has_prefix(path: &str, prefix: &str) -> bool {
+///
+/// `fold` follows the ROOT's probed case policy and is not a free "be
+/// generous". Folding unconditionally on a case-sensitive filesystem makes
+/// `/home/u/Shepherd` — a state directory, say — also exclude the user's own
+/// `/home/u/shepherd/`, and the files under it are then never catalogued and
+/// never backed up. A deny list that silently swallows a subtree is worse than
+/// one that misses a case variant of a system path, because nothing surfaces
+/// it: the scan reports success, and the absence looks like an empty
+/// directory.
+fn path_has_prefix(path: &str, prefix: &str, fold: bool) -> bool {
+    if !fold {
+        if path == prefix {
+            return true;
+        }
+        return match path.strip_prefix(prefix) {
+            Some(rest) => rest.starts_with('/'),
+            None => false,
+        };
+    }
     let path_l = path.to_ascii_lowercase();
     let prefix_l = prefix.to_ascii_lowercase();
     if path_l == prefix_l {
@@ -395,6 +413,53 @@ mod tests {
     ///
     /// Both directions are asserted. On a case-SENSITIVE root `.GIT` really is
     /// a different directory, and denying it would prune one of the user's own.
+    /// The same policy governs PATH exclusions, which folded unconditionally.
+    ///
+    /// A runtime exclusion is an absolute path — the state directory, the
+    /// socket's lock file — and folding it on a case-sensitive root makes
+    /// `/home/u/Shepherd` also exclude the user's own `/home/u/shepherd/`.
+    /// Those files are then never catalogued and never backed up, and nothing
+    /// surfaces it: the scan reports success and the subtree just looks empty.
+    #[test]
+    fn absolute_path_exclusions_follow_the_roots_policy_too() {
+        let sensitive = DenyList::builtin().with_extra_path(&p("/home/u/Shepherd"));
+        let insensitive = DenyList::builtin()
+            .case_insensitive(true)
+            .with_extra_path(&p("/home/u/Shepherd"));
+
+        // The exact path is excluded under either policy — that is the point of
+        // adding it.
+        for d in [&sensitive, &insensitive] {
+            assert!(d.deny_dir("Shepherd", &p("/home/u/Shepherd")).is_some());
+            assert!(d.deny_dir("sub", &p("/home/u/Shepherd/sub")).is_some());
+        }
+
+        // A DIFFERENT directory that merely differs in case is the user's own
+        // on a case-sensitive root, and the same directory on an insensitive
+        // one.
+        assert_eq!(
+            sensitive.deny_dir("shepherd", &p("/home/u/shepherd")),
+            None,
+            "`/home/u/shepherd` is not `/home/u/Shepherd` on a case-sensitive root; \
+             excluding it silently drops the user's files from every backup"
+        );
+        assert_eq!(
+            sensitive.deny_file("notes.txt", &p("/home/u/shepherd/notes.txt")),
+            None
+        );
+        assert!(
+            insensitive
+                .deny_dir("shepherd", &p("/home/u/shepherd"))
+                .is_some(),
+            "on a case-insensitive root the two names ARE one directory"
+        );
+        assert!(
+            insensitive
+                .deny_file("notes.txt", &p("/home/u/shepherd/notes.txt"))
+                .is_some()
+        );
+    }
+
     #[test]
     fn case_folding_follows_the_roots_policy() {
         let sensitive = DenyList::builtin();

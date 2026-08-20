@@ -206,6 +206,71 @@ fn conflict_names_keep_climbing_until_one_is_free() {
     }
 }
 
+/// Running out of names is REFUSED, not answered with an untested one.
+///
+/// The ceiling used to return `(restored 10001)` without probing it. The caller
+/// then created it exclusively, got `AlreadyExists`, and reported a race that
+/// had not happened — while the truth was "there is no free name here", which
+/// no retry could change. Every attempt re-walked all ten thousand probes to
+/// reach the same occupied path, so that file could never be restored.
+#[test]
+fn exhausting_every_conflict_name_refuses_instead_of_guessing() {
+    // Everything is taken, including well past the ceiling.
+    let all_taken = |_: &str| true;
+    match choose_restore_path("/root/a.txt", &all_taken) {
+        RestoreTarget::Exhausted { original, ceiling } => {
+            assert_eq!(original, "/root/a.txt");
+            assert_eq!(ceiling, crate::fidelity::CONFLICT_NAME_CEILING);
+        }
+        other => panic!("a name it never probed is not an answer: {other:?}"),
+    }
+
+    // The boundary, so the ceiling is not off by one in the other direction:
+    // the LAST candidate below it is still returned when it is free.
+    let last = format!(
+        "/root/a (restored {}).txt",
+        crate::fidelity::CONFLICT_NAME_CEILING
+    );
+    let all_but_last = |p: &str| p != last;
+    match choose_restore_path("/root/a.txt", &all_but_last) {
+        RestoreTarget::Conflict { chosen, .. } => assert_eq!(chosen, last),
+        other => panic!("the last candidate under the ceiling is usable: {other:?}"),
+    }
+}
+
+/// A backslash separates on Windows and is an ordinary filename character on
+/// Unix, so the split has to ask the platform rather than assume.
+///
+/// Searching only for `/` sent `C:\\Users\\foo.bar\\README` to
+/// `C:\\Users\\foo (restored 1).bar\\README` — not an odd name but a different,
+/// usually nonexistent DIRECTORY, so the restore failed instead of landing
+/// beside the file it conflicted with.
+#[test]
+#[cfg(windows)]
+fn a_windows_path_splits_on_the_backslash() {
+    let occupied = |p: &str| p == r"C:\Users\foo.bar\README";
+    match choose_restore_path(r"C:\Users\foo.bar\README", &occupied) {
+        RestoreTarget::Conflict { chosen, .. } => {
+            assert_eq!(chosen, r"C:\Users\foo.bar\README (restored 1)");
+        }
+        other => panic!("expected a conflict name: {other:?}"),
+    }
+}
+
+/// The other half of the same rule: on Unix a backslash is part of the NAME,
+/// so it must not be treated as a separator.
+#[test]
+#[cfg(unix)]
+fn a_backslash_is_an_ordinary_character_in_a_unix_filename() {
+    let name = r"/root/weird\name.txt";
+    match choose_restore_path(name, &|p| p == name) {
+        RestoreTarget::Conflict { chosen, .. } => {
+            assert_eq!(chosen, r"/root/weird\name (restored 1).txt");
+        }
+        other => panic!("expected a conflict name: {other:?}"),
+    }
+}
+
 #[test]
 fn an_extensionless_path_still_gets_a_conflict_name() {
     match choose_restore_path("/root/README", &|p| p == "/root/README") {

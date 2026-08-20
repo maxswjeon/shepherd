@@ -43,7 +43,7 @@
 //! rebuild**. Keying recovery on it would make the artifact useless in exactly
 //! the scenario it exists for.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use shepherd_core::{Blake3Hash, CustodyClass, TargetId, Timestamp};
@@ -280,7 +280,7 @@ pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
     live
 }
 
-/// Merge durable-config records across all valid branches.
+/// Merge durable-config records across the branches of a chain.
 ///
 /// **Last-writer-wins by `(writer_epoch, seq)` per entity id, with delete-wins
 /// on an update-vs-delete conflict.** A union is not a value here: merging
@@ -292,57 +292,101 @@ pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
 /// user removed, and a resurrected *tiering* rule could tier files the user
 /// deliberately excluded.
 ///
-/// The concurrency rule, stated precisely: a tombstone the winner does **not
-/// dominate** is treated as concurrent with it and wins. Everything the winner
-/// dominates is in its past and is an ordinary sequential edit.
+/// # It takes BRANCHES, and that is the correctness argument
 ///
-/// This used to read "a tombstone in a different writer epoch is concurrent",
-/// which is exactly backwards for the common case. `writer_epoch` increments on
+/// It used to take one flat `&[DurableConfigRecord]`, and flattening is
+/// precisely what destroyed the information the reducer needs. `LogicalClock`
+/// is totally ordered as a *value* and only partially ordered as *causality*:
+/// two records on sibling branches have comparable numbers and no causal
+/// relationship at all. Reading the number as the order let a live record at
+/// `(epoch 5, seq 10)` beat a concurrent tombstone at `(epoch 3, seq 40)`
+/// purely because 5 > 3 — a restarted stale writer republishing without ever
+/// seeing the sibling's delete, and disaster recovery resurrecting the rule the
+/// user removed.
+///
+/// So domination is decided by ANCESTRY, and a branch is where ancestry lives:
+///
+/// * two records **in the same branch** are causally ordered, because a branch
+///   is a chain and a chain's clocks increase along it — so a lower clock there
+///   really is in the winner's past;
+/// * two records that **share no branch** are concurrent, whatever their
+///   numbers say, and a concurrent tombstone wins.
+///
+/// Records before a fork point appear in every branch that descends from it,
+/// which is what makes the shared-branch test give the right answer for the
+/// common history as well as for the fork.
+///
+/// # What this preserves
+///
+/// The earlier reading — "a tombstone in a different writer epoch is
+/// concurrent" — was wrong for the ordinary case: `writer_epoch` increments on
 /// every daemon START, so a delete in epoch 2 and a re-create in epoch 3 are
-/// not two branches — they are one writer, on two days, doing the obvious
-/// thing. Treating the old tombstone as concurrent suppressed the re-created
-/// rule, target or setting, so recovery omitted entities the user was actively
-/// using, and it did so precisely when the re-creation crossed a restart.
+/// one writer, on two days, doing the obvious thing, and treating the old
+/// tombstone as concurrent suppressed entities the user was actively using.
+/// Those two records share a branch, so they stay causally ordered here and the
+/// re-creation still wins.
 ///
-/// `LogicalClock` is `(writer_epoch, seq)` and totally ordered, so the records
-/// this rule can still call concurrent are those sharing the winner's exact
-/// clock — a genuine two-writer collision, where delete-wins remains the
-/// conservative answer because a resurrected tiering rule could tier files the
-/// user deliberately excluded.
-pub fn merge_durable_config(records: &[DurableConfigRecord]) -> Vec<DurableConfigRecord> {
-    // The key borrows for the same reason the values already do: nothing here
-    // outlives `records`. `&str` orders identically to `String`, so the group
-    // order — and therefore the order of `out` — is unchanged.
-    let mut by_entity: BTreeMap<(ConfigKind, &str), Vec<&DurableConfigRecord>> = BTreeMap::new();
-    for r in records {
-        by_entity
-            .entry((r.kind, r.entity_id.as_str()))
-            .or_default()
-            .push(r);
+/// Records sharing the winner's exact clock remain concurrent with it — a
+/// genuine two-writer collision — and delete-wins remains the answer.
+pub fn merge_durable_config(branches: &[Vec<DurableConfigRecord>]) -> Vec<DurableConfigRecord> {
+    // Each entity's records, each tagged with the set of branches carrying it.
+    // The key borrows for the same reason the values do: nothing here outlives
+    // `branches`. `&str` orders identically to `String`, so the group order —
+    // and therefore the order of `out` — is unchanged.
+    let mut by_entity: BTreeMap<(ConfigKind, &str), Vec<Seen<'_>>> = BTreeMap::new();
+    for (b, branch) in branches.iter().enumerate() {
+        for r in branch {
+            let group = by_entity.entry((r.kind, r.entity_id.as_str())).or_default();
+            // The same record published before a fork appears in every
+            // descendant branch. It is ONE record seen from several branches,
+            // not several records, and collapsing it here is what lets the
+            // shared-branch test below mean "causally related".
+            match group.iter_mut().find(|seen| seen.record == r) {
+                Some(seen) => {
+                    seen.branches.insert(b);
+                }
+                None => group.push(Seen {
+                    record: r,
+                    branches: BTreeSet::from([b]),
+                }),
+            }
+        }
     }
 
     let mut out = Vec::new();
     for (_, group) in by_entity {
-        let winner = group.iter().max_by_key(|r| r.clock).copied();
-        let Some(winner) = winner else { continue };
-        if winner.tombstone {
+        let Some(winner) = group.iter().max_by_key(|seen| seen.record.clock) else {
+            continue;
+        };
+        if winner.record.tombstone {
             continue;
         }
-        // A tombstone the winner dominates is in the winner's PAST, not
-        // concurrent with it — see this function's docs.
-        let concurrent_delete = group
-            .iter()
-            // `>=`, i.e. "not dominated by the winner". With a totally ordered
-            // clock and a strict max that means an equal clock — a genuine
-            // two-writer collision, where delete-wins is the conservative
-            // answer.
-            .any(|r| r.tombstone && r.clock >= winner.clock);
+        let concurrent_delete = group.iter().any(|seen| {
+            if !seen.record.tombstone {
+                return false;
+            }
+            // Dominated — in the winner's past — only if some ONE branch holds
+            // both, and this one comes earlier on it. Anything else is
+            // concurrent, and a concurrent delete wins.
+            let shares_a_branch = seen
+                .branches
+                .intersection(&winner.branches)
+                .next()
+                .is_some();
+            !(shares_a_branch && seen.record.clock < winner.record.clock)
+        });
         if concurrent_delete {
             continue;
         }
-        out.push(winner.clone());
+        out.push(winner.record.clone());
     }
     out
+}
+
+/// One record and the branches it was seen on.
+struct Seen<'a> {
+    record: &'a DurableConfigRecord,
+    branches: BTreeSet<usize>,
 }
 
 /// Encode entries as a zstd-compressed JSONL segment.

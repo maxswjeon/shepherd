@@ -49,8 +49,8 @@ use shepherd_core::{FileId, FileStat, Timestamp};
 
 use crate::r#match::{MatchContext, MatchError, Matcher};
 use crate::preview::{
-    AccessSignalSource, EnableDecision, EnableRefusal, PreviewRecord, PreviewedMatch, RuleAction,
-    RuleBody, may_enable, preview_hash,
+    AccessSignalSource, EnableDecision, EnableRefusal, FileIdentity, PreviewRecord, PreviewedMatch,
+    RuleAction, RuleBody, may_enable, preview_hash,
 };
 
 /// One file the engine may act on, with the context its predicates need.
@@ -288,6 +288,11 @@ impl<'a> Engine<'a> {
             // exists to prevent.
             matches.push(PreviewedMatch {
                 file: c.file,
+                // The FILE, not the row that names it. `upsert_file` conflicts
+                // on `(root_id, rel_path)`, so a file replaced at the same path
+                // keeps its `FileId` — and a preview keyed on the id alone
+                // compared equal to a file the operator never saw.
+                identity: FileIdentity::of(&c.stat),
                 signal: out.age_signal,
             });
             if mode == RunMode::Execute {

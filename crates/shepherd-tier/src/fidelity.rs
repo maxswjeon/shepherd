@@ -284,6 +284,16 @@ pub enum RestoreTarget {
     /// conflict name and raises an alert. The occupant may be a file the user
     /// created while this one was gone, and it is not ours to overwrite.
     Conflict { original: String, chosen: String },
+    /// Every conflict name up to the ceiling is taken, so there is no name to
+    /// restore under.
+    ///
+    /// A distinct outcome rather than a `Conflict` carrying the last candidate.
+    /// The loop used to return `(restored 10001)` without ever testing it, so
+    /// `restore_file` failed with `AlreadyExists` on a path it had never
+    /// probed, and every retry re-walked all ten thousand names to arrive at
+    /// the same occupied one — a file that could never be restored, reported as
+    /// a race that never happened.
+    Exhausted { original: String, ceiling: u32 },
 }
 
 /// Choose a restore path without ever replacing an existing file.
@@ -303,7 +313,14 @@ pub fn choose_restore_path(original: &str, exists: &dyn Fn(&str) -> bool) -> Res
     // `/root/.bashrc` to `/root (restored 1).bashrc` — which does not merely
     // pick an odd name, it writes into a **different directory**. A dotfile has
     // no extension, and a dot in a parent directory is not one either.
-    let name_start = original.rfind('/').map_or(0, |i| i + 1);
+    // Platform-aware, via `std::path::is_separator`: `\\` separates on Windows
+    // and is an ORDINARY CHARACTER in a Unix filename, so a fixed two-character
+    // set is wrong on one platform or the other. Searching only for `/` sent
+    // `C:\\Users\\foo.bar\\README` to `C:\\Users\\foo (restored 1).bar\\README`,
+    // which is not an odd name but a different, usually nonexistent
+    // DIRECTORY — the same class of bug as the whole-path dot search below,
+    // and the reason both are one lookup now.
+    let name_start = original.rfind(std::path::is_separator).map_or(0, |i| i + 1);
     let name = &original[name_start..];
     let (stem, ext) = match name.rfind('.') {
         // `i > 0` is relative to the NAME, so `.bashrc` (i == 0) is excluded.
@@ -322,14 +339,26 @@ pub fn choose_restore_path(original: &str, exists: &dyn Fn(&str) -> bool) -> Res
         n += 1;
         // Astronomically unlikely, but a loop that cannot terminate on a
         // destructive path is not something to leave to optimism.
-        if n > 10_000 {
-            return RestoreTarget::Conflict {
+        //
+        // REFUSING, not returning the next name. Handing back
+        // `(restored 10001)` without probing it was worse than the loop it
+        // guarded: the caller created it exclusively, got `AlreadyExists`, and
+        // reported a race — while the real state of the world was "there is no
+        // free name here", which no number of retries would change.
+        if n > CONFLICT_NAME_CEILING {
+            return RestoreTarget::Exhausted {
                 original: original.to_owned(),
-                chosen: format!("{stem} (restored {n}){ext}"),
+                ceiling: CONFLICT_NAME_CEILING,
             };
         }
     }
 }
+
+/// How many `(restored N)` names are tried before giving up.
+///
+/// Not a tuning knob so much as the point at which "the directory is in a state
+/// no automatic choice will fix" is a better answer than another probe.
+pub const CONFLICT_NAME_CEILING: u32 = 10_000;
 
 #[cfg(test)]
 #[path = "fidelity_tests.rs"]

@@ -583,6 +583,72 @@ async fn a_corrupted_segment_of_the_same_size_invalidates_custody() {
     );
 }
 
+/// A pass that gives up partway must not leave the previous pass's verdict
+/// standing, nor throw away what it did observe.
+///
+/// The evidence used to be written only at the end. So a resolution an earlier
+/// pass had marked `Verified` stayed `Verified` while a later pass ran — and
+/// stayed `Verified` if that pass hit a transport error, even though it had
+/// already, conclusively, seen a segment go missing. `custody_eligible()` went
+/// on authorizing destruction on the strength of a verification that had just
+/// been contradicted.
+///
+/// Both halves are asserted: the stale `Verified` is gone, and the failure
+/// observed before the error is in `invalid` rather than discarded.
+#[tokio::test]
+async fn a_verification_that_errors_partway_neither_keeps_nor_discards_evidence() {
+    let adapter = MemAdapter::content_addressed();
+    let (first, second) = published_pair(&adapter).await;
+
+    // A clean pass first, so there is a stale `Verified` for the next one to
+    // wrongly inherit. Without this the test proves only half of it.
+    let mut resolved = read_chain(&adapter).await.expect("read");
+    verify_segments(&adapter, &mut resolved)
+        .await
+        .expect("intact segments verify");
+    assert_eq!(resolved.segments, SegmentEvidence::Verified);
+    assert!(resolved.custody_eligible());
+
+    // Now the world breaks in two ways: one segment is gone (a verdict), and
+    // the provider stops answering for the other (not a verdict).
+    let gone = ObjectKey::new(first.segment_key.clone());
+    adapter.remove_raw(&gone);
+    adapter.set_faults(crate::testing::Faults {
+        fail_head_for: Some(second.segment_key.clone()),
+        ..Default::default()
+    });
+    assert_eq!(
+        resolved.records.first().map(|r| r.segment_key.as_str()),
+        Some(first.segment_key.as_str()),
+        "precondition: the deleted segment must be visited BEFORE the one that \
+         errors, or this run never reaches the case under test"
+    );
+
+    let err = verify_segments(&adapter, &mut resolved)
+        .await
+        .expect_err("the provider stopped answering");
+    assert!(
+        matches!(err, StorageError::Transient { .. }),
+        "the transport error must propagate as itself: {err:?}"
+    );
+
+    assert_eq!(
+        resolved.segments,
+        SegmentEvidence::Unchecked,
+        "a pass that gave up partway left the previous pass's `Verified` standing"
+    );
+    assert!(
+        resolved
+            .invalid
+            .iter()
+            .any(|(_, why)| why.contains(gone.as_str())),
+        "the missing segment was observed and then discarded because a LATER \
+         segment could not be reached: {:?}",
+        resolved.invalid
+    );
+    assert!(!resolved.custody_eligible());
+}
+
 /// Verification is not something a caller can skip by accident: the only
 /// constructor of a `ChainResolution` starts at `Unchecked`, and reading the
 /// chain — however completely — never raises it.

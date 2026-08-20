@@ -625,6 +625,41 @@ fn an_empty_predicate_is_refused_because_it_would_match_everything() {
     );
 }
 
+/// An empty LIST predicate is refused for the same reason an empty predicate
+/// object is, and `tags` is the one that matters.
+///
+/// `{"tags":[]}` compiled to `Predicate::All([])`, and an `all` over no
+/// conditions is vacuously TRUE — so the rule matched every candidate in the
+/// corpus, with a destructive action attached. `{"ext":[]}` fails the other
+/// way, matching nothing; still not something anybody meant to write, and
+/// refused at the same place so a future list predicate inherits the guard
+/// rather than having to remember it.
+#[test]
+fn an_empty_list_predicate_is_refused_rather_than_matching_everything() {
+    for empty in [
+        serde_json::json!({ "tags": [] }),
+        serde_json::json!({ "ext": [] }),
+        // Nested, because a rule reaches the same hazard through a combinator.
+        serde_json::json!({ "any": [{ "tags": [] }] }),
+        serde_json::json!({ "all": [{ "ext": ["raw"] }, { "tags": [] }] }),
+    ] {
+        let err = Matcher::compile("empty-list", &empty, &tier(), AtimeMode::Reliable)
+            .expect_err(&format!("{empty} must be refused"));
+        assert!(matches!(err, MatchError::Invalid(_)), "{empty} -> {err:?}");
+    }
+
+    // The accepting direction, so "refuse every list" cannot pass.
+    assert!(
+        Matcher::compile(
+            "populated",
+            &serde_json::json!({ "tags": ["keep"] }),
+            &tier(),
+            AtimeMode::Reliable
+        )
+        .is_ok()
+    );
+}
+
 #[test]
 fn an_invalid_glob_is_reported_rather_than_matching_nothing() {
     let err = Matcher::compile(

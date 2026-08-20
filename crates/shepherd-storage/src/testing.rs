@@ -34,6 +34,12 @@ use crate::transfer_session::{
 pub struct Faults {
     /// Fail `upload_part` for this part number, once.
     pub fail_part_once: Option<u32>,
+    /// Fail every `head` for this key with a transient transport error.
+    ///
+    /// A *transport* failure, not a missing object: the read paths have to tell
+    /// "the provider did not answer" from "the object is gone", and only one of
+    /// those is a verdict about the data.
+    pub fail_head_for: Option<String>,
     /// Report the session unknown on the next `list_parts` or `upload_part`,
     /// once — provider session expiry (window 4).
     ///
@@ -480,6 +486,12 @@ impl StorageAdapter for MemAdapter {
 
     async fn head(&self, key: &ObjectKey) -> StorageResult<Option<ObjectMeta>> {
         let inner = self.lock();
+        if inner.faults.fail_head_for.as_deref() == Some(key.as_str()) {
+            return Err(StorageError::Transient {
+                op: "head".into(),
+                detail: "injected".into(),
+            });
+        }
         Ok(inner.objects.get(key.as_str()).map(|(b, v)| ObjectMeta {
             key: key.clone(),
             size: b.len() as u64,

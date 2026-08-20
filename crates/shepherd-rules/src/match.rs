@@ -552,6 +552,24 @@ fn as_str_list(v: &serde_json::Value, what: &str) -> Result<Vec<String>> {
     let arr = v
         .as_array()
         .ok_or_else(|| MatchError::Invalid(format!("{what} must be an array of strings")))?;
+    // Refused HERE, at the one place list predicates are parsed, rather than in
+    // each arm — the hazard is the same for every list and the arms are where a
+    // future one would forget.
+    //
+    // It is not merely meaningless, it is dangerous in one direction. `tags: []`
+    // compiled to `Predicate::All([])`, and an `all` over nothing is vacuously
+    // TRUE: the rule matched every candidate in the corpus, and rule actions
+    // destroy files. (`ext: []` fails the other way, matching nothing — still
+    // not something a user meant to write.) The compiler already refuses an
+    // empty `all`/`any` list and an empty predicate object for exactly this
+    // reason; a list predicate is the third door into the same room.
+    if arr.is_empty() {
+        return Err(MatchError::Invalid(format!(
+            "`{what}` is an empty list. An empty `tags` list matches EVERY file — an `all` \
+             over no conditions is vacuously true — and the action may destroy them. State \
+             the values, or remove the predicate"
+        )));
+    }
     arr.iter()
         .map(|x| {
             x.as_str()

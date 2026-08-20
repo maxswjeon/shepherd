@@ -20,6 +20,12 @@ fn preview_of(b: &RuleBody) -> PreviewRecord {
         previewed_at: Timestamp::from_nanos(1),
         matches: vec![PreviewedMatch {
             file: FileId::new(7),
+            identity: FileIdentity {
+                ino: shepherd_core::InodeSighting::Known(7),
+                size: 1,
+                mtime: Timestamp::from_nanos(1),
+                ctime: Timestamp::from_nanos(1),
+            },
             signal: Some(AccessSignalSource::Observed),
         }],
     }

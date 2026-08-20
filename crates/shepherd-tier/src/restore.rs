@@ -119,6 +119,17 @@ pub enum RestoreError {
         "{path} no longer names the inode this restore created — something replaced the          destination after the exclusive create, so nothing was published there"
     )]
     Displaced { path: String },
+
+    /// The original path and every `(restored N)` name up to the ceiling are
+    /// taken. Distinct from [`RestoreError::AlreadyExists`], which is a race:
+    /// this is a directory whose state no automatic choice will resolve, so
+    /// retrying is pointless and the message says why rather than naming one
+    /// occupied path.
+    #[error(
+        "{path} is occupied and so are all {ceiling} `(restored N)` names beside it; \
+         there is no free name to restore under — move or remove some of them"
+    )]
+    NoFreeName { path: String, ceiling: u32 },
 }
 
 type Result<T> = std::result::Result<T, RestoreError>;
@@ -155,6 +166,11 @@ impl RestoreOutcome {
         match &self.target {
             RestoreTarget::Original(p) => p,
             RestoreTarget::Conflict { chosen, .. } => chosen,
+            // Unreachable: `restore_file` turns exhaustion into
+            // `RestoreError::NoFreeName` and never builds an outcome from it.
+            // Kept as the original path rather than an `unreachable!` — a
+            // panic in a getter is not worth an impossible branch.
+            RestoreTarget::Exhausted { original, .. } => original,
         }
     }
 
@@ -189,6 +205,12 @@ pub fn restore_file(
     let chosen = PathBuf::from(match &target {
         RestoreTarget::Original(p) => p.clone(),
         RestoreTarget::Conflict { chosen, .. } => chosen.clone(),
+        RestoreTarget::Exhausted { original, ceiling } => {
+            return Err(RestoreError::NoFreeName {
+                path: original.clone(),
+                ceiling: *ceiling,
+            });
+        }
     });
 
     // O_EXCL, not exists()-then-create. The gap between a check and a create is

@@ -573,6 +573,20 @@ pub async fn verify_segments(
 ) -> StorageResult<()> {
     let mut failures: Vec<(String, String)> = Vec::new();
 
+    // Cleared BEFORE the pass, not raised after it.
+    //
+    // The evidence used to be written only at the end, so a resolution some
+    // earlier pass had marked `Verified` stayed `Verified` for as long as this
+    // one ran — and, decisively, stayed `Verified` if this one gave up partway.
+    // A transport error on segment nine returned early, discarding the missing
+    // segment observed at segment two, and `custody_eligible()` went on
+    // authorizing destruction on the strength of a verification that had just
+    // been contradicted.
+    //
+    // Nothing is verified until this pass says so, including what a previous
+    // pass said.
+    resolution.segments = SegmentEvidence::Unchecked;
+
     for record in &resolution.records {
         let name = record.key().pointer_name();
         let key = ObjectKey::new(record.segment_key.clone());
@@ -584,7 +598,17 @@ pub async fn verify_segments(
             continue;
         };
 
-        let Some(meta) = adapter.head(&key).await? else {
+        // Not `?`. A transport error here has the same shape as the one below:
+        // it is not a verdict about this segment, and it must not carry away
+        // the verdicts already reached about earlier ones.
+        let head = match adapter.head(&key).await {
+            Ok(h) => h,
+            Err(e) => {
+                resolution.invalid.extend(failures);
+                return Err(e);
+            }
+        };
+        let Some(meta) = head else {
             failures.push((
                 name,
                 format!(
@@ -614,8 +638,15 @@ pub async fn verify_segments(
                 name,
                 format!("segment {k} does not hash to the value its pointer names: expected {e}, read {a}"),
             )),
-            // Not a verdict about the segment. See the note above.
-            Err(other) => return Err(other),
+            // Not a verdict about the segment. See the note above — but the
+            // failures already OBSERVED are verdicts, and they are committed
+            // before the error propagates. Losing them because a LATER segment
+            // could not be reached is how a conclusively damaged recovery
+            // segment left `invalid` empty.
+            Err(other) => {
+                resolution.invalid.extend(failures);
+                return Err(other);
+            }
         }
     }
 
@@ -623,7 +654,6 @@ pub async fn verify_segments(
         resolution.segments = SegmentEvidence::Verified;
     } else {
         resolution.invalid.extend(failures);
-        resolution.segments = SegmentEvidence::Unchecked;
     }
     Ok(())
 }

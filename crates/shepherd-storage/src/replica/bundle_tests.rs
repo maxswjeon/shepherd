@@ -191,7 +191,7 @@ fn a_custody_record_retired_later_by_the_same_writer_stays_retired() {
 fn durable_config_is_last_writer_wins_within_one_epoch() {
     let old = config("rule-1", 1, clock(3, 10), false);
     let new = config("rule-1", 2, clock(3, 11), false);
-    let merged = merge_durable_config(&[new.clone(), old]);
+    let merged = merge_durable_config(&[vec![new.clone(), old]]);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].body, new.body);
 }
@@ -202,7 +202,7 @@ fn a_delete_then_recreate_in_one_epoch_yields_the_recreated_entity() {
     // undelete is legitimate and must not be swallowed by delete-wins.
     let deleted = config("rule-1", 0, clock(4, 7), true);
     let recreated = config("rule-1", 9, clock(4, 8), false);
-    let merged = merge_durable_config(&[deleted, recreated.clone()]);
+    let merged = merge_durable_config(&[vec![deleted, recreated.clone()]]);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].body, recreated.body);
 }
@@ -214,15 +214,79 @@ fn delete_wins_over_a_concurrent_edit_on_another_branch() {
     // resurrect a rule the user removed, and a resurrected tiering rule could
     // tier files the user deliberately excluded.
     //
-    // Concurrency is the SAME clock. A `(writer_epoch, seq)` clock is totally
-    // ordered and carries no writer identity, so two records are concurrent
-    // exactly when neither is in the other's past — which here means equal.
+    // ORACLE CHANGED. This test used to give both records the SAME clock, under
+    // the comment "concurrency is the same clock" — which is what the reducer
+    // believed and is false. Two records on sibling branches are concurrent
+    // whatever their numbers say, and the numbers are usually different.
     let edited = config("rule-1", 5, clock(9, 100), false);
     let deleted = config("rule-1", 0, clock(9, 100), true);
     assert!(
-        merge_durable_config(&[edited, deleted]).is_empty(),
+        merge_durable_config(&[vec![edited], vec![deleted]]).is_empty(),
         "a concurrent delete must win"
     );
+}
+
+/// The resurrection this reducer was returning: a HIGHER clock on a sibling
+/// branch is not a later edit.
+///
+/// A stale writer that restarted (epoch 5) republishes a rule while a sibling
+/// branch, still in epoch 3, deleted it. `(5, 10) > (3, 40)` as a value and
+/// means nothing as causality: neither writer ever saw the other. The reducer
+/// read the number as the order, the live record won, and disaster recovery
+/// brought back a rule the user had removed — for a tiering rule, one that
+/// would then act on files they deliberately excluded.
+///
+/// The clocks are deliberately the wrong way round: the delete has the LARGER
+/// `seq` and the smaller epoch, so no clock-only rule can pass this and the
+/// preceding test at once.
+#[test]
+fn a_numerically_higher_record_on_a_sibling_branch_does_not_beat_a_delete() {
+    let stale_writer_republished = config("rule-1", 5, clock(5, 10), false);
+    let deleted_elsewhere = config("rule-1", 0, clock(3, 40), true);
+
+    assert!(
+        merge_durable_config(&[
+            vec![stale_writer_republished.clone()],
+            vec![deleted_elsewhere.clone()],
+        ])
+        .is_empty(),
+        "the branches share no ancestry, so the delete is concurrent and wins"
+    );
+
+    // Order of the branches must not matter.
+    assert!(
+        merge_durable_config(&[vec![deleted_elsewhere], vec![stale_writer_republished]]).is_empty()
+    );
+}
+
+/// History before a fork point belongs to every branch that descends from it,
+/// so a pre-fork tombstone stays in the winner's past.
+///
+/// Without this, "share a branch" could be implemented as "the winner's branch
+/// list is exactly this one's" and every entity with any history at all would
+/// come back deleted.
+#[test]
+fn a_tombstone_from_before_the_fork_is_still_in_the_winners_past() {
+    let deleted_early = config("rule-1", 0, clock(1, 1), true);
+    let recreated = config("rule-1", 9, clock(1, 2), false);
+    // Both branches carry the shared prefix; one of them went on to edit.
+    let edited_on_a = config("rule-1", 9, clock(2, 5), false);
+
+    let merged = merge_durable_config(&[
+        vec![
+            deleted_early.clone(),
+            recreated.clone(),
+            edited_on_a.clone(),
+        ],
+        vec![deleted_early, recreated],
+    ]);
+    assert_eq!(
+        merged.len(),
+        1,
+        "the tombstone precedes both branches' surviving records on a branch \
+         they share, so it is history, not a conflict"
+    );
+    assert_eq!(merged[0].body, edited_on_a.body);
 }
 
 /// A delete and a re-creation ACROSS a restart is one writer editing, not two
@@ -239,7 +303,7 @@ fn a_delete_then_recreate_across_a_restart_yields_the_recreated_entity() {
     let deleted = config("rule-1", 0, clock(2, 7), true);
     let recreated = config("rule-1", 9, clock(3, 1), false);
 
-    let merged = merge_durable_config(&[deleted.clone(), recreated.clone()]);
+    let merged = merge_durable_config(&[vec![deleted.clone(), recreated.clone()]]);
     assert_eq!(
         merged.len(),
         1,
@@ -251,14 +315,14 @@ fn a_delete_then_recreate_across_a_restart_yields_the_recreated_entity() {
     // by a delete in epoch 3 is equally sequential.
     let created = config("rule-1", 9, clock(2, 7), false);
     let then_deleted = config("rule-1", 0, clock(3, 1), true);
-    assert!(merge_durable_config(&[created, then_deleted]).is_empty());
+    assert!(merge_durable_config(&[vec![created, then_deleted]]).is_empty());
 }
 
 #[test]
 fn a_tombstone_as_outright_winner_deletes() {
     let edited = config("rule-1", 5, clock(2, 1), false);
     let deleted = config("rule-1", 0, clock(2, 2), true);
-    assert!(merge_durable_config(&[edited, deleted]).is_empty());
+    assert!(merge_durable_config(&[vec![edited, deleted]]).is_empty());
 }
 
 #[test]
@@ -268,7 +332,7 @@ fn distinct_entities_and_kinds_do_not_interfere() {
     let mut b = config("rule-1", 2, clock(1, 1), false);
     b.kind = ConfigKind::DeletePolicy; // same id, different kind
     let c = config("rule-2", 3, clock(1, 1), false);
-    assert_eq!(merge_durable_config(&[a, b, c]).len(), 3);
+    assert_eq!(merge_durable_config(&[vec![a, b, c]]).len(), 3);
 }
 
 #[test]

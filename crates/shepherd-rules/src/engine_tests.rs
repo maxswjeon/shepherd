@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::delete_policy::DeleteAction;
+use crate::preview::FileIdentity;
 use shepherd_core::{Blake3Hash, RootId, TargetId};
 
 const DAY: i64 = 86_400 * 1_000_000_000;
@@ -315,6 +316,18 @@ fn zero_matches_is_distinguishable_from_nothing_considered() {
 
 /// A candidate whose Shepherd-owned access signal is absent, so an `atime`
 /// predicate falls through to `atime` itself.
+/// The identity a corpus gives one file, so a hand-written expectation names
+/// the same FILE the engine saw rather than only the same row id.
+fn identity_in(corpus: &[Candidate], id: i64) -> FileIdentity {
+    FileIdentity::of(
+        &corpus
+            .iter()
+            .find(|c| c.file == FileId::new(id))
+            .expect("the id is in this corpus")
+            .stat,
+    )
+}
+
 fn candidate_without_observed_access(id: i64, name: &str, age_days: i64) -> Candidate {
     Candidate {
         last_observed_access: None,
@@ -338,6 +351,7 @@ fn a_file_that_appeared_after_the_preview_is_not_acted_on() {
                 drift.added,
                 vec![PreviewedMatch {
                     file: FileId::new(4),
+                    identity: identity_in(&later, 4),
                     signal: Some(AccessSignalSource::Observed),
                 }],
                 "the operator never saw file 4"
@@ -349,6 +363,73 @@ fn a_file_that_appeared_after_the_preview_is_not_acted_on() {
         }
         other => panic!("a file the preview never enumerated must not be acted on, got {other:?}"),
     }
+}
+
+/// **A row id is not a file.** A replacement at the same path must not inherit
+/// the preview taken of its predecessor.
+///
+/// `FileRepo::upsert_file` conflicts on `(root_id, rel_path)`, so a file
+/// deleted and re-created at the same path keeps the SAME `FileId`. With the
+/// preview keyed on the id alone, a replacement that happened to match the rule
+/// through the same signal produced a record byte-for-byte equal to the
+/// preview: `drift_against` found nothing and the run destroyed a file the
+/// operator had never been shown.
+///
+/// The replacement here is built to be as indistinguishable as the old record
+/// allowed — same id, same path, same age, so the same signal drives it. The
+/// only thing that differs is the file, which is the whole point.
+#[test]
+fn a_file_replaced_at_the_same_path_is_not_the_file_that_was_previewed() {
+    let b = tiering();
+    let e = Engine::new(&b, AtimeMode::Reliable);
+    let previewed = e.preview(&corpus(), now()).expect("preview");
+
+    // Same row, same path, same age — a different file. A new inode and a new
+    // size are what a replacement actually looks like.
+    let later: Vec<Candidate> = corpus()
+        .into_iter()
+        .map(|c| {
+            if c.file != FileId::new(1) {
+                return c;
+            }
+            Candidate {
+                stat: FileStat {
+                    ino: shepherd_core::InodeSighting::Known(999),
+                    size: c.stat.size + 4_096,
+                    ..c.stat
+                },
+                ..c
+            }
+        })
+        .collect();
+
+    match e.run(&later, RunMode::Execute, Some(&previewed), now()) {
+        Err(EngineRefusal::PreviewDrifted { drift }) => {
+            assert_eq!(drift.changed.len(), 1, "{drift:?}");
+            let d = &drift.changed[0];
+            assert_eq!(d.previewed.file, FileId::new(1));
+            assert_ne!(
+                d.previewed.identity, d.current.identity,
+                "the refusal must rest on the identity, since every other field \
+                 of this record is identical by construction"
+            );
+        }
+        other => panic!(
+            "a replacement at a previewed path must refuse; the preview the \
+             operator read was of a different file. Got {other:?}"
+        ),
+    }
+}
+
+/// The accepting direction, so "always drift" cannot pass: an untouched corpus
+/// still runs against its own preview.
+#[test]
+fn an_unchanged_file_still_matches_the_preview_that_authorized_it() {
+    let b = tiering();
+    let e = Engine::new(&b, AtimeMode::Reliable);
+    let previewed = e.preview(&corpus(), now()).expect("preview");
+    e.run(&corpus(), RunMode::Execute, Some(&previewed), now())
+        .expect("nothing moved, so nothing drifted");
 }
 
 #[test]
@@ -369,6 +450,7 @@ fn a_previewed_file_that_vanished_refuses_rather_than_quietly_shrinking() {
                 drift.removed,
                 vec![PreviewedMatch {
                     file: FileId::new(1),
+                    identity: identity_in(&corpus(), 1),
                     signal: Some(AccessSignalSource::Observed),
                 }]
             );
@@ -468,6 +550,7 @@ fn a_ctime_rule_previews_as_ctime_and_a_preview_labelled_mtime_refuses() {
     let stale = PreviewRecord {
         matches: vec![PreviewedMatch {
             file: FileId::new(1),
+            identity: identity_in(&c, 1),
             signal: Some(AccessSignalSource::Mtime),
         }],
         ..previewed.clone()
