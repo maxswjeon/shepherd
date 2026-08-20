@@ -175,6 +175,17 @@ pub enum EventPayload {
         done: bool,
     },
     IndexProgress {
+        /// Which rebuild this frame belongs to — the snapshot generation.
+        ///
+        /// Rebuilds run concurrently: a scan finishing triggers one, and
+        /// several workers finishing near each other trigger several. Without
+        /// an identifier their counts and their terminal `done` frames
+        /// interleave, so one rebuild's `done` looks like the end of another's
+        /// progress and a dashboard still cannot tell an active index from an
+        /// idle one. The generation is the value that already orders snapshots
+        /// against each other, so it is the one that identifies them.
+        #[serde(default)]
+        build: u64,
         rows_indexed: u64,
         #[serde(default)]
         rows_total: Option<u64>,

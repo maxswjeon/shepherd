@@ -233,47 +233,49 @@ pub fn bundle_class_of(class: CustodyClass) -> Option<BundleClass> {
 /// ancestry carried into the reduction — the pointer chain has it, this
 /// signature does not — and that is a merge contract for whoever wires the
 /// publisher, not something to infer from a counter.
-pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
-    let mut by_key: BTreeMap<(CustodyKey, i64), Vec<&CustodyRecord>> = BTreeMap::new();
-    for r in records {
-        by_key
-            .entry((r.key.clone(), r.target.get()))
-            .or_default()
-            .push(r);
-    }
+pub fn merge_custody(branches: &[Vec<Publication<CustodyRecord>>]) -> Vec<CustodyRecord> {
+    let by_key = group_by(branches, |r: &CustodyRecord| {
+        (r.key.clone(), r.target.get())
+    });
 
     let mut live: Vec<CustodyRecord> = Vec::new();
     for (_, group) in by_key {
         // A live assertion survives unless some tombstone PROVABLY FOLLOWS it.
         //
-        // "Provably" is doing the work. `LogicalClock` is a counter, not a
-        // causal clock, and these records arrive flattened across every valid
-        // fork branch — so `t.clock > l.clock` says only that some writer
-        // counted higher, which a restarted writer resuming from a stale
-        // predecessor does without having observed the sibling branch at all.
-        // Reading that as domination let such a tombstone filter out the only
-        // live assertion of a record it never retired.
+        // "Provably" is doing the work, and what counts as proof has changed.
+        // It used to be `same writer_epoch && higher seq`, on the reasoning
+        // that within one epoch the ordering is that writer's own. That reads
+        // an epoch as a branch, and this module explicitly supports the case
+        // where it is not: a rolled-back local catalog REUSES an epoch, which
+        // is why the key carries a uuid at all. Such a writer republishes from
+        // a stale predecessor, counts past a sibling branch it never saw, and
+        // its tombstone then retired the only live custody record for bytes
+        // whose original may already be gone.
         //
-        // Within ONE `writer_epoch` the ordering is that writer's own, and a
-        // higher `seq` really is later on the same branch. That is the whole
-        // set of comparisons this clock can justify, so it is the whole set
-        // applied.
-        let retired = |l: &CustodyRecord| {
-            group.iter().any(|t| {
-                t.tombstone
-                    && t.clock.writer_epoch == l.clock.writer_epoch
-                    && t.clock.seq > l.clock.seq
-            })
+        // Ancestry is the proof. A tombstone retires an assertion only when
+        // some ONE branch holds both and the tombstone is later on it. Two
+        // records sharing no branch are concurrent, and a concurrent tombstone
+        // retires nothing — the conservative direction for a class whose whole
+        // purpose is being the last address of missing bytes.
+        //
+        // Dropping the epoch equality is not a loosening: it was never
+        // sufficient, and on a shared branch it is not necessary either, since
+        // a delete and a re-publication across a restart are one writer's own
+        // sequence.
+        let retired = |l: &SeenOn<'_, CustodyRecord>| {
+            group
+                .iter()
+                .any(|t| t.record.tombstone && precedes(l, t, l.record.clock, t.record.clock))
         };
 
         let survivor = group
             .iter()
-            .filter(|r| !r.tombstone)
+            .filter(|r| !r.record.tombstone)
             .filter(|r| !retired(r))
-            .max_by_key(|r| r.clock);
+            .max_by_key(|r| r.record.clock);
 
         if let Some(s) = survivor {
-            live.push((*s).clone());
+            live.push(s.record.clone());
         }
     }
 
@@ -301,21 +303,81 @@ pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
 /// the same order, so equal identities really are one record, and unequal ones
 /// really are two.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Publication {
+pub struct Publication<T> {
     /// The publishing pointer's `self_blake3` — a content hash of the pointer,
     /// so two branches naming it really did descend through this publication.
     pub id: String,
-    /// The segment's durable-config entries, in the order it held them.
-    pub records: Vec<DurableConfigRecord>,
+    /// The segment's entries of this class, in the order it held them.
+    pub records: Vec<T>,
 }
 
-impl Publication {
-    pub fn new(id: impl Into<String>, records: Vec<DurableConfigRecord>) -> Self {
+impl<T> Publication<T> {
+    pub fn new(id: impl Into<String>, records: Vec<T>) -> Self {
         Self {
             id: id.into(),
             records,
         }
     }
+}
+
+/// One record of any bundle class, and the branches it was seen on.
+///
+/// Shared by both reducers because the question they ask of ancestry is the
+/// same one: is this record in that record's past, or merely numbered lower?
+struct SeenOn<'a, T> {
+    record: &'a T,
+    /// `(publication id, position)` — see [`Publication`] for why identity is
+    /// not the record's value and not the pointer hash alone.
+    id: (&'a str, usize),
+    branches: BTreeSet<usize>,
+}
+
+/// Group one class's records by a caller-chosen key, collapsing each
+/// publication seen from several branches into one entry.
+fn group_by<'a, T, K: Ord>(
+    branches: &'a [Vec<Publication<T>>],
+    key_of: impl Fn(&T) -> K,
+) -> BTreeMap<K, Vec<SeenOn<'a, T>>> {
+    let mut out: BTreeMap<K, Vec<SeenOn<'a, T>>> = BTreeMap::new();
+    for (b, branch) in branches.iter().enumerate() {
+        for publication in branch {
+            for (position, r) in publication.records.iter().enumerate() {
+                let group = out.entry(key_of(r)).or_default();
+                let id = (publication.id.as_str(), position);
+                match group.iter_mut().find(|seen| seen.id == id) {
+                    Some(seen) => {
+                        seen.branches.insert(b);
+                    }
+                    None => group.push(SeenOn {
+                        record: r,
+                        id,
+                        branches: BTreeSet::from([b]),
+                    }),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `earlier` is provably in `later`'s past.
+///
+/// Two records are causally ordered only when some ONE branch holds both — a
+/// branch is a chain, and a chain's clocks increase along it. Records sharing
+/// no branch are concurrent whatever their numbers say, because a clock is a
+/// counter and not a causal order.
+fn precedes<T>(
+    earlier: &SeenOn<'_, T>,
+    later: &SeenOn<'_, T>,
+    earlier_clock: LogicalClock,
+    later_clock: LogicalClock,
+) -> bool {
+    earlier_clock < later_clock
+        && earlier
+            .branches
+            .intersection(&later.branches)
+            .next()
+            .is_some()
 }
 
 /// Merge durable-config records across the branches of a chain.
@@ -366,39 +428,18 @@ impl Publication {
 ///
 /// Records sharing the winner's exact clock remain concurrent with it — a
 /// genuine two-writer collision — and delete-wins remains the answer.
-pub fn merge_durable_config(branches: &[Vec<Publication>]) -> Vec<DurableConfigRecord> {
+pub fn merge_durable_config(
+    branches: &[Vec<Publication<DurableConfigRecord>>],
+) -> Vec<DurableConfigRecord> {
     // Each entity's records, each tagged with the set of branches carrying it.
     // The key borrows for the same reason the values do: nothing here outlives
     // `branches`. `&str` orders identically to `String`, so the group order —
     // and therefore the order of `out` — is unchanged.
-    let mut by_entity: BTreeMap<(ConfigKind, &str), Vec<Seen<'_>>> = BTreeMap::new();
-    for (b, branch) in branches.iter().enumerate() {
-        for publication in branch {
-            for (position, r) in publication.records.iter().enumerate() {
-                let group = by_entity.entry((r.kind, r.entity_id.as_str())).or_default();
-                // A publication made before a fork appears in every descendant
-                // branch, and collapsing it is what lets the shared-branch test
-                // below mean "causally related".
-                //
-                // The key is `(publication, position)`, which is an identity
-                // rather than a guess. The pointer hash ALONE was not: one
-                // segment can carry several entries for one entity — a batched
-                // edit and the tombstone that follows it — and collapsing on
-                // the pointer kept only the first, so the rule came back alive.
-                let key = (publication.id.as_str(), position);
-                match group.iter_mut().find(|seen| seen.id == key) {
-                    Some(seen) => {
-                        seen.branches.insert(b);
-                    }
-                    None => group.push(Seen {
-                        record: r,
-                        id: key,
-                        branches: BTreeSet::from([b]),
-                    }),
-                }
-            }
-        }
-    }
+    // Grouped by `(kind, entity_id)`, with each publication collapsed across
+    // the branches that descend through it — see [`group_by`].
+    let by_entity = group_by(branches, |r: &DurableConfigRecord| {
+        (r.kind, r.entity_id.clone())
+    });
 
     let mut out = Vec::new();
     for (_, group) in by_entity {
@@ -416,7 +457,7 @@ pub fn merge_durable_config(branches: &[Vec<Publication>]) -> Vec<DurableConfigR
             .iter()
             .flat_map(|seen| seen.branches.iter().copied())
             .collect();
-        let frontiers: Vec<&Seen<'_>> = branch_ids
+        let frontiers: Vec<&SeenOn<'_, DurableConfigRecord>> = branch_ids
             .iter()
             .filter_map(|b| {
                 group
@@ -458,16 +499,6 @@ pub fn merge_durable_config(branches: &[Vec<Publication>]) -> Vec<DurableConfigR
         out.push(winner.record.clone());
     }
     out
-}
-
-/// One record, and the branches it was seen on.
-struct Seen<'a> {
-    record: &'a DurableConfigRecord,
-    /// `(publication id, position in that publication)` — the identity this is
-    /// collapsed on. See [`Publication`] for why it is not the record's value
-    /// and not the pointer hash alone.
-    id: (&'a str, usize),
-    branches: BTreeSet<usize>,
 }
 
 /// Encode entries as a zstd-compressed JSONL segment.

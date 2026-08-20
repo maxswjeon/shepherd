@@ -702,12 +702,18 @@ impl ShepherdApi for Session {
         let forget = req.forget_catalog;
         let force = req.force;
 
-        // Taken BEFORE the removal, so it names a moment no in-flight rebuild
-        // can have seen past. `invalidate_index` uses it to tell an index that
-        // predates this change from one that already reflects it.
-        let before_removal = self.daemon.index_watermark();
-
-        match self.cat(move |cat| remove_root(cat, id, forget, force))? {
+        // The removal and its watermark happen UNDER ONE LOCK.
+        //
+        // Reading a watermark and then removing are two steps, and a rebuild
+        // can pin its snapshot between them: it sees the pre-removal catalog
+        // and still takes `watermark + 1`, so `invalidate_index` would read it
+        // as post-mutation and keep — or later admit — an index full of
+        // forgotten rows. The ticket orders snapshots against each other, so it
+        // has to order them against the mutation too.
+        let (removal, before_removal) = self
+            .daemon
+            .with_catalog_mutation(|| self.cat(move |cat| remove_root(cat, id, forget, force)));
+        match removal? {
             RootRemoval::NotFound => Err(RpcError::new(
                 ErrorCode::NotFound,
                 format!("no scan root with id {}", req.root_id),

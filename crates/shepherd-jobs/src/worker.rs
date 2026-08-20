@@ -400,7 +400,12 @@ pub fn run_one(
     let (id, class, attempts) = (job.id, job.class, job.attempts);
     match outcome {
         Ok(()) => {
-            writer.try_with(move |cat| Queue::complete(cat, id, now()))?;
+            // `?` here used to abandon the claimed row: `run_one` returned the
+            // writer error, the worker went back to polling, and the row stayed
+            // `running` with no live path able to claim or recover it. Freeing
+            // the disk did not unblock it — only a restart did, because
+            // `recover_interrupted` runs at start-up.
+            persist(|| writer.try_with(move |cat| Queue::complete(cat, id, now())))?;
             observer.transition(Transition {
                 id,
                 class,
@@ -411,9 +416,10 @@ pub fn run_one(
             });
         }
         Err(message) => {
-            let disposition = writer.try_with({
+            let disposition = persist(|| {
                 let message = message.clone();
-                move |cat| Queue::fail(cat, &job, &message, now())
+                let job = job.clone();
+                writer.try_with(move |cat| Queue::fail(cat, &job, &message, now()))
             })?;
             // The reported error is the one the ROW now holds, which is not
             // always the message the executor returned.
@@ -448,6 +454,53 @@ pub fn run_one(
         }
     }
     Ok(true)
+}
+
+/// How many times a job's FINAL transition is retried before giving up.
+///
+/// Small: the executor's work is finished and the only thing missing is the row
+/// that records it, so this waits out a transient writer failure rather than
+/// retrying the job.
+const FINAL_TRANSITION_ATTEMPTS: usize = 5;
+
+/// The gap between those attempts.
+const FINAL_TRANSITION_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Persist a job's terminal state, retrying a transient writer failure.
+///
+/// # Why the final transition is special
+///
+/// Every other write in `run_one` can fail and leave the queue consistent: the
+/// row is still `running`, the claim is still valid, and the next attempt
+/// re-does the work. The transition that FOLLOWS the executor cannot. The work
+/// is already done — bytes uploaded, a file destroyed — and the row that says
+/// so is the only record of it. Returning the error there left the row
+/// `running` with no live path able to claim or recover it, so a transiently
+/// full disk stranded a COMPLETED job until the daemon restarted.
+///
+/// `WriterError::Gone` is not retried: the actor is shut down, and no number of
+/// attempts brings it back. Exhausting the attempts propagates as before, which
+/// leaves the row for start-up recovery — requeued for a retryable class, and
+/// quarantined for `destroy` under §4.10.4.
+fn persist<T>(mut op: impl FnMut() -> Result<T, WriterError>) -> Result<T, WriterError> {
+    let mut last = None;
+    for attempt in 0..FINAL_TRANSITION_ATTEMPTS {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(WriterError::Gone) => return Err(WriterError::Gone),
+            Err(e) => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    error = %e,
+                    "a job's final transition could not be persisted; retrying before \
+                     leaving the row for start-up recovery"
+                );
+                last = Some(e);
+                std::thread::sleep(FINAL_TRANSITION_BACKOFF);
+            }
+        }
+    }
+    Err(last.expect("the loop runs at least once"))
 }
 
 /// The message a panic carried, for the failure the queue records.

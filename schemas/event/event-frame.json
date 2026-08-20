@@ -86,6 +86,13 @@
         },
         {
           "properties": {
+            "build": {
+              "default": 0,
+              "description": "Which rebuild this frame belongs to — the snapshot generation.\n\nRebuilds run concurrently: a scan finishing triggers one, and\nseveral workers finishing near each other trigger several. Without\nan identifier their counts and their terminal `done` frames\ninterleave, so one rebuild's `done` looks like the end of another's\nprogress and a dashboard still cannot tell an active index from an\nidle one. The generation is the value that already orders snapshots\nagainst each other, so it is the one that identifies them.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "done": {
               "type": "boolean"
             },

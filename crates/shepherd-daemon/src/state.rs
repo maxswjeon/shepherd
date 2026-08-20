@@ -265,7 +265,7 @@ impl Daemon {
                     .map_err(|e| format!("building the metadata index: {e}"))?;
                 indexed += 1;
                 if indexed.is_multiple_of(INDEX_PROGRESS_ROWS) {
-                    self.publish_index_progress(indexed, expected, false);
+                    self.publish_index_progress(generation, indexed, expected, false);
                 }
             }
         }
@@ -279,7 +279,7 @@ impl Daemon {
         let entries = built.len();
         // The terminal frame. A subscriber that only ever saw periodic updates
         // could not tell a finished rebuild from one that stopped.
-        self.publish_index_progress(entries as u64, expected, true);
+        self.publish_index_progress(generation, entries as u64, expected, true);
         // Counted, then compared: a rebuild that silently indexed fewer rows
         // than the catalog holds is a search that silently cannot find them.
         if entries as i64 != expected {
@@ -356,10 +356,17 @@ impl Daemon {
     /// `rows_total` is the count the snapshot was pinned against, so it is the
     /// denominator the rebuild is actually working towards rather than a
     /// live-changing catalog total.
-    fn publish_index_progress(&self, rows_indexed: u64, expected: i64, done: bool) {
+    fn publish_index_progress(
+        &self,
+        generation: u64,
+        rows_indexed: u64,
+        expected: i64,
+        done: bool,
+    ) {
         self.events.publish(
             shepherd_proto::event::EventStream::Index,
             shepherd_proto::event::EventPayload::IndexProgress {
+                build: generation,
                 rows_indexed,
                 rows_total: u64::try_from(expected).ok(),
                 done,
@@ -428,16 +435,29 @@ impl Daemon {
         }
     }
 
-    /// The ticket a snapshot pinned right now would carry.
+    /// Run `mutation` while holding the snapshot ticket, and return the
+    /// watermark it happened at.
     ///
-    /// Taken by a caller BEFORE it mutates the catalog, so it can later say
-    /// which rebuilds could not possibly have seen the change. Every snapshot
-    /// pinned after the mutation has a strictly greater generation.
-    pub fn index_watermark(&self) -> u64 {
-        *self
+    /// # Why the mutation is inside the lock
+    ///
+    /// Reading a watermark and then mutating are two steps, and a rebuild can
+    /// pin its snapshot between them: that snapshot sees the OLD catalog and
+    /// still takes `watermark + 1`, so a later `invalidate_index` reads it as
+    /// post-mutation and keeps — or lets in — an index full of forgotten rows.
+    /// The ticket is what orders snapshots against each other, so it has to be
+    /// what orders them against the mutation too.
+    ///
+    /// The lock is held for the catalog write, which is the cost. That write is
+    /// a `DELETE` behind the single-writer actor; a rebuild's own hold is a
+    /// `COUNT(*)`, and the arena build — the part measured in seconds — is
+    /// deliberately outside it. See [`Self::build_snapshot`].
+    pub fn with_catalog_mutation<T>(&self, mutation: impl FnOnce() -> T) -> (T, u64) {
+        let ticket = self
             .snapshot_ticket
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let out = mutation();
+        (out, *ticket)
     }
 
     /// The self-checks behind the `doctor` method.
@@ -659,8 +679,8 @@ mod tests {
         let (daemon, dir) = daemon_on_disk("keepnewer");
         add_root(&daemon, "/data");
 
-        // The watermark the removal would take.
-        let mutated_at = daemon.index_watermark();
+        // The watermark the removal would take, under the same lock it uses.
+        let ((), mutated_at) = daemon.with_catalog_mutation(|| ());
 
         // A concurrent scan pins AFTER the mutation and installs.
         daemon.rebuild_index().expect("the scan's rebuild installs");
@@ -702,8 +722,9 @@ mod tests {
             .expect("an ordinary rebuild installs");
 
         // The catalog changes and the rebuild that should have followed fails.
-        // The watermark is taken before the change, as `root_remove` does.
-        let mutated_at = daemon.index_watermark();
+        // The mutation and its watermark are taken together, as `root_remove`
+        // does — the closure stands in for the removal.
+        let ((), mutated_at) = daemon.with_catalog_mutation(|| ());
         daemon.invalidate_index(mutated_at);
         assert!(
             daemon.index().is_err(),

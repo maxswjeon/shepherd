@@ -983,6 +983,83 @@ where
 /// Same discipline as `shepherd-catalog`'s filesystem probes
 /// (`identity::unique_stem`, `atime::probe_atime_advance`): a per-invocation
 /// name, and delete only what this invocation created.
+/// Where every checksum probe's objects and uploads live.
+///
+/// One place, so the sweep and the key builder cannot disagree about what the
+/// sweep is allowed to delete.
+const PROBE_PREFIX: &str = "_shepherd/probe/";
+
+/// Abort and delete whatever earlier probes left under the probe prefix.
+///
+/// Best-effort by construction: this is tidying, and a provider that will not
+/// list or will not abort must not turn a registration into a failure. What it
+/// must not do is stay silent — a sweep that never works is a leak nobody sees,
+/// so every refusal is logged with the key it could not reap.
+///
+/// Uploads first. An incomplete multipart holds allocated parts and bills for
+/// them; a finished probe object is 10 MiB. Both are worth reclaiming, and the
+/// first is worth more.
+async fn sweep_probe_leftovers(adapter: &S3Adapter) {
+    let prefix = PROBE_PREFIX;
+    match adapter.list_incomplete_uploads(prefix).await {
+        Ok(uploads) => {
+            for u in uploads {
+                if let Err(e) = adapter.abort_multipart(&u.key, &u.upload_id).await {
+                    tracing::warn!(
+                        key = u.key.as_str(),
+                        error = %e,
+                        "could not abort a probe upload left by an earlier run; its parts \
+                         stay allocated"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(
+            prefix,
+            error = %e,
+            "could not list probe uploads to reap; earlier runs' parts may still be allocated"
+        ),
+    }
+
+    let mut page = None;
+    loop {
+        match adapter.list(prefix, page.as_ref()).await {
+            Ok(listing) => {
+                for key in &listing.keys {
+                    // `delete_system_object`, never `delete_object`: §4.1 rule 4
+                    // makes `shepherd-tier::destroy` the sole caller of the
+                    // latter, and this is a control object rather than a user's
+                    // bytes. `ControlKey::new` returning `None` would mean the
+                    // provider listed something outside the prefix it was
+                    // asked for, which is not ours to delete.
+                    let Some(control) = ControlKey::new(key.clone()) else {
+                        continue;
+                    };
+                    if let Err(e) = adapter.delete_system_object(&control).await {
+                        tracing::warn!(
+                            key = key.as_str(),
+                            error = %e,
+                            "could not delete a probe object left by an earlier run"
+                        );
+                    }
+                }
+                match listing.next {
+                    Some(token) => page = Some(token),
+                    None => break,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    prefix,
+                    error = %e,
+                    "could not list probe objects to reap; earlier runs' objects may remain"
+                );
+                break;
+            }
+        }
+    }
+}
+
 fn probe_key(alg: ChecksumAlgorithm, nonce: &str) -> ControlKey {
     ControlKey::under(format!(
         "probe/checksum-{}-{nonce}",
@@ -1069,6 +1146,21 @@ impl ChecksumRoundTrip for S3RoundTrip {
             ..self.cfg.clone()
         };
         let adapter = S3Adapter::new(cfg).await.map_err(|e| classify("new", e))?;
+
+        // SWEEP FIRST, then probe.
+        //
+        // Every failure path below cleans up after itself, and none of them
+        // runs if the daemon exits mid-probe: a kill between `create_multipart`
+        // and the abort leaves parts allocated, and one between `complete` and
+        // the delete leaves a 10 MiB control object. The nonce means the next
+        // probe never collides with them — and never tidies them either, so
+        // they accumulated with nothing in the product that would ever look.
+        //
+        // Registration is the right moment: it is the only time this prefix is
+        // touched at all, so a sweep here cannot race a live probe of the same
+        // algorithm in another process, and the cost falls on an operation
+        // already measured in seconds.
+        sweep_probe_leftovers(&adapter).await;
 
         let key = probe_key(alg, &probe_nonce());
         let object = key.as_key();

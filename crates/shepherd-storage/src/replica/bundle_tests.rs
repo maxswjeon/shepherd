@@ -71,7 +71,7 @@ fn custody_is_keyed_on_path_and_hash_never_on_file_id() {
     // stable across an AC-6 rebuild anyway.
     let a = custody("docs/a.txt", 1, 1, clock(1, 1), false);
     let b = custody("docs/a.txt", 2, 1, clock(1, 2), false);
-    let merged = merge_custody(&[a, b]);
+    let merged = merge_custody(&[branch("p", &[&a, &b])]);
     assert_eq!(merged.len(), 2);
 }
 
@@ -81,7 +81,7 @@ fn custody_merges_as_a_union_across_branches() {
     // the failure mode that matters; duplicating one is harmless.
     let branch_a = custody("docs/a.txt", 1, 1, clock(1, 5), false);
     let branch_b = custody("docs/b.txt", 2, 1, clock(2, 5), false);
-    let merged = merge_custody(&[branch_a.clone(), branch_b.clone()]);
+    let merged = merge_custody(&[branch("pa", &[&branch_a]), branch("pb", &[&branch_b])]);
     assert_eq!(merged.len(), 2);
     assert!(merged.iter().any(|r| r.key == branch_a.key));
     assert!(merged.iter().any(|r| r.key == branch_b.key));
@@ -90,7 +90,10 @@ fn custody_merges_as_a_union_across_branches() {
 #[test]
 fn the_same_record_on_two_branches_collapses_to_one() {
     let r = custody("docs/a.txt", 1, 1, clock(1, 5), false);
-    assert_eq!(merge_custody(&[r.clone(), r]).len(), 1);
+    assert_eq!(
+        merge_custody(&[vec![cus_of(&r, "shared")], vec![cus_of(&r, "shared")]]).len(),
+        1
+    );
 }
 
 #[test]
@@ -98,7 +101,7 @@ fn a_custody_tombstone_yields_to_a_live_assertion_it_does_not_dominate() {
     let dead = custody("docs/a.txt", 1, 1, clock(9, 9), true);
 
     // Tombstoned on every branch, asserted live on none: gone.
-    assert!(merge_custody(std::slice::from_ref(&dead)).is_empty());
+    assert!(merge_custody(&[branch("p", &[&dead])]).is_empty());
 
     // A tombstone from a DIFFERENT epoch retires nothing. `writer_epoch`
     // increments on every daemon start, so a writer restarted from a stale
@@ -117,7 +120,7 @@ fn a_custody_tombstone_yields_to_a_live_assertion_it_does_not_dominate() {
         // A higher epoch — a re-assertion, and equally unretired.
         custody("docs/a.txt", 1, 1, clock(10, 1), false),
     ] {
-        let merged = merge_custody(&[dead.clone(), other_branch.clone()]);
+        let merged = merge_custody(&[branch("pa", &[&dead]), branch("pb", &[&other_branch])]);
         assert_eq!(
             merged.len(),
             1,
@@ -129,7 +132,7 @@ fn a_custody_tombstone_yields_to_a_live_assertion_it_does_not_dominate() {
 
     // Distinct target: unaffected by the other target's tombstone.
     let other_target = custody("docs/a.txt", 1, 2, clock(1, 5), false);
-    let merged = merge_custody(&[dead, other_target]);
+    let merged = merge_custody(&[branch("pa", &[&dead]), branch("pb", &[&other_target])]);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].target, TargetId::new(2));
 }
@@ -151,7 +154,7 @@ fn a_restarted_writers_tombstone_does_not_retire_another_branch() {
     // retiring what IT believed the record to be.
     let tombstone = custody("docs/a.txt", 1, 1, clock(7, 1), true);
 
-    let merged = merge_custody(&[tombstone.clone(), live.clone()]);
+    let merged = merge_custody(&[branch("pb", &[&tombstone]), branch("pa", &[&live])]);
     assert_eq!(
         merged.len(),
         1,
@@ -162,7 +165,67 @@ fn a_restarted_writers_tombstone_does_not_retire_another_branch() {
     assert!(!merged[0].tombstone);
 
     // Order-independent, as a merge must be.
-    assert_eq!(merge_custody(&[live, tombstone]).len(), 1);
+    assert_eq!(
+        merge_custody(&[branch("pa", &[&live]), branch("pb", &[&tombstone])]).len(),
+        1
+    );
+}
+
+/// A tombstone in the SAME epoch on a sibling branch retires nothing.
+///
+/// The reducer used to accept `same writer_epoch && higher seq` as proof that a
+/// tombstone followed an assertion. That reads an epoch as a branch, and this
+/// module explicitly supports the case where it is not: a rolled-back local
+/// catalog REUSES an epoch — which is why the pointer key carries a uuid at all
+/// — so such a writer republishes from a stale predecessor, counts past a
+/// sibling branch it never saw, and its tombstone retired the only live custody
+/// record for bytes whose original may already be gone.
+///
+/// Custody is the class where this costs the most: honouring a tombstone that
+/// retired nothing loses the last address of a missing file, while keeping a
+/// duplicate costs nothing.
+#[test]
+fn a_same_epoch_tombstone_on_a_sibling_branch_retires_nothing() {
+    // Branch A holds the only live assertion.
+    let live = custody("docs/a.txt", 1, 1, clock(4, 2), false);
+    // Branch B: the same epoch, reused after a rollback, counting higher from a
+    // predecessor that never carried A.
+    let stale_tombstone = custody("docs/a.txt", 1, 1, clock(4, 9), true);
+
+    let merged = merge_custody(&[branch("pa", &[&live]), branch("pb", &[&stale_tombstone])]);
+    assert_eq!(
+        merged.len(),
+        1,
+        "a same-epoch tombstone from a branch that never saw this assertion \
+         retired it: {merged:?}"
+    );
+    assert!(!merged[0].tombstone);
+    assert_eq!(merged[0].clock, live.clock);
+
+    // THE DISCRIMINATOR. Put both on ONE branch — now the tombstone really does
+    // follow the assertion — and it retires it, which is what
+    // `a_custody_record_retired_later_by_the_same_writer_stays_retired`
+    // requires and what a rule of "never retire across epochs" would break.
+    assert!(
+        merge_custody(&[branch("p", &[&live, &stale_tombstone])]).is_empty(),
+        "a tombstone later on the SAME branch is an ordinary retirement"
+    );
+}
+
+/// And across a restart on one branch, which the old epoch-equality rule
+/// could not express at all.
+///
+/// A live assertion in epoch 4 retired in epoch 5 by the same writer, on the
+/// same chain, is one writer's own sequence — exactly the cross-restart case
+/// the durable-config reducer was corrected for in round 11.
+#[test]
+fn a_retirement_across_a_restart_on_one_branch_still_retires() {
+    let live = custody("docs/a.txt", 1, 1, clock(4, 12), false);
+    let retired_next_boot = custody("docs/a.txt", 1, 1, clock(5, 1), true);
+    assert!(
+        merge_custody(&[branch("p", &[&live, &retired_next_boot])]).is_empty(),
+        "one writer's own history spans its restarts"
+    );
 }
 
 /// A live record retired later by the SAME writer stays retired.
@@ -179,18 +242,33 @@ fn a_custody_record_retired_later_by_the_same_writer_stays_retired() {
     let retired = custody("docs/a.txt", 1, 1, clock(1, 2), true);
 
     assert!(
-        merge_custody(&[live.clone(), retired.clone()]).is_empty(),
+        merge_custody(&[branch("p", &[&live, &retired])]).is_empty(),
         "a tombstone that strictly dominates the live assertion retires it"
     );
     // Order of records must not matter — this is a merge, not a fold over a
     // stream someone controls the order of.
-    assert!(merge_custody(&[retired, live]).is_empty());
+    assert!(merge_custody(&[branch("p", &[&retired, &live])]).is_empty());
 }
 
 /// One publication carrying one record. Distinct ids are distinct
 /// publications even when the records are byte-identical.
-fn pub_of(r: &DurableConfigRecord, id: &str) -> Publication {
+fn pub_of(r: &DurableConfigRecord, id: &str) -> Publication<DurableConfigRecord> {
     Publication::new(id, vec![r.clone()])
+}
+
+/// The same, for custody records.
+fn cus_of(r: &CustodyRecord, id: &str) -> Publication<CustodyRecord> {
+    Publication::new(id, vec![r.clone()])
+}
+
+/// One branch carrying a sequence of single-record publications, ids derived
+/// from `prefix` so two branches built this way share no ancestry.
+fn branch(prefix: &str, records: &[&CustodyRecord]) -> Vec<Publication<CustodyRecord>> {
+    records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| cus_of(r, &format!("{prefix}-{i}")))
+        .collect()
 }
 
 #[test]

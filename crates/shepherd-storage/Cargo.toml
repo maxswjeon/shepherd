@@ -35,6 +35,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# For the probe sweep only. Tidying that silently never works is a leak nobody
+# sees, so every refusal it hits is reported with the key it could not reap.
+tracing.workspace = true
 uuid.workspace = true
 zstd.workspace = true
 

@@ -394,9 +394,47 @@ impl<'a> ChainWriter<'a> {
             key: key.pointer_name(),
             detail: e.to_string(),
         })?;
+        let pointer_key = key.pointer_key();
         self.adapter
-            .create(key.pointer_key().as_key(), Bytes::from(body), precondition)
+            .create(
+                pointer_key.as_key(),
+                Bytes::from(body.clone()),
+                precondition,
+            )
             .await?;
+
+        // READ THE POINTER BACK before recording it as the head.
+        //
+        // The segment above is verified for exactly this reason and the pointer
+        // was still trusted on the strength of `create` returning success. A
+        // truncated or corrupted pointer body is worse than a bad segment: the
+        // segment can be re-published, but the local replica head records the
+        // hash of the bytes we MEANT to write, and the next publication chains
+        // from a predecessor no valid remote pointer provides — a permanent gap
+        // that `read_chain` reports and nothing can repair, because the object
+        // is immutable.
+        //
+        // The stored bytes are compared to the bytes sent, not merely hashed:
+        // the hash the caller would compare against is derived from those same
+        // local bytes, so hashing alone would be asking the write to vouch for
+        // itself.
+        let stored = self
+            .adapter
+            .get_range(
+                pointer_key.as_key(),
+                crate::adapter::ByteRange {
+                    offset: 0,
+                    len: body.len() as u64,
+                },
+            )
+            .await?;
+        if stored.as_ref() != body.as_slice() {
+            return Err(ChainError::Storage(StorageError::ContentMismatch {
+                key: pointer_key.as_key().as_str().to_owned(),
+                expected: format!("{} bytes as written", body.len()),
+                actual: format!("{} bytes read back", stored.len()),
+            }));
+        }
 
         let head = record.compute_self_hash()?;
         self.allocator.record_head(self.target, head).await?;

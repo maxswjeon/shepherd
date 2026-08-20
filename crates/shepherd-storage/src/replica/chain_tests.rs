@@ -560,6 +560,63 @@ async fn a_segment_that_did_not_store_correctly_publishes_no_pointer() {
     );
 }
 
+/// A pointer the provider stored WRONG must not become the replica head.
+///
+/// The segment is read back for exactly this reason and the pointer was still
+/// trusted on `create` returning success. A corrupted pointer is the worse of
+/// the two: a segment can be re-published, but the local head records the hash
+/// of the bytes we MEANT to write, so the next publication chains from a
+/// predecessor no valid remote pointer provides — a permanent gap that
+/// `read_chain` reports and nothing can repair, because the object is
+/// immutable.
+#[tokio::test]
+async fn a_pointer_that_did_not_store_correctly_does_not_become_the_head() {
+    let adapter = MemAdapter::content_addressed();
+    let alloc = FakeAllocator::at_epoch(3);
+    let writer = ChainWriter::new(&adapter, &alloc, TargetId::new(1));
+
+    // The accepting direction first.
+    let good = writer
+        .publish(
+            SegmentKind::Delta,
+            Bytes::from_static(b"segment-one"),
+            None,
+            Blake3Hash::from_bytes([1; 32]),
+        )
+        .await
+        .expect("an intact publication succeeds");
+
+    // A provider that acknowledges every create and stores it short. The
+    // SEGMENT read-back catches its own write; this asserts the pointer is
+    // covered too, so the fault has to survive past that check.
+    adapter.set_faults(crate::testing::Faults {
+        truncate_on_create: true,
+        ..Default::default()
+    });
+
+    let before = read_chain(&adapter).await.expect("read").records.len();
+    let err = writer
+        .publish(
+            SegmentKind::Delta,
+            Bytes::from_static(b"segment-two"),
+            Some(good.compute_self_hash().expect("hash")),
+            Blake3Hash::from_bytes([2; 32]),
+        )
+        .await;
+    assert!(
+        matches!(
+            err,
+            Err(ChainError::Storage(StorageError::ContentMismatch { .. }))
+        ),
+        "a publication whose bytes did not store must fail before the head moves, got {err:?}"
+    );
+    assert_eq!(
+        read_chain(&adapter).await.expect("read").records.len(),
+        before,
+        "the chain must not gain a record it cannot read back"
+    );
+}
+
 /// **The accepting direction.** A guard hard-wired to refuse would pass all
 /// three refusal tests below while making every replica permanently
 /// custody-ineligible — which is the failure mode that voids tiering rather
