@@ -123,17 +123,6 @@ fn describe_file_type(ft: std::fs::FileType) -> &'static str {
     }
 }
 
-/// The lock file that guards one socket: `daemon.sock` -> `daemon.sock.lock`.
-///
-/// Public because two places must agree on it — [`bind`], which holds it, and
-/// the scan executor, which denies it by path so the daemon does not catalogue
-/// its own runtime file when `SHEPHERD_SOCKET` points inside a scan root.
-pub fn socket_lock_path(socket: &Path) -> std::path::PathBuf {
-    let mut p = socket.as_os_str().to_os_string();
-    p.push(".lock");
-    std::path::PathBuf::from(p)
-}
-
 /// Bind the listener, creating the directory and clearing a stale socket.
 ///
 /// Three things that each cause a confusing failure if skipped:
@@ -206,11 +195,12 @@ pub fn bind(path: &Path, lock_path: &Path) -> Result<Bound, ServerError> {
     // and that directory can sit inside a scan root — the socket itself is
     // invisible to the walk only because it is not a regular file, and this
     // is. So it is denied by path where the state directory already is, in
-    // `scan_exec`; see [`socket_lock_path`], which both sides name it through.
+    // `scan_exec` — which compiles on every platform while this module does
+    // not, so both sides name it through `shepherd_obs::paths`.
     //
     // Non-blocking on both locks, so the ordering cannot deadlock — a loser is
     // refused rather than parked.
-    let socket_lock_path = socket_lock_path(path);
+    let socket_lock_path = shepherd_obs::paths::socket_lock_path(path);
     let socket_lock = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -796,12 +786,31 @@ fn write_frame<T: serde::Serialize>(
 mod tests {
     use super::*;
 
+    /// A unique socket path for one test, kept SHORT on purpose.
+    ///
+    /// `sun_path` is 104 bytes including the NUL on macOS, and its temp
+    /// directory is `/var/folders/<2>/<28>/T/` — 47 of them gone before this
+    /// name begins. The old `shepherd-srv-<pid>-<tag>-ThreadId(NN)` left about
+    /// eleven characters of headroom, so a descriptive tag was enough to push
+    /// `two_state_directories_cannot_share_one_socket` over it and fail with
+    /// `path must be shorter than SUN_LEN` on macOS alone. The prefix is now
+    /// three characters and the thread id contributes only its digits.
     fn tmp_socket(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "shepherd-srv-{}-{tag}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let thread = format!("{:?}", std::thread::current().id());
+        let thread: String = thread.chars().filter(char::is_ascii_digit).collect();
+        let d = std::env::temp_dir().join(format!("shp-{}-{tag}-{thread}", std::process::id()));
+        // Checked against the BUDGET, not against the local path. `/tmp/` costs
+        // five bytes and `/var/folders/<2>/<28>/T/` costs forty-nine, so an
+        // assertion on the assembled path would pass on Linux for a tag that
+        // cannot work on macOS — a green local run and a `SUN_LEN` failure a CI
+        // round-trip later, which is exactly how this arrived. What a fixture
+        // may spend on its own name plus `/daemon.sock` is 103 - 49 = 54.
+        let spend = d.file_name().unwrap_or_default().len() + "/daemon.sock".len();
+        assert!(
+            spend <= 54,
+            "this fixture spends {spend} bytes of the 54 macOS leaves for a socket \
+             path under its temp directory; shorten the tag `{tag}`"
+        );
         let _ = std::fs::remove_dir_all(&d);
         d.join("daemon.sock")
     }

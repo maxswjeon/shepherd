@@ -33,7 +33,7 @@
 //! `SHEPHERD_SOCKET` is the one case with no fallbacks at all — see
 //! [`socket_candidates`] for why falling through would be worse than failing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The environment inputs path resolution depends on.
 #[derive(Debug, Clone, Default)]
@@ -59,6 +59,19 @@ impl Env {
     }
 }
 
+/// The lock file that guards one socket: `daemon.sock` -> `daemon.sock.lock`.
+///
+/// Here, rather than beside the code that takes the lock, because two sides
+/// must agree on the name and only one of them is Unix-only. `server::bind`
+/// holds it; the scan executor denies it by path so the daemon does not
+/// catalogue its own runtime file when `SHEPHERD_SOCKET` points inside a scan
+/// root — and `scan_exec` compiles on every platform, while `server` does not.
+pub fn socket_lock_path(socket: &Path) -> PathBuf {
+    let mut p = socket.as_os_str().to_os_string();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
 /// Resolved locations for one daemon instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -73,6 +86,11 @@ impl Paths {
 
     pub fn secrets(&self) -> PathBuf {
         self.state_dir.join("secrets.json")
+    }
+
+    /// The lock file that guards this socket, `daemon.sock.lock`.
+    pub fn socket_lock(&self) -> PathBuf {
+        socket_lock_path(&self.socket)
     }
 
     /// Resolve from an environment.

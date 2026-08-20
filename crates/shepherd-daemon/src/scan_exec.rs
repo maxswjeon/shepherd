@@ -179,7 +179,7 @@ impl Executor for ScanExecutor {
         let deny = DenyList::builtin()
             .case_insensitive(root.case_policy == PathCasePolicy::Insensitive)
             .with_extra_path(state_dir)
-            .with_extra_path(&crate::server::socket_lock_path(&self.daemon.paths.socket));
+            .with_extra_path(&self.daemon.paths.socket_lock());
         let ignores = IgnoreSet::new(&path, &patterns)
             .map_err(|e| format!("root {root_id} has an unusable ignore pattern: {e}"))?;
 
