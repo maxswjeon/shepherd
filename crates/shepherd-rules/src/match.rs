@@ -341,7 +341,11 @@ fn eval_predicate(
 fn eval_simple(p: &Predicate, file: &FileStat, ctx: &MatchContext<'_>) -> bool {
     match p {
         Predicate::Ext(exts) => {
-            let name = file.rel_path.rsplit(['/', '\\']).next().unwrap_or("");
+            let name = file
+                .rel_path
+                .rsplit(|c: char| is_component_boundary(c))
+                .next()
+                .unwrap_or("");
             // A leading dot is not an extension separator — `.gitignore` has
             // none. Same rule the scanner applies, deliberately.
             match name.rfind('.').filter(|&i| i > 0) {
@@ -352,7 +356,7 @@ fn eval_simple(p: &Predicate, file: &FileStat, ctx: &MatchContext<'_>) -> bool {
                 None => false,
             }
         }
-        Predicate::PathGlob(g) => g.is_match(file.rel_path.replace('\\', "/")),
+        Predicate::PathGlob(g) => g.is_match(glob_subject(&file.rel_path).as_ref()),
         Predicate::MinSize(n) => file.size >= *n,
         Predicate::MaxSize(n) => file.size <= *n,
         Predicate::Tag(t) => ctx.tags.iter().any(|x| x == t),
@@ -360,6 +364,37 @@ fn eval_simple(p: &Predicate, file: &FileStat, ctx: &MatchContext<'_>) -> bool {
         Predicate::OlderThan { .. } | Predicate::All(_) | Predicate::Any(_) | Predicate::Not(_) => {
             eval_predicate(p, file, ctx).0
         }
+    }
+}
+
+/// Whether this character separates path components on the host.
+///
+/// **`\` is an ordinary character in a Unix filename**, and this is the
+/// destructive side of that fact. A root-level file literally named
+/// `cache\private.txt` was rewritten to `cache/private.txt` before matching, so
+/// `path_glob: "cache/**"` selected a file that is not inside the directory the
+/// operator named — and a rule's action can destroy it. Selecting a file the
+/// operator did not name is the one thing the glob predicate exists to prevent;
+/// `literal_separator(true)` is set on every glob for the same reason.
+///
+/// The catalog stores `rel_path` "with separators left exactly as the OS gave
+/// them", so on Windows both characters really are boundaries and both are
+/// treated as such there.
+#[inline]
+fn is_component_boundary(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
+}
+
+/// The path a glob is matched against.
+///
+/// Globs are written with `/` — that is what `globset` parses and what a user
+/// types — so a Windows path's `\` separators are rewritten to match. On Unix
+/// nothing is rewritten, because there is nothing there that is a separator.
+fn glob_subject(rel_path: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) && rel_path.contains('\\') {
+        std::borrow::Cow::Owned(rel_path.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(rel_path)
     }
 }
 

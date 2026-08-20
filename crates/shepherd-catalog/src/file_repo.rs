@@ -307,8 +307,10 @@ impl<'a> FileRepo<'a> {
                  catalog rows carry `fs_id` values built from `{stored}`, so reviving the \
                  root against a different filesystem would mix them with files from another \
                  volume — and the scan-time check compares the root record, which this would \
-                 have just rewritten. Re-add with `--forget` to drop the retained rows, or \
-                 mount the volume this root was enrolled on",
+                 have just rewritten. To adopt the new filesystem, drop the retained rows \
+                 first with `shepctl root remove --forget-catalog` (add `--force` if tiered \
+                 files' custody rows are being discarded deliberately) and then add the root \
+                 again; otherwise mount the volume this root was enrolled on",
                 match volume_id {
                     Some(v) => format!("`{v}`"),
                     None => "no stable identity at all".to_string(),

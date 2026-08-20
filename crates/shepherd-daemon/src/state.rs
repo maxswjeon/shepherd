@@ -70,6 +70,14 @@ struct Indexed {
     index: Option<Arc<MetaIndex>>,
     /// 0 before anything is installed, so the first real generation (1) wins.
     generation: u64,
+    /// The lowest generation still allowed to install.
+    ///
+    /// Raised by [`Daemon::invalidate_index`] when the catalog changed and the
+    /// rebuild that should have followed it failed. A snapshot pinned before
+    /// that moment describes a catalog that no longer exists, and its
+    /// generation can still exceed the installed one — so ordering against
+    /// `generation` alone is not enough to keep it out.
+    floor: u64,
 }
 
 /// A built index, tagged with the generation of the snapshot it came from.
@@ -290,6 +298,14 @@ impl Daemon {
             .index
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if snapshot.generation < guard.floor {
+            tracing::info!(
+                stale = snapshot.generation,
+                floor = guard.floor,
+                "discarding a metadata index pinned before the catalog changed under it"
+            );
+            return guard.index.as_ref().map_or(0, |i| i.len());
+        }
         if snapshot.generation <= guard.generation {
             tracing::info!(
                 stale = snapshot.generation,
@@ -324,16 +340,39 @@ impl Daemon {
     /// answers `Precondition` and `doctor` reports it, precisely so an index
     /// that is absent is never mistaken for one that found nothing.
     ///
-    /// The generation is left alone deliberately. It orders SNAPSHOTS, and a
-    /// concurrent rebuild reading the newer catalog must still be able to
-    /// install — clearing it would let an older in-flight snapshot win.
+    /// # The floor, and why clearing the generation would not do
+    ///
+    /// A rebuild that PINNED its snapshot before the catalog changed can still
+    /// be running, and its generation can still be higher than whatever is
+    /// installed — tickets are issued in snapshot order, not completion order.
+    /// Dropping the arena without recording anything let exactly that snapshot
+    /// pass `install_snapshot`'s check afterwards and reinstall the rows this
+    /// invalidation existed to remove.
+    ///
+    /// So the invalidation records a FLOOR: the next ticket. Every snapshot
+    /// pinned before this moment has a lower one and is refused; every rebuild
+    /// started after it has a higher one and installs normally. Clearing the
+    /// generation instead would have the opposite effect — it would let the
+    /// oldest in-flight snapshot win.
     pub fn invalidate_index(&self) {
         let mut guard = self
             .index
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Taken while the index write lock is held, so no rebuild can slip
+        // between choosing the floor and installing it.
+        guard.floor = {
+            // The ticket a rebuild starting NOW would take. Every snapshot
+            // pinned before this line has a lower one.
+            let ticket = self
+                .snapshot_ticket
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *ticket + 1
+        };
         if guard.index.take().is_some() {
             tracing::warn!(
+                floor = guard.floor,
                 generation = guard.generation,
                 "metadata index dropped: the catalog changed and the rebuild that should \
                  have followed it failed. `search` is refused until one succeeds"
@@ -546,6 +585,51 @@ mod tests {
     /// would notice — not merely that some counter went the right way. A daemon
     /// that installed A's stale snapshot would still have `beta.txt` in SQLite
     /// and would not find it, which is the bug.
+    /// A snapshot pinned BEFORE an invalidation must not reinstall afterwards.
+    ///
+    /// Tickets are issued in snapshot order, not completion order, so a rebuild
+    /// that started before `root.remove --forget` committed can still finish
+    /// after it with a generation higher than whatever is installed. Dropping
+    /// the arena without recording anything let exactly that snapshot pass the
+    /// generation check and put the forgotten ids back — recreating the short
+    /// and empty search pages the invalidation existed to prevent.
+    #[test]
+    fn a_snapshot_pinned_before_an_invalidation_cannot_reinstall() {
+        let (daemon, dir) = daemon_on_disk("floor");
+        add_root(&daemon, "/data");
+
+        // The in-flight rebuild: pinned now, installed later.
+        let in_flight = daemon.build_snapshot().expect("pin a snapshot");
+        daemon
+            .rebuild_index()
+            .expect("an ordinary rebuild installs");
+
+        // The catalog changes and the rebuild that should have followed fails.
+        daemon.invalidate_index();
+        assert!(
+            daemon.index().is_err(),
+            "precondition: `search` must be refused while there is no index"
+        );
+
+        // ...and the older snapshot lands.
+        daemon.install_snapshot(in_flight);
+        assert!(
+            daemon.index().is_err(),
+            "a snapshot pinned before the catalog changed reinstalled the rows the \
+             invalidation removed"
+        );
+
+        // THE ACCEPTING DIRECTION: a rebuild started after the invalidation
+        // installs normally, or `search` would be refused until a restart.
+        daemon.rebuild_index().expect("rebuild after the floor");
+        assert!(
+            daemon.index().is_ok(),
+            "a fresh rebuild must be installable"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_rebuild_from_an_older_snapshot_does_not_replace_a_newer_index() {
         let (daemon, dir) = daemon_on_disk("stale-swap");

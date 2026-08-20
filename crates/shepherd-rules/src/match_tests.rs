@@ -66,8 +66,56 @@ fn path_glob_matches_and_does_not_over_match() {
     assert!(hit(&m, &file("Photos/2024/a.raw", 1, 0)));
     assert!(hit(&m, &file("Photos/2024/06/b.raw", 1, 0)));
     assert!(!hit(&m, &file("Docs/2024/a.raw", 1, 0)));
-    // Separators are unified, so a Windows-authored path matches the same rule.
-    assert!(hit(&m, &file("Photos\\2024\\c.raw", 1, 0)));
+
+    // ORACLE CHANGED. This used to assert that a `\`-separated path matched on
+    // every host, under "separators are unified". On Unix `\` is an ordinary
+    // character in a filename, so unifying them made a root-level file named
+    // `Photos\2024\c.raw` match `Photos/**/*.raw` — a file that is not inside
+    // the directory the operator named, selected for an action that can destroy
+    // it. That is precisely what the test below this one forbids `*` from
+    // doing, and the reason every glob is compiled with
+    // `literal_separator(true)`.
+    //
+    // Both halves per platform, so neither is quietly lost.
+    let windows_authored = file("Photos\\2024\\c.raw", 1, 0);
+    if cfg!(windows) {
+        assert!(
+            hit(&m, &windows_authored),
+            "on Windows `\\` really is a separator, so this path IS inside Photos"
+        );
+    } else {
+        assert!(
+            !hit(&m, &windows_authored),
+            "on Unix this is one root-level file whose NAME contains backslashes; \
+             matching it would select a file the operator did not name"
+        );
+    }
+}
+
+/// The Unix half, on a file a user can actually create, and on the predicate
+/// that decides whether it gets destroyed.
+///
+/// A rule saying `cache/**` names the contents of a directory called `cache`.
+/// A root-level file named `cache\private.txt` is not one of them, and
+/// rewriting its backslash made it one.
+#[test]
+#[cfg(unix)]
+fn a_backslash_in_a_unix_filename_does_not_put_a_file_inside_a_directory() {
+    let m = compile(serde_json::json!({ "path_glob": "cache/**" }));
+    assert!(
+        hit(&m, &file("cache/a.txt", 1, 0)),
+        "the directory's real contents still match"
+    );
+    assert!(
+        !hit(&m, &file("cache\\private.txt", 1, 0)),
+        "a root-level file whose name contains a backslash is not inside `cache`"
+    );
+
+    // And the extension predicate reads the same boundary: the name here is the
+    // whole thing, so its extension is `txt` either way — what must not happen
+    // is the name being taken as `private.txt` alone.
+    let ext = compile(serde_json::json!({ "ext": ["txt"] }));
+    assert!(hit(&ext, &file("cache\\private.txt", 1, 0)));
 }
 
 /// The direction of failure that matters: a glob must not select files the user

@@ -415,14 +415,25 @@ pub fn run_one(
                 let message = message.clone();
                 move |cat| Queue::fail(cat, &job, &message, now())
             })?;
-            let to = match &disposition {
+            // The reported error is the one the ROW now holds, which is not
+            // always the message the executor returned.
+            //
+            // `Queue::fail` synthesises a terminal reason — "giving up after 5
+            // attempts: <message>", or the abort-forward-never sentence for a
+            // non-retryable class — and persists THAT as `last_error`.
+            // Publishing the raw message alongside a committed `to: failed`
+            // gave a subscriber a state that disagreed with the durable one and
+            // omitted the only part that explains why the failure became
+            // terminal. A retry keeps the raw message, because that is what its
+            // row holds.
+            let (to, last_error) = match disposition {
                 Disposition::Retry { at, attempt } => {
                     tracing::info!(attempt, retry_at = at.as_nanos(), "job will be retried");
-                    JobState::Queued
+                    (JobState::Queued, message)
                 }
                 Disposition::Failed { reason } => {
                     tracing::warn!(reason, "job failed terminally");
-                    JobState::Failed
+                    (JobState::Failed, reason)
                 }
                 Disposition::Done => unreachable!("fail() never returns Done"),
             };
@@ -432,7 +443,7 @@ pub fn run_one(
                 from: JobState::Running,
                 to,
                 attempts,
-                last_error: Some(message),
+                last_error: Some(last_error),
             });
         }
     }
@@ -622,6 +633,69 @@ mod tests {
                 (JobState::Queued, JobState::Running),
                 (JobState::Running, JobState::Done),
             ]
+        );
+    }
+
+    /// A terminal failure reports the reason the ROW holds, not the raw
+    /// executor message.
+    ///
+    /// `Queue::fail` synthesises "giving up after N attempts: <message>" and
+    /// persists THAT as `last_error`. Publishing the raw message alongside a
+    /// committed `to: failed` gave a subscriber a state that disagreed with the
+    /// durable one and omitted the only part explaining why the failure became
+    /// terminal. A retry keeps the raw message, because that is what its row
+    /// holds.
+    #[test]
+    fn a_terminal_failure_reports_what_the_row_says() {
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<(JobState, Option<String>)>>);
+        impl JobObserver for Recorder {
+            fn transition(&self, t: Transition) {
+                if t.from == JobState::Running {
+                    self.0.lock().unwrap().push((t.to, t.last_error));
+                }
+            }
+        }
+
+        let actor = actor_in_memory();
+        let w = actor.handle();
+        let seen = Arc::new(Recorder::default());
+        // A `destroy` job, because §4.10.4 makes it non-retryable: the FIRST
+        // failure is terminal, so this reaches the synthesised-reason path in
+        // one claim rather than through five backoff deadlines. It is the same
+        // arm of `Queue::fail` the exhausted-budget case takes.
+        let registry = Arc::new(Registry::new().with(JobClass::Destroy, |_: &JobContext| {
+            Err("disk on fire".into())
+        }));
+
+        let id = w
+            .try_with(|cat| Queue::enqueue(cat, JobClass::Destroy, 0, "{}", now()))
+            .unwrap();
+
+        assert!(run_one(&w, &registry, seen.as_ref()).unwrap());
+
+        let row_error = w
+            .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(id))
+            .unwrap()
+            .expect("the job row")
+            .last_error
+            .unwrap_or_default();
+        let published = seen.0.lock().unwrap().clone();
+        let (state, reported) = published
+            .last()
+            .cloned()
+            .expect("a transition was reported");
+        assert_eq!(state, JobState::Failed, "{published:?}");
+        assert_eq!(
+            reported.as_deref(),
+            Some(row_error.as_str()),
+            "the event must carry what the row holds, or a subscriber's view \
+             disagrees with the daemon's"
+        );
+        assert!(
+            row_error.contains("never retried automatically") && row_error.contains("disk on fire"),
+            "precondition: the row holds a SYNTHESISED reason that the raw message \
+             alone does not carry: {row_error}"
         );
     }
 

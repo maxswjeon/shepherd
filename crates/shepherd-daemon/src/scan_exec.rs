@@ -207,7 +207,8 @@ impl Executor for ScanExecutor {
         // stable identity" would — this check is about a path that still
         // resolves and now belongs to a different filesystem, which is
         // precisely the case a deleted root is not.
-        if std::fs::symlink_metadata(&path).is_ok()
+        let present = std::fs::symlink_metadata(&path).is_ok();
+        if present
             && let Some(reason) = volume_refusal(
                 rid,
                 &root.path,
@@ -217,6 +218,9 @@ impl Executor for ScanExecutor {
         {
             return Err(reason);
         }
+        // The device the check above passed on, remembered so the same question
+        // can be asked again after the walk.
+        let checked_dev = present.then(|| device_of(&path)).flatten();
 
         self.publish(root_id, 0, 0, Some(root.path.clone()), false);
 
@@ -225,6 +229,35 @@ impl Executor for ScanExecutor {
         // must not run inside the single-writer actor.
         let output = walk(rid, &path, &deny, &ignores, now())
             .map_err(|e| format!("walking {}: {e}", root.path))?;
+
+        // RE-ASKED, after the walk and before anything is committed.
+        //
+        // The check above and the walk are two pathname operations, so a volume
+        // unmounted, replaced, or a registered symlink retargeted in between
+        // leaves the walker reading a different filesystem entirely — capturing
+        // its device as `root_dev`, accepting its inode sightings, and handing
+        // them to `upsert_file` to be paired with the enrolled volume's id.
+        //
+        // Pinning the traversal to an opened directory would close the window
+        // rather than narrow it, and that is `openat`-relative walking: a
+        // change to every step of `shepherd_scan::walk`, tracked in #3 with the
+        // other residuals of this shape. What this does instead is put the
+        // check on the other side of the harm. The walk reading the wrong tree
+        // costs nothing by itself; COMMITTING it is what writes false
+        // identities, so the last thing before the commit is asking whether the
+        // filesystem is still the one that was verified.
+        //
+        // Compared on `st_dev` rather than by re-deriving the volume id: this
+        // is the same question over a much shorter interval, and `st_dev` is
+        // exactly what the walker keyed its sightings on.
+        if checked_dev.is_some() && device_of(&path) != checked_dev {
+            return Err(format!(
+                "the filesystem at root {root_id} ({}) changed while it was being walked, so \
+                 the files this pass observed belong to a volume that was never verified. \
+                 Nothing has been committed. Re-run the scan once the mount is stable",
+                root.path
+            ));
+        }
 
         // **An unreadable root is not an empty root, and the difference is the
         // whole safety of the reconciliation below.**
@@ -508,6 +541,24 @@ fn summarise_skips(skips: &[Skip]) -> String {
          symlinked_dirs={symlinked} unreadable={unreadable} \
          unrepresentable={unrepresentable}"
     )
+}
+
+/// The device number behind a path, or `None` if it cannot be read.
+///
+/// A coarser identity than `volume_id` and the right one for this job: it
+/// answers "is this the same mounted filesystem as a moment ago", which is what
+/// a check taken on both sides of a walk is asking.
+fn device_of(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|md| md.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Whether the filesystem mounted at a root disagrees with the one it was
