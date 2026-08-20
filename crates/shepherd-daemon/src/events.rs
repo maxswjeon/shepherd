@@ -79,9 +79,71 @@ struct Inner {
 
 /// Fan-out over one [`EventBuffer`].
 pub struct EventHub {
-    inner: Mutex<Inner>,
+    /// `Arc` so a [`SubscriptionGuard`] can hold a `Weak` to it and unregister
+    /// without a lifetime tying every connection to the hub's borrow.
+    inner: Arc<Mutex<Inner>>,
     epoch: String,
     next_id: AtomicU64,
+}
+
+/// What [`EventHub::subscribe`] hands back.
+///
+/// A struct rather than a tuple because of `guard`: in a tuple it is one `_`
+/// away from being dropped at the end of the statement that created it, which
+/// unregisters the subscription the caller just made and reads like nothing.
+pub struct Subscription {
+    pub result: SubscribeResult,
+    /// Frames to write before live delivery begins.
+    pub replay: Vec<EventFrame>,
+    pub rx: Receiver<EventFrame>,
+    /// Set if this subscriber is unregistered for falling behind, so the pump
+    /// can tell that from an ordinary shutdown.
+    pub overflowed: Arc<AtomicBool>,
+    /// **Keep this for as long as the connection lives.** See
+    /// [`SubscriptionGuard`].
+    pub guard: SubscriptionGuard,
+}
+
+/// Unregisters its subscription from the hub when dropped.
+///
+/// The connection that made the subscription holds it; when that connection
+/// ends — EOF, a write error, an oversized frame — the guard drops and the
+/// subscriber goes with it.
+///
+/// Without one, nothing ever removed a subscriber whose client had gone away
+/// while its streams were quiet. [`EventHub::publish`] only probes the senders
+/// of subscribers that WANT the stream being published, so a client subscribed
+/// to `target` alone is untouched by an hour of scan traffic: its pump stays
+/// parked on `recv`, and the thread, the channel, the subscriber entry and the
+/// socket handle all outlive the connection. Ordinary reconnects then grow the
+/// daemon without bound.
+///
+/// Dropping closes the channel, which is the signal the pump already
+/// understands as "stop" — and with `overflowed` still false, so it exits
+/// quietly instead of shutting down a socket that has already gone.
+pub struct SubscriptionGuard {
+    /// `Weak`, so a guard outliving its hub — a connection thread still
+    /// unwinding as the daemon shuts down — neither keeps the buffer alive nor
+    /// panics.
+    inner: std::sync::Weak<Mutex<Inner>>,
+    id: u64,
+}
+
+impl SubscriptionGuard {
+    /// The subscription this guard ends; the same id the client was told.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut inner = inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.subscribers.retain(|s| s.id != self.id);
+    }
 }
 
 impl EventHub {
@@ -89,10 +151,10 @@ impl EventHub {
     /// one; tests pass a fixed value.
     pub fn new(capacity: usize, epoch: impl Into<String>) -> Self {
         Self {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 buffer: EventBuffer::new(capacity),
                 subscribers: Vec::new(),
-            }),
+            })),
             epoch: epoch.into(),
             next_id: AtomicU64::new(1),
         }
@@ -164,24 +226,16 @@ impl EventHub {
 
     /// Register a subscription.
     ///
-    /// Returns the result frame, the frames to replay before live delivery, the
-    /// receiver the connection pumps, and the overflow flag.
-    ///
-    /// The flag is what the pump reads once the channel closes, to distinguish
-    /// "this subscriber fell behind and was cut off" — where the socket must be
-    /// shut down so the client learns of it — from an ordinary shutdown, where
-    /// it must not be.
+    /// The caller must keep [`Subscription::guard`] alive for exactly as long
+    /// as the connection: dropping it is what unregisters the subscriber, and
+    /// it is the only thing that does so for a subscription whose streams stay
+    /// quiet.
     pub fn subscribe(
         &self,
         streams: Vec<EventStream>,
         resume_from: Option<Seq>,
         client_epoch: Option<&str>,
-    ) -> (
-        SubscribeResult,
-        Vec<EventFrame>,
-        Receiver<EventFrame>,
-        Arc<AtomicBool>,
-    ) {
+    ) -> Subscription {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -220,7 +274,16 @@ impl EventHub {
                 streams
             },
         };
-        (result, replay, rx, overflowed)
+        Subscription {
+            result,
+            replay,
+            rx,
+            overflowed,
+            guard: SubscriptionGuard {
+                inner: Arc::downgrade(&self.inner),
+                id,
+            },
+        }
     }
 
     /// Live subscriber count, for `status` and tests.
@@ -250,7 +313,8 @@ mod tests {
     #[test]
     fn a_subscriber_receives_what_it_asked_for_and_nothing_else() {
         let hub = EventHub::new(64, "e1");
-        let (_, _, rx, _) = hub.subscribe(vec![EventStream::Scan], None, None);
+        let sub = hub.subscribe(vec![EventStream::Scan], None, None);
+        let rx = &sub.rx;
 
         hub.publish(EventStream::Scan, scan(1));
         hub.publish(EventStream::Job, scan(2));
@@ -269,8 +333,9 @@ mod tests {
     #[test]
     fn an_empty_stream_list_subscribes_to_everything() {
         let hub = EventHub::new(64, "e1");
-        let (result, _, rx, _) = hub.subscribe(vec![], None, None);
-        assert_eq!(result.streams, EventStream::ALL.to_vec());
+        let sub = hub.subscribe(vec![], None, None);
+        let rx = &sub.rx;
+        assert_eq!(sub.result.streams, EventStream::ALL.to_vec());
         hub.publish(EventStream::Power, scan(1));
         assert!(rx.try_recv().is_ok());
     }
@@ -281,7 +346,8 @@ mod tests {
         for i in 1..=5 {
             hub.publish(EventStream::Scan, scan(i));
         }
-        let (result, replay, _rx, _) = hub.subscribe(vec![], Some(Seq(3)), Some("e1"));
+        let sub = hub.subscribe(vec![], Some(Seq(3)), Some("e1"));
+        let (result, replay) = (&sub.result, &sub.replay);
         assert!(matches!(
             result.resume,
             ResumeOutcome::Resumed { replayed: 2, .. }
@@ -301,7 +367,8 @@ mod tests {
         for i in 1..=5 {
             hub.publish(EventStream::Scan, scan(i));
         }
-        let (result, replay, _rx, _) = hub.subscribe(vec![], Some(Seq(3)), Some("run-1"));
+        let sub = hub.subscribe(vec![], Some(Seq(3)), Some("run-1"));
+        let (result, replay) = (&sub.result, &sub.replay);
         assert!(
             matches!(
                 result.resume,
@@ -342,8 +409,9 @@ mod tests {
     #[test]
     fn a_slow_subscriber_does_not_stall_the_publisher_or_its_peers() {
         let hub = EventHub::new(4096, "e1");
-        let (_, _, slow, _) = hub.subscribe(vec![], None, None);
-        let (_, _, fast, fast_overflowed) = hub.subscribe(vec![], None, None);
+        let slow = hub.subscribe(vec![], None, None);
+        let fast_sub = hub.subscribe(vec![], None, None);
+        let (fast, fast_overflowed) = (&fast_sub.rx, &fast_sub.overflowed);
 
         let total = SUBSCRIBER_QUEUE as u64 + 50;
         let mut delivered = 0;
@@ -377,8 +445,10 @@ mod tests {
     #[test]
     fn a_subscriber_whose_queue_overflows_is_disconnected() {
         let hub = EventHub::new(4096, "e1");
-        let (_, _, slow, slow_overflowed) = hub.subscribe(vec![], None, None);
-        let (_, _, fast, _) = hub.subscribe(vec![], None, None);
+        let slow = hub.subscribe(vec![], None, None);
+        let slow_overflowed = Arc::clone(&slow.overflowed);
+        let fast_sub = hub.subscribe(vec![], None, None);
+        let fast = &fast_sub.rx;
 
         for i in 0..(SUBSCRIBER_QUEUE as u64 + 50) {
             hub.publish(EventStream::Scan, scan(i));
@@ -406,7 +476,8 @@ mod tests {
     #[test]
     fn a_subscriber_that_keeps_up_is_never_disconnected() {
         let hub = EventHub::new(4096, "e1");
-        let (_, _, rx, overflowed) = hub.subscribe(vec![], None, None);
+        let sub = hub.subscribe(vec![], None, None);
+        let (rx, overflowed) = (&sub.rx, &sub.overflowed);
 
         for i in 0..(SUBSCRIBER_QUEUE as u64 * 4) {
             hub.publish(EventStream::Scan, scan(i));
@@ -424,23 +495,65 @@ mod tests {
         );
     }
 
+    /// A receiver that goes away is noticed by the next publish **on a stream
+    /// that subscriber wanted**. That qualifier is why the guard below exists.
     #[test]
-    fn a_disconnected_subscriber_is_reaped() {
+    fn a_disconnected_subscriber_is_reaped_by_the_next_publish() {
         let hub = EventHub::new(64, "e1");
-        {
-            let (_, _, _rx, _) = hub.subscribe(vec![], None, None);
-            assert_eq!(hub.subscriber_count(), 1);
-        }
-        // The receiver dropped with the scope; the next publish notices.
+        let sub = hub.subscribe(vec![], None, None);
+        // The guard is held deliberately: this test is about the OTHER
+        // mechanism, so the receiver alone is dropped.
+        let _guard = sub.guard;
+        drop(sub.rx);
+        assert_eq!(hub.subscriber_count(), 1, "nothing has published yet");
+
         hub.publish(EventStream::Scan, scan(1));
         assert_eq!(hub.subscriber_count(), 0);
+    }
+
+    /// The guard, and the leak it closes.
+    ///
+    /// A client subscribed to `target` alone hangs up. `publish` only probes
+    /// the senders of subscribers that WANT the stream being published, so no
+    /// amount of scan traffic touches it: before the guard, this subscriber
+    /// stayed registered indefinitely, its connection's pump stayed parked on
+    /// `recv`, and the thread, channel, subscriber entry and socket handle went
+    /// with it. Ordinary reconnects grew the daemon without bound.
+    ///
+    /// The publishes are the load-bearing part of this test. Without them it
+    /// would pass on the reaping path above and prove nothing.
+    #[test]
+    fn dropping_the_guard_unregisters_a_subscriber_no_publish_would_reach() {
+        let hub = EventHub::new(64, "e1");
+        let sub = hub.subscribe(vec![EventStream::Target], None, None);
+        assert_eq!(hub.subscriber_count(), 1);
+
+        // Traffic on a stream it did not ask for: the sender is never probed.
+        for i in 1..=10 {
+            hub.publish(EventStream::Scan, scan(i));
+        }
+        assert_eq!(
+            hub.subscriber_count(),
+            1,
+            "precondition: publishing an unwanted stream must not reap it, or \
+             this test would be measuring the wrong mechanism"
+        );
+
+        // The connection ends.
+        drop(sub);
+        assert_eq!(
+            hub.subscriber_count(),
+            0,
+            "the subscriber outlived its connection; only the guard can end a \
+             subscription whose streams stay quiet"
+        );
     }
 
     #[test]
     fn subscription_ids_are_distinct() {
         let hub = EventHub::new(64, "e1");
-        let (a, _, _ra, _) = hub.subscribe(vec![], None, None);
-        let (b, _, _rb, _) = hub.subscribe(vec![], None, None);
-        assert_ne!(a.subscription_id, b.subscription_id);
+        let a = hub.subscribe(vec![], None, None);
+        let b = hub.subscribe(vec![], None, None);
+        assert_ne!(a.result.subscription_id, b.result.subscription_id);
     }
 }

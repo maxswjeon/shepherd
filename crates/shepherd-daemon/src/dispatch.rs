@@ -360,6 +360,26 @@ impl ShepherdApi for Session {
         // different scheme so a human reading the column can tell a weaker
         // identity from a UUID-backed one. That is the distinction worth
         // keeping; silently having none is not.
+        //
+        // The fallback is NOT taken for every `NoStableId`, which is where this
+        // first landed. `volume_id_fallback` now refuses any source that is
+        // named at mount time — `/dev/loopN`, `/dev/sdb1`, `tmpfs` — because an
+        // id derived from one changes under the next remount and nothing
+        // downstream reads the `src:` label to notice. A loop-backed archive
+        // disk enrolled as `src:ext4:/dev/loop3` and reattached as `/dev/loop7`
+        // has every reconstructed `fs_id` stop matching its catalog row, and
+        // the identity locks that serialize upload and destruction stop
+        // colliding — two operations on one file, each believing it holds it
+        // alone. A NULL identity is a degradation the callers already handle;
+        // a wrong one is a lie they cannot detect.
+        //
+        // A root that reaches NULL is warned about rather than refused. Refusal
+        // would be the tidier rule and it is not one this can afford: every
+        // non-Linux build has no `volume_id` at all until Phase 3, and a
+        // container on overlayfs has no UUID and no stable source either, so
+        // refusing would make enrollment fail on platforms and deployments
+        // where nothing is wrong beyond the identity being weak. The operator
+        // is told what they lose instead.
         let volume = match shepherd_catalog::volume::volume_id(&path) {
             Ok(id) => Some(id),
             Err(shepherd_catalog::volume::VolumeError::NoStableId { .. }) => {
@@ -369,6 +389,18 @@ impl ShepherdApi for Session {
         };
 
         let mut warnings = Vec::new();
+
+        if volume.is_none() {
+            warnings.push(format!(
+                "no stable volume identity is available for `{}`: it has no filesystem UUID \
+                 and its mount source is assigned at mount time rather than naming the volume. \
+                 Files under this root get no `fs_id`, so they are tracked by path alone — a \
+                 rename cannot be told from a delete-plus-create, and the identity locks that \
+                 keep an upload and a destruction off the same file do not engage. Put the \
+                 archive on a UUID-backed filesystem or an NFS/CIFS export if that matters.",
+                req.path
+            ));
+        }
 
         // A root nested under an existing one, or containing one.
         //
@@ -814,9 +846,15 @@ impl ShepherdApi for Session {
         // the pump thread; this arm exists because the trait requires it and
         // because a `subscribe` arriving outside a connection context (a future
         // in-process caller) still needs a correct answer.
-        let (result, _replay, _rx, _overflowed) =
-            self.hub().subscribe(req.streams, req.resume_from, None);
-        Ok(result)
+        //
+        // The receiver AND the guard both drop with this statement, which
+        // unregisters the subscription before the reply is even encoded. That
+        // is the honest outcome: nothing here can deliver a frame, so the id in
+        // the reply names a subscription that is already over. A caller that
+        // wants live delivery has to hold the `Subscription` — which is why the
+        // guard is on it rather than being something the hub tracks itself.
+        let sub = self.hub().subscribe(req.streams, req.resume_from, None);
+        Ok(sub.result)
     }
 
     // --- search -----------------------------------------------------------

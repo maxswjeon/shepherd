@@ -229,6 +229,23 @@ mod linux {
     }
 
     /// The weaker, explicitly-labelled identity for volumes with no UUID.
+    ///
+    /// Weaker, not arbitrary: it is offered only for sources that name the
+    /// volume itself rather than the slot it was plugged into. An NFS export
+    /// `server:/vol` and a CIFS share `//server/share` reach the same
+    /// filesystem after a remount, a reboot, or from another client, which is
+    /// the property §4.4 actually asks of a volume id.
+    ///
+    /// `/dev/loop3`, `/dev/sdb1` and `tmpfs` do not have it, and minting an id
+    /// from one is worse than having none. A loop-backed or removable
+    /// filesystem that momentarily has no `/dev/disk/by-uuid` entry would be
+    /// enrolled as `src:ext4:/dev/loop3`; reattached under another device node
+    /// it becomes `src:ext4:/dev/loop7`, every reconstructed `fs_id` stops
+    /// matching the catalog rows for the same files, and the identity-based
+    /// serialization that upload and destruction lock on silently stops
+    /// colliding — two operations on one file each believing they hold it
+    /// alone. A NULL volume id is a degradation the callers already handle; a
+    /// wrong one is a lie they cannot detect.
     pub fn volume_id_fallback(path: &Path) -> Result<String> {
         let canonical = path.canonicalize().map_err(|e| VolumeError::Stat {
             path: path.display().to_string(),
@@ -247,7 +264,58 @@ mod linux {
                 detail: "no mountinfo entry covers this path".into(),
             }
         })?;
+        if !source_is_remount_stable(&entry.source) {
+            return Err(VolumeError::NoStableId {
+                path: path.display().to_string(),
+                detail: format!(
+                    "mount source `{}` (fstype {}) is assigned at mount time, not carried by \
+                     the volume, so `src:{}:{}` would change under this root the next time it \
+                     is mounted; refusing to mint an identity that silently stops matching \
+                     the catalog",
+                    entry.source, entry.fs_type, entry.fs_type, entry.source
+                ),
+            });
+        }
         Ok(format!("src:{}:{}", entry.fs_type, entry.source))
+    }
+
+    /// Does this mount source name the volume, or the slot it is in?
+    ///
+    /// Two shapes name the volume: `//server/share` (CIFS/SMB) and
+    /// `host:/export` (NFS, and `user@host:/path` for fuse.sshfs). Both encode
+    /// where the data lives, so the same string reaches the same filesystem
+    /// after any remount.
+    ///
+    /// Everything else is refused, and the refusal is deliberately the default
+    /// rather than a device-path blocklist: an unrecognised source is one whose
+    /// stability nobody here has reasoned about, and the safe answer for those
+    /// is the NULL identity callers already degrade to. That covers device
+    /// nodes (`/dev/loop3`), bind sources, and the pseudo-sources of virtual
+    /// filesystems — `tmpfs` and `overlay` are not merely unstable but
+    /// *ambiguous*, since every tmpfs mount on the box reports the same source
+    /// and would be handed the same volume id, colliding `fs_id` across
+    /// genuinely different filesystems.
+    pub(crate) fn source_is_remount_stable(source: &str) -> bool {
+        if let Some(rest) = source.strip_prefix("//") {
+            // `//server/share`: both halves must be there. `//server` alone
+            // names a host and no filesystem on it.
+            return match rest.split_once('/') {
+                Some((host, share)) => !host.is_empty() && !share.is_empty(),
+                None => false,
+            };
+        }
+        if source.starts_with('/') {
+            // An absolute path is a device node or a bind source; both are
+            // named by where they were attached this time.
+            return false;
+        }
+        // `host:/export`. The export half must be absolute — `tmpfs` and
+        // friends have no colon at all, and a colon with a relative tail is
+        // not a mount source shape this understands.
+        match source.split_once(':') {
+            Some((host, export)) => !host.is_empty() && export.starts_with('/'),
+            None => false,
+        }
     }
 
     /// Resolve a block device to its filesystem UUID via `/dev/disk/by-uuid`,
@@ -341,13 +409,14 @@ mod remount_tests {
         );
 
         // The UUID is what makes that true, so assert the identity is actually
-        // UUID-derived. Without this the test would also pass for the
-        // `src:<fstype>:<source>` fallback, whose source is `/dev/loopN` and
-        // therefore does NOT survive the remount below.
+        // UUID-derived. Without this the test would pass on a weaker identity
+        // it never meant to bless — and for a loop device there is now no
+        // weaker identity at all, because the fallback refuses `/dev/loopN`
+        // outright (see `the_fallback_refuses_a_device_path_source`).
         assert!(
             vol_a.starts_with("uuid:"),
-            "expected a UUID-derived volume id, got {vol_a:?} — the fallback is \
-             device-path-derived and is not remount-stable"
+            "expected a UUID-derived volume id, got {vol_a:?} — for a loop \
+             device there is no second option, so this fixture is broken"
         );
 
         let dev_before = std::fs::metadata(&file_a).expect("stat before").dev();
@@ -392,34 +461,65 @@ mod remount_tests {
         );
     }
 
-    /// The negative that gives the assertion above its meaning: the documented
-    /// fallback identity is NOT remount-stable, so a caller may not treat it as
-    /// interchangeable with the UUID-derived one.
+    /// The negative that gives the assertion above its meaning: the fallback
+    /// REFUSES a device-path source, because an id derived from one would
+    /// change under the very remount `fs_id` exists to survive.
     ///
-    /// Without this, `volume_id_fallback` reads like a harmless second option.
-    /// It is not: its source is `/dev/loopN`, which is exactly the mount-time
-    /// assignment §4.4 forbids relying on.
+    /// This test used to assert the opposite — that the fallback returned two
+    /// DIFFERENT ids across the remount — and called that acceptable because
+    /// the id was labelled `src:`. It is not acceptable: nothing consuming the
+    /// column branches on the label, so the loop-backed root was enrolled as
+    /// `src:ext4:/dev/loopN`, came back as `/dev/loopM`, and every
+    /// reconstructed `fs_id` quietly stopped matching its catalog row. The
+    /// label documented the hazard instead of preventing it.
+    ///
+    /// So the property is now the refusal, and the old assertion survives as
+    /// its justification: the two ids the fallback WOULD have minted are shown
+    /// to differ, which is exactly why neither is offered.
     #[test]
     #[ignore = "needs root: builds a loopback ext4 filesystem and mounts it"]
-    fn the_fallback_identity_is_explicitly_not_remount_stable() {
+    fn the_fallback_refuses_a_device_path_source() {
         let fixture = Fixture::new();
         let a = fixture.mount("a");
         std::fs::write(a.join(FILE), b"payload").expect("write into the fresh fs");
-        let before = volume_id_fallback(&a.join(FILE)).expect("fallback before");
+        let dev_before = mount_source(&a.join(FILE));
+        let refused = volume_id_fallback(&a.join(FILE));
 
         fixture.unmount_all();
         fixture.reattach_on_a_different_loop_device();
         let c = fixture.mount("c");
-        let after = volume_id_fallback(&c.join(FILE)).expect("fallback after");
+        let dev_after = mount_source(&c.join(FILE));
 
+        // THE PRECONDITION. If the reattachment reused the device node, this
+        // run says nothing about instability and the refusal below would be
+        // asserting an unrelated thing.
         assert_ne!(
-            before, after,
-            "the fallback is device-path-derived; if it ever became stable the \
-             comment calling it WEAKER is what is now wrong"
+            dev_before, dev_after,
+            "the reattachment reused {dev_before}, so the SIMULATION failed — \
+             this run proves nothing about device-path instability"
         );
-        // And it is labelled, so a human reading the column can tell which kind
-        // of identity a row holds.
-        assert!(before.starts_with("src:"), "unlabelled fallback: {before}");
+
+        let Err(VolumeError::NoStableId { detail, .. }) = refused else {
+            panic!(
+                "the fallback minted an identity from {dev_before}, which the \
+                 assertion above just showed becomes {dev_after}: got {refused:?}"
+            );
+        };
+        assert!(
+            detail.contains(&dev_before),
+            "the refusal must name the source it refused, got {detail:?}"
+        );
+    }
+
+    /// The mount source `/proc/self/mountinfo` reports for a path.
+    fn mount_source(path: &Path) -> String {
+        let canonical = path.canonicalize().expect("canonicalize");
+        let text = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        let entries = super::linux::parse_mountinfo(&text);
+        super::linux::entry_for(&entries, &canonical.to_string_lossy())
+            .expect("a mountinfo entry covers the fixture")
+            .source
+            .clone()
     }
 
     const FILE: &str = "payload.bin";
@@ -591,6 +691,53 @@ mod remount_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::linux::*;
+
+    /// Which mount sources may back a `src:` volume id.
+    ///
+    /// The accept list is the point: an id minted from a mount-time name
+    /// changes under a remount, and nothing downstream branches on the `src:`
+    /// label to notice. Two of the reject cases are the ones that bite —
+    /// `/dev/loopN` for a loop-backed archive disk, and `tmpfs`, whose source
+    /// is not merely unstable but shared by every tmpfs on the box, so two
+    /// unrelated filesystems would be handed one identity.
+    #[test]
+    fn only_sources_that_name_the_volume_may_back_an_identity() {
+        for stable in [
+            "nas:/export/photos",
+            "10.0.0.4:/vol0",
+            "//nas/share",
+            "//nas/deep/share",
+            "user@host:/srv/media",
+        ] {
+            assert!(
+                source_is_remount_stable(stable),
+                "{stable} names the volume itself and must be usable"
+            );
+        }
+        for unstable in [
+            "/dev/loop3",
+            "/dev/sdb1",
+            "/dev/mapper/vg-lv",
+            "/srv/bind-source",
+            "tmpfs",
+            "overlay",
+            "none",
+            "cgroup2",
+            "//nas",
+            "//nas/",
+            "//",
+            "host:relative/path",
+            "host:",
+            ":/export",
+            "",
+        ] {
+            assert!(
+                !source_is_remount_stable(unstable),
+                "{unstable} is assigned at mount time (or shared between mounts) \
+                 and must not back a volume id"
+            );
+        }
+    }
 
     /// A mount point with a non-ASCII character survives mountinfo decoding.
     ///

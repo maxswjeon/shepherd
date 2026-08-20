@@ -358,7 +358,7 @@ pub fn walk(
             if !md.is_file() && !md.is_symlink() {
                 continue; // sockets, fifos, devices
             }
-            if let Some(reason) = deny.deny_file(&name) {
+            if let Some(reason) = deny.deny_file(&name, &path) {
                 out.skipped.push(Skip::Denied { path, reason });
                 continue;
             }

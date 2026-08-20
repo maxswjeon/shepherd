@@ -221,7 +221,7 @@ impl Pool {
     pub fn shutdown(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         for t in self.threads.drain(..) {
-            let _ = t.join();
+            join_worker(t);
         }
     }
 }
@@ -230,8 +230,22 @@ impl Drop for Pool {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         for t in self.threads.drain(..) {
-            let _ = t.join();
+            join_worker(t);
         }
+    }
+}
+
+/// Join a worker, reporting rather than swallowing a panic.
+///
+/// `let _ = t.join()` discarded the one signal that a worker died of something
+/// `run_one` does not catch, which is how a pool could shrink to nothing while
+/// the daemon still reported itself live.
+fn join_worker(t: std::thread::JoinHandle<()>) {
+    if let Err(panic) = t.join() {
+        tracing::error!(
+            detail = panic_text(&*panic),
+            "a worker thread panicked; the pool is one worker smaller until the daemon restarts"
+        );
     }
 }
 
@@ -285,7 +299,29 @@ pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, Writ
         job: job.clone(),
         writer: writer.clone(),
     };
-    let outcome = executor.run(&ctx);
+
+    // An executor is arbitrary code, and a panic in one used to unwind straight
+    // past both `complete` and `fail`. The row it had just claimed stayed
+    // `running` until the whole daemon restarted and `recover` ran, and the
+    // pool silently lost that worker, because both join sites discard the
+    // panic result. A handful of input-triggered panics could therefore strand
+    // jobs and drain the pool while the daemon went on reporting itself live.
+    //
+    // Caught at this boundary specifically: it is the only place that still has
+    // the claimed job in hand, so the panic can be routed through the SAME
+    // failure policy an `Err` takes. A panicking executor then retries under
+    // the queue's own budget and gives up terminally like anything else,
+    // instead of leaving a row nothing will touch again.
+    //
+    // `AssertUnwindSafe` because the two things reachable across the boundary
+    // are the job (a snapshot this function owns) and the writer handle (an
+    // actor with no observable interior state of its own). Nothing here is a
+    // half-updated structure a later read could see.
+    let outcome =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run(&ctx))) {
+            Ok(outcome) => outcome,
+            Err(panic) => Err(format!("executor panicked: {}", panic_text(&*panic))),
+        };
 
     match outcome {
         Ok(()) => {
@@ -305,6 +341,26 @@ pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, Writ
         }
     }
     Ok(true)
+}
+
+/// The message a panic carried, for the failure the queue records.
+///
+/// `panic!("...")` payloads are `String` and `&'static str`; anything else was
+/// raised with `panic_any` and has no text we can render. The row still records
+/// that the executor panicked — losing the detail is better than losing the
+/// failure.
+///
+/// Call it as `panic_text(&*payload)`, never `panic_text(&payload)`: the second
+/// unsizes the `Box` itself into the `dyn Any`, every downcast misses, and the
+/// message silently becomes `(no message)`.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = panic.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s
+    } else {
+        "(no message)"
+    }
 }
 
 /// Resolve crash-interrupted jobs. Call before starting the pool.
@@ -402,6 +458,68 @@ mod tests {
         let scan = depth.iter().find(|d| d.class == "scan").unwrap();
         assert_eq!((scan.pending, scan.running, scan.failed), (0, 0, 0));
         assert!(!run_one(&w, &registry).unwrap(), "queue is drained");
+    }
+
+    /// A panicking executor must leave the job the queue's problem, not a
+    /// permanently `running` row.
+    ///
+    /// The unwind used to pass straight through `run_one` and out of the worker
+    /// thread: the claimed row stayed `running` until the daemon restarted and
+    /// `recover` ran, and the pool lost a worker that no join site reported. A
+    /// few input-triggered panics could drain the pool while the daemon still
+    /// looked healthy.
+    ///
+    /// Asserted through `depth`, not through a mock: `running == 0` is the
+    /// literal shape of the harm, and it is only reachable if the panic went
+    /// through the same `fail` path an `Err` takes.
+    #[test]
+    fn a_panicking_executor_does_not_strand_its_job() {
+        let actor = actor_in_memory();
+        let w = actor.handle();
+        let registry = Arc::new(
+            Registry::new().with(JobClass::Scan, |_: &JobContext| -> Result<(), String> {
+                panic!("executor blew up on its input")
+            }),
+        );
+
+        let id = w
+            .try_with(|cat| Queue::enqueue(cat, JobClass::Scan, 0, "{}", now()))
+            .unwrap();
+
+        // The panic is expected, so its backtrace is not a test failure to
+        // print. Silenced only around the call that provokes it.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let ran = run_one(&w, &registry);
+        std::panic::set_hook(hook);
+
+        assert!(
+            ran.unwrap(),
+            "the job was claimed and dealt with, so this round did work"
+        );
+
+        let depth = w.try_with(|cat| Queue::depth(cat)).unwrap();
+        let scan = depth.iter().find(|d| d.class == "scan").unwrap();
+        assert_eq!(
+            scan.running, 0,
+            "a panicking executor left its row `running`; nothing will touch it \
+             again until the whole daemon restarts"
+        );
+        assert_eq!(
+            scan.pending, 1,
+            "the panic must go through the retry policy like any other failure"
+        );
+
+        // And the message is recorded, so an operator reading the row learns it
+        // was a panic rather than a returned error.
+        let job = w
+            .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(id))
+            .unwrap();
+        let last = job.and_then(|j| j.last_error).unwrap_or_default();
+        assert!(
+            last.contains("executor panicked") && last.contains("blew up on its input"),
+            "the recorded failure must name the panic and carry its message, got {last:?}"
+        );
     }
 
     /// A class nobody can execute must cost it **nothing**.

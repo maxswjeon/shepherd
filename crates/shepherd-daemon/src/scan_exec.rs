@@ -170,9 +170,16 @@ impl Executor for ScanExecutor {
         // Case folding follows the ROOT's probed policy: on a case-insensitive
         // volume `.GIT` is the same directory as `.git`, and a deny-list entry
         // that can be evaded by pressing shift is not a safety policy.
+        //
+        // The socket's lock file is denied alongside it. `SHEPHERD_SOCKET` can
+        // name a directory outside the state directory and inside a scan root
+        // — the e2e suite runs exactly that arrangement — and unlike the socket
+        // node, which the walk skips because it is not a regular file,
+        // `<socket>.lock` is an ordinary file the daemon created for itself.
         let deny = DenyList::builtin()
             .case_insensitive(root.case_policy == PathCasePolicy::Insensitive)
-            .with_extra_path(state_dir);
+            .with_extra_path(state_dir)
+            .with_extra_path(&crate::server::socket_lock_path(&self.daemon.paths.socket));
         let ignores = IgnoreSet::new(&path, &patterns)
             .map_err(|e| format!("root {root_id} has an unusable ignore pattern: {e}"))?;
 

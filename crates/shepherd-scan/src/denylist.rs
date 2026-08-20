@@ -292,8 +292,23 @@ impl DenyList {
         None
     }
 
-    /// Whether this file is denied on its own name.
-    pub fn deny_file(&self, name: &str) -> Option<DenyReason> {
+    /// Whether this file is denied, on its extension or on its path.
+    ///
+    /// The path half is why this takes `abs` as well as `name`. A path added
+    /// with [`Self::with_extra_path`] used to be consulted only by
+    /// [`Self::deny_dir`], so a denied path that names a FILE rather than a
+    /// directory was not denied at all — and the daemon's socket lock is
+    /// exactly that: one ordinary file, in a directory that can sit inside a
+    /// scan root, which the daemon created for itself.
+    pub fn deny_file(&self, name: &str, abs: &Path) -> Option<DenyReason> {
+        let norm = abs.to_string_lossy().replace('\\', "/");
+        if self
+            .extra_paths
+            .iter()
+            .any(|prefix| path_has_prefix(&norm, prefix))
+        {
+            return Some(DenyReason::ShepherdInternal);
+        }
         let ext = name.rfind('.').filter(|&i| i > 0).map(|i| &name[i + 1..]);
         let ext = ext?.to_ascii_lowercase();
         self.file_exts
@@ -539,17 +554,23 @@ mod tests {
     #[test]
     fn vm_images_are_denied_by_extension_case_insensitively() {
         let d = DenyList::builtin();
-        assert_eq!(d.deny_file("disk.vmdk"), Some(DenyReason::VmImage));
-        assert_eq!(d.deny_file("Disk.QCOW2"), Some(DenyReason::VmImage));
-        assert_eq!(d.deny_file("notes.txt"), None);
+        assert_eq!(
+            d.deny_file("disk.vmdk", Path::new("/srv/disk.vmdk")),
+            Some(DenyReason::VmImage)
+        );
+        assert_eq!(
+            d.deny_file("Disk.QCOW2", Path::new("/srv/Disk.QCOW2")),
+            Some(DenyReason::VmImage)
+        );
+        assert_eq!(d.deny_file("notes.txt", Path::new("/srv/notes.txt")), None);
         // A dotfile has no extension, so it cannot be denied by one.
-        assert_eq!(d.deny_file(".vmdk"), None);
+        assert_eq!(d.deny_file(".vmdk", Path::new("/srv/.vmdk")), None);
     }
 
     #[test]
     fn an_empty_list_denies_nothing() {
         let d = DenyList::empty();
         assert_eq!(d.deny_dir(".git", &p("/home/u/.git")), None);
-        assert_eq!(d.deny_file("disk.vmdk"), None);
+        assert_eq!(d.deny_file("disk.vmdk", Path::new("/srv/disk.vmdk")), None);
     }
 }

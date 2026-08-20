@@ -206,8 +206,72 @@ fn the_preview_records_the_signal_that_actually_drove_each_match() {
     assert!(!p.matches.is_empty());
     assert_ne!(
         p.matches[0].signal,
-        AccessSignalSource::Atime,
+        Some(AccessSignalSource::Atime),
         "under relatime the signal must not claim to be atime"
+    );
+}
+
+/// A match no timestamp authorized records NO signal — the `None` has to
+/// survive the trip into the stored preview.
+///
+/// This is the finding's own scenario. `any: [{ext}, {mtime_older_than_days}]`
+/// is satisfied by the extension alone for a file whose mtime is fresh, so the
+/// matcher correctly reports no age signal — and the engine then wrote
+/// `.unwrap_or(AccessSignalSource::Mtime)`, so the dry run a user reads, and
+/// the record `may_enable` compares against, both claimed mtime drove a match
+/// mtime had nothing to do with.
+///
+/// Written as a value assertion rather than a type check because the type
+/// check `PreviewedMatch::signal: Option<_>` is satisfied by an engine that
+/// re-introduces the `unwrap_or`. This is not: `new.raw` is 5 days old against
+/// a 365-day predicate, so the ONLY way it appears in the preview is the
+/// extension branch, and the only honest signal for it is `None`.
+#[test]
+fn a_match_no_timestamp_authorized_records_no_signal() {
+    let mut b = tiering();
+    b.match_json = serde_json::json!({
+        "any": [{ "ext": ["raw"] }, { "mtime_older_than_days": 365 }]
+    });
+    let e = Engine::new(&b, AtimeMode::Reliable);
+    let p = e.preview(&corpus(), now()).expect("preview");
+
+    let fresh = p
+        .matches
+        .iter()
+        .find(|m| m.file == FileId::new(2))
+        .expect("`Photos/new.raw` matches through the extension branch");
+    assert_eq!(
+        fresh.signal, None,
+        "nothing about a timestamp selected this file — it is 5 days old \
+         against a 365-day predicate — so the preview must say so rather than \
+         inventing mtime"
+    );
+
+    // The accepting direction, so "always None" cannot pass. A rule whose age
+    // predicate is REQUIRED — the implicit AND of `{ext, older_than_days}` —
+    // still names the timestamp that selected the file.
+    //
+    // A separate rule rather than the other file under the same one: `old.raw`
+    // satisfies the `any` above through its extension too, so what it records
+    // is a fact about which branch the matcher happened to try first, and
+    // pinning that here would test evaluation order instead of provenance.
+    let required_body = tiering();
+    let required = Engine::new(&required_body, AtimeMode::Reliable);
+    let p = required.preview(&corpus(), now()).expect("preview");
+    let aged = p
+        .matches
+        .iter()
+        .find(|m| m.file == FileId::new(1))
+        .expect("`Photos/old.raw` is old enough and has the right extension");
+    // `Observed`, not `Mtime`: the corpus carries a Shepherd-recorded access
+    // time and the mode is `Reliable`, so that is the signal the age predicate
+    // actually resolved against. Which variant is not the point here — that a
+    // required age predicate records the one it used is.
+    assert_eq!(
+        aged.signal,
+        Some(AccessSignalSource::Observed),
+        "a match the age predicate had to authorize must name the timestamp \
+         that did it"
     );
 }
 
@@ -274,7 +338,7 @@ fn a_file_that_appeared_after_the_preview_is_not_acted_on() {
                 drift.added,
                 vec![PreviewedMatch {
                     file: FileId::new(4),
-                    signal: AccessSignalSource::Observed,
+                    signal: Some(AccessSignalSource::Observed),
                 }],
                 "the operator never saw file 4"
             );
@@ -305,7 +369,7 @@ fn a_previewed_file_that_vanished_refuses_rather_than_quietly_shrinking() {
                 drift.removed,
                 vec![PreviewedMatch {
                     file: FileId::new(1),
-                    signal: AccessSignalSource::Observed,
+                    signal: Some(AccessSignalSource::Observed),
                 }]
             );
             assert!(
@@ -350,7 +414,7 @@ fn a_match_driven_by_a_different_signal_is_not_the_match_that_was_approved() {
     let previewed = e.preview(&observed, now()).expect("preview");
     assert_eq!(
         previewed.matches[0].signal,
-        AccessSignalSource::Observed,
+        Some(AccessSignalSource::Observed),
         "precondition: the dry run rested on the Shepherd-owned signal"
     );
 
@@ -361,9 +425,12 @@ fn a_match_driven_by_a_different_signal_is_not_the_match_that_was_approved() {
             assert_eq!(drift.changed.len(), 1, "{drift:?}");
             assert_eq!(
                 drift.changed[0].previewed.signal,
-                AccessSignalSource::Observed
+                Some(AccessSignalSource::Observed)
             );
-            assert_eq!(drift.changed[0].current.signal, AccessSignalSource::Atime);
+            assert_eq!(
+                drift.changed[0].current.signal,
+                Some(AccessSignalSource::Atime)
+            );
         }
         other => panic!("a match on a different signal is a different match, got {other:?}"),
     }
@@ -388,7 +455,7 @@ fn a_ctime_rule_previews_as_ctime_and_a_preview_labelled_mtime_refuses() {
     let previewed = e.preview(&c, now()).expect("preview");
     assert_eq!(
         previewed.matches[0].signal,
-        AccessSignalSource::Ctime,
+        Some(AccessSignalSource::Ctime),
         "the driving signal is the one the matcher read"
     );
 
@@ -401,15 +468,21 @@ fn a_ctime_rule_previews_as_ctime_and_a_preview_labelled_mtime_refuses() {
     let stale = PreviewRecord {
         matches: vec![PreviewedMatch {
             file: FileId::new(1),
-            signal: AccessSignalSource::Mtime,
+            signal: Some(AccessSignalSource::Mtime),
         }],
         ..previewed.clone()
     };
     match e.run(&c, RunMode::Execute, Some(&stale), now()) {
         Err(EngineRefusal::PreviewDrifted { drift }) => {
             assert_eq!(drift.changed.len(), 1, "{drift:?}");
-            assert_eq!(drift.changed[0].previewed.signal, AccessSignalSource::Mtime);
-            assert_eq!(drift.changed[0].current.signal, AccessSignalSource::Ctime);
+            assert_eq!(
+                drift.changed[0].previewed.signal,
+                Some(AccessSignalSource::Mtime)
+            );
+            assert_eq!(
+                drift.changed[0].current.signal,
+                Some(AccessSignalSource::Ctime)
+            );
         }
         other => panic!("a pre-upgrade `Mtime` label must refuse, not act, got {other:?}"),
     }

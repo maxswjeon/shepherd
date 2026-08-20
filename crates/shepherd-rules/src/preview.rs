@@ -142,9 +142,21 @@ pub fn preview_hash(body: &RuleBody) -> Blake3Hash {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewedMatch {
     pub file: FileId,
-    /// Not optional: AC-14 requires the preview to state which signal drove
-    /// each match, so a preview that omits it is not representable.
-    pub signal: AccessSignalSource,
+    /// Which signal drove this match, or `None` when **no timestamp did**.
+    ///
+    /// AC-14 requires the preview to state what drove each match, and this was
+    /// read as "a signal is always nameable" — so a match selected by
+    /// extension, or by a negated age predicate, had `Mtime` substituted. That
+    /// is not a preview stating what drove the match; it is a preview stating
+    /// something false, and `Engine::run` refuses on a preview/run signal
+    /// difference, so the label has to be true for the refusal to mean
+    /// anything.
+    ///
+    /// "Nothing about a timestamp selected this file" IS the statement AC-14
+    /// wants for those matches, and `None` is how the type makes it. The field
+    /// is still mandatory — a preview cannot omit the question, only answer it
+    /// with an absence.
+    pub signal: Option<AccessSignalSource>,
 }
 
 /// A stored dry-run (`rule.last_preview_at` / `last_preview_hash`).

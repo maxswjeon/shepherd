@@ -20,7 +20,7 @@ fn preview_of(b: &RuleBody) -> PreviewRecord {
         previewed_at: Timestamp::from_nanos(1),
         matches: vec![PreviewedMatch {
             file: FileId::new(7),
-            signal: AccessSignalSource::Observed,
+            signal: Some(AccessSignalSource::Observed),
         }],
     }
 }
@@ -217,11 +217,13 @@ fn both_refusals_are_reported_together() {
 
 #[test]
 fn a_preview_records_the_signal_that_drove_every_match() {
-    // Structural rather than checked: `PreviewedMatch::signal` is not optional,
+    // Structural rather than checked: `PreviewedMatch::signal` is mandatory,
     // so a preview that omits provenance cannot be constructed.
     let p = preview_of(&body());
     assert!(!p.matches.is_empty());
     for m in &p.matches {
-        let _: AccessSignalSource = m.signal;
+        // The FIELD is mandatory; its value may be `None`, which is the
+        // statement "no timestamp drove this match" rather than an omission.
+        let _: Option<AccessSignalSource> = m.signal;
     }
 }

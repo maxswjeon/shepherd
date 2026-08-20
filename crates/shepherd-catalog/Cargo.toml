@@ -10,6 +10,17 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# The intent-fabrication escape hatch, off by default.
+#
+# `PreparedIntent` exists so that "an intent was durably prepared before
+# anything irreversible" is a precondition the destroy path cannot be handed
+# without. A public constructor that mints one from an arbitrary `IntentId`
+# gives that back to every dependent — `#[doc(hidden)]` hides documentation and
+# enforces nothing — so the constructor is behind this feature and the shipping
+# API does not have it. Enabled in `shepherd-tier`'s dev-dependencies only.
+test-util = []
+
 [dependencies]
 shepherd-core.workspace = true
 rusqlite = { workspace = true }

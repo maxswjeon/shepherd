@@ -46,7 +46,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 shepherd-rules = { workspace = true }
-shepherd-catalog = { workspace = true }
+# `test-util` for `PreparedIntent::fabricated_for_tests`. A dev-dependency
+# feature, so the shipping build of this crate cannot reach it — see the
+# feature's own note in `shepherd-catalog`.
+shepherd-catalog = { workspace = true, features = ["test-util"] }
 shepherd-scan = { workspace = true }
 blake3 = { workspace = true }
 serde_json = { workspace = true }

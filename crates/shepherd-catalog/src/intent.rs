@@ -300,14 +300,19 @@ impl PreparedIntent {
         self.0
     }
 
-    /// Mint one WITHOUT a journal. Tests only, and it is `#[cfg(test)]`-free on
-    /// purpose so integration tests in other crates can reach it — the name is
-    /// the guard.
+    /// Mint one WITHOUT a journal. **Behind the `test-util` feature**, which is
+    /// off by default, so no production dependent can reach it.
     ///
-    /// Every use of this is a test that is not exercising the journal, which is
-    /// exactly what the finding behind [`PreparedIntent`] objected to. Prefer
-    /// `IntentJournal::prepare` wherever a `Catalog` is at hand.
-    #[doc(hidden)]
+    /// The name was the only guard before, and a name enforces nothing: this
+    /// was a public method on a shipping API that hands the destroy path a
+    /// token no `prepared` row backs, which is the crash window
+    /// [`PreparedIntent`] exists to close. `#[doc(hidden)]` hides the
+    /// documentation and not the function.
+    ///
+    /// Every use of this is a test that is NOT exercising the journal. Prefer
+    /// [`IntentJournal::prepare`] wherever a `Catalog` is at hand — `ac6_recovery`
+    /// does, and the destroy path is the better tested for it.
+    #[cfg(feature = "test-util")]
     pub fn fabricated_for_tests(id: IntentId) -> Self {
         Self(id)
     }

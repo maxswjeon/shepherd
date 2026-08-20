@@ -280,9 +280,15 @@ impl<'a> Engine<'a> {
             // is legitimately `Mtime` even for an `atime_older_than_days`
             // predicate. The preview must print what drove the match, not what
             // the rule asked for — that difference is the point of the field.
+            //
+            // Carried through as-is, `None` included. `unwrap_or(Mtime)` here
+            // undid the matcher's own correction one line after it was made: a
+            // match selected by extension or by a negated age predicate has no
+            // driving timestamp, and naming one is the mislabel this field
+            // exists to prevent.
             matches.push(PreviewedMatch {
                 file: c.file,
-                signal: out.age_signal.unwrap_or(AccessSignalSource::Mtime),
+                signal: out.age_signal,
             });
             if mode == RunMode::Execute {
                 actions.push(PlannedAction {

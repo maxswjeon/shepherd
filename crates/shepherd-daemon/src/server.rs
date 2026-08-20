@@ -123,6 +123,17 @@ fn describe_file_type(ft: std::fs::FileType) -> &'static str {
     }
 }
 
+/// The lock file that guards one socket: `daemon.sock` -> `daemon.sock.lock`.
+///
+/// Public because two places must agree on it — [`bind`], which holds it, and
+/// the scan executor, which denies it by path so the daemon does not catalogue
+/// its own runtime file when `SHEPHERD_SOCKET` points inside a scan root.
+pub fn socket_lock_path(socket: &Path) -> std::path::PathBuf {
+    let mut p = socket.as_os_str().to_os_string();
+    p.push(".lock");
+    std::path::PathBuf::from(p)
+}
+
 /// Bind the listener, creating the directory and clearing a stale socket.
 ///
 /// Three things that each cause a confusing failure if skipped:
@@ -167,16 +178,55 @@ pub fn bind(path: &Path, lock_path: &Path) -> Result<Bound, ServerError> {
     // sequence as one critical section, and a second daemon is refused at
     // startup rather than after it has begun writing.
     //
-    // In the STATE directory, which the caller names, and not beside the socket.
-    // Two reasons, and the second is the one that decided it:
+    // TWO locks, because there are two resources and one lock cannot key both.
     //
-    // * the deeper harm is two daemons on one CATALOG and one job queue, and
-    //   the state directory is what that is; the socket is only how the loser
-    //   is noticed;
-    // * a lock file beside the socket is an ordinary file in whatever directory
-    //   `SHEPHERD_SOCKET` points at, which can be inside a scan root — and then
-    //   the daemon catalogues its own lock. The state directory is already
-    //   refused as a root and excluded from every walk.
+    // The state lock (below) is keyed by the caller's state directory and
+    // protects the catalog and the job queue — the deeper harm, and the one
+    // that outlives the socket. But two daemons started with DIFFERENT
+    // `SHEPHERD_STATE_DIR` values can still resolve to the SAME socket through
+    // one `XDG_RUNTIME_DIR`, and they then take different state locks and race
+    // over the socket exactly as before: both find the stale node, both fail to
+    // connect, and the second unlinks the listener the first just bound.
+    //
+    // So the socket is locked too, by a file named for the socket itself:
+    // `daemon.sock` is guarded by `daemon.sock.lock` beside it. Every process
+    // resolving to that socket path resolves to that lock path, whatever state
+    // directory it was started with, which is exactly the set that must not
+    // overlap.
+    //
+    // Keyed by the socket PATH, not by its directory. The directory was the
+    // first shape of this and it is too coarse: `$XDG_RUNTIME_DIR/shepherd/`
+    // holding both a system socket and a second instance's is a legitimate
+    // arrangement, and a directory-granular lock refuses the second for a
+    // conflict that does not exist. It also put an `flock` on a directory
+    // descriptor, which is odd enough territory that it produced an
+    // intermittent failure in this crate's own tests.
+    //
+    // The cost is one small file in whatever directory `SHEPHERD_SOCKET` names,
+    // and that directory can sit inside a scan root — the socket itself is
+    // invisible to the walk only because it is not a regular file, and this
+    // is. So it is denied by path where the state directory already is, in
+    // `scan_exec`; see [`socket_lock_path`], which both sides name it through.
+    //
+    // Non-blocking on both locks, so the ordering cannot deadlock — a loser is
+    // refused rather than parked.
+    let socket_lock_path = socket_lock_path(path);
+    let socket_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&socket_lock_path)
+        .map_err(|e| err(format!("cannot open {}: {e}", socket_lock_path.display())))?;
+    let _ = std::fs::set_permissions(&socket_lock_path, std::fs::Permissions::from_mode(0o600));
+    socket_lock.try_lock().map_err(|e| {
+        err(format!(
+            "another shepherdd already holds the socket lock {} ({e}); two daemons on one \
+             socket would race over it",
+            socket_lock_path.display()
+        ))
+    })?;
+
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -225,6 +275,7 @@ pub fn bind(path: &Path, lock_path: &Path) -> Result<Bound, ServerError> {
     Ok(Bound {
         listener,
         _lock: lock,
+        _socket_lock: socket_lock,
     })
 }
 
@@ -237,7 +288,15 @@ pub fn bind(path: &Path, lock_path: &Path) -> Result<Bound, ServerError> {
 #[derive(Debug)]
 pub struct Bound {
     pub listener: UnixListener,
+    /// The state directory's lock: one daemon per catalog and job queue.
     _lock: std::fs::File,
+    /// The socket's own lock, `<socket>.lock`: one daemon per socket, whatever
+    /// state directory each was started with.
+    ///
+    /// Never unlinked, including on shutdown — removing a lock file while
+    /// another process may be about to open it is how a lock stops locking.
+    /// It is an empty file whose only content is the flock on it.
+    _socket_lock: std::fs::File,
 }
 
 /// Accept connections until `stop` is set.
@@ -305,6 +364,14 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
     };
 
     // --- requests ---------------------------------------------------------
+    //
+    // Held here, at connection scope, so that EVERY way out of the loop below
+    // ends this connection's subscriptions: EOF, an oversized frame, a write
+    // that fails, or an `Err` propagated by `?`. A client that hangs up while
+    // its streams are quiet is invisible to the hub — see
+    // [`subscribe_on_connection`] — and this is what makes it visible.
+    let mut guards: Vec<crate::events::SubscriptionGuard> = Vec::new();
+
     loop {
         let line = match read_frame(&mut reader)? {
             Frame::Line(l) => l,
@@ -324,7 +391,7 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
         // `None` means the frame is already on the socket. Only
         // `events.subscribe` answers that way, because only it has to write
         // more than one frame and has to write them in a fixed order.
-        if let Some(response) = serve_one(&line, &mut session, &writer) {
+        if let Some(response) = serve_one(&line, &mut session, &writer, &mut guards) {
             write_frame(&writer, &response)?;
         }
     }
@@ -472,6 +539,7 @@ fn serve_one(
     line: &str,
     session: &mut Session,
     writer: &Arc<std::sync::Mutex<UnixStream>>,
+    guards: &mut Vec<crate::events::SubscriptionGuard>,
 ) -> Option<RpcResponse> {
     let frame: RpcRequest = match serde_json::from_str(line) {
         Ok(f) => f,
@@ -518,7 +586,7 @@ fn serve_one(
     // the table is handed straight back to `dispatch` untouched.
     let call = match call {
         Method::EventsSubscribe(req) => {
-            return subscribe_on_connection(req, session, writer, id);
+            return subscribe_on_connection(req, session, writer, id, guards);
         }
         other => other,
     };
@@ -557,15 +625,33 @@ fn serve_one(
 /// The pump thread is spawned in step 1 parked on `go_rx` rather than spawned
 /// last, so a thread-spawn failure is still answerable: the client is told
 /// `Busy` instead of being told it is subscribed to a pump that does not exist.
-/// Dropping `go_tx` on any early return unparks it into a `RecvError`, it
-/// returns, `rx` drops, and the hub reaps the subscriber on its next publish.
+/// Dropping `go_tx` on any early return unparks it into a `RecvError` and it
+/// returns; the guard drops on the same path and takes the subscription with
+/// it.
+///
+/// # The guard belongs to the CONNECTION, not to the pump
+///
+/// `guards` is the connection's, and that is the whole point. Publishing only
+/// probes the senders of subscribers that want the stream being published, so
+/// a client subscribed to `target` alone was never touched by scan traffic: it
+/// could hang up and leave its pump parked on `recv` forever, holding a thread,
+/// a channel, a subscriber entry and a clone of the socket. Only the read side
+/// sees that hang-up, so only the read side can end the subscription — `handle`
+/// drops these when its loop ends, the channel closes, and the pump falls out.
 fn subscribe_on_connection(
     req: shepherd_proto::SubscribeRequest,
     session: &Session,
     writer: &Arc<std::sync::Mutex<UnixStream>>,
     id: RequestId,
+    guards: &mut Vec<crate::events::SubscriptionGuard>,
 ) -> Option<RpcResponse> {
-    let (result, replay, rx, overflowed) = session.daemon.events.subscribe(
+    let crate::events::Subscription {
+        result,
+        replay,
+        rx,
+        overflowed,
+        guard,
+    } = session.daemon.events.subscribe(
         req.streams,
         req.resume_from,
         // A cursor without the epoch it was issued under cannot be told from a
@@ -622,6 +708,9 @@ fn subscribe_on_connection(
             return None;
         }
     }
+    // Handed over only now. Every early return above drops it instead, which
+    // unregisters a subscription whose client will never hear about it.
+    guards.push(guard);
     let _ = go_tx.send(());
     None
 }
@@ -631,11 +720,13 @@ fn subscribe_on_connection(
 ///
 /// # Why EOF, and not another dropped frame
 ///
-/// The loop ends for one of three reasons: the hub dropped the sender (daemon
-/// shutdown), the socket died, or this subscriber overflowed its queue and the
-/// hub unregistered it. The first two need nothing from us. The third is the
+/// The loop ends for one of four reasons: the hub dropped the sender (daemon
+/// shutdown), the connection ended and its `SubscriptionGuard` dropped, the
+/// socket died, or this subscriber overflowed its queue and the hub
+/// unregistered it. The first three need nothing from us — in the second the
+/// client is already gone, which is what closed the channel. The fourth is the
 /// one the client has to be told about, and `overflowed` is the only thing that
-/// distinguishes it — all three arrive here as a closed channel.
+/// distinguishes it — all four arrive here as a closed channel.
 ///
 /// It used to be told nothing: the hub dropped frames and kept the subscription
 /// alive, on the reasoning that the client would notice the sequence gap. For a
@@ -715,6 +806,159 @@ mod tests {
         d.join("daemon.sock")
     }
 
+    /// The connection, not the pump, is what ends a subscription.
+    ///
+    /// A client subscribes to `target` alone and hangs up. Nothing publishes a
+    /// `target` event — so `publish` never probes its sender, since it only
+    /// probes subscribers that want the stream being published — and before the
+    /// guard nothing else ever removed it either: the pump stayed parked on
+    /// `recv` holding a thread, a channel, a subscriber entry and a clone of
+    /// the socket, for the life of the daemon. Ordinary reconnects grew all
+    /// four without bound.
+    ///
+    /// Driven through `handle` over a real socket pair rather than through the
+    /// hub, because the hub half already has its own test and it is the *read
+    /// side noticing EOF* that this is about. The scan publishes are
+    /// load-bearing: without them the reaping-on-publish path would end the
+    /// subscription and the test would pass on the wrong mechanism.
+    #[test]
+    fn a_closed_connection_ends_its_subscription() {
+        // `temp_dir` is fine here and only here: this is a STATE directory, not
+        // a scan root, so the macOS `/var` -> `/private/var` deny-list problem
+        // that moved the scan fixtures to `CARGO_TARGET_TMPDIR` does not apply
+        // — and `CARGO_TARGET_TMPDIR` is not set for unit tests anyway.
+        let dir = std::env::temp_dir().join(format!(
+            "shepherd-subguard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = shepherd_obs::paths::Paths {
+            state_dir: dir.clone(),
+            socket: dir.join("daemon.sock"),
+        };
+        let catalog = shepherd_catalog::Catalog::open(&paths.catalog()).unwrap();
+        let actor = shepherd_catalog::writer::CatalogActor::start(catalog, None);
+        let daemon = Daemon::new(actor, crate::events::EventHub::new(64, "test"), paths);
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let conn = std::thread::spawn({
+            let daemon = Arc::clone(&daemon);
+            move || {
+                let _ = handle(server, daemon);
+            }
+        });
+
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut client = client;
+        let mut send = |line: String| {
+            use std::io::Write;
+            client.write_all(line.as_bytes()).unwrap();
+            client.write_all(b"\n").unwrap();
+        };
+        let mut read_line = || {
+            let mut buf = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut buf).unwrap();
+            buf
+        };
+
+        send(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "hello",
+                "params": {
+                    "proto_version": shepherd_proto::PROTO_VERSION,
+                    "client": {"name": "guard-test", "build": "0"},
+                    "capabilities": [],
+                }
+            })
+            .to_string(),
+        );
+        let hello = read_line();
+        assert!(hello.contains("\"result\""), "handshake failed: {hello}");
+
+        send(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "events.subscribe",
+                "params": {"streams": ["target"]}
+            })
+            .to_string(),
+        );
+        let subscribed = read_line();
+        assert!(
+            subscribed.contains("subscription_id"),
+            "subscribe failed: {subscribed}"
+        );
+        assert_eq!(daemon.events.subscriber_count(), 1);
+
+        // Traffic on a stream this subscriber did not ask for. Its sender is
+        // never touched, so nothing here can reap it.
+        for i in 1..=10 {
+            daemon.events.publish(
+                shepherd_proto::event::EventStream::Scan,
+                shepherd_proto::event::EventPayload::ScanProgress {
+                    root_id: 1,
+                    files_seen: i,
+                    bytes_seen: i,
+                    current_path: None,
+                    done: false,
+                },
+            );
+        }
+        assert_eq!(
+            daemon.events.subscriber_count(),
+            1,
+            "precondition: an unwanted stream must not reap it, or this test \
+             would be measuring the reaping path instead"
+        );
+
+        drop(client);
+        drop(reader);
+        conn.join().expect("the connection thread must end at EOF");
+
+        assert_eq!(
+            daemon.events.subscriber_count(),
+            0,
+            "the client hung up and its subscription outlived the connection"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `bind`, retried until the fork window a TEST BINARY opens has closed.
+    ///
+    /// Not a weakened assertion and not a product concern — it is a fact about
+    /// this process. An `flock` lives on the open file *description*, and
+    /// `fork` duplicates every description into the child; Rust marks its file
+    /// descriptors close-on-exec, so the duplicate survives only the few
+    /// milliseconds between `fork` and `exec`. This binary runs the service
+    /// tests, which shell out to `systemctl`, `launchctl` and `id` on other
+    /// threads, so a socket lock — or a listening socket — released here can
+    /// still be alive inside somebody else's half-spawned child. Measured at
+    /// 3.6ms, at roughly one run in six.
+    ///
+    /// So the property is "the lock is released when its holder is dropped",
+    /// not "released within one syscall of it". The wait is bounded tightly and
+    /// reports the last refusal if it expires, which is what a real regression
+    /// — a lock nobody releases — looks like from here.
+    ///
+    /// Only for re-binding a path this test just released. A `bind` that must
+    /// FAIL is never routed through it: retrying an expected refusal would turn
+    /// this into exactly the kind of test that cannot fail.
+    fn bind_once_released(path: &Path, lock: &Path, why: &str) -> Bound {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = None;
+        loop {
+            match bind(path, lock) {
+                Ok(b) => return b,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("{why}: still refused after 5s: {}", last.unwrap_or(e)),
+            }
+        }
+    }
+
     /// `bind` will not delete something that is not a socket.
     ///
     /// The unlink exists for one case: a socket node left behind by a killed
@@ -763,7 +1007,12 @@ mod tests {
             .unwrap();
 
         let hub = EventHub::new(4096, "e1");
-        let (_, _, rx, overflowed) = hub.subscribe(vec![], None, None);
+        let crate::events::Subscription {
+            rx,
+            overflowed,
+            guard: _guard,
+            ..
+        } = hub.subscribe(vec![], None, None);
 
         // Nothing drains `rx`, so this overflows the queue and the hub drops
         // the subscription.
@@ -860,7 +1109,12 @@ mod tests {
             .unwrap();
 
         let hub = EventHub::new(4096, "e1");
-        let (_, _, rx, overflowed) = hub.subscribe(vec![], None, None);
+        let crate::events::Subscription {
+            rx,
+            overflowed,
+            guard: _guard,
+            ..
+        } = hub.subscribe(vec![], None, None);
         hub.publish(
             EventStream::Scan,
             EventPayload::ScanProgress {
@@ -975,6 +1229,59 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Two daemons with DIFFERENT state directories still cannot share a
+    /// socket.
+    ///
+    /// The state lock keys the catalog and the job queue, which is the deeper
+    /// harm — and it is not the socket. `SHEPHERD_STATE_DIR` and
+    /// `SHEPHERD_SOCKET` are separate settings, so two starts can take
+    /// different state locks and resolve to the same socket through one
+    /// `XDG_RUNTIME_DIR`, at which point the original race is back untouched.
+    ///
+    /// The second lock is keyed by the socket PATH — `<socket>.lock` beside it
+    /// — so the set that contends is exactly the set that would fight over one
+    /// socket. The second half of this test is the other side of that: two
+    /// DIFFERENT sockets in one directory are not a conflict, and an earlier
+    /// directory-granular version of this lock refused them.
+    #[test]
+    fn two_state_directories_cannot_share_one_socket() {
+        let path = tmp_socket("shared-socket");
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two DIFFERENT state locks, as two daemons with different
+        // `SHEPHERD_STATE_DIR` values would have.
+        let state_a = dir.join("a.lock");
+        let state_b = dir.join("b.lock");
+
+        let first = bind(&path, &state_a).expect("the first daemon takes the socket");
+        let err = bind(&path, &state_b)
+            .expect_err("a second daemon must not take a socket the first is listening on");
+        assert!(
+            err.to_string().contains("socket lock"),
+            "the refusal must be the SOCKET lock, not the state lock — the state locks \
+             differ here and would both succeed: {err}"
+        );
+        UnixStream::connect(&path).expect("and the first is still listening");
+
+        // A different socket in the same directory is a different daemon, not a
+        // conflict. `$XDG_RUNTIME_DIR/shepherd/` holding two instances' sockets
+        // is a legitimate arrangement and the lock must not refuse it.
+        let sibling = dir.join("other.sock");
+        let other = bind(&sibling, &state_b)
+            .expect("a different socket in the same directory is not a conflict");
+        drop(other);
+
+        drop(first);
+        let restarted = bind_once_released(
+            &path,
+            &state_b,
+            "once released, another state directory may take it",
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A killed daemon leaves a socket file behind. Without this, every restart
     /// after a hard kill fails with EADDRINUSE and looks like a port conflict.
     ///
@@ -989,8 +1296,11 @@ mod tests {
         drop(UnixListener::bind(&path).expect("bind the socket a killed daemon left"));
         assert!(path.exists(), "dropping a listener leaves the node behind");
 
-        let listener = bind(&path, &path.with_extension("lock"))
-            .expect("a stale socket must not block startup");
+        let listener = bind_once_released(
+            &path,
+            &path.with_extension("lock"),
+            "a stale socket must not block startup",
+        );
         drop(listener);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -1070,8 +1380,11 @@ mod tests {
         // intermittently and be read as a product flake.
         other_daemon.unlock().expect("release the lock");
         drop(other_daemon);
-        let restarted = bind(&path, &path.with_extension("lock"))
-            .expect("a restart after a clean stop must not be refused");
+        let restarted = bind_once_released(
+            &path,
+            &path.with_extension("lock"),
+            "a restart after a clean stop must not be refused",
+        );
         UnixStream::connect(&path).expect("and it really is listening");
         drop(restarted);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();

@@ -810,8 +810,24 @@ fn a_scan_does_not_catalogue_the_daemons_own_state_directory() {
     let root_id = added["root"]["root_id"].as_i64().unwrap();
     c.call("scan.start", serde_json::json!({"root_id": root_id}));
 
+    // The socket's lock file is the one daemon-owned REGULAR file that is not
+    // in the state directory — `SHEPHERD_SOCKET` points outside it here, which
+    // is the arrangement this harness exists to create. The socket node itself
+    // is invisible to the walk because it is not a regular file; the lock is
+    // not, so it has to be denied by path or the daemon catalogues it.
+    let socket_lock = d.socket.with_file_name(format!(
+        "{}.lock",
+        d.socket.file_name().unwrap().to_str().unwrap()
+    ));
+    assert!(
+        socket_lock.exists(),
+        "the daemon must have taken its socket lock at {}",
+        socket_lock.display()
+    );
+
     // Exactly the one file the user put there. `catalog.db`, `catalog.db-wal`,
-    // `catalog.db-shm` and the socket are all inside the root.
+    // `catalog.db-shm`, the socket and the socket's lock are all inside the
+    // root.
     scan_and_expect(&mut c, root_id, 1);
 
     let hits = c.call(
@@ -822,6 +838,13 @@ fn a_scan_does_not_catalogue_the_daemons_own_state_directory() {
         hits["hits"].as_array().map(Vec::len),
         Some(0),
         "the daemon's own catalog must not be a file in the catalog: {hits}"
+    );
+
+    let locks = c.call("search", serde_json::json!({"query": "lock", "limit": 50}));
+    assert_eq!(
+        locks["hits"].as_array().map(Vec::len),
+        Some(0),
+        "the daemon's own socket lock must not be a file in the catalog: {locks}"
     );
 }
 
