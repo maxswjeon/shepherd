@@ -736,16 +736,30 @@ impl ShepherdApi for Session {
                             root = req.root_id,
                             "metadata index rebuilt after forgetting a root"
                         ),
-                        // Not fatal, and not silent. The removal itself
-                        // committed; refusing it now would report a failure for
-                        // work that is done. `search` reports a stale or absent
-                        // index on its own terms — see `Daemon::index`.
-                        Err(e) => tracing::error!(
-                            error = %e,
-                            root = req.root_id,
-                            "the metadata index could not be rebuilt after forgetting a \
-                             root; `search` may return short pages until the next scan"
-                        ),
+                        // Not fatal — the removal itself committed, and
+                        // refusing it now would report a failure for work that
+                        // is done — but not survivable either. `Daemon::index`
+                        // has no staleness check: it hands out whatever is
+                        // installed, so a failed rebuild would leave the
+                        // pre-removal arena serving forgotten ids indefinitely,
+                        // eating the capped candidate prefix and returning
+                        // short or empty pages with nothing to say why.
+                        //
+                        // So the index is DROPPED. `search` then answers
+                        // `Precondition` and `doctor` reports it, which is the
+                        // one thing this daemon insists on: an index that is
+                        // absent must never be mistaken for one that found
+                        // nothing.
+                        Err(e) => {
+                            self.daemon.invalidate_index();
+                            tracing::error!(
+                                error = %e,
+                                root = req.root_id,
+                                "the metadata index could not be rebuilt after forgetting a \
+                                 root; it has been dropped and `search` is refused until a \
+                                 rebuild succeeds"
+                            );
+                        }
                     }
                 }
                 Ok(RootRemoveResult {

@@ -244,18 +244,26 @@ impl<'a> FileRepo<'a> {
         // writer actor (`CatalogWriter`) — this whole function runs inside one
         // of its closures. Splitting the lookup and the write across two
         // `Session::cat` calls would put a real TOCTOU window between them.
-        let existing: Option<(i64, bool, String, String)> = self
+        let existing: Option<(i64, bool, String, String, Option<String>)> = self
             .0
             .conn()
             .query_row(
-                "SELECT id, enabled, path_case_policy, path_norm_policy
+                "SELECT id, enabled, path_case_policy, path_norm_policy, volume_id
                  FROM scan_root WHERE path = ?1",
                 params![path],
-                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get::<_, i64>(1)? != 0,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                },
             )
             .optional()?;
 
-        let Some((id, enabled, stored_case, stored_norm)) = existing else {
+        let Some((id, enabled, stored_case, stored_norm, stored_volume)) = existing else {
             return Ok(Enrollment::Created(self.insert_root(
                 path,
                 stub_mode,
@@ -271,6 +279,40 @@ impl<'a> FileRepo<'a> {
         if enabled {
             return Err(CatalogError::AlreadyInState(format!(
                 "`{path}` is already registered as an enabled scan root (id {id})"
+            )));
+        }
+
+        // The retained catalog was built against the OLD volume, so the old
+        // volume is what it still describes.
+        //
+        // A soft-removed root keeps every file row, and each one's `fs_id`
+        // embeds the identity this root had when they were written. Rewriting
+        // `scan_root.volume_id` on revival made the record agree with whatever
+        // is mounted there NOW while the rows went on describing what was
+        // mounted there then — and the scan-time swap check compares the
+        // record, so it would then see agreement and walk a different
+        // filesystem into a catalog full of the previous one's identities.
+        //
+        // Refused rather than silently corrected, because the two possible
+        // intentions are opposite and only the user knows which is theirs: the
+        // volume really was replaced and the retained rows are stale (forget
+        // them), or the wrong disk is mounted (mount the right one). A revival
+        // whose identity cannot be established is refused for the same reason —
+        // unverifiable is not verified.
+        if let Some(stored) = stored_volume.as_deref()
+            && volume_id != Some(stored)
+        {
+            return Err(CatalogError::Invalid(format!(
+                "`{path}` was enrolled on volume `{stored}` and now reports {}. Its retained \
+                 catalog rows carry `fs_id` values built from `{stored}`, so reviving the \
+                 root against a different filesystem would mix them with files from another \
+                 volume — and the scan-time check compares the root record, which this would \
+                 have just rewritten. Re-add with `--forget` to drop the retained rows, or \
+                 mount the volume this root was enrolled on",
+                match volume_id {
+                    Some(v) => format!("`{v}`"),
+                    None => "no stable identity at all".to_string(),
+                }
             )));
         }
 
@@ -929,7 +971,7 @@ mod tests {
                 PathCasePolicy::Sensitive,
                 PathNormPolicy::Nfc,
                 AtimeMode::Reliable,
-                Some("uuid:moved"),
+                Some("uuid:abc"),
                 true,
                 &["*.tmp".to_string()],
                 Timestamp::from_nanos(9),
@@ -948,8 +990,69 @@ mod tests {
         assert_eq!(stub, "dehydrate");
         assert_eq!(optin, 1, "consent is per-request and must not be stale");
         assert_eq!(ignores, r#"["*.tmp"]"#, "AC-9's exclusions, as just stated");
-        assert_eq!(vol, "uuid:moved", "a remount can legitimately change this");
+        // ORACLE CHANGED. This used to revive against `uuid:moved` under the
+        // comment "a remount can legitimately change this". It cannot:
+        // `volume_id` is derived from the filesystem's UUID precisely so a
+        // remount does NOT change it — that is what
+        // `fs_id_survives_a_remount_that_changes_st_dev` proves. A different
+        // value means a different filesystem, and the test below is what
+        // happens then.
+        assert_eq!(
+            vol, "uuid:abc",
+            "the identity the retained rows were built against"
+        );
         assert_eq!(at, "reliable");
+    }
+
+    /// Reviving a soft-removed root against a DIFFERENT volume is refused.
+    ///
+    /// The retained file rows carry `fs_id` values built from the old identity.
+    /// Rewriting `scan_root.volume_id` on revival made the record agree with
+    /// whatever is mounted there now while the rows went on describing what was
+    /// mounted there then — and the scan-time swap check compares the record,
+    /// so it would see agreement and walk a different filesystem into a catalog
+    /// full of the previous one's identities.
+    ///
+    /// Refused rather than silently corrected: the two possible intentions are
+    /// opposite and only the user knows which is theirs.
+    #[test]
+    fn re_enrolling_against_a_different_volume_is_refused() {
+        let (mut cat, _root) = fixture();
+        cat.conn_mut()
+            .execute("UPDATE scan_root SET enabled = 0", [])
+            .unwrap();
+
+        let revive = |cat: &mut Catalog, volume: Option<&str>| {
+            FileRepo::new(cat).enroll_root(
+                "/data",
+                StubMode::Delete,
+                PathCasePolicy::Sensitive,
+                PathNormPolicy::Nfc,
+                AtimeMode::Relatime,
+                volume,
+                false,
+                &[],
+                Timestamp::from_nanos(9),
+            )
+        };
+
+        let err = revive(&mut cat, Some("uuid:different"))
+            .expect_err("a different filesystem at the same path must not adopt these rows");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("uuid:abc") && msg.contains("uuid:different"),
+            "the refusal must name both identities: {msg}"
+        );
+
+        // Unverifiable is not verified: an identity that has DISAPPEARED is the
+        // unmounted-volume case, and adopting the rows against it is the same
+        // mistake.
+        let err = revive(&mut cat, None).expect_err("no identity is not the same identity");
+        assert!(err.to_string().contains("no stable identity"), "{err}");
+
+        // And the accepting direction, so this cannot pass by refusing every
+        // revival: the same volume revives.
+        revive(&mut cat, Some("uuid:abc")).expect("the enrolled volume is still there");
     }
 
     /// An ENABLED root at the same path is a genuine duplicate and stays

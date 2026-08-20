@@ -327,7 +327,12 @@ fn cmd_run() -> Result<(), String> {
         shepherd_catalog::job_repo::JobClass::Scan,
         ScanExecutor::new(Arc::clone(&daemon)),
     ));
-    let pool = Pool::start(daemon.writer.clone(), registry, POOL_SIZE);
+    let pool = Pool::start(
+        daemon.writer.clone(),
+        registry,
+        POOL_SIZE,
+        Arc::new(HubJobObserver(Arc::clone(&daemon))),
+    );
 
     let stop = shutdown_flag();
     // `bound` is held to the end of `run`, which is what keeps the startup lock
@@ -358,6 +363,34 @@ fn report_recovery(recovered: &[Recovery]) {
                 tracing::warn!(job = %id, why, "quarantined an interrupted job");
             }
         }
+    }
+}
+
+/// The queue's transitions, on the `job` event stream.
+///
+/// `events.subscribe` advertises that stream and nothing published to it: a
+/// client could subscribe successfully and watch an entire queue drain without
+/// receiving a frame. This is the join — `shepherd-jobs` reports plain data
+/// about its own queue and stays free of a protocol dependency, and the mapping
+/// onto the wire type lives here, where the two already meet.
+struct HubJobObserver(Arc<Daemon>);
+
+impl shepherd_jobs::worker::JobObserver for HubJobObserver {
+    fn transition(&self, t: shepherd_jobs::worker::Transition) {
+        self.0.events.publish(
+            shepherd_proto::event::EventStream::Job,
+            shepherd_proto::event::EventPayload::JobTransition {
+                job_id: t.id.get(),
+                class: t.class.as_str().to_owned(),
+                from: t.from.as_str().to_owned(),
+                to: t.to.as_str().to_owned(),
+                // The wire field is `u32` and the catalog's is `i64`. A
+                // saturating cast rather than a wrapping one: an attempts count
+                // that wrapped to 0 would read as "this is the first try".
+                attempts: u32::try_from(t.attempts).unwrap_or(u32::MAX),
+                last_error: t.last_error,
+            },
+        );
     }
 }
 

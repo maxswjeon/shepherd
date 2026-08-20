@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use shepherd_catalog::job_repo::{Job, JobClass};
+use shepherd_catalog::job_repo::{Job, JobClass, JobState};
 use shepherd_catalog::writer::{CatalogWriter, WriterError};
 use shepherd_core::{JobId, Timestamp};
 
@@ -133,6 +133,45 @@ where
     }
 }
 
+/// One committed state change, as the pool reports it.
+///
+/// Plain data, and deliberately not `shepherd_proto`'s `JobTransition`: this
+/// crate has no protocol dependency and should not acquire one to describe its
+/// own queue. The daemon maps this onto the wire type where the two meet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    pub id: JobId,
+    pub class: JobClass,
+    pub from: JobState,
+    pub to: JobState,
+    /// The count AFTER the transition, which is what a reader wants: "attempt
+    /// 3 of 5", not "it had 2 before this one".
+    pub attempts: i64,
+    pub last_error: Option<String>,
+}
+
+/// Where the pool reports transitions it has already committed.
+///
+/// # Why the pool has to be the one reporting
+///
+/// `events.subscribe` advertises a `job` stream and nothing in the daemon ever
+/// published to it: a client could subscribe successfully and watch an entire
+/// queue drain without receiving a frame. An advertised capability that emits
+/// nothing is indistinguishable from a quiet system, which is the same shape as
+/// a check that passes without its subject.
+///
+/// Reported AFTER the catalog write returns, never before. A transition
+/// announced and then not committed is worse than one nobody saw — a client
+/// that acted on it would be acting on a state the daemon does not have.
+pub trait JobObserver: Send + Sync + 'static {
+    fn transition(&self, t: Transition);
+}
+
+/// The pool with nobody listening. What tests and any in-process caller use.
+impl JobObserver for () {
+    fn transition(&self, _: Transition) {}
+}
+
 /// Class → executor.
 ///
 /// A class with no executor is **not** claimed-and-failed: the pool leaves it
@@ -186,7 +225,12 @@ pub struct Pool {
 impl Pool {
     /// Start `size` workers against `writer`, running the executors in
     /// `registry`.
-    pub fn start(writer: CatalogWriter, registry: Arc<Registry>, size: usize) -> Self {
+    pub fn start(
+        writer: CatalogWriter,
+        registry: Arc<Registry>,
+        size: usize,
+        observer: Arc<dyn JobObserver>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let threads = (0..size)
             .map(|n| {
@@ -203,9 +247,10 @@ impl Pool {
                 let writer = writer.clone();
                 let registry = Arc::clone(&registry);
                 let stop = Arc::clone(&stop);
+                let observer = Arc::clone(&observer);
                 std::thread::Builder::new()
                     .name(format!("shepherd-worker-{n}"))
-                    .spawn(move || worker_loop(&writer, &registry, &stop))
+                    .spawn(move || worker_loop(&writer, &registry, &stop, observer.as_ref()))
                     .expect("spawning a worker thread")
             })
             .collect();
@@ -249,9 +294,14 @@ fn join_worker(t: std::thread::JoinHandle<()>) {
     }
 }
 
-fn worker_loop(writer: &CatalogWriter, registry: &Registry, stop: &AtomicBool) {
+fn worker_loop(
+    writer: &CatalogWriter,
+    registry: &Registry,
+    stop: &AtomicBool,
+    observer: &dyn JobObserver,
+) {
     while !stop.load(Ordering::SeqCst) {
-        match run_one(writer, registry) {
+        match run_one(writer, registry, observer) {
             Ok(true) => {}
             Ok(false) => std::thread::sleep(IDLE_POLL),
             Err(WriterError::Gone) => return,
@@ -267,7 +317,11 @@ fn worker_loop(writer: &CatalogWriter, registry: &Registry, stop: &AtomicBool) {
 ///
 /// Exposed so tests can drive the pool's logic deterministically, without
 /// threads or sleeps.
-pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, WriterError> {
+pub fn run_one(
+    writer: &CatalogWriter,
+    registry: &Registry,
+    observer: &dyn JobObserver,
+) -> Result<bool, WriterError> {
     // Ask only for classes this build can actually run. Claiming counts an
     // attempt, so claiming-then-returning an unrunnable job burns its retry
     // budget — measured at 12 attempts in 3 seconds from one thread before this
@@ -277,6 +331,16 @@ pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, Writ
     let Some(job) = claimed else {
         return Ok(false);
     };
+    // The claim is committed by the time `claim_of` returns, so this is a
+    // transition that has already happened.
+    observer.transition(Transition {
+        id: job.id,
+        class: job.class,
+        from: JobState::Queued,
+        to: JobState::Running,
+        attempts: job.attempts,
+        last_error: job.last_error.clone(),
+    });
 
     let Some(executor) = registry.get(job.class) else {
         // Unreachable: the claim filtered on exactly this registry's classes.
@@ -292,6 +356,14 @@ pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, Writ
                 now(),
             )
         })?;
+        observer.transition(Transition {
+            id: job.id,
+            class: job.class,
+            from: JobState::Running,
+            to: JobState::Queued,
+            attempts: job.attempts,
+            last_error: Some("claimed a class this worker has no executor for".into()),
+        });
         return Ok(false);
     };
 
@@ -323,21 +395,45 @@ pub fn run_one(writer: &CatalogWriter, registry: &Registry) -> Result<bool, Writ
             Err(panic) => Err(format!("executor panicked: {}", panic_text(&*panic))),
         };
 
+    // Every arm reports AFTER its catalog write returns. A transition announced
+    // and then not committed is worse than one nobody saw.
+    let (id, class, attempts) = (job.id, job.class, job.attempts);
     match outcome {
         Ok(()) => {
-            let id = job.id;
             writer.try_with(move |cat| Queue::complete(cat, id, now()))?;
+            observer.transition(Transition {
+                id,
+                class,
+                from: JobState::Running,
+                to: JobState::Done,
+                attempts,
+                last_error: None,
+            });
         }
         Err(message) => {
-            let disposition =
-                writer.try_with(move |cat| Queue::fail(cat, &job, &message, now()))?;
-            match disposition {
+            let disposition = writer.try_with({
+                let message = message.clone();
+                move |cat| Queue::fail(cat, &job, &message, now())
+            })?;
+            let to = match &disposition {
                 Disposition::Retry { at, attempt } => {
                     tracing::info!(attempt, retry_at = at.as_nanos(), "job will be retried");
+                    JobState::Queued
                 }
-                Disposition::Failed { reason } => tracing::warn!(reason, "job failed terminally"),
+                Disposition::Failed { reason } => {
+                    tracing::warn!(reason, "job failed terminally");
+                    JobState::Failed
+                }
                 Disposition::Done => unreachable!("fail() never returns Done"),
-            }
+            };
+            observer.transition(Transition {
+                id,
+                class,
+                from: JobState::Running,
+                to,
+                attempts,
+                last_error: Some(message),
+            });
         }
     }
     Ok(true)
@@ -451,13 +547,82 @@ mod tests {
 
         w.try_with(|cat| Queue::enqueue(cat, JobClass::Scan, 0, r#"{"root":1}"#, now()))
             .unwrap();
-        assert!(run_one(&w, &registry).unwrap());
+        assert!(run_one(&w, &registry, &()).unwrap());
         assert_eq!(&*seen.lock().unwrap(), &[r#"{"root":1}"#.to_string()]);
 
         let depth = w.try_with(|cat| Queue::depth(cat)).unwrap();
         let scan = depth.iter().find(|d| d.class == "scan").unwrap();
         assert_eq!((scan.pending, scan.running, scan.failed), (0, 0, 0));
-        assert!(!run_one(&w, &registry).unwrap(), "queue is drained");
+        assert!(!run_one(&w, &registry, &()).unwrap(), "queue is drained");
+    }
+
+    /// Every committed transition is reported, and reported AFTER it commits.
+    ///
+    /// `events.subscribe` advertises a `job` stream and nothing in the daemon
+    /// published to it: a client could subscribe successfully and watch a whole
+    /// queue drain without receiving a frame. An advertised capability that
+    /// emits nothing is indistinguishable from a quiet system.
+    #[test]
+    fn every_committed_transition_reaches_the_observer() {
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<(JobState, JobState)>>);
+        impl JobObserver for Recorder {
+            fn transition(&self, t: Transition) {
+                self.0.lock().unwrap().push((t.from, t.to));
+            }
+        }
+
+        let actor = actor_in_memory();
+        let w = actor.handle();
+        let seen = Arc::new(Recorder::default());
+
+        // A job that fails once and then succeeds, so one run covers claim,
+        // retry and completion.
+        let attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Arc::new(Registry::new().with(JobClass::Scan, {
+            let attempt = Arc::clone(&attempt);
+            move |_: &JobContext| {
+                if attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Err("first attempt fails".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+
+        w.try_with(|cat| Queue::enqueue(cat, JobClass::Scan, 0, "{}", now()))
+            .unwrap();
+        assert!(run_one(&w, &registry, seen.as_ref()).unwrap());
+        let depth = w.try_with(|cat| Queue::depth(cat)).unwrap();
+        let scan = depth.iter().find(|d| d.class == "scan").unwrap();
+        assert_eq!(
+            (scan.pending, scan.running),
+            (1, 0),
+            "precondition: the failure really was a retry, not a terminal give-up"
+        );
+
+        let got = seen.0.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                (JobState::Queued, JobState::Running),
+                (JobState::Running, JobState::Queued),
+            ],
+            "a claim and a retry must both be reported: {got:?}"
+        );
+
+        // And the completing run reports the terminal transition.
+        let seen2 = Arc::new(Recorder::default());
+        w.try_with(|cat| Queue::enqueue(cat, JobClass::Scan, 0, "{}", now()))
+            .unwrap();
+        assert!(run_one(&w, &registry, seen2.as_ref()).unwrap());
+        assert_eq!(
+            seen2.0.lock().unwrap().clone(),
+            vec![
+                (JobState::Queued, JobState::Running),
+                (JobState::Running, JobState::Done),
+            ]
+        );
     }
 
     /// A panicking executor must leave the job the queue's problem, not a
@@ -490,7 +655,7 @@ mod tests {
         // print. Silenced only around the call that provokes it.
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let ran = run_one(&w, &registry);
+        let ran = run_one(&w, &registry, &());
         std::panic::set_hook(hook);
 
         assert!(
@@ -544,7 +709,7 @@ mod tests {
             .unwrap();
 
         for _ in 0..200 {
-            assert!(!run_one(&w, &registry).unwrap(), "nothing is runnable");
+            assert!(!run_one(&w, &registry, &()).unwrap(), "nothing is runnable");
         }
         let job = w
             .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(id))
@@ -574,7 +739,7 @@ mod tests {
             .try_with(|cat| Queue::enqueue(cat, JobClass::Hash, 0, "{}", now()))
             .unwrap();
 
-        assert!(run_one(&w, &registry).unwrap());
+        assert!(run_one(&w, &registry, &()).unwrap());
         let job = w
             .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(hash))
             .unwrap()
@@ -593,7 +758,7 @@ mod tests {
             .try_with(|cat| Queue::enqueue(cat, JobClass::Upload, 0, "{}", now()))
             .unwrap();
 
-        assert!(run_one(&w, &registry).unwrap());
+        assert!(run_one(&w, &registry, &()).unwrap());
         let job = w
             .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(id))
             .unwrap()
@@ -682,7 +847,10 @@ mod tests {
                 },
             ));
 
-            assert!(run_one(&w, &registry).unwrap(), "the job must be claimable");
+            assert!(
+                run_one(&w, &registry, &()).unwrap(),
+                "the job must be claimable"
+            );
             assert_eq!(
                 resumed_from.lock().unwrap().as_deref(),
                 Some(r#"{"parts_done":7}"#),
@@ -715,7 +883,7 @@ mod tests {
             w.try_with(|cat| Queue::enqueue(cat, JobClass::Hash, 0, "{}", now()))
                 .unwrap();
         }
-        let pool = Pool::start(w.clone(), registry, POOL_SIZE);
+        let pool = Pool::start(w.clone(), registry, POOL_SIZE, Arc::new(()));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while done.load(Ordering::SeqCst) < 20 && std::time::Instant::now() < deadline {

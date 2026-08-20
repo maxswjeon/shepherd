@@ -3098,8 +3098,13 @@ fn shepctl_events_subscribe_renders_the_events_it_subscribed_to() {
          second thing that can be right while the output is empty"
     );
 
-    // By content: these are `scan` events with monotonic sequence numbers, not
-    // merely "some JSON was printed".
+    // By content: real event frames with monotonic sequence numbers, not merely
+    // "some JSON was printed".
+    //
+    // The streams are `scan` AND `job` now: the seeding scan is a queue job, so
+    // its claim and completion are published too. This used to assert every
+    // frame was `scan`, which was true only because nothing had ever published
+    // a job transition — the stream was advertised and silent.
     let mut last = 0;
     for e in &events {
         let seq = e["seq"]
@@ -3107,8 +3112,20 @@ fn shepctl_events_subscribe_renders_the_events_it_subscribed_to() {
             .unwrap_or_else(|| panic!("an event frame has no `seq`: {e}"));
         assert!(seq > last, "replay went backwards: {events:?}");
         last = seq;
-        assert_eq!(e["stream"], serde_json::json!("scan"), "{e}");
+        let stream = e["stream"].as_str().unwrap_or_default();
+        assert!(
+            stream == "scan" || stream == "job",
+            "an unsubscribed stream reached the client: {e}"
+        );
     }
+    assert!(
+        events
+            .iter()
+            .any(|e| e["stream"] == serde_json::json!("job")),
+        "the `job` stream is advertised and must actually carry the queue's \
+         transitions; a client that subscribes and sees nothing cannot tell \
+         that from a quiet system: {events:?}"
+    );
     assert!(
         events
             .iter()

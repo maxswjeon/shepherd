@@ -200,12 +200,21 @@ impl Executor for ScanExecutor {
         // about at `root.add` — and no platform outside Linux can answer at
         // all until Phase 3, so demanding an answer here would refuse every
         // scan on macOS and Windows.
-        if let Some(reason) = volume_refusal(
-            rid,
-            &root.path,
-            root.volume_id.as_deref(),
-            shepherd_catalog::volume::current_volume_id(&path).as_deref(),
-        ) {
+        //
+        // Only when the path is THERE. A root whose directory has been deleted
+        // has no identity to report either, and the walk's own
+        // unreadable-root refusal says something truer about it than "no
+        // stable identity" would — this check is about a path that still
+        // resolves and now belongs to a different filesystem, which is
+        // precisely the case a deleted root is not.
+        if std::fs::symlink_metadata(&path).is_ok()
+            && let Some(reason) = volume_refusal(
+                rid,
+                &root.path,
+                root.volume_id.as_deref(),
+                shepherd_catalog::volume::current_volume_id(&path).as_deref(),
+            )
+        {
             return Err(reason);
         }
 
@@ -510,17 +519,42 @@ fn summarise_skips(skips: &[Skip]) -> String {
 /// is Phase 3's all answer `None` — and a test that depended on the answer
 /// would assert this rule only on the machines that happen to have one.
 ///
-/// `None` from either side is not a disagreement. A root enrolled without a
-/// stable identity has nothing to disagree with — that case is warned about at
-/// `root.add` — and demanding an answer the platform cannot give would refuse
-/// every scan on macOS and Windows.
+/// The two `None`s are not symmetric, and the asymmetry is the point.
+///
+/// **`enrolled` is `None`** — nothing to disagree with. That root was recorded
+/// without a stable identity, which `root.add` warns about, and no platform
+/// outside Linux can answer at all until Phase 3. Refusing here would refuse
+/// every scan on macOS and Windows for a check that could never have run.
+///
+/// **`current` is `None` while `enrolled` is `Some`** — a refusal. This root
+/// HAS an identity and the filesystem at its path will not say whether it is
+/// the same one, which is not the same as saying it is. It is what an unmounted
+/// removable disk looks like: the mount point is still a readable directory, on
+/// whatever overlay or tmpfs parent it sits on, and that parent has no stable
+/// identity to report. Walking it pairs the parent's inode numbers with the
+/// enrolled volume's id and writes `fs_id` values that are well-formed and name
+/// files on neither filesystem.
+///
+/// Unverifiable is not verified. The direction is the same one PM-3 takes for
+/// an unreadable root: absence of evidence about a destructive precondition is
+/// a refusal, never a pass.
 fn volume_refusal(
     root_id: RootId,
     path: &str,
     enrolled: Option<&str>,
     current: Option<&str>,
 ) -> Option<String> {
-    let (enrolled, current) = (enrolled?, current?);
+    let enrolled = enrolled?;
+    let Some(current) = current else {
+        return Some(format!(
+            "root {root_id} at {path} was enrolled on volume `{enrolled}` and the filesystem \
+             mounted there now reports no stable identity at all. That is what an unmounted \
+             volume looks like — the mount point is still a readable directory on its parent \
+             — and scanning it would pair the parent's inode numbers with the enrolled \
+             volume's id, producing `fs_id` values that name files on neither. Mount the \
+             volume, or resynchronise the root if it really has moved"
+        ));
+    };
     if enrolled == current {
         return None;
     }
@@ -584,16 +618,24 @@ mod tests {
             None,
             "the same volume is the ordinary case and must scan"
         );
+        // The asymmetric pair. An enrolled root with no answer is a refusal
+        // above; a root that never had an identity has nothing to disagree
+        // with, and refusing it would refuse every scan on a platform whose
+        // implementation is Phase 3's.
         assert_eq!(
             volume_refusal(id, "/data", None, Some("uuid:bbb")),
             None,
             "a root enrolled without a stable identity has nothing to disagree \
              with; that case is warned about at `root.add`"
         );
-        assert_eq!(
-            volume_refusal(id, "/data", Some("uuid:aaa"), None),
-            None,
-            "a platform that cannot answer must not have every scan refused"
+        assert_eq!(volume_refusal(id, "/data", None, None), None);
+        let unverifiable = volume_refusal(id, "/data", Some("uuid:aaa"), None).expect(
+            "a root WITH an identity must not be scanned against a filesystem \
+                     that will not say whether it is the same one",
+        );
+        assert!(
+            unverifiable.contains("no stable identity"),
+            "the refusal must say what was missing: {unverifiable}"
         );
     }
 

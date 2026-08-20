@@ -309,6 +309,38 @@ impl Daemon {
         entries
     }
 
+    /// Drop the installed index, so `search` refuses instead of answering from
+    /// one that is known to be wrong.
+    ///
+    /// For the case where the catalog has moved and the rebuild that was
+    /// supposed to follow it FAILED. `Daemon::index` has no staleness check —
+    /// it hands out whatever is installed — so leaving the pre-change arena in
+    /// place means serving it indefinitely, until a scan or a restart happens
+    /// to rebuild. Rows the catalog no longer has go on consuming the capped,
+    /// file-id-ordered candidate prefix that `hydrate` then drops, and searches
+    /// come back short or empty with no indication why.
+    ///
+    /// "No index" is a state this daemon already models honestly: `search`
+    /// answers `Precondition` and `doctor` reports it, precisely so an index
+    /// that is absent is never mistaken for one that found nothing.
+    ///
+    /// The generation is left alone deliberately. It orders SNAPSHOTS, and a
+    /// concurrent rebuild reading the newer catalog must still be able to
+    /// install — clearing it would let an older in-flight snapshot win.
+    pub fn invalidate_index(&self) {
+        let mut guard = self
+            .index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.index.take().is_some() {
+            tracing::warn!(
+                generation = guard.generation,
+                "metadata index dropped: the catalog changed and the rebuild that should \
+                 have followed it failed. `search` is refused until one succeeds"
+            );
+        }
+    }
+
     /// The self-checks behind the `doctor` method.
     ///
     /// The lingering check comes from `shepherd_obs::lingering`, shared with
