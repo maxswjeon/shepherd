@@ -8,7 +8,7 @@
 //! remains the unique key for *storage*; `norm_key` is the key for *matching*.
 
 use rusqlite::{OptionalExtension, params};
-use shepherd_core::{Blake3Hash, FileStat, RootId, StubMode, Timestamp};
+use shepherd_core::{Blake3Hash, FileStat, InodeSighting, RootId, StubMode, Timestamp};
 
 use crate::atime::AtimeMode;
 use crate::identity::{PathCasePolicy, PathNormPolicy, norm_key};
@@ -486,14 +486,27 @@ impl<'a> FileRepo<'a> {
         // on (`FileLocks`, and `LocalDestroyRequest::fs_id` says so in
         // capitals), and what tells a rename from a replacement — a NULL there
         // is a lock that protects nothing and a rename indistinguishable from a
-        // delete-plus-create. `None` only where the root has no stable volume
-        // id, which `root.add` already warns about, or on a platform with no
-        // inode.
-        let fs_id = root
-            .volume_id
-            .as_deref()
-            .zip(stat.ino)
-            .map(|(vol, ino)| crate::volume::fs_id_from_ino(vol, ino).as_str().to_owned());
+        // delete-plus-create.
+        //
+        // `clear_fs_id` is the second half, and it exists because a NULL means
+        // two opposite things. For [`InodeSighting::Unknown`] — no inode on
+        // this platform, or an unreadable probe — the scan learned nothing and
+        // must not overwrite a recorded identity, which is what the `COALESCE`
+        // below does. For [`InodeSighting::ForeignVolume`] the scan learned
+        // something specific: this path is now on a nested mount, so whatever
+        // `fs_id` it carries was derived from the root's volume and the inode
+        // of the file that USED to be here, and keeping it points the locks at
+        // a file that is no longer at the path.
+        let (fs_id, clear_fs_id) = match stat.ino {
+            InodeSighting::Known(ino) => (
+                root.volume_id
+                    .as_deref()
+                    .map(|vol| crate::volume::fs_id_from_ino(vol, ino).as_str().to_owned()),
+                false,
+            ),
+            InodeSighting::ForeignVolume => (None, true),
+            InodeSighting::Unknown => (None, false),
+        };
         self.0.conn_mut().execute(
             "INSERT INTO file
                  (root_id, rel_path, name, ext, size, mtime, ctime, atime,
@@ -508,7 +521,15 @@ impl<'a> FileRepo<'a> {
                  -- volume id could not be determined carries NULL, and letting
                  -- that overwrite a good identity would silently unprotect a
                  -- file that had one.
-                 fs_id = COALESCE(excluded.fs_id, file.fs_id),
+                 --
+                 -- ?14 is the deliberate exception. It is set only when the
+                 -- walk positively established that the path is on a NESTED
+                 -- MOUNT, where the recorded identity is not merely unknown but
+                 -- WRONG — see `InodeSighting::ForeignVolume`.
+                 fs_id = CASE
+                     WHEN ?14 = 1 THEN NULL
+                     ELSE COALESCE(excluded.fs_id, file.fs_id)
+                 END,
                  -- last_seen_gen IS in this list, and that is the whole point
                  -- of it. The reconciling sweep is
                  -- `SET state='missing' WHERE last_seen_gen < :this_scan`, so a
@@ -580,6 +601,7 @@ impl<'a> FileRepo<'a> {
                 stat.blake3.map(|h| h.as_bytes().to_vec()),
                 generation,
                 fs_id,
+                clear_fs_id as i64,
             ],
         )?;
         Ok(())
@@ -745,7 +767,7 @@ mod tests {
             ctime: Timestamp::from_nanos(1),
             atime: None,
             blake3: None,
-            ino: None,
+            ino: InodeSighting::Unknown,
         }
     }
 
@@ -1303,7 +1325,7 @@ mod tests {
         assert_eq!(root.volume_id.as_deref(), Some("uuid:abc"));
 
         let mut s = stat(root.id, "a.txt");
-        s.ino = Some(4242);
+        s.ino = InodeSighting::Known(4242);
         FileRepo::new(&mut cat)
             .upsert_file(&root, &s, GEN, Timestamp::from_nanos(1))
             .unwrap();
@@ -1319,7 +1341,7 @@ mod tests {
         // `DO UPDATE`. Letting it through would silently unprotect a file that
         // was protected a moment ago.
         let mut blind = stat(root.id, "a.txt");
-        blind.ino = None;
+        blind.ino = InodeSighting::Unknown;
         blind.size = 99;
         FileRepo::new(&mut cat)
             .upsert_file(&root, &blind, GEN + 1, Timestamp::from_nanos(2))
@@ -1337,6 +1359,68 @@ mod tests {
             Some("uuid:abc:4242"),
             "a scan that could not identify the file must not erase the identity \
              the lock depends on"
+        );
+    }
+
+    /// A path that a nested mount has covered CLEARS its recorded identity.
+    ///
+    /// `ino: Unknown` and `ino: ForeignVolume` both arrive as "no `fs_id` to
+    /// write", and they are opposite instructions. `COALESCE` keeps what is
+    /// recorded, which is right for an unreadable probe and wrong here: the
+    /// stored `fs_id` was `<root-volume>:<inode>` for the file that USED to be
+    /// at this path, so keeping it leaves `FileLocks` — and the
+    /// rename-versus-replacement decision — pointed at a file that is no longer
+    /// there, on the irreversible path.
+    #[test]
+    fn a_path_covered_by_a_nested_mount_loses_its_recorded_identity() {
+        let (mut cat, root) = fixture();
+
+        let mut first = stat(root.id, "a.txt");
+        first.ino = InodeSighting::Known(4242);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &first, GEN, Timestamp::from_nanos(1))
+            .unwrap();
+        let stored: Option<String> = cat
+            .conn()
+            .query_row("SELECT CAST(fs_id AS TEXT) FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("uuid:abc:4242"));
+
+        // A later scan finds the same path on another filesystem.
+        let mut covered = stat(root.id, "a.txt");
+        covered.ino = InodeSighting::ForeignVolume;
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &covered, GEN + 1, Timestamp::from_nanos(2))
+            .unwrap();
+
+        let stored: Option<String> = cat
+            .conn()
+            .query_row("SELECT CAST(fs_id AS TEXT) FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            stored, None,
+            "the identity of the file that used to be at this path must not survive it"
+        );
+
+        // And `Unknown` still does NOT clear — the two must stay distinguishable.
+        let mut known_again = stat(root.id, "a.txt");
+        known_again.ino = InodeSighting::Known(99);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &known_again, GEN + 2, Timestamp::from_nanos(3))
+            .unwrap();
+        let mut blind = stat(root.id, "a.txt");
+        blind.ino = InodeSighting::Unknown;
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &blind, GEN + 3, Timestamp::from_nanos(4))
+            .unwrap();
+        let stored: Option<String> = cat
+            .conn()
+            .query_row("SELECT CAST(fs_id AS TEXT) FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("uuid:abc:99"),
+            "a scan that learned nothing must not erase what a scan that learned something wrote"
         );
     }
 
@@ -1366,7 +1450,7 @@ mod tests {
         let root = FileRepo::new(&mut cat).get_root(id).unwrap().unwrap();
 
         let mut s = stat(root.id, "a.txt");
-        s.ino = Some(4242);
+        s.ino = InodeSighting::Known(4242);
         FileRepo::new(&mut cat)
             .upsert_file(&root, &s, GEN, Timestamp::from_nanos(1))
             .unwrap();

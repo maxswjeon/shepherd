@@ -26,7 +26,7 @@ fn candidate(id: i64, name: &str, age_days: i64, size: u64) -> Candidate {
             ctime: mtime,
             atime: Some(mtime),
             blake3: Some(Blake3Hash::from_bytes([1u8; 32])),
-            ino: None,
+            ino: shepherd_core::InodeSighting::Unknown,
         },
         last_observed_access: Some(mtime),
         tags: Vec::new(),

@@ -189,12 +189,23 @@ pub struct PathPolicies {
 /// distinction. It never silently reports a probed result it did not obtain.
 pub fn probe_path_policies(root: &Path) -> PathPolicies {
     let probe = ProbeFiles::new(root);
-    let case = probe.case().unwrap_or_else(platform_default_case);
-    let norm = probe.norm().unwrap_or_else(platform_default_norm);
+    // Each OBSERVATION is asked whether it succeeded, not just each file
+    // creation. `assumed` used to mean "the two probe files could not be
+    // written", which is a strictly smaller condition than "the policy was not
+    // measured": a directory that permits creation but not enumeration writes
+    // both files happily and then `norm()` returns `None` at `read_dir`, so the
+    // platform default was substituted and recorded as MEASURED. `norm_key` is
+    // derived from these policies and every watcher event is matched against
+    // that key, so a wrong guess makes lookups miss — which PM-3 treats as
+    // absence, and absence is discard-trigger territory. The warning
+    // `dispatch::root_add` raises on `assumed` is what an operator has to go
+    // on, and it only fires if this flag is honest.
+    let case = probe.case();
+    let norm = probe.norm();
     PathPolicies {
-        case,
-        norm,
-        assumed: probe.failed(),
+        case: case.unwrap_or_else(platform_default_case),
+        norm: norm.unwrap_or_else(platform_default_norm),
+        assumed: probe.failed() || case.is_none() || norm.is_none(),
     }
 }
 
@@ -303,14 +314,24 @@ impl ProbeFiles {
         self.failed
     }
 
+    /// `None` when the lookup could not be performed, which is NOT the same as
+    /// "the lowercase name is absent".
+    ///
+    /// `Path::exists` answers `false` for every error — a permission denied on
+    /// the directory, an I/O fault, a path that turned unsearchable — so a
+    /// failed lookup was reported as a MEASURED `Sensitive`, and a
+    /// case-insensitive root then got case-sensitive `norm_key`s with nothing
+    /// recording that the policy had been guessed.
     fn case(&self) -> Option<PathCasePolicy> {
         self.upper.as_ref()?;
         let lower = self.root.join(format!("{}case", self.stem));
-        Some(if lower.exists() {
-            PathCasePolicy::Insensitive
-        } else {
-            PathCasePolicy::Sensitive
-        })
+        match std::fs::symlink_metadata(&lower) {
+            Ok(_) => Some(PathCasePolicy::Insensitive),
+            // The one error that IS an observation: the name does not exist, so
+            // the filesystem did not fold the case.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(PathCasePolicy::Sensitive),
+            Err(_) => None,
+        }
     }
 
     fn norm(&self) -> Option<PathNormPolicy> {
@@ -669,6 +690,56 @@ mod tests {
         std::fs::remove_dir_all(&missing).ok();
         let p = probe_path_policies(&missing);
         assert!(p.assumed, "an unprobeable root must report `assumed`");
+    }
+
+    /// A root that permits file CREATION but not enumeration reports `assumed`.
+    ///
+    /// `assumed` used to mean only "the two probe files could not be written",
+    /// which is strictly smaller than "the policy was not measured". Here both
+    /// files are written happily and then `norm()` returns `None` at
+    /// `read_dir`, so the platform default was substituted and recorded as a
+    /// MEASURED result.
+    ///
+    /// That matters because `norm_key` is derived from these policies and every
+    /// watcher event is matched against it: a wrong guess makes lookups miss,
+    /// PM-3 treats a miss as absence, and absence is discard-trigger territory.
+    /// The warning `root.add` raises is the only disclosure, and it fires on
+    /// this flag.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_enumerated_reports_assumed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "shepherd-probe-writeonly-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write and traverse, but not read: `create_new` succeeds, `read_dir`
+        // does not.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let p = probe_path_policies(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Running as root makes a 0300 directory readable anyway, in which case
+        // the probe really did measure and `assumed` is correctly false. Read
+        // the euid from `/proc/self` rather than through `libc`, which this
+        // crate does not depend on.
+        let euid = std::fs::metadata("/proc/self")
+            .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+            .unwrap_or(1);
+        if euid == 0 {
+            return;
+        }
+        assert!(
+            p.assumed,
+            "the normalization observation could not run, so the policy is a guess and must \
+             say so: {p:?}"
+        );
     }
 }
 

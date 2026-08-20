@@ -346,11 +346,52 @@ impl PlaceholderProvider for DeleteModeProvider {
                     // Durability could not be established, so this must not be
                     // reported as staged. §4.10.4 is abort-forward-never: put
                     // the file back before saying so.
-                    let _ = rename_noreplace(&staged, path);
-                    return Err(ProviderError::Io {
-                        path: dir.display().to_string(),
-                        detail: format!("staging rename is not durable: {e}"),
-                    });
+                    //
+                    // And the rollback's own result is not discardable. It is a
+                    // `RENAME_NOREPLACE`, so it fails if the original name was
+                    // reoccupied while the file was in staging — and this
+                    // function returns no `Staged`, so the caller has nothing to
+                    // hand `restore_staged`. A discarded failure here left the
+                    // user's only local copy out of its original path with the
+                    // caller told only that a sync failed.
+                    //
+                    // Recovery can still find it: the entry is in the staging
+                    // directory and `list_staged` is exactly what lists it. So
+                    // the error says WHERE, loudly, which is the same contract
+                    // `restore_or_report` keeps on the other rollback path.
+                    match rename_noreplace(&staged, path) {
+                        Ok(true) => {
+                            return Err(ProviderError::Io {
+                                path: dir.display().to_string(),
+                                detail: format!(
+                                    "staging rename is not durable ({e}); the file was put \
+                                     back at {}",
+                                    path.display()
+                                ),
+                            });
+                        }
+                        rolled_back => {
+                            tracing::error!(
+                                original = %path.display(),
+                                staged = %staged.display(),
+                                sync_error = %e,
+                                rollback = ?rolled_back,
+                                "STAGED AND STRANDED: the staging rename could not be made \
+                                 durable and could not be undone. The file's only local copy \
+                                 is in the staging directory and is NOT at its original \
+                                 path; startup recovery lists it, and a human should not \
+                                 have to wait for that"
+                            );
+                            return Err(ProviderError::StagedAndStranded {
+                                original: path.display().to_string(),
+                                staged: staged.display().to_string(),
+                                detail: format!(
+                                    "the staging rename could not be made durable ({e}) and \
+                                     the file could not be moved back"
+                                ),
+                            });
+                        }
+                    }
                 }
             }
             Ok(false) => {
@@ -930,6 +971,51 @@ mod tests {
                  filesystem: {v:?}"
             );
         }
+    }
+
+    /// A staging rollback that cannot complete is reported, not discarded.
+    ///
+    /// The rollback is a `RENAME_NOREPLACE`, so it fails when the original name
+    /// was reoccupied while the file was in staging. `stage_for_destruction`
+    /// returns no `Staged` on this path, so the caller has nothing to hand
+    /// `restore_staged` — a discarded failure left the user's only local copy
+    /// out of its original path with the caller told only that a sync failed.
+    ///
+    /// Driven directly against the rollback rather than by making an fsync
+    /// fail, which is not something a test can arrange portably: the shape
+    /// under test is "the reverse rename refused", and reoccupying the name is
+    /// how that happens in practice.
+    #[cfg(unix)]
+    #[test]
+    fn a_staging_rollback_that_cannot_complete_is_reported() {
+        let t = Tmp::new("rollback");
+        let f = t.0.join("only-copy.bin");
+        std::fs::write(&f, b"the only local copy").unwrap();
+        let p = DeleteModeProvider::new();
+        let Some(staged) = staged_or_refused(p.stage_for_destruction(&t.0, &f)) else {
+            return;
+        };
+
+        // The user creates a new file at the original name while the old one is
+        // staged. This is exactly the state a rollback meets and cannot undo.
+        std::fs::write(&f, b"something the user made").unwrap();
+        assert!(
+            !matches!(rename_noreplace(&staged.staged, &f), Ok(true)),
+            "the fixture must actually make the reverse rename refuse"
+        );
+
+        // And the bytes are still discoverable where the error would say they
+        // are, which is what makes reporting rather than discarding useful.
+        assert_eq!(
+            p.list_staged(&t.0).unwrap(),
+            vec![staged.staged.clone()],
+            "recovery has to be able to find the stranded copy"
+        );
+        assert_eq!(
+            std::fs::read(&f).unwrap(),
+            b"something the user made",
+            "and the user's new file is untouched — the rollback must never replace"
+        );
     }
 
     #[test]

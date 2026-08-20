@@ -510,7 +510,7 @@ fn scan_stat(i: usize) -> FileStat {
         ctime: Timestamp::from_nanos(1),
         atime: None,
         blake3: None,
-        ino: None,
+        ino: shepherd_core::InodeSighting::Unknown,
     }
 }
 

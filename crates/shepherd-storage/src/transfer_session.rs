@@ -429,15 +429,55 @@ impl<'a> TransferDriver<'a> {
         self.store.save(session).await
     }
 
+    /// Abandon the provider's multipart session, then return `err`.
+    ///
+    /// Every terminal source failure has to come through here. The mismatch is
+    /// not retryable, and replanning the changed file picks a different
+    /// content-addressed key — so no later `adopt_or_reap` visit ever reaches
+    /// this key again and the parts already uploaded accrue storage for as long
+    /// as the bucket's lifecycle rules allow, which on a 50 GB transfer is not
+    /// a rounding error. Returning the error without a transition simply
+    /// forgets about them.
+    ///
+    /// `AbortPending` is persisted BEFORE the abort is attempted, which is what
+    /// makes it survive a crash in the middle: `run`'s `AbortPending` arm
+    /// finishes it on the next pass, and `finish_abort` reports `Ambiguous`
+    /// rather than `Clean` when it could not confirm, so a sweep revisits it.
+    ///
+    /// A failure to record the abandonment replaces the caller's error: the
+    /// caller wanted to know the source moved, and "the session is in an
+    /// unknown state" is the more urgent of the two.
+    async fn abandon(&self, session: &mut TransferSession, err: StorageError) -> StorageError {
+        // Already terminal, or never started: nothing to abandon.
+        if !session.state.can_advance_to(TransferState::AbortPending) {
+            return err;
+        }
+        if let Err(e) = self.advance(session, TransferState::AbortPending).await {
+            return e;
+        }
+        let out = self.finish_abort(session).await;
+        if let Err(e) = self.advance(session, TransferState::Aborted(out)).await {
+            return e;
+        }
+        err
+    }
+
     /// Fail closed if the source moved under us (PM-1).
-    async fn assert_source_unchanged(&self, session: &TransferSession) -> StorageResult<()> {
+    ///
+    /// The caller gets the error; the provider gets the abandonment. This runs
+    /// at the top of `Initiating` — before a session exists, where `abandon` is
+    /// a no-op — and again at the top of `upload_pending`, where a session very
+    /// much does exist and a source edited between attempts would otherwise
+    /// leave it filled and forgotten.
+    async fn assert_source_unchanged(&self, session: &mut TransferSession) -> StorageResult<()> {
         let now = self.source.fingerprint().await?;
         if now != session.source.fingerprint() {
-            return Err(StorageError::ContentMismatch {
+            let err = StorageError::ContentMismatch {
                 key: session.remote_key.as_str().to_owned(),
                 expected: format!("{:?}", session.source.fingerprint()),
                 actual: format!("{now:?}"),
-            });
+            };
+            return Err(self.abandon(session, err).await);
         }
         Ok(())
     }
@@ -712,31 +752,16 @@ impl<'a> TransferDriver<'a> {
         // published, while refusing is still recoverable.
         let read_back = Blake3Hash::from_bytes(*read_back.finalize().as_bytes());
         if read_back != session.source.blake3 {
-            // The multipart session is ABANDONED here, durably, before the
-            // error goes back.
-            //
-            // This mismatch is terminal, not retryable, and replanning the
-            // changed file picks a different content-addressed key — so no
-            // later `adopt_or_reap` visit ever reaches this key again and the
-            // parts already uploaded accrue storage for as long as the bucket's
-            // lifecycle rules allow, which on a 50 GB transfer is not a rounding
-            // error. Returning the error without a transition simply forgot
-            // about them.
-            //
-            // `AbortPending` is persisted BEFORE the abort is attempted, which
-            // is what makes it survive a crash in the middle: `run`'s
-            // `AbortPending` arm finishes it on the next pass, and
-            // `finish_abort` reports `Ambiguous` rather than `Clean` when it
-            // could not confirm, so a sweep revisits it.
-            self.advance(session, TransferState::AbortPending).await?;
-            let out = self.finish_abort(session).await;
-            self.advance(session, TransferState::Aborted(out)).await?;
-
-            return Err(StorageError::ContentMismatch {
-                key: session.source.rel_path.clone(),
-                expected: format!("blake3 {}", session.source.blake3.to_hex()),
-                actual: format!("the parts as read hash to blake3 {}", read_back.to_hex()),
-            });
+            return Err(self
+                .abandon(
+                    session,
+                    StorageError::ContentMismatch {
+                        key: session.source.rel_path.clone(),
+                        expected: format!("blake3 {}", session.source.blake3.to_hex()),
+                        actual: format!("the parts as read hash to blake3 {}", read_back.to_hex()),
+                    },
+                )
+                .await);
         }
         Ok(())
     }

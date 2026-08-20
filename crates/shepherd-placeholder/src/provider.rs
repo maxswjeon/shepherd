@@ -74,6 +74,22 @@ pub enum ProviderError {
     #[error("io error on {path}: {detail}")]
     Io { path: String, detail: String },
 
+    /// The file is in the staging directory, is NOT at its original path, and
+    /// this call could not put it back.
+    ///
+    /// The one outcome `stage_for_destruction` cannot describe with an ordinary
+    /// error: it returns no [`Staged`], so the caller has nothing to hand
+    /// [`PlaceholderProvider::restore_staged`], and the user's only local copy
+    /// is somewhere they did not put it. `list_staged` is what finds it, and
+    /// startup recovery is what calls that — but a human should not have to
+    /// wait for a restart to be told.
+    #[error("{original} was staged to {staged} and could not be restored: {detail}")]
+    StagedAndStranded {
+        original: String,
+        staged: String,
+        detail: String,
+    },
+
     /// The unlink SUCCEEDED and its directory could not be made durable.
     ///
     /// Distinct from [`ProviderError::Io`] because it means the opposite thing

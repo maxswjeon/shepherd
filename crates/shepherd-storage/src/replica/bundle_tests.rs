@@ -94,33 +94,61 @@ fn the_same_record_on_two_branches_collapses_to_one() {
 }
 
 #[test]
-fn a_custody_tombstone_yields_to_any_live_branch_that_reasserts_it() {
-    let live = custody("docs/a.txt", 1, 1, clock(1, 5), false);
+fn a_custody_tombstone_yields_to_a_live_assertion_it_does_not_dominate() {
     let dead = custody("docs/a.txt", 1, 1, clock(9, 9), true);
 
     // Tombstoned on every branch, asserted live on none: gone.
     assert!(merge_custody(std::slice::from_ref(&dead)).is_empty());
 
-    // Tombstone PLUS a live re-assertion on another branch: kept, even though
-    // the tombstone's clock is strictly higher. This is the case that separates
-    // the custody reducer from the durable-config one — there, delete wins;
-    // here, honouring a stale tombstone costs the only surviving address of a
-    // file whose original may already be destroyed, while keeping a duplicate
-    // costs nothing.
-    let merged = merge_custody(&[dead, live.clone()]);
+    // Concurrent — the SAME clock, which is the only concurrency a
+    // `(writer_epoch, seq)` clock can express — and the tie goes to `live`.
+    // This is the case that separates the custody reducer from the
+    // durable-config one: there, delete wins; here, honouring a tombstone
+    // costs the only surviving address of a file whose original may already be
+    // destroyed, while keeping a duplicate costs nothing.
+    let concurrent_live = custody("docs/a.txt", 1, 1, clock(9, 9), false);
+    let merged = merge_custody(&[dead.clone(), concurrent_live.clone()]);
     assert_eq!(
         merged.len(),
         1,
-        "a live branch re-asserting the record must defeat the tombstone"
+        "a live assertion the tombstone does not dominate must defeat it"
     );
-    assert_eq!(merged[0].key, live.key);
+    assert_eq!(merged[0].key, concurrent_live.key);
+    assert!(!merged[0].tombstone);
+
+    // A NEWER live assertion is a genuine re-assertion and survives too.
+    let reasserted = custody("docs/a.txt", 1, 1, clock(10, 1), false);
+    let merged = merge_custody(&[dead.clone(), reasserted]);
+    assert_eq!(merged.len(), 1);
     assert!(!merged[0].tombstone);
 
     // Distinct target: unaffected by the other target's tombstone.
     let other_target = custody("docs/a.txt", 1, 2, clock(1, 5), false);
-    let merged = merge_custody(&[custody("docs/a.txt", 1, 1, clock(9, 9), true), other_target]);
+    let merged = merge_custody(&[dead, other_target]);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].target, TargetId::new(2));
+}
+
+/// A live record retired later by the SAME writer stays retired.
+///
+/// The reducer used to filter every tombstone out before grouping, so a live
+/// assertion survived any tombstone at all — correct against a concurrent
+/// branch, and wrong against the writer's own history. Live at `(1, 1)` then a
+/// tombstone at `(1, 2)` is an ordinary retirement, and resurrecting it during
+/// disaster recovery hands the user a remote location that no longer holds the
+/// object.
+#[test]
+fn a_custody_record_retired_later_by_the_same_writer_stays_retired() {
+    let live = custody("docs/a.txt", 1, 1, clock(1, 1), false);
+    let retired = custody("docs/a.txt", 1, 1, clock(1, 2), true);
+
+    assert!(
+        merge_custody(&[live.clone(), retired.clone()]).is_empty(),
+        "a tombstone that strictly dominates the live assertion retires it"
+    );
+    // Order of records must not matter — this is a merge, not a fold over a
+    // stream someone controls the order of.
+    assert!(merge_custody(&[retired, live]).is_empty());
 }
 
 #[test]
@@ -149,12 +177,45 @@ fn delete_wins_over_a_concurrent_edit_on_another_branch() {
     // additive answer. Delete-wins is the conservative direction: it cannot
     // resurrect a rule the user removed, and a resurrected tiering rule could
     // tier files the user deliberately excluded.
-    let edited = config("rule-1", 5, clock(9, 100), false); // higher clock
-    let deleted = config("rule-1", 0, clock(2, 1), true); // different epoch
+    //
+    // Concurrency is the SAME clock. A `(writer_epoch, seq)` clock is totally
+    // ordered and carries no writer identity, so two records are concurrent
+    // exactly when neither is in the other's past — which here means equal.
+    let edited = config("rule-1", 5, clock(9, 100), false);
+    let deleted = config("rule-1", 0, clock(9, 100), true);
     assert!(
         merge_durable_config(&[edited, deleted]).is_empty(),
-        "a concurrent delete must win even against a numerically newer edit"
+        "a concurrent delete must win"
     );
+}
+
+/// A delete and a re-creation ACROSS a restart is one writer editing, not two
+/// branches conflicting.
+///
+/// `writer_epoch` increments on every daemon start, so the rule "a tombstone in
+/// a different epoch is concurrent" called every cross-restart re-creation a
+/// conflict and let the old tombstone suppress it. Recovery then omitted rules,
+/// targets and settings the user was actively using — and did so precisely when
+/// the re-creation crossed a restart, which is the ordinary way a user
+/// re-creates anything.
+#[test]
+fn a_delete_then_recreate_across_a_restart_yields_the_recreated_entity() {
+    let deleted = config("rule-1", 0, clock(2, 7), true);
+    let recreated = config("rule-1", 9, clock(3, 1), false);
+
+    let merged = merge_durable_config(&[deleted.clone(), recreated.clone()]);
+    assert_eq!(
+        merged.len(),
+        1,
+        "an epoch-2 delete is in an epoch-3 re-creation's PAST, not concurrent with it"
+    );
+    assert_eq!(merged[0].body, recreated.body);
+
+    // And the opposite order still deletes: a re-creation in epoch 2 followed
+    // by a delete in epoch 3 is equally sequential.
+    let created = config("rule-1", 9, clock(2, 7), false);
+    let then_deleted = config("rule-1", 0, clock(3, 1), true);
+    assert!(merge_durable_config(&[created, then_deleted]).is_empty());
 }
 
 #[test]

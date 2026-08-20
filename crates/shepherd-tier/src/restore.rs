@@ -312,9 +312,29 @@ fn read_back_through(f: &mut std::fs::File, chosen: &Path) -> Result<RestoredAtt
         detail: e.to_string(),
     };
 
+    // STREAMED, not `read_to_end`. §4.5 sizes this path for 50 GB objects, and
+    // reading the restored file whole allocated a second copy of it beside the
+    // one the caller is already holding — so verifying a 50 GB restore asked
+    // for another 50 GB of resident memory and normally terminated the daemon
+    // instead of restoring anything.
+    //
+    // A fixed buffer plus an incremental hasher answers the same two questions
+    // — what the bytes hash to, and how many there are — in constant space.
+    // The caller still passes the whole payload in as `bytes`, which is the
+    // other half of the same problem and a signature change rather than a fix
+    // here; this is the half this function owns.
     f.seek(SeekFrom::Start(0)).map_err(io)?;
-    let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes).map_err(io)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
 
     // `fstat`, so the mode and mtime describe the same inode as the bytes.
     let md = f.metadata().map_err(io)?;
@@ -329,8 +349,8 @@ fn read_back_through(f: &mut std::fs::File, chosen: &Path) -> Result<RestoredAtt
     let mode = u32::from(md.permissions().readonly());
 
     Ok(RestoredAttrs {
-        blake3: Blake3Hash::from_bytes(*blake3::hash(&bytes).as_bytes()),
-        size: bytes.len() as u64,
+        blake3: Blake3Hash::from_bytes(*hasher.finalize().as_bytes()),
+        size,
         mtime: from_system_time(mtime),
         mode,
     })
@@ -454,10 +474,27 @@ fn discard_failed_attempt(chosen: &Path, created: Option<CreatedInode>) {
 /// Separate and public because "we asked for this mtime" and "the filesystem
 /// kept it" are different claims, and only the read-back settles the second.
 pub fn read_back(path: &Path) -> Result<RestoredAttrs> {
-    let bytes = std::fs::read(path).map_err(|e| RestoreError::Io {
+    use std::io::Read;
+    let io = |e: std::io::Error| RestoreError::Io {
         path: path.display().to_string(),
         detail: e.to_string(),
-    })?;
+    };
+
+    // Streamed for the same reason [`read_back_through`] is: §4.5 sizes this
+    // path for 50 GB objects, and `std::fs::read` allocates the whole file.
+    let mut f = std::fs::File::open(path).map_err(io)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+
     let md = std::fs::metadata(path).map_err(|e| RestoreError::Io {
         path: path.display().to_string(),
         detail: e.to_string(),
@@ -476,8 +513,8 @@ pub fn read_back(path: &Path) -> Result<RestoredAttrs> {
     let mode = u32::from(md.permissions().readonly());
 
     Ok(RestoredAttrs {
-        blake3: Blake3Hash::from_bytes(*blake3::hash(&bytes).as_bytes()),
-        size: bytes.len() as u64,
+        blake3: Blake3Hash::from_bytes(*hasher.finalize().as_bytes()),
+        size,
         mtime: from_system_time(mtime),
         mode,
     })

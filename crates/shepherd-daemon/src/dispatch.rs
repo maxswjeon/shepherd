@@ -1103,22 +1103,20 @@ fn catalog_totals(cat: &mut Catalog) -> Result<Totals, CatalogError> {
 /// That is the fail-closed direction and the safe way for the two to differ: no
 /// root can be registered that the walker would later decline, only the reverse.
 ///
-/// # Why the canonical name is read only when the root is itself a symlink
+/// # The canonical name is read whenever it differs
 ///
-/// Deliberately the same scope as `walk::deny_root`, and it is a scope, not an
-/// oversight. Canonicalizing unconditionally resolves macOS's `/var/folders`
-/// temp tree to `/private/var/...`, which the `/private/var` absolute-prefix
-/// rule then denies — refusing ordinary roots for their platform's symlink
-/// layout rather than for anything the user did.
+/// Not only when the root is itself a symlink. `symlink_metadata` answers about
+/// the leaf, so a root reached through a symlinked ANCESTOR — `<alias>/objects`
+/// where `alias -> <repo>/.git` — reported an ordinary directory and skipped
+/// canonicalization entirely, leaving three innocent literal components to
+/// check. `walk::deny_root` now does the same, because roots are stored under
+/// their literal spelling and an alias can be retargeted after enrollment: the
+/// registration-time answer is about the target the alias had that day.
 ///
-/// # What this does NOT close
-///
-/// A root reached through a symlinked *ancestor* — `/tmp/x/sub` where
-/// `x -> /repo/.git`. `symlink_metadata` on the root reports a directory, not a
-/// link, so no canonical name is taken and the literal components are all
-/// innocent. `walk::deny_root` declares the same gap for the same reason; making
-/// registration canonicalize unconditionally to close it is what the paragraph
-/// above rules out.
+/// This does refuse macOS's `/var/folders` temp tree, which canonicalizes into
+/// `/private/var` and is denied as a `SystemPath` — correctly. That is a real
+/// system tree, and the test fixtures that used to live there were moved to the
+/// build directory rather than the rule being weakened for them.
 fn deny_registration(
     deny: &shepherd_scan::DenyList,
     literal: &Path,
@@ -1135,27 +1133,16 @@ fn deny_registration(
 
 /// `deny_dir` applied to the path and to each of its parents.
 ///
-/// `Path::ancestors` yields the path itself first and each parent after it, so
-/// the **deepest** match is the one reported — `/repo/.git/objects` names
-/// `/repo/.git`, the directory the rule is actually about.
-///
-/// Each ancestor is passed as its own `abs`, so the absolute-prefix rules are
-/// asked the question they are phrased for ("is THIS directory inside `/proc`")
-/// rather than being re-asked about the leaf every time. The root of the
-/// filesystem yields an empty component, which matches no name or suffix while
-/// the prefix comparison still runs — the same degradation `walk::deny_root`
-/// documents for a root with no final component.
+/// One implementation, in `shepherd-scan`, shared with `walk::deny_root`: this
+/// boundary and the walker ask the identical question about the identical
+/// paths, and two copies of a safety predicate are two chances to answer
+/// differently. See [`shepherd_scan::deny_any_component`] for the ordering and
+/// the empty-component degradation.
 fn deny_any_component(
     deny: &shepherd_scan::DenyList,
     path: &Path,
 ) -> Option<(PathBuf, shepherd_scan::DenyReason)> {
-    path.ancestors().find_map(|a| {
-        let component = a
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        deny.deny_dir(&component, a).map(|r| (a.to_path_buf(), r))
-    })
+    shepherd_scan::deny_any_component(deny, path)
 }
 
 /// The refusal's predicate, read outside any transaction.
@@ -1590,24 +1577,38 @@ fn list_roots(cat: &mut Catalog, include_disabled: bool) -> Result<Vec<RootSumma
 /// and checkpoint, and a parallel progress table would be a second place for
 /// the same fact to be wrong.
 fn scan_states(cat: &mut Catalog, root_id: Option<i64>) -> Result<Vec<ScanState>, CatalogError> {
-    // The root filter is applied in SQL, BEFORE the limit.
+    // The LATEST scan per root, chosen in SQL, with no output cap at all.
     //
-    // Filtering afterwards meant the 200-row tail was taken across every root:
-    // a root whose last scan sat behind 200 newer jobs for other roots was cut
-    // before its own filter ran, and `scan.status {root_id}` answered with an
-    // empty list for a root that plainly has scan history. The unfiltered form
-    // has the same shape — roots outside the tail simply vanish — so the limit
-    // now applies per requested root rather than globally.
+    // Two versions of this were wrong in the same way. Originally a global
+    // `LIMIT 200` was taken across every root and the `root_id` filter applied
+    // afterwards, so a root whose last scan sat behind 200 newer jobs answered
+    // with an empty list. Moving the filter into SQL fixed the *filtered* form
+    // and left the unfiltered one identical: with `?1` bound to NULL the
+    // predicate is true for every scan and the same global tail cuts the same
+    // roots out.
+    //
+    // A cap cannot be part of the answer here. `scan.status` promises progress
+    // PER ROOT, so the row count it owes is the number of roots — bounded by
+    // enrollment, not by job history — and any cap over the job table is a cap
+    // over the wrong thing. `ROW_NUMBER() OVER (PARTITION BY root)` picks one
+    // row per root directly, which also retires the "only the most recent job
+    // per root" de-duplication this used to do in Rust after the fact.
     //
     // `json_extract` because `root_id` lives in `payload_json` and is not a
     // column; the bundled SQLite ships JSON1.
     let mut stmt = cat.conn().prepare(
         "SELECT payload_json, checkpoint_json, state, created_at, updated_at, last_error
-         FROM job
-         WHERE class = 'scan'
-           AND (?1 IS NULL OR json_extract(payload_json, '$.root_id') = ?1)
-         ORDER BY id DESC
-         LIMIT 200",
+         FROM (
+             SELECT payload_json, checkpoint_json, state, created_at, updated_at, last_error,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY json_extract(payload_json, '$.root_id')
+                        ORDER BY id DESC
+                    ) AS rn
+             FROM job
+             WHERE class = 'scan'
+               AND (?1 IS NULL OR json_extract(payload_json, '$.root_id') = ?1)
+         )
+         WHERE rn = 1",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![root_id], |r| {
@@ -1626,13 +1627,12 @@ fn scan_states(cat: &mut Catalog, root_id: Option<i64>) -> Result<Vec<ScanState>
     for (payload, checkpoint, state, created, updated, last_error) in rows {
         let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
         let rid = payload.get("root_id").and_then(|v| v.as_i64()).unwrap_or(0);
-        if root_id.is_some_and(|want| want != rid) {
-            continue;
-        }
-        // Only the most recent job per root.
-        if out.iter().any(|s| s.root_id == rid) {
-            continue;
-        }
+        // The SQL has selected exactly one row per root, and filtered by root
+        // where one was asked for; nothing is left to reject here.
+        debug_assert!(
+            !out.iter().any(|s| s.root_id == rid),
+            "the window function must already have de-duplicated by root"
+        );
         let cp: serde_json::Value = checkpoint
             .and_then(|c| serde_json::from_str(&c).ok())
             .unwrap_or_default();
@@ -1795,7 +1795,7 @@ mod tests {
                         ctime: Timestamp::from_nanos(1),
                         atime: None,
                         blake3: None,
-                        ino: None,
+                        ino: shepherd_core::InodeSighting::Unknown,
                     },
                     // These tests are not about generations; the sweep that
                     // reads this column is a separate concern.
@@ -1949,6 +1949,65 @@ mod tests {
         let all = list_roots(&mut cat, true).unwrap();
         assert_eq!(all.len(), 1, "the root row itself must still exist");
         assert!(!all[0].enabled, "and it must be disabled: {:?}", all[0]);
+    }
+
+    /// Every root's latest scan is reported, however much unrelated scan
+    /// traffic sits on top of it.
+    ///
+    /// This was wrong twice. A global `LIMIT 200` over the job table with the
+    /// `root_id` filter applied afterwards dropped a root whose last scan sat
+    /// behind 200 newer jobs; moving the filter into SQL fixed the filtered
+    /// form and left the unfiltered one identical, because with no root
+    /// requested the predicate is true for everything and the same tail cuts
+    /// the same roots.
+    ///
+    /// A cap cannot be part of the answer: the method promises progress PER
+    /// ROOT, so what it owes is one row per root.
+    #[test]
+    fn scan_status_reports_every_roots_latest_scan_past_any_cap() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let old_root = seed(&mut cat, "/data/quiet", &[]);
+        let busy_root = seed(&mut cat, "/data/busy", &[]);
+
+        let enqueue = |cat: &mut Catalog, root: RootId, n: i64| {
+            for i in 0..n {
+                let payload = serde_json::json!({ "root_id": root.get(), "full": false });
+                Queue::enqueue(
+                    cat,
+                    JobClass::Scan,
+                    10,
+                    &payload.to_string(),
+                    Timestamp::from_nanos(i + 1),
+                )
+                .unwrap();
+            }
+        };
+
+        // The quiet root scanned once, long ago.
+        enqueue(&mut cat, old_root, 1);
+        // Then 500 scans for another root pile on top of it — well past the
+        // 200-row tail this used to take.
+        enqueue(&mut cat, busy_root, 500);
+
+        let all = scan_states(&mut cat, None).unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "both roots have scan history and both must be reported: {all:?}"
+        );
+        assert!(
+            all.iter().any(|s| s.root_id == old_root.get()),
+            "the quiet root vanished behind another root's traffic: {all:?}"
+        );
+
+        // And the filtered form answers for it too.
+        let just_quiet = scan_states(&mut cat, Some(old_root.get())).unwrap();
+        assert_eq!(just_quiet.len(), 1, "{just_quiet:?}");
+        assert_eq!(just_quiet[0].root_id, old_root.get());
+
+        // One row per root, not one per job.
+        let busy = scan_states(&mut cat, Some(busy_root.get())).unwrap();
+        assert_eq!(busy.len(), 1, "the LATEST scan, not every scan: {busy:?}");
     }
 
     /// The custody refusal must be decided by the operation that does the

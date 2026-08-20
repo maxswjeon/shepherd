@@ -449,7 +449,8 @@ fn upsert_batch(
 /// Reported rather than swallowed: a scan that quietly skipped half a tree
 /// looks identical to one that found half a tree.
 fn summarise_skips(skips: &[Skip]) -> String {
-    let (mut denied, mut cycles, mut ignored, mut symlinked, mut unreadable) = (0, 0, 0, 0, 0);
+    let (mut denied, mut cycles, mut ignored, mut symlinked, mut unreadable, mut unrepresentable) =
+        (0, 0, 0, 0, 0, 0);
     for s in skips {
         match s {
             Skip::Denied { .. } => denied += 1,
@@ -457,11 +458,13 @@ fn summarise_skips(skips: &[Skip]) -> String {
             Skip::Ignored { .. } => ignored += 1,
             Skip::SymlinkedDir { .. } => symlinked += 1,
             Skip::Unreadable { .. } => unreadable += 1,
+            Skip::Unrepresentable { .. } => unrepresentable += 1,
         }
     }
     format!(
         "denied={denied} cycles={cycles} ignored={ignored} \
-         symlinked_dirs={symlinked} unreadable={unreadable}"
+         symlinked_dirs={symlinked} unreadable={unreadable} \
+         unrepresentable={unrepresentable}"
     )
 }
 

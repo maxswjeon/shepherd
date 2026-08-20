@@ -1013,6 +1013,43 @@ fn probe_nonce() -> String {
     )
 }
 
+/// What a completed upload's HEAD says about checksum support.
+///
+/// Two different `None`s used to be one. `head.and_then(|m| m.whole_object_checksum)`
+/// gave `None` both when the object was PRESENT without a checksum and when the
+/// object was ABSENT, and reported both as [`AttemptError::Unsupported`].
+///
+/// That difference decides whether a bucket can be registered. `Unsupported`
+/// means "this provider does not do this algorithm", and every algorithm
+/// answering that is exactly what makes `target.add` record `adopted: none` and
+/// register the bucket anyway — a legitimate outcome for R2 or B2. But a
+/// lifecycle rule, an inconsistent provider or an external deletion produces
+/// the absent-`None` for every algorithm too, and then registration succeeds on
+/// a bucket that has just demonstrated it does not retain what is uploaded to
+/// it. That is the one property this probe most needs to establish, and it was
+/// being reported as a checksum quirk.
+///
+/// [`AttemptError::Fatal`] for the absent case: a complete provider answer
+/// about something other than the checksum algorithm, which is the variant's
+/// stated purpose, and the one the orchestration refuses registration on.
+fn checksum_from_head(head: Option<ObjectMeta>) -> Result<ObjectChecksum, AttemptError> {
+    let Some(meta) = head else {
+        return Err(AttemptError::Fatal {
+            step: "head",
+            detail: "the multipart upload completed and HEAD then reported the object ABSENT. \
+                     That is not a statement about checksum support: the bucket did not retain \
+                     an object it had just accepted, so nothing uploaded to it can be trusted \
+                     to survive"
+                .into(),
+        });
+    };
+    meta.whole_object_checksum
+        .ok_or_else(|| AttemptError::Unsupported {
+            step: "head",
+            detail: "the object completed but HEAD returned no whole-object checksum".into(),
+        })
+}
+
 /// One S3 target, probed one algorithm at a time through the **real** upload
 /// path.
 struct S3RoundTrip {
@@ -1096,12 +1133,7 @@ impl ChecksumRoundTrip for S3RoundTrip {
         // `ChecksumType` there while reporting it correctly on HEAD, so the
         // attributes call produces a false negative on a provider that
         // supports the feature. Recorded in E-5 from handling the API directly.
-        let checksum = head.and_then(|m| m.whole_object_checksum).ok_or_else(|| {
-            AttemptError::Unsupported {
-                step: "head",
-                detail: "the object completed but HEAD returned no whole-object checksum".into(),
-            }
-        })?;
+        let checksum = checksum_from_head(head)?;
 
         if !checksum.whole_object {
             return Err(AttemptError::Unsupported {
@@ -1547,6 +1579,51 @@ mod probe_tests {
                 other => panic!("{code} was classified as {other:?}, not as fatal"),
             }
         }
+    }
+
+    /// An object that VANISHED after completing is fatal, not "no checksum".
+    ///
+    /// Both used to arrive as `None` and both were reported as `Unsupported` —
+    /// and every algorithm reporting `Unsupported` is precisely what makes
+    /// `target.add` record `adopted: none` and register the bucket anyway. A
+    /// lifecycle rule, an inconsistent provider or an external deletion
+    /// therefore looked like a bucket that merely lacks CRC64NVME, while it was
+    /// a bucket that did not keep an object it had just accepted.
+    #[test]
+    fn a_probe_object_that_disappears_is_fatal_not_unsupported() {
+        match checksum_from_head(None) {
+            Err(AttemptError::Fatal { step, detail }) => {
+                assert_eq!(step, "head");
+                assert!(detail.contains("ABSENT"), "{detail}");
+            }
+            other => panic!("a vanished probe object must be fatal, got {other:?}"),
+        }
+
+        // The paired non-zero: a PRESENT object with no checksum is still the
+        // ordinary negative result, or this fix would refuse every legitimate
+        // R2/B2 bucket.
+        let present = ObjectMeta {
+            key: ObjectKey::new("k"),
+            size: 1,
+            version: None,
+            etag: None,
+            whole_object_checksum: None,
+        };
+        assert!(matches!(
+            checksum_from_head(Some(present.clone())),
+            Err(AttemptError::Unsupported { .. })
+        ));
+
+        // And a present object WITH one is the success path.
+        let supported = ObjectMeta {
+            whole_object_checksum: Some(ObjectChecksum {
+                algorithm: ChecksumAlgorithm::Crc64Nvme,
+                value: "abc".into(),
+                whole_object: true,
+            }),
+            ..present
+        };
+        assert!(checksum_from_head(Some(supported)).is_ok());
     }
 
     /// The paired non-zero. Without it the guard above is satisfiable by

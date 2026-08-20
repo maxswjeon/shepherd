@@ -112,21 +112,36 @@ pub struct FileStat {
     /// §4.12's `atime_mode` detection decides that per root.
     pub atime: Option<Timestamp>,
     pub blake3: Option<Blake3Hash>,
-    /// The inode, as the walk's own `stat` reported it — **and only where it is
-    /// meaningful against the ROOT's volume id.**
+    /// What the walk learned about this entry's filesystem identity.
     ///
     /// Carried from the walk rather than re-`stat`ed at write time for two
     /// reasons: the writer actor must not do filesystem I/O, and a second
     /// `stat` by path would be a different file if the path was replaced in
     /// between — which is precisely the event this identity exists to detect.
-    ///
-    /// `None` on platforms with no inode, on any entry whose metadata could not
-    /// be read, and on any entry that lives on a NESTED MOUNT: the catalog
-    /// pairs this with the root's `volume_id`, and an inode is unique only
-    /// within its own filesystem, so a nested-mount inode would collide with a
-    /// root-filesystem one under a single `fs_id`. See
-    /// `shepherd_scan::walk::on_root_volume`.
-    pub ino: Option<u64>,
+    pub ino: InodeSighting,
+}
+
+/// What one walk learned about an entry's inode.
+///
+/// Three states rather than `Option<u64>`, because "no identity to record" and
+/// "this entry MUST NOT keep the identity it has" are opposite instructions to
+/// the catalog and were the same value. `upsert_file` merges with
+/// `COALESCE(excluded.fs_id, file.fs_id)` so a NULL means *keep what is there*
+/// — correct for an unreadable probe, and wrong for a path that has since been
+/// covered by a nested mount, which would go on carrying the `fs_id` of the
+/// file that used to be there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InodeSighting {
+    /// Read, and on the ROOT's own filesystem — so pairing it with the root's
+    /// `volume_id` names this file.
+    Known(u64),
+    /// Read, and on a NESTED MOUNT. An inode is unique only within its own
+    /// filesystem, so `<root-volume>:<inode>` would name a different file;
+    /// any recorded identity for this path is now stale and must be CLEARED.
+    ForeignVolume,
+    /// Not read at all — no inode on this platform, or metadata that could not
+    /// be obtained. Says nothing, so it must not overwrite what is recorded.
+    Unknown,
 }
 
 impl FileStat {
@@ -154,7 +169,7 @@ mod tests {
             ctime: Timestamp::from_nanos(1),
             atime: None,
             blake3: None,
-            ino: None,
+            ino: InodeSighting::Unknown,
         };
         assert!(!f.is_hash_bearing());
         f.blake3 = Some(Blake3Hash::from_bytes([0u8; 32]));

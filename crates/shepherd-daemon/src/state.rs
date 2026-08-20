@@ -478,7 +478,7 @@ mod tests {
                             ctime: shepherd_core::Timestamp::from_nanos(1),
                             atime: None,
                             blake3: None,
-                            ino: None,
+                            ino: shepherd_core::InodeSighting::Unknown,
                         },
                         1,
                         shepherd_core::Timestamp::from_nanos(2),

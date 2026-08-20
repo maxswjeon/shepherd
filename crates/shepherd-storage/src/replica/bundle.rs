@@ -193,35 +193,62 @@ pub fn bundle_class_of(class: CustodyClass) -> Option<BundleClass> {
 /// address of bytes whose original may already be gone — while duplicating one
 /// is harmless.
 ///
-/// A tombstone applies **only when no live branch re-asserts the record**. That
-/// asymmetry is deliberate and points the same way as everything else on this
-/// path: re-asserting a custody record costs a duplicate, honouring a stale
-/// tombstone costs the file.
-/// A tombstone is therefore **not** applied against a key that any branch still
-/// asserts live, no matter how new the tombstone's clock is. Note what that
-/// means mechanically: a tombstone contributes nothing at all to the output,
-/// and a key tombstoned on every branch simply never enters `live`. An earlier
-/// draft of this function kept a separate tombstone set and subtracted it at
+/// A tombstone applies **only against a live assertion it strictly dominates**.
+/// That asymmetry is deliberate and points the same way as everything else on
+/// this path: re-asserting a custody record costs a duplicate, honouring a
+/// stale tombstone costs the file. So a tombstone whose clock is not strictly
+/// greater than a live assertion's — concurrent with it, or older than it — is
+/// ignored, and a tie goes to `live`.
+///
+/// # Sequential retirement is not concurrency, and used to be treated as it
+///
+/// An earlier version ignored tombstones **entirely**: it filtered them out
+/// before grouping, so a live record survived any tombstone at all. That is
+/// correct against a concurrent branch and wrong against the writer's own
+/// history — live at `(1, 1)` followed by a tombstone at `(1, 2)` is an
+/// ordinary retirement, and dropping the tombstone resurrected a discarded
+/// remote location during disaster recovery, which is a location that no longer
+/// holds the object.
+///
+/// The version before THAT kept a separate tombstone set and subtracted it at
 /// the end, which quietly implemented *delete-wins* — the custody reducer with
 /// the durable-config reducer's rule, and the one direction that can drop the
-/// only remaining address of a destroyed file.
+/// only remaining address of a destroyed file. Domination is the rule that is
+/// neither: it honours the writer's own ordering and refuses to let one
+/// branch's delete erase another's assertion.
 pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
-    let mut live: BTreeMap<(CustodyKey, i64), CustodyRecord> = BTreeMap::new();
+    let mut by_key: BTreeMap<(CustodyKey, i64), Vec<&CustodyRecord>> = BTreeMap::new();
+    for r in records {
+        by_key
+            .entry((r.key.clone(), r.target.get()))
+            .or_default()
+            .push(r);
+    }
 
-    for r in records.iter().filter(|r| !r.tombstone) {
-        let k = (r.key.clone(), r.target.get());
-        match live.get(&k) {
-            // Highest clock wins among live assertions of the same record;
-            // they are the same custody fact, so this only picks the
-            // best-attested copy.
-            Some(prev) if prev.clock >= r.clock => {}
-            _ => {
-                live.insert(k, r.clone());
-            }
+    let mut live: Vec<CustodyRecord> = Vec::new();
+    for (_, group) in by_key {
+        // The newest tombstone for this key, if any. Only it can retire
+        // anything: a tombstone older than another tombstone retires a strict
+        // subset of what that one does.
+        let newest_tomb = group.iter().filter(|r| r.tombstone).map(|r| r.clock).max();
+
+        // Among the live assertions this tombstone does NOT dominate, the
+        // best-attested one. `>=` on the tombstone side would make a tie go to
+        // the delete, which is the direction this reducer exists to refuse.
+        let survivor = group
+            .iter()
+            .filter(|r| !r.tombstone)
+            // `>=`, i.e. "not dominated": a tie goes to `live`, which is this
+            // reducer's stated asymmetry.
+            .filter(|r| newest_tomb.is_none_or(|t| r.clock >= t))
+            .max_by_key(|r| r.clock);
+
+        if let Some(s) = survivor {
+            live.push((*s).clone());
         }
     }
 
-    live.into_values().collect()
+    live
 }
 
 /// Merge durable-config records across all valid branches.
@@ -236,11 +263,23 @@ pub fn merge_custody(records: &[CustodyRecord]) -> Vec<CustodyRecord> {
 /// user removed, and a resurrected *tiering* rule could tier files the user
 /// deliberately excluded.
 ///
-/// The concurrency rule, stated precisely: a tombstone written in a **different
-/// writer epoch** from the winning update is treated as concurrent with it and
-/// wins regardless of `seq`. Within a single epoch the writer's own ordering is
-/// meaningful, so a delete followed by a re-create in the same epoch correctly
-/// yields the re-created entity.
+/// The concurrency rule, stated precisely: a tombstone the winner does **not
+/// dominate** is treated as concurrent with it and wins. Everything the winner
+/// dominates is in its past and is an ordinary sequential edit.
+///
+/// This used to read "a tombstone in a different writer epoch is concurrent",
+/// which is exactly backwards for the common case. `writer_epoch` increments on
+/// every daemon START, so a delete in epoch 2 and a re-create in epoch 3 are
+/// not two branches — they are one writer, on two days, doing the obvious
+/// thing. Treating the old tombstone as concurrent suppressed the re-created
+/// rule, target or setting, so recovery omitted entities the user was actively
+/// using, and it did so precisely when the re-creation crossed a restart.
+///
+/// `LogicalClock` is `(writer_epoch, seq)` and totally ordered, so the records
+/// this rule can still call concurrent are those sharing the winner's exact
+/// clock — a genuine two-writer collision, where delete-wins remains the
+/// conservative answer because a resurrected tiering rule could tier files the
+/// user deliberately excluded.
 pub fn merge_durable_config(records: &[DurableConfigRecord]) -> Vec<DurableConfigRecord> {
     // The key borrows for the same reason the values already do: nothing here
     // outlives `records`. `&str` orders identically to `String`, so the group
@@ -260,10 +299,15 @@ pub fn merge_durable_config(records: &[DurableConfigRecord]) -> Vec<DurableConfi
         if winner.tombstone {
             continue;
         }
-        // Any tombstone from a different epoch is concurrent with the winner.
+        // A tombstone the winner dominates is in the winner's PAST, not
+        // concurrent with it — see this function's docs.
         let concurrent_delete = group
             .iter()
-            .any(|r| r.tombstone && r.clock.writer_epoch != winner.clock.writer_epoch);
+            // `>=`, i.e. "not dominated by the winner". With a totally ordered
+            // clock and a strict max that means an equal clock — a genuine
+            // two-writer collision, where delete-wins is the conservative
+            // answer.
+            .any(|r| r.tombstone && r.clock >= winner.clock);
         if concurrent_delete {
             continue;
         }

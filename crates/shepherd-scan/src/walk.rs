@@ -43,7 +43,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use shepherd_core::{FileStat, RootId, Timestamp};
+use shepherd_core::{FileStat, InodeSighting, RootId, Timestamp};
 
 use crate::denylist::{DenyList, DenyReason};
 use crate::ignore::IgnoreSet;
@@ -83,6 +83,27 @@ pub enum Skip {
         path: PathBuf,
     },
     Unreadable {
+        path: PathBuf,
+        detail: String,
+    },
+    /// A name this catalog cannot represent without losing it.
+    ///
+    /// `rel_path` is a `String` — it is a `TEXT` column with a
+    /// `UNIQUE(root_id, rel_path)` on it, it is the wire type, and `norm_key`
+    /// is derived from it. On Unix a filename is bytes, not UTF-8, so two
+    /// distinct real files whose names contain *different* invalid sequences
+    /// both render as the same replacement-character string. Catalogued, they
+    /// collide on that UNIQUE and one silently overwrites the other's
+    /// metadata — and neither row can reconstruct the original name for
+    /// hashing, tiering or restore.
+    ///
+    /// Reported and skipped rather than stored lossily. Refusing costs the user
+    /// a file that is not backed up and SAYS SO in the scan summary; storing it
+    /// costs a file that is silently wrong about which bytes it names, on a
+    /// path that later destroys originals. Representing them properly means a
+    /// reversible byte encoding for `rel_path` and `norm_key`, which is a §4.9
+    /// change rather than a walker one.
+    Unrepresentable {
         path: PathBuf,
         detail: String,
     },
@@ -148,24 +169,42 @@ pub fn walk(
     // what the caller handed in, so `rel_path` and everything downstream are
     // unchanged — this is a second reading of one path for one purpose, not a
     // redefinition of the root.
-    let canonical = match std::fs::symlink_metadata(root) {
-        Ok(md) if md.is_symlink() => match std::fs::canonicalize(root) {
-            Ok(c) => Some(c),
-            // A symlinked root whose target will not resolve is not walked on
-            // the strength of a check that never ran. `read_dir` can still
-            // succeed after a failure here, and that window is exactly what
-            // returning rather than falling through closes.
-            Err(e) => {
-                out.skipped.push(Skip::Unreadable {
-                    path: root.to_path_buf(),
-                    detail: format!("cannot resolve symlinked root for the deny check: {e}"),
-                });
-                return Ok(out);
-            }
-        },
-        // Not a symlink, or unstattable. An unstattable root falls through to
-        // `read_dir` and is reported as `Unreadable` there, as it always was.
-        _ => None,
+    //
+    // Canonicalized whenever the result DIFFERS from the literal path, not only
+    // when the final component is a symlink — the same rule `dispatch::root_add`
+    // applies, and it has to be applied HERE TOO rather than once at
+    // registration. Roots are stored under their literal spelling, so an
+    // ancestor alias can be retargeted after enrollment: `<alias>/objects`
+    // pointed at a safe tree when it was registered and at a `.git` by the time
+    // the scan runs. `symlink_metadata` answers about the leaf alone and
+    // reports an ordinary directory in both cases, so a leaf-only check let the
+    // second one through and catalogued the denied tree.
+    //
+    // The LITERAL check runs first and on its own, because it must not depend
+    // on the path existing: `/Library/Caches` is denied on Linux, where it does
+    // not exist, and `a_denied_absolute_prefix_as_the_root_is_refused_without_
+    // being_opened` pins exactly that. Canonicalization needs a real path, so
+    // ordering it ahead of this check would answer `Unreadable` for a root the
+    // deny list has an opinion about.
+    if let Some((path, reason)) = deny_root(deny, root, None) {
+        out.skipped.push(Skip::Denied { path, reason });
+        return Ok(out);
+    }
+    let canonical = match std::fs::canonicalize(root) {
+        Ok(c) if c != root => Some(c),
+        // Already canonical: nothing to check twice.
+        Ok(_) => None,
+        // Innocent by its literal name and unresolvable: not walked on the
+        // strength of a check that never ran. `read_dir` can still succeed
+        // after a failure here, and that window is exactly what returning
+        // rather than falling through closes.
+        Err(e) => {
+            out.skipped.push(Skip::Unreadable {
+                path: root.to_path_buf(),
+                detail: format!("cannot resolve the root for the deny check: {e}"),
+            });
+            return Ok(out);
+        }
     };
     if let Some((path, reason)) = deny_root(deny, root, canonical.as_deref()) {
         out.skipped.push(Skip::Denied { path, reason });
@@ -281,12 +320,25 @@ pub fn walk(
                 continue;
             }
 
-            let Some(rel) = rel_path(root, &path) else {
-                out.skipped.push(Skip::Unreadable {
-                    path,
-                    detail: "entry is not under the scan root".into(),
-                });
-                continue;
+            let rel = match rel_path(root, &path) {
+                RelPath::Ok(rel) => rel,
+                RelPath::NotUnderRoot => {
+                    out.skipped.push(Skip::Unreadable {
+                        path,
+                        detail: "entry is not under the scan root".into(),
+                    });
+                    continue;
+                }
+                RelPath::NotUtf8 => {
+                    out.skipped.push(Skip::Unrepresentable {
+                        path,
+                        detail: "the name is not valid UTF-8; the catalog stores `rel_path` as \
+                                 text with a uniqueness constraint, so storing it lossily \
+                                 would let it collide with another file's row"
+                            .into(),
+                    });
+                    continue;
+                }
             };
 
             out.files.push(FileStat {
@@ -298,7 +350,7 @@ pub fn walk(
                 atime: md.accessed().ok().map(|t| sys_time(Some(t))),
                 // §6: hashing is its own job class, never a scan prerequisite.
                 blake3: None,
-                ino: ino_of(&md).filter(|_| on_root_volume(&md, root_dev)),
+                ino: sighting(&md, root_dev),
             });
         }
     }
@@ -316,6 +368,23 @@ fn ino_of(md: &std::fs::Metadata) -> Option<u64> {
 #[cfg(not(unix))]
 fn ino_of(_md: &std::fs::Metadata) -> Option<u64> {
     None
+}
+
+/// What this walk can tell the catalog about the entry's identity.
+///
+/// The foreign-mount case is [`InodeSighting::ForeignVolume`] rather than
+/// "no inode", and the difference is not cosmetic: a path that was scanned
+/// before a nested mount covered it already HAS an `fs_id`, derived from the
+/// root's volume and the inode of the file that used to be there. "No inode"
+/// tells `upsert_file` to keep that, which leaves the upload and destruction
+/// locks — and the rename-versus-replacement decision — keyed to a file that
+/// is no longer at the path. `ForeignVolume` tells it to clear.
+fn sighting(md: &std::fs::Metadata, root_dev: Option<u64>) -> InodeSighting {
+    match ino_of(md) {
+        Some(ino) if on_root_volume(md, root_dev) => InodeSighting::Known(ino),
+        Some(_) => InodeSighting::ForeignVolume,
+        None => InodeSighting::Unknown,
+    }
 }
 
 /// This entry's `st_dev`, for the nested-mount check.
@@ -392,27 +461,62 @@ fn deny_root(
     literal: &Path,
     canonical: Option<&Path>,
 ) -> Option<(PathBuf, DenyReason)> {
-    if let Some(reason) = deny_as_root(deny, literal) {
-        return Some((literal.to_path_buf(), reason));
+    if let Some(hit) = deny_any_component(deny, literal) {
+        return Some(hit);
     }
-    let canonical = canonical?;
-    deny_as_root(deny, canonical).map(|reason| (canonical.to_path_buf(), reason))
+    deny_any_component(deny, canonical?)
 }
 
-fn deny_as_root(deny: &DenyList, path: &Path) -> Option<DenyReason> {
-    let component = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    deny.deny_dir(&component, path)
+/// [`DenyList::deny_dir`] applied to a path **and to each of its parents**.
+///
+/// The leaf alone is not the question. `<repo>/.git/objects` has an innocent
+/// final component and is inside a denied tree, and after canonicalization that
+/// is exactly the shape an aliased root takes: the alias resolves to a path
+/// whose *ancestor* is the `.git`, never its last component. A leaf-only check
+/// therefore passed the resolved path it had just gone to the trouble of
+/// resolving.
+///
+/// `Path::ancestors` yields the path itself first and each parent after it, so
+/// the **deepest** match is reported — `/repo/.git/objects` names `/repo/.git`,
+/// the directory the rule is actually about. Each ancestor is passed as its own
+/// `abs`, so the absolute-prefix rules are asked the question they are phrased
+/// for ("is THIS directory inside `/proc`") rather than being re-asked about
+/// the leaf every time. The filesystem root yields an empty component, which
+/// matches no name or suffix while the prefix comparison still runs.
+///
+/// Public because `shepherd-daemon`'s registration boundary asks the identical
+/// question about the identical paths, and two copies of a safety predicate is
+/// two chances to answer differently.
+pub fn deny_any_component(deny: &DenyList, path: &Path) -> Option<(PathBuf, DenyReason)> {
+    path.ancestors().find_map(|a| {
+        let component = a
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        deny.deny_dir(&component, a).map(|r| (a.to_path_buf(), r))
+    })
+}
+
+/// Why a path has no `rel_path`, so the two reasons stay distinguishable.
+enum RelPath {
+    Ok(String),
+    NotUnderRoot,
+    /// Not valid UTF-8. See [`Skip::Unrepresentable`] — `to_string_lossy` here
+    /// mapped distinct real filenames onto one string, and the catalog's
+    /// `UNIQUE(root_id, rel_path)` then merged two files into one row.
+    NotUtf8,
 }
 
 /// Path relative to the root, with separators left exactly as the OS gave them.
 /// Normalization is the catalog's job (§4.9).
-fn rel_path(root: &Path, path: &Path) -> Option<String> {
-    path.strip_prefix(root)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
+fn rel_path(root: &Path, path: &Path) -> RelPath {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return RelPath::NotUnderRoot;
+    };
+    match rel.to_str() {
+        Some(s) => RelPath::Ok(s.to_string()),
+        None => RelPath::NotUtf8,
+    }
 }
 
 fn dir_id(path: &Path) -> Option<DirId> {
@@ -1032,6 +1136,114 @@ mod tests {
         }
     }
 
+    /// A denied tree reached through a symlinked ANCESTOR is refused at SCAN
+    /// time, not only at registration.
+    ///
+    /// Roots are stored under their literal spelling, so an ancestor alias can
+    /// be retargeted after enrollment: `<alias>/objects` pointed somewhere
+    /// harmless when the user registered it and at a `.git` by the time the
+    /// scan runs. `symlink_metadata` answers about the LEAF, which is an
+    /// ordinary directory in both cases, so the walk's leaf-only check let the
+    /// retargeted one through and catalogued the denied tree — registration
+    /// having done the right thing once, months earlier, on a different target.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_under_a_retargeted_symlinked_ancestor_is_refused_at_scan_time() {
+        let t = Tmp::new("ancestor-retarget");
+        t.file("safe/objects/a.txt", b"a");
+        t.file("repo/.git/objects/pack.idx", b"idx");
+
+        let alias = t.0.join("alias");
+        std::os::unix::fs::symlink(t.0.join("safe"), &alias).unwrap();
+        let root = alias.join("objects");
+
+        // As registered: innocent, and walked.
+        let out = go_root(&root, &DenyList::builtin());
+        assert_eq!(out.files.len(), 1, "{:?}", out.skipped);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+
+        // The alias is repointed at a `.git`. The literal root string has not
+        // changed, and neither has the leaf's own type.
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(t.0.join("repo/.git"), &alias).unwrap();
+        assert!(
+            !std::fs::symlink_metadata(&root).unwrap().is_symlink(),
+            "the leaf must be an ordinary directory, or this tests the old path"
+        );
+
+        let out = go_root(&root, &DenyList::builtin());
+        assert!(
+            out.files.is_empty(),
+            "a `.git` reached through a retargeted alias was catalogued: {:?}",
+            out.files
+        );
+        assert!(
+            matches!(
+                out.skipped.as_slice(),
+                [Skip::Denied {
+                    reason: DenyReason::VersionControl,
+                    ..
+                }]
+            ),
+            "{:?}",
+            out.skipped
+        );
+    }
+
+    /// Two files whose names are different invalid UTF-8 are not catalogued as
+    /// one file.
+    ///
+    /// `to_string_lossy` maps every invalid byte to U+FFFD, so distinct real
+    /// filenames collapse to the same `rel_path` — and the catalog's
+    /// `UNIQUE(root_id, rel_path)` then merges them, one file silently
+    /// overwriting the other's metadata, with neither row able to reconstruct
+    /// the original name for hashing, tiering or restore.
+    ///
+    /// Refused and REPORTED rather than stored lossily: a file that is not
+    /// backed up and says so is recoverable by a human; a row that is silently
+    /// wrong about which bytes it names is on the path that later destroys
+    /// originals.
+    #[cfg(unix)]
+    #[test]
+    fn names_that_are_not_utf8_are_skipped_rather_than_merged() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let t = Tmp::new("nonutf8");
+        // Two DIFFERENT invalid sequences. Both render as the same lossy
+        // string, which is the whole bug.
+        let a = t.0.join(std::ffi::OsStr::from_bytes(b"bad-\xff.bin"));
+        let b = t.0.join(std::ffi::OsStr::from_bytes(b"bad-\xfe.bin"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "the fixture must actually collide under lossy conversion, or this tests nothing"
+        );
+        // And one ordinary file, so the walk is not simply refusing everything.
+        t.file("fine.txt", b"ok");
+
+        let out = go(&t, &DenyList::builtin());
+
+        let paths: Vec<_> = out.files.iter().map(|f| f.rel_path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec!["fine.txt".to_string()],
+            "a name the catalog cannot represent must not be catalogued: {paths:?}"
+        );
+        let unrepresentable: Vec<_> = out
+            .skipped
+            .iter()
+            .filter(|s| matches!(s, Skip::Unrepresentable { .. }))
+            .collect();
+        assert_eq!(
+            unrepresentable.len(),
+            2,
+            "both must be reported, or the user cannot know what was left out: {:?}",
+            out.skipped
+        );
+    }
+
     /// A far-future filesystem timestamp clamps instead of wrapping into the
     /// past.
     ///
@@ -1102,7 +1314,7 @@ mod tests {
             .find(|f| f.rel_path.ends_with("own.txt"))
             .expect("the root's own file is walked");
         assert!(
-            own.ino.is_some(),
+            matches!(own.ino, InodeSighting::Known(_)),
             "a file on the root's own filesystem must carry its identity"
         );
 

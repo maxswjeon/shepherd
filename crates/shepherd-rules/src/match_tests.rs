@@ -19,7 +19,7 @@ fn file(rel: &str, size: u64, age_days: i64) -> FileStat {
         ctime: t,
         atime: Some(t),
         blake3: None,
-        ino: None,
+        ino: shepherd_core::InodeSighting::Unknown,
     }
 }
 

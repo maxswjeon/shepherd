@@ -398,6 +398,27 @@ async fn a_source_that_changes_between_attempts_aborts_rather_than_splicing() {
         "expected the fingerprint gate to fire, got {err:?}"
     );
     assert_ne!(resumed.state, TransferState::Committed);
+
+    // And the provider session it had been filling is ABANDONED, not merely
+    // left behind. This mismatch is terminal — replanning the edited file picks
+    // a different content-addressed key, so no `adopt_or_reap` visit ever
+    // reaches this one again — and the parts already uploaded would otherwise
+    // accrue storage until the bucket's lifecycle rules noticed.
+    //
+    // The read-stream hash at the END of `upload_pending` already abandoned;
+    // this is the fingerprint gate at the TOP of it, which returned directly
+    // and never reached that code.
+    assert_eq!(
+        resumed.state,
+        TransferState::Aborted(AbortOutcome::Clean),
+        "a terminal source mismatch must abandon its multipart session wherever it is \
+         detected, not only at the last of the two places that detect it"
+    );
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        0,
+        "and the abandonment has to reach the provider"
+    );
 }
 
 #[test]

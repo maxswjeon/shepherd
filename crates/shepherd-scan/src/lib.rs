@@ -6,7 +6,7 @@
 //! walk ──► denylist (prunes directories)
 //!      ──► ignore   (user patterns, .gitignore semantics)
 //!      ──► floors   (AC-8 eligibility)
-//!      ──► FileStat { blake3: None     ino: None,
+//!      ──► FileStat { blake3: None     ino: shepherd_core::InodeSighting::Unknown,
 //!      ──► FileStat { blake3: None }  ──► catalog
 //!                                     ──► `hash` job class, later
 //! ```
@@ -34,4 +34,4 @@ pub use denylist::{DenyList, DenyReason, STAGING_DIR_NAME};
 pub use floors::{FloorContext, FloorInput, FloorPolicy, FloorRefusal, Verdict};
 pub use hash::{HashOutcome, hash_bytes, hash_file};
 pub use ignore::IgnoreSet;
-pub use walk::{Skip, WalkOutput, walk};
+pub use walk::{Skip, WalkOutput, deny_any_component, walk};
