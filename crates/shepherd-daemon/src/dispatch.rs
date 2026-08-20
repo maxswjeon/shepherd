@@ -103,6 +103,14 @@ impl Session {
     }
 }
 
+/// Whether `path` is `ancestor` or lives under it, on canonical paths where
+/// they resolve. `Path::starts_with` compares COMPONENTS, so a shared prefix
+/// like `state-old` is not "under" `state`.
+fn under(path: &Path, ancestor: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    real(path).starts_with(real(ancestor))
+}
+
 fn map_worker_error(e: shepherd_catalog::writer::WriterError) -> RpcError {
     use shepherd_catalog::writer::WriterError;
     match e {
@@ -167,6 +175,30 @@ impl ShepherdApi for Session {
             ));
         }
 
+        // The daemon's own state directory is not a scan target, and this is the
+        // registration-time half of the refusal `scan_exec` performs.
+        //
+        // Above the probes for the same reason AC-7 is: everything below writes
+        // into the root, and `probe_path_policies` dropping a probe file into
+        // the directory holding the live catalog and the secret store is the
+        // trespass, not the scan that follows it.
+        //
+        // Only AT or INSIDE. A root that CONTAINS the state directory — `$HOME`,
+        // the common case — is legitimate and is handled by excluding the state
+        // directory from its walk.
+        if under(&path, &self.daemon.paths.state_dir) {
+            return Err(RpcError::new(
+                ErrorCode::Refused,
+                format!(
+                    "`{}` is inside Shepherd's own state directory (`{}`), which holds the \
+                     catalog, its write-ahead log and the secret store. It cannot be \
+                     registered as a scan root.",
+                    req.path,
+                    self.daemon.paths.state_dir.display()
+                ),
+            ));
+        }
+
         // AC-7 applies to registration, not only to the walk — and it has to be
         // consulted HERE, above this line, because everything below it writes.
         //
@@ -196,27 +228,36 @@ impl ShepherdApi for Session {
         // an innocently-named symlink into a denied tree through on the alias's
         // own name. Both then reached the probes below, which is the trespass
         // this block exists to prevent.
-        let canonical = match std::fs::symlink_metadata(&path) {
-            Ok(md) if md.is_symlink() => match std::fs::canonicalize(&path) {
-                Ok(c) => Some(c),
-                // Fail closed. `is_dir()` above follows the link, so a target
-                // that resolved for that check and not for this one is exotic
-                // (a parent that turned unsearchable) — and the direction to be
-                // exotic in is refusing, not probing a tree whose identity was
-                // never established.
-                Err(e) => {
-                    return Err(RpcError::new(
-                        ErrorCode::Refused,
-                        format!(
-                            "`{}` is a symlink whose target cannot be resolved ({e}), so \
-                             Shepherd cannot check it against the AC-7 deny list. It is \
-                             refused rather than probed.",
-                            req.path
-                        ),
-                    ));
-                }
-            },
-            _ => None,
+        // Canonicalized whenever the result DIFFERS from the literal path — not
+        // only when the final component is a symlink.
+        //
+        // `symlink_metadata` answers about the leaf alone, so `/tmp/alias/objects`
+        // with `alias -> /repo/.git` reported an ordinary directory and skipped
+        // canonicalization entirely. `deny_registration` then read `tmp`,
+        // `alias` and `objects` — three innocent names — and the registration
+        // ran its write probes inside a `.git` and enrolled it. The alias does
+        // not have to be the last component to hide a denied tree; it only has
+        // to be somewhere on the path.
+        let canonical = match std::fs::canonicalize(&path) {
+            Ok(c) if c != path => Some(c),
+            // Already canonical: nothing to check twice.
+            Ok(_) => None,
+            // Fail closed. `is_dir()` above follows every link on the path, so a
+            // path that resolved for that check and not for this one is exotic
+            // (an ancestor that turned unsearchable) — and the direction to be
+            // exotic in is refusing, not probing a tree whose identity was never
+            // established.
+            Err(e) => {
+                return Err(RpcError::new(
+                    ErrorCode::Refused,
+                    format!(
+                        "`{}` cannot be resolved to a real path ({e}), so Shepherd cannot \
+                         check it against the AC-7 deny list. It is refused rather than \
+                         probed.",
+                        req.path
+                    ),
+                ));
+            }
         };
         if let Some((denied, reason)) = deny_registration(
             &shepherd_scan::DenyList::builtin(),
@@ -282,14 +323,31 @@ impl ShepherdApi for Session {
         // ignore patterns), and §4.9 gives no basis for refusing them. The user
         // hears it while standing in front of the command that caused it.
         let mine = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let literal = req.path.clone();
         for other in self.cat(move |cat| list_roots(cat, false))? {
             let raw = PathBuf::from(&other.path);
             let theirs = std::fs::canonicalize(&raw).unwrap_or(raw);
-            if theirs == mine {
-                // The same path re-added; `enroll_root` reports that itself.
+            // Skipped on the LITERAL path, not the canonical one. `enroll_root`
+            // keys on `scan_root.path` — the string the user typed — so it is
+            // literal equality that turns an add into a re-enrollment it reports
+            // itself. Skipping on canonical equality suppressed the warning for
+            // exactly the case canonicalization was added to catch: `/data/link`
+            // pointing at an enrolled `/data/real` compares equal here, is a
+            // DIFFERENT row to `enroll_root`, and a second enabled root over the
+            // same files gets registered in silence.
+            if other.path == literal {
                 continue;
             }
-            if mine.starts_with(&theirs) {
+            if theirs == mine {
+                warnings.push(format!(
+                    "this path is another name for the already-registered root `{}` (id {}) \
+                     — they resolve to the same directory. Both will be scanned, so every \
+                     file under it gets a catalog row per root: counted twice in `status` \
+                     and `search`, and offered twice to later rule and tier passes. Remove \
+                     one of the two.",
+                    other.path, other.root_id
+                ));
+            } else if mine.starts_with(&theirs) {
                 warnings.push(format!(
                     "this root is inside the already-registered root `{}` (id {}). Both will \
                      be scanned, so every file under this one gets a catalog row per root — \

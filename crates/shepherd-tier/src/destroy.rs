@@ -245,6 +245,34 @@ pub async fn execute_local_destruction(
     // recovering in-process while we still hold the context is strictly better
     // than deferring to a pass that has to reconstruct it.
     if let Err(e) = provider.destroy_local(&staged, req.expected_hash) {
+        // `DestroyedNotDurable` is the one failure here that is NOT a failure to
+        // destroy: the unlink succeeded and only its directory could not be
+        // fsync'd. Abort-forward-never does not apply — there is nothing left to
+        // restore, and a retry would unlink a name that is already gone. What is
+        // owed is what any unresolvable irreversible step is owed: the record,
+        // written under the permit still held, and the global halt, because a
+        // crash can still resurrect the entry and leave the log describing a
+        // destruction that did not survive.
+        if let shepherd_placeholder::provider::ProviderError::DestroyedNotDurable { path, detail } =
+            &e
+        {
+            let detail = format!("{path} was unlinked but the removal is not durable: {detail}");
+            tracing::error!(%detail, "destruction is irreversible but not durable");
+            permit.append(&AuditRecord {
+                at: now,
+                intent: req.intent,
+                kind: "local",
+                path: req.path.display().to_string(),
+                size: req.expected_size,
+                blake3: Some(req.expected_hash),
+                attestation: format!("{:?}", req.custodian.attestation).to_lowercase(),
+                target_keys: vec![req.remote_key.as_str().to_owned()],
+                reconstructed: false,
+            })?;
+            audit.halt_for_recovery(&detail);
+            return Err(e.into());
+        }
+
         // The permit goes back before the restore: nothing irreversible
         // happened, so there is no record owed and no reason to hold every
         // other destruction while this one unwinds.

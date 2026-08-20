@@ -67,12 +67,18 @@ impl Daemon {
     fn start_with_env(tag: &str, env: &[(&str, &str)]) -> Daemon {
         let dir = std::env::temp_dir().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // The state directory is a CHILD of the harness directory, not the
+        // harness directory itself. Every test builds its corpus at
+        // `d.dir.join(..)`, and a state directory sitting above those corpora
+        // made each of them a root inside the daemon's own state — which
+        // `root.add` now refuses, and which no real user has. Siblings is the
+        // real shape.
+        std::fs::create_dir_all(dir.join("state")).unwrap();
         let socket = dir.join("daemon.sock");
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_shepherdd"));
         cmd.arg("run")
-            .env("SHEPHERD_STATE_DIR", &dir)
+            .env("SHEPHERD_STATE_DIR", dir.join("state"))
             .env("SHEPHERD_SOCKET", &socket);
         for (k, v) in env {
             cmd.env(k, v);
@@ -131,7 +137,7 @@ impl Daemon {
     /// returns.
     fn stored_target_config(&self, name: &str) -> serde_json::Value {
         let conn = rusqlite::Connection::open_with_flags(
-            self.dir.join("catalog.db"),
+            self.dir.join("state").join("catalog.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .expect("open the daemon's catalog read-only");
@@ -148,7 +154,7 @@ impl Daemon {
     /// How many targets the daemon has committed.
     fn target_count(&self) -> i64 {
         let conn = rusqlite::Connection::open_with_flags(
-            self.dir.join("catalog.db"),
+            self.dir.join("state").join("catalog.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .expect("open the daemon's catalog read-only");
@@ -549,7 +555,7 @@ fn a_scan_records_the_filesystem_identity_of_every_file() {
     scan_and_expect(&mut c, root_id, 2);
 
     let conn = rusqlite::Connection::open_with_flags(
-        d.dir.join("catalog.db"),
+        d.dir.join("state").join("catalog.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
@@ -643,6 +649,28 @@ fn enrolling_an_overlapping_root_warns_in_both_directions() {
     assert!(
         !warnings_of(&unrelated).iter().any(|w| w.contains("inside")),
         "`corpus-overlap-notes` is not inside `corpus-overlap`: {unrelated}"
+    );
+
+    // A different NAME for a root already enrolled. This is the case
+    // canonicalization was added for, and the one a canonical-equality skip
+    // silently swallowed: `enroll_root` keys on the literal path, so the alias
+    // is a second enabled root over the same files.
+    let alias = d.dir.join("corpus-overlap-alias");
+    std::os::unix::fs::symlink(&outer, &alias).unwrap();
+    let aliased = c.call(
+        "root.add",
+        serde_json::json!({"path": alias.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    assert!(
+        warnings_of(&aliased)
+            .iter()
+            .any(|w| w.contains("another name for") && w.contains(&outer_id.to_string())),
+        "an alias of a registered root must say so: {aliased}"
+    );
+    assert_ne!(
+        aliased["root"]["root_id"].as_i64().unwrap(),
+        outer_id,
+        "and it really did become a second root — which is why the warning matters"
     );
 
     // And the other direction: a new root that CONTAINS a registered one.
@@ -795,6 +823,98 @@ fn a_scan_does_not_catalogue_the_daemons_own_state_directory() {
         Some(0),
         "the daemon's own catalog must not be a file in the catalog: {hits}"
     );
+}
+
+/// A denied tree reached through a symlinked ANCESTOR is refused too.
+///
+/// The deny decision canonicalized only when the final component was itself a
+/// symlink, and `symlink_metadata` answers about the leaf alone. So
+/// `<alias>/objects`, where `alias` points at a `.git`, reported an ordinary
+/// directory, skipped canonicalization, and offered `deny_registration` three
+/// innocent names — after which registration ran its write probes inside the
+/// `.git` and enrolled it. The alias never had to be the last component.
+#[test]
+fn a_denied_tree_reached_through_a_symlinked_ancestor_is_refused() {
+    let d = Daemon::start("ancestor-alias");
+    let mut c = d.connect();
+
+    let git = d.dir.join("repo").join(".git");
+    let objects = git.join("objects");
+    std::fs::create_dir_all(&objects).unwrap();
+    let alias = d.dir.join("alias");
+    std::os::unix::fs::symlink(&git, &alias).unwrap();
+
+    // The leaf is an ordinary directory; only the ancestor is the alias.
+    let target = alias.join("objects");
+    assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink());
+    let before = std::fs::metadata(&objects).unwrap().modified().unwrap();
+
+    let err = c.call_err(
+        "root.add",
+        serde_json::json!({"path": target.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    assert_eq!(
+        err.kind(),
+        Some(shepherd_proto::ErrorCode::Refused),
+        "a `.git` reached through an alias is still a `.git`: {err:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&objects).unwrap().modified().unwrap(),
+        before,
+        "the enrollment probes wrote into a denied tree before it was refused"
+    );
+}
+
+/// Registering the daemon's own state directory is refused, at `root.add`.
+///
+/// The exclusion added for the `$HOME`-contains-state-dir case is deliberately
+/// about a state directory found *during* a walk. A root registered AT or
+/// INSIDE the state directory is a different thing: excluding it would prune
+/// the walk root itself and surface as "could not be read", and NOT excluding
+/// it walks the live `catalog.db`, its WAL companions and any `secrets.json`.
+/// Neither is an answer, so the registration is refused — before the enrollment
+/// probes, which would otherwise write their probe files into the directory
+/// holding the secret store.
+#[test]
+fn registering_the_state_directory_as_a_root_is_refused() {
+    let d = Daemon::start("statedir-root");
+    let mut c = d.connect();
+    let state = d.dir.join("state");
+
+    for path in [state.clone(), state.join("nested")] {
+        std::fs::create_dir_all(&path).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let err = c.call_err(
+            "root.add",
+            serde_json::json!({"path": path.to_str().unwrap(), "stub_mode": "delete"}),
+        );
+        assert_eq!(
+            err.kind(),
+            Some(shepherd_proto::ErrorCode::Refused),
+            "{} must not be registerable: {err:?}",
+            path.display()
+        );
+        assert!(
+            err.message.contains("state directory"),
+            "the refusal must say why: {}",
+            err.message
+        );
+        // Refused BEFORE the probes, which write into the root.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "{} was written into before it was refused",
+            path.display()
+        );
+    }
+
+    // And the containing case is still fine — that is what the exclusion is for.
+    let outer = c.call(
+        "root.add",
+        serde_json::json!({"path": d.dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    assert!(outer["root"]["root_id"].as_i64().is_some(), "{outer}");
 }
 
 /// An explicit `scan.start --root-id` on a deregistered root must be refused,
@@ -4467,7 +4587,7 @@ fn a_scan_stamps_its_job_id_as_the_generation_and_a_rescan_advances_it() {
 
     let gen_of = || -> i64 {
         let conn = rusqlite::Connection::open_with_flags(
-            d.dir.join("catalog.db"),
+            d.dir.join("state").join("catalog.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .expect("open the daemon's catalog read-only");
@@ -4507,7 +4627,7 @@ fn a_scan_stamps_its_job_id_as_the_generation_and_a_rescan_advances_it() {
 /// Every file row under `root`, as `(rel_path, state)`.
 fn rows_by_state(d: &Daemon, root_id: i64) -> Vec<(String, String)> {
     let conn = rusqlite::Connection::open_with_flags(
-        d.dir.join("catalog.db"),
+        d.dir.join("state").join("catalog.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .expect("open the daemon's catalog read-only");

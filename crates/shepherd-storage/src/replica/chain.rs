@@ -748,7 +748,24 @@ pub async fn read_chain(adapter: &dyn StorageAdapter) -> StorageResult<ChainReso
             continue; // a segment, not a pointer
         }
         let meta = adapter.head(&k).await?;
-        let Some(meta) = meta else { continue };
+        // LISTED, then absent. Skipping it resolves whatever older prefix
+        // remains — and if the vanished key was the newest tip, what is left can
+        // look gapless and single-headed, so the caller is told the replica is
+        // whole while it is missing its latest catalog mutations. That is the
+        // one failure this resolution exists to make impossible, so a pointer
+        // the provider named and then could not produce is malformed evidence,
+        // not an entry to drop.
+        let Some(meta) = meta else {
+            return Err(StorageError::Provider {
+                provider: adapter.capabilities().provider,
+                op: "read_chain".into(),
+                detail: format!(
+                    "pointer {} was returned by LIST and is absent on HEAD; the chain \
+                     cannot be resolved from a listing the provider will not stand behind",
+                    k.as_str()
+                ),
+            });
+        };
         let raw = adapter
             .get_range(
                 &k,

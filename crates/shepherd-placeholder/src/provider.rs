@@ -74,6 +74,17 @@ pub enum ProviderError {
     #[error("io error on {path}: {detail}")]
     Io { path: String, detail: String },
 
+    /// The unlink SUCCEEDED and its directory could not be made durable.
+    ///
+    /// Distinct from [`ProviderError::Io`] because it means the opposite thing
+    /// to a caller: the irreversible step happened, so §4.10.4's
+    /// abort-forward-never does not apply — there is nothing left to restore,
+    /// and retrying would unlink a name that is already gone. What the caller
+    /// owes is a record and a halt, exactly as for any other outcome it cannot
+    /// establish.
+    #[error("{path} was destroyed but the removal is not durable: {detail}")]
+    DestroyedNotDurable { path: String, detail: String },
+
     #[error("{0} is not implemented on this platform yet")]
     Unsupported(&'static str),
 }

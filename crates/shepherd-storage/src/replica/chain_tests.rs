@@ -606,3 +606,59 @@ async fn reading_the_chain_alone_never_produces_custody() {
         "every topology clause passes and custody must still be refused"
     );
 }
+
+/// A pointer LIST named and HEAD cannot produce is malformed evidence, not an
+/// entry to drop.
+///
+/// Skipping it resolved whatever older prefix remained — and if the vanished
+/// key was the newest tip, what is left looks gapless and single-headed. The
+/// caller is then told the replica is whole while it is missing its latest
+/// catalog mutations, which is the one conclusion this resolution exists to
+/// make impossible.
+#[tokio::test]
+async fn a_listed_pointer_that_head_cannot_produce_is_refused() {
+    let adapter = MemAdapter::content_addressed();
+    let alloc = FakeAllocator::at_epoch(3);
+    let writer = ChainWriter::new(&adapter, &alloc, TargetId::new(1));
+    writer
+        .publish(
+            SegmentKind::Delta,
+            Bytes::from_static(b"a"),
+            None,
+            Blake3Hash::from_bytes([1; 32]),
+        )
+        .await
+        .expect("first");
+
+    // Without the phantom the chain resolves cleanly — so the assertion below
+    // is about the phantom and not about an already-broken fixture.
+    let ok = read_chain(&adapter).await.expect("resolves");
+    assert_eq!(ok.status, ChainStatus::Single);
+
+    // A newer tip the provider lists and then will not produce.
+    let ghost = RecordKey {
+        epoch: 9,
+        seq: 99,
+        uuid: "ghost".into(),
+    }
+    .pointer_key()
+    .as_key()
+    .clone();
+    assert!(
+        RecordKey::parse_pointer(ghost.as_str()).is_some(),
+        "the fixture key must actually parse as a pointer, or this test skips it \
+         before reaching the branch under test"
+    );
+    adapter.add_phantom_key(&ghost);
+
+    let err = read_chain(&adapter)
+        .await
+        .expect_err("a listing the provider will not stand behind is not a chain");
+    match err {
+        StorageError::Provider { op, detail, .. } => {
+            assert_eq!(op, "read_chain");
+            assert!(detail.contains("absent on HEAD"), "{detail}");
+        }
+        other => panic!("expected a provider error, got {other:?}"),
+    }
+}

@@ -43,6 +43,7 @@ use crate::audit::AuditLog;
 use crate::breaker::{BreakerLimits, BreakerRefusal, Candidate, Episode, RateLedger, RateWindow};
 use crate::destroy::{DestroyError, RemoteGate, execute_remote_discard};
 use crate::plan::derive_object_key;
+use crate::serialize::FileLocks;
 
 /// Translate a platform stub state into the fact the policy engine consumes.
 ///
@@ -394,6 +395,30 @@ const SENTINEL: TargetId = TargetId::new(0);
 /// The wrong key is not something this function refuses; it is something no
 /// caller can express. See [`DiscardCharge`] for why that is stronger than
 /// accepting a key and checking it.
+/// # NOT YET SAFE UNDER AC-47 DEDUP — the last-referent check is missing
+///
+/// Keys here are content-addressed, so two files with identical bytes on the
+/// same target and prefix resolve to **one object**. This function deletes that
+/// object on the strength of one file's candidate, without asking whether any
+/// other file still points at it — so discarding either sibling would destroy
+/// the remote bytes the other one still needs, and the survivor's
+/// `object_location` row would name a key that is gone.
+///
+/// It is not a live defect and it is not fixed here, for the same reason D-12's
+/// enrollment probe is deferred at `dispatch::root_add`: the consuming path does
+/// not exist. `object_location` is schema-only — nothing in this repository
+/// writes a binding, `tier.plan` and `tier.run` answer `MethodNotImplemented`,
+/// and `execute_discard` has no caller outside its own tests. There is
+/// therefore no referent to count, and inventing the count now would mean
+/// designing T10's binding lifecycle inside a review round.
+///
+/// **What T10 must do here, in this order:** remove *this* file's
+/// `object_location` row, then count the rows still naming the same
+/// `remote_object`, then delete the object only if that count is zero — all in
+/// ONE catalog transaction, because a count and a delete in two writer
+/// operations is the race `dispatch::root_remove` already had to close. The
+/// remote-key lock this function now takes is the other half: it serializes
+/// against a concurrent upload republishing the same key.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_discard(
     charge: &mut DiscardCharge,
@@ -404,6 +429,7 @@ pub async fn execute_discard(
     root: RootId,
     prefix: &str,
     guard: &VersionGuard,
+    locks: &FileLocks,
     audit: &AuditLog,
     attestation: &str,
     now: Timestamp,
@@ -414,6 +440,20 @@ pub async fn execute_discard(
     let key = charge
         .spend(candidate, target, root, prefix)
         .map_err(DestroyError::Breaker)?;
+
+    // The SAME process-wide remote-key lock `upload::upload_item` takes through
+    // `acquire_both`. Without it the two operations interleave on one key:
+    // a delete landing between an upload's completion and its verification
+    // makes that upload fail after it has already published, and a completion
+    // landing after the delete recreates an object this discard has already
+    // audited as gone — a live object with a forensic record saying it was
+    // destroyed.
+    //
+    // Held across the audit resolution, not just the DELETE: it is
+    // `execute_remote_discard`'s closing HEAD that decides whether an ambiguous
+    // failure gets a record or a halt, and a republish underneath that HEAD is
+    // exactly what would make it decide wrongly.
+    let _key_lock = locks.acquire_key(&key).await;
 
     // One call site. PM-2's requirement is that the discard branch runs through
     // the same intent + audit apparatus as local destruction; a second path

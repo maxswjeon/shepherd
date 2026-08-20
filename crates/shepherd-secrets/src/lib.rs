@@ -116,18 +116,45 @@ impl SecretRef {
         &self.0
     }
 
-    /// The environment variable [`EnvStore`] looks this up in.
+    /// The environment variable [`EnvStore`] looks this up in, or `None` when
+    /// this reference has no unambiguous one.
     ///
     /// `target/7` becomes `SHEPHERD_SECRET_TARGET_7`.
-    pub fn env_var(&self) -> String {
+    ///
+    /// # Why this is `Option`, and why only `/` survives
+    ///
+    /// An environment variable name is `[A-Z0-9_]`, so every separator this
+    /// reference alphabet allows — `/`, `.`, `-`, `_` — has to become `_`. That
+    /// map is **not injective**: `target/a-b`, `target/a_b` and `target.a/b`
+    /// all named `SHEPHERD_SECRET_TARGET_A_B`, so two targets could read each
+    /// other's credentials, and the one that was misconfigured would get a
+    /// working secret rather than the "missing" it deserved. A credential
+    /// silently resolving to the wrong value is the worst shape this module
+    /// has.
+    ///
+    /// Restricted rather than escaped. An escaping scheme (`_` doubled, or
+    /// hex-encoded separators) buys the full alphabet at the cost of variable
+    /// names an operator cannot guess, and would change the one spelling the
+    /// docs promise — `SHEPHERD_SECRET_TARGET_7`. Over `[a-z0-9/]` the map is
+    /// injective as it stands, because nothing but `/` produces `_`, and
+    /// [`SecretRef::for_target`] — the reference this project actually mints —
+    /// is always of that shape.
+    ///
+    /// The other three characters remain legal in a `SecretRef`: they are fine
+    /// as [`KeyfileStore`] keys, which are the reference itself. It is only the
+    /// environment that cannot address them apart.
+    pub fn env_var(&self) -> Option<String> {
+        if self.0.contains(['.', '-', '_']) {
+            return None;
+        }
         let mut s = String::from(ENV_PREFIX);
         for c in self.0.chars() {
             s.push(match c {
-                '/' | '.' | '-' => '_',
+                '/' => '_',
                 other => other.to_ascii_uppercase(),
             });
         }
-        s
+        Some(s)
     }
 }
 
@@ -222,8 +249,18 @@ impl Backend for EnvStore {
         "environment"
     }
 
+    /// A reference with no unambiguous variable name is **not found here**, not
+    /// resolved to whatever happens to share its spelling.
+    ///
+    /// `Ok(None)` rather than an error: this backend is first in the chain, and
+    /// an error here would refuse a reference the keyfile store can resolve
+    /// perfectly well. Missing-from-the-environment is exactly what it is, and
+    /// the chain moves on. See [`SecretRef::env_var`].
     fn get(&self, key: &SecretRef) -> Result<Option<Secret>> {
-        Ok(std::env::var(key.env_var()).ok().map(Secret::new))
+        let Some(var) = key.env_var() else {
+            return Ok(None);
+        };
+        Ok(std::env::var(var).ok().map(Secret::new))
     }
 
     fn put(&mut self, _key: &SecretRef, _secret: &Secret) -> Result<()> {
@@ -492,12 +529,49 @@ mod tests {
     #[test]
     fn env_var_names_are_derived_predictably() {
         assert_eq!(
-            SecretRef::for_target(7).env_var(),
-            "SHEPHERD_SECRET_TARGET_7"
+            SecretRef::for_target(7).env_var().as_deref(),
+            Some("SHEPHERD_SECRET_TARGET_7"),
+            "the documented spelling, and the only one this project mints"
         );
         assert_eq!(
-            SecretRef::new("s3.prod-key").unwrap().env_var(),
-            "SHEPHERD_SECRET_S3_PROD_KEY"
+            SecretRef::new("a/b/c").unwrap().env_var().as_deref(),
+            Some("SHEPHERD_SECRET_A_B_C")
+        );
+    }
+
+    /// Two different references must never name one environment variable.
+    ///
+    /// `/`, `.`, `-` and `_` all had to become `_` — an environment variable
+    /// name has nothing else — so `target/a-b` and `target/a_b` both read
+    /// `SHEPHERD_SECRET_TARGET_A_B`. One target would receive the other's
+    /// credentials, and the misconfigured one would get a WORKING secret rather
+    /// than the "missing" that would have told its operator what was wrong.
+    ///
+    /// The three ambiguous separators stay legal in a `SecretRef` — they are
+    /// fine as keyfile keys, which are the reference itself — and simply have
+    /// no environment name.
+    #[test]
+    fn references_that_would_collide_have_no_environment_name() {
+        for r in ["target/a-b", "target/a_b", "s3.prod-key", "a_b"] {
+            assert_eq!(
+                SecretRef::new(r).unwrap().env_var(),
+                None,
+                "`{r}` shares an environment spelling with other references, so it must \
+                 have none rather than read one of theirs"
+            );
+        }
+
+        // The restriction did not simply turn the backend off: the shape this
+        // project mints is still addressable, and the environment is still
+        // where `e2e::a_target_credential_comes_from_the_environment` supplies
+        // it from.
+        assert!(SecretRef::for_target(91).env_var().is_some());
+
+        // And a colliding sibling reads NOTHING from the environment rather
+        // than reading `SHEPHERD_SECRET_TARGET_91`.
+        assert_eq!(
+            EnvStore.get(&SecretRef::new("target_91").unwrap()).unwrap(),
+            None
         );
     }
 

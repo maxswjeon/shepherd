@@ -326,6 +326,31 @@ fn open_handles(path: &Path) -> OpenCheck {
     }
 }
 
+/// Linux's `/proc/<pid>/fd` sweep — and the one floor in this module that
+/// **cannot** deliver "cannot determine is treated as open" in full.
+///
+/// The rule is honoured wherever it is expressible: an unresolvable path and an
+/// unreadable `/proc` both fail closed below. What cannot fail closed is a
+/// single process whose descriptors are unreadable, and the reason is
+/// structural rather than a shortcut.
+///
+/// A per-user daemon (§4.2) cannot read `/proc/<pid>/fd` for another user's
+/// process, and root always has processes — so "refuse whenever enumeration is
+/// incomplete" refuses on every machine, forever, and destruction never
+/// proceeds at all. Nor does restricting the rule to this daemon's OWN
+/// processes rescue it: a same-uid process that cleared `PR_SET_DUMPABLE`
+/// refuses its fd directory to its own user, and `sshd`, `ssh-agent` and
+/// `(sd-pam)` all do. Measured on one ordinary developer host: 577 unreadable
+/// fd directories, 10 of them same-uid.
+///
+/// So the incompleteness is COUNTED and logged at WARN rather than pretended
+/// away, and the residual is stated here: this floor rules out holders among
+/// the processes the daemon can inspect, and no more. §8.2's held-writable-fd
+/// hazard is additionally covered by the identity-bound staging that follows
+/// it — the destroy path re-hashes through the held handle rather than trusting
+/// this check alone. Closing the gap properly needs a mechanism that does not
+/// enumerate other processes at all (a lease, `F_SETLEASE`, or an LSM hook);
+/// that is a design change, not a patch to this function.
 #[cfg(target_os = "linux")]
 fn linux_open_handles(path: &Path) -> OpenCheck {
     let Ok(target) = path.canonicalize() else {
@@ -339,18 +364,37 @@ fn linux_open_handles(path: &Path) -> OpenCheck {
         });
     };
 
+    use std::os::unix::fs::MetadataExt;
+
+    // Our own euid, read from `/proc/self` rather than through `libc`, so this
+    // stays dependency-free.
+    let my_uid = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+
     let mut pids = Vec::new();
+    let mut foreign_unreadable = 0usize;
+    let mut same_uid_unreadable = 0usize;
     for entry in procs.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        // A process that exits mid-scan is not evidence of anything, so an
-        // unreadable fd directory is skipped rather than failing the whole
-        // check closed. Permission-denied on another user's process is the
-        // common case here and would otherwise make every acquisition refuse.
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
-            continue;
+        let fds = match std::fs::read_dir(entry.path().join("fd")) {
+            Ok(fds) => fds,
+            // The process exited between the `/proc` listing and this open. It
+            // holds nothing now and held nothing that matters, so this is not
+            // a gap in the evidence.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Unreadable. MEASURED, not skipped in silence — see the note on
+            // this function for why it cannot be a refusal.
+            Err(_) => {
+                let owner = std::fs::metadata(entry.path()).map(|m| m.uid()).ok();
+                if owner == my_uid {
+                    same_uid_unreadable += 1;
+                } else {
+                    foreign_unreadable += 1;
+                }
+                continue;
+            }
         };
         for fd in fds.flatten() {
             if std::fs::read_link(fd.path()).is_ok_and(|l| l == target) {
@@ -360,11 +404,30 @@ fn linux_open_handles(path: &Path) -> OpenCheck {
         }
     }
 
-    if pids.is_empty() {
-        OpenCheck::None
-    } else {
-        OpenCheck::Held(OpenEvidence::Descriptors { pids })
+    if !pids.is_empty() {
+        return OpenCheck::Held(OpenEvidence::Descriptors { pids });
     }
+
+    // Stated rather than hidden. `None` here means "no holder among the
+    // processes this daemon could inspect", which is a narrower claim than "no
+    // holder", and the gap is not small: on an ordinary Linux host most of
+    // `/proc` belongs to other users, and even same-uid processes that cleared
+    // `dumpable` (`sshd`, `ssh-agent`, `sd-pam`, anything that dropped
+    // privileges) refuse `/proc/<pid>/fd` to their own user.
+    //
+    // WARN rather than DEBUG on purpose: this is the coverage of a floor on the
+    // irreversible path, and an operator reading the log after a destruction
+    // should be able to see what the check could and could not see.
+    if foreign_unreadable > 0 || same_uid_unreadable > 0 {
+        tracing::warn!(
+            path = %target.display(),
+            foreign_unreadable,
+            same_uid_unreadable,
+            "no open descriptor found, but descriptor enumeration was INCOMPLETE: the \
+             open-handle floor passed on the processes it could inspect"
+        );
+    }
+    OpenCheck::None
 }
 
 #[cfg(test)]

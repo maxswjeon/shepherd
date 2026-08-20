@@ -56,6 +56,10 @@ struct Upload {
 #[derive(Debug, Default)]
 struct Inner {
     objects: HashMap<String, (Bytes, Option<ObjectVersion>)>,
+    /// Keys LIST reports and HEAD does not — a provider naming an object it
+    /// will not stand behind. Real: an eventually-consistent listing, or an
+    /// object deleted between the two calls.
+    phantom_keys: Vec<String>,
     uploads: HashMap<String, Upload>,
     next_token: u64,
     faults: Faults,
@@ -214,6 +218,11 @@ impl MemAdapter {
 
     /// Remove an object *without* going through the destructive verb — for
     /// setting up "the remote copy vanished underneath us" states.
+    /// Make LIST report `key` while HEAD reports it absent.
+    pub fn add_phantom_key(&self, key: &ObjectKey) {
+        self.lock().phantom_keys.push(key.as_str().to_owned());
+    }
+
     pub fn remove_raw(&self, key: &ObjectKey) {
         self.lock().objects.remove(key.as_str());
     }
@@ -505,10 +514,12 @@ impl StorageAdapter for MemAdapter {
         let mut keys: Vec<ObjectKey> = inner
             .objects
             .keys()
+            .chain(inner.phantom_keys.iter())
             .filter(|k| k.starts_with(prefix))
             .map(|k| ObjectKey::new(k.clone()))
             .collect();
         keys.sort();
+        keys.dedup();
         Ok(ListPage { keys, next: None })
     }
 

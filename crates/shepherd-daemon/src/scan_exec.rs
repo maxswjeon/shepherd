@@ -147,19 +147,27 @@ impl Executor for ScanExecutor {
         // under their own scan, and worse, candidates a later rule pass could
         // hash and tier.
         //
-        // Skipped when the root is AT or INSIDE the state directory. The
-        // exclusion exists to keep the daemon's internals out of a scan of the
-        // user's data; when the root is under the state directory the deny
-        // would prune the walk root itself, and a pruned root is reported as
-        // "could not be read" — an unreadable-root refusal manufactured out of
-        // an exclusion, which is the one thing the check below must never see
-        // spuriously.
+        // A root AT or INSIDE the state directory is REFUSED here rather than
+        // excluded. Excluding it would prune the walk root itself, which
+        // surfaces as "could not be read" — an unreadable-root refusal
+        // manufactured out of an exclusion, and that check must never fire
+        // spuriously. Falling back to the builtin-only list instead was worse:
+        // it walked the live `catalog.db`, its WAL companions and any
+        // `secrets.json`, which is exactly what the exclusion exists to stop.
+        // `root.add` refuses the same path, so this is for rows enrolled before
+        // that refusal existed, or for a state directory relocated under an
+        // enrolled root.
         let state_dir = &self.daemon.paths.state_dir;
-        let deny = if under(&path, state_dir) {
-            DenyList::builtin()
-        } else {
-            DenyList::builtin().with_extra_path(state_dir)
-        };
+        if under(&path, state_dir) {
+            return Err(format!(
+                "root {root_id} at {} is inside the daemon's own state directory ({}); \
+                 refusing to scan Shepherd's catalog, its write-ahead log and its secret \
+                 store as if they were the user's files",
+                root.path,
+                state_dir.display()
+            ));
+        }
+        let deny = DenyList::builtin().with_extra_path(state_dir);
         let ignores = IgnoreSet::new(&path, &patterns)
             .map_err(|e| format!("root {root_id} has an unusable ignore pattern: {e}"))?;
 

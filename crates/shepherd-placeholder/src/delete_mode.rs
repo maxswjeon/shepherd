@@ -350,10 +350,7 @@ impl PlaceholderProvider for DeleteModeProvider {
             hash = %expected,
             "destroying local file"
         );
-        std::fs::remove_file(&staged.staged).map_err(|e| ProviderError::Io {
-            path: staged.staged.display().to_string(),
-            detail: e.to_string(),
-        })
+        unlink_durably(&staged.staged)
     }
 
     fn restore_staged(&self, staged: Staged) -> Result<RestoreOutcome> {
@@ -387,16 +384,47 @@ impl PlaceholderProvider for DeleteModeProvider {
         }
     }
 
+    /// # An unreadable staging directory is not an empty one
+    ///
+    /// This is startup recovery's ONLY view of the files a crash left staged —
+    /// files whose bytes exist nowhere else, because staging is the step that
+    /// removed them from their original name. `read_dir` failing was mapped to
+    /// an empty list, so a permission change, an I/O error or an unmounted
+    /// volume made recovery conclude there was nothing to recover and let
+    /// destructive work resume beside the entries it had not seen.
+    ///
+    /// `NotFound` is the one error that genuinely means empty: no staging
+    /// directory has ever been created under this root. Everything else — and
+    /// every per-entry error, which `flatten()` used to discard one at a time —
+    /// propagates.
     fn list_staged(&self, root: &Path) -> Result<Vec<PathBuf>> {
         let dir = Self::staging_dir(root);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Ok(Vec::new());
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(ProviderError::Io {
+                    path: dir.display().to_string(),
+                    detail: format!(
+                        "the staging directory could not be listed, so it must not be \
+                         reported as empty: {e}"
+                    ),
+                });
+            }
         };
-        Ok(entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "staged"))
-            .collect())
+
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| ProviderError::Io {
+                path: dir.display().to_string(),
+                detail: format!("a staging entry could not be read: {e}"),
+            })?;
+            let p = entry.path();
+            if p.extension().is_some_and(|x| x == "staged") {
+                out.push(p);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -414,6 +442,44 @@ fn conflict_name(original: &Path) -> PathBuf {
 /// filesystem afterwards, so the call itself is what gets asserted on.
 #[cfg(test)]
 pub(crate) static SYNCED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Unlink a staged file and make the removal durable.
+///
+/// Separate from [`PlaceholderProvider::destroy_local`] so it can be tested
+/// without naming the tracked symbol — §4.1 rule 4a makes `shepherd-tier`'s
+/// `destroy.rs` the sole caller of that method, and a test calling it would be
+/// a second call site of exactly the kind the rule exists to prevent. The
+/// durability primitive is not the destruction protocol.
+///
+/// # Why the directory fsync is here and not left to the caller
+///
+/// The unlink is not durable until its directory is, and what follows it IS
+/// durable: an fsync'd audit record and a committed catalog transition, both
+/// claiming the file is gone. A power loss between the two leaves the staged
+/// entry on disk beside a record saying it was destroyed — the forensic log
+/// describing a destruction that did not happen, which is the mirror of the
+/// case the record exists to prevent.
+///
+/// A sync failure is [`ProviderError::DestroyedNotDurable`], NOT an ordinary
+/// `Io`. The unlink already succeeded, so the caller must not restore or retry:
+/// a plain error would send it down abort-forward-never, renaming a file that
+/// may no longer exist and reporting a failure for an operation that happened.
+fn unlink_durably(staged: &Path) -> Result<()> {
+    std::fs::remove_file(staged).map_err(|e| ProviderError::Io {
+        path: staged.display().to_string(),
+        detail: e.to_string(),
+    })?;
+
+    if let Some(parent) = staged.parent()
+        && let Err(e) = sync_dir(parent)
+    {
+        return Err(ProviderError::DestroyedNotDurable {
+            path: staged.display().to_string(),
+            detail: e.to_string(),
+        });
+    }
+    Ok(())
+}
 
 /// fsync a directory, so an entry created or removed in it survives a crash.
 ///
@@ -558,6 +624,104 @@ mod tests {
             synced.contains(&nested),
             "the original's parent was never fsync'd, so the removal may not \
              survive a crash: {synced:?}"
+        );
+    }
+
+    /// An unreadable staging directory must not read as an empty one.
+    ///
+    /// This is startup recovery's only view of the files a crash left staged,
+    /// and staging is the step that removed them from their original name — so
+    /// "nothing staged" and "I could not look" have opposite consequences and
+    /// used to be the same value. `NotFound` is the one error that really means
+    /// empty.
+    ///
+    /// Unix-only because making a directory unlistable is: the mode bits come
+    /// from `PermissionsExt`, and delete-mode refuses staging off unix anyway.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_staging_directory_is_an_error_not_an_empty_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = Tmp::new("liststaged");
+        let p = DeleteModeProvider::new();
+
+        // No staging directory has ever existed: genuinely empty.
+        assert_eq!(
+            p.list_staged(&t.0).expect("a missing staging dir is empty"),
+            Vec::<PathBuf>::new()
+        );
+
+        let f = t.0.join("only-copy.bin");
+        std::fs::write(&f, b"the only local copy").unwrap();
+        let Some(staged) = staged_or_refused(p.stage_for_destruction(&t.0, &f)) else {
+            return;
+        };
+        assert_eq!(
+            p.list_staged(&t.0).expect("listing works"),
+            vec![staged.staged.clone()],
+            "the staged entry is what recovery has to find"
+        );
+
+        // Now make it unlistable. Recovery must hear about it.
+        let dir = staged.staged.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let listed = p.list_staged(&t.0);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Running as root makes a 0000 directory readable anyway, in which case
+        // there is nothing to assert — the entry is simply still found.
+        match listed {
+            Err(ProviderError::Io { detail, .. }) => assert!(
+                detail.contains("must not be reported as empty"),
+                "the error must say what the empty list would have meant: {detail}"
+            ),
+            Ok(found) => assert_eq!(
+                found,
+                vec![staged.staged.clone()],
+                "the only acceptable Ok here is the entry itself (running as root)"
+            ),
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    /// The staged unlink is made durable, and a failure to do so is reported as
+    /// destroyed-but-undurable rather than as a failed delete.
+    ///
+    /// What follows the unlink IS durable — an fsync'd audit record and a
+    /// committed catalog transition, both claiming the file is gone. Without a
+    /// directory fsync a power loss can preserve the staged entry beside a
+    /// record saying it was destroyed: the forensic log describing a
+    /// destruction that did not happen.
+    #[test]
+    fn the_staged_unlink_syncs_its_directory() {
+        let t = Tmp::new("destroysync");
+        let f = t.0.join("doomed.bin");
+        std::fs::write(&f, b"bytes").unwrap();
+        let p = DeleteModeProvider::new();
+        let Some(staged) = staged_or_refused(p.stage_for_destruction(&t.0, &f)) else {
+            return;
+        };
+        let dir = staged.staged.parent().unwrap().to_path_buf();
+
+        // Counted rather than cleared: the recorder is process-wide and other
+        // tests read it concurrently. Staging already synced this directory
+        // once, so the assertion is that the unlink adds ANOTHER — `contains`
+        // alone would be satisfied by the staging sync and prove nothing.
+        let syncs_of = |d: &PathBuf| {
+            SYNCED_DIRS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == d)
+                .count()
+        };
+        let before = syncs_of(&dir);
+
+        unlink_durably(&staged.staged).expect("the unlink succeeds");
+
+        assert!(
+            syncs_of(&dir) > before,
+            "the staging directory was not fsync'd after the unlink, so the removal may \
+             not survive the crash the audit record will"
         );
     }
 

@@ -441,6 +441,7 @@ struct Remote {
     dir: std::path::PathBuf,
     adapter: shepherd_storage::testing::MemAdapter,
     audit: crate::audit::AuditLog,
+    locks: crate::serialize::FileLocks,
     keys: Vec<shepherd_core::ObjectKey>,
 }
 
@@ -470,6 +471,7 @@ impl Remote {
             dir,
             adapter,
             audit,
+            locks: crate::serialize::FileLocks::new(),
             keys,
         }
     }
@@ -511,6 +513,7 @@ impl Remote {
             root,
             prefix,
             &Self::guard(),
+            &self.locks,
             &self.audit,
             "version",
             now,
@@ -1056,4 +1059,45 @@ async fn an_unhashed_candidate_is_refused_rather_than_naming_a_key_from_nothing(
         1,
         "a refusal that consumed the unit would be a silent budget leak"
     );
+}
+
+/// A discard waits on the **remote-key** lock, the one `upload_item` takes.
+///
+/// `upload::upload_item` holds `FileLocks::acquire_key` for the object it is
+/// publishing; this path did not even accept `FileLocks`, so the two
+/// interleaved freely on one content-addressed key. A delete landing between an
+/// upload's completion and its verification makes that upload fail after it has
+/// already published, and a completion landing after the delete recreates an
+/// object the discard has already audited as gone — a live object with a
+/// forensic record saying it was destroyed.
+///
+/// Asserted by CONTENTION rather than by reading the code: the lock is taken
+/// first, and the discard must not get past it. A timeout that expires is the
+/// pass, and the release-then-finish afterwards is what proves the test was
+/// measuring the lock rather than a hang.
+#[tokio::test]
+async fn a_discard_waits_on_the_remote_key_lock() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let r = Remote::new("keylock", 1);
+    let mut charge = charge_for(&ledger, 1, now).await;
+
+    let held = r.locks.acquire_key(&r.keys[0]).await;
+
+    let discarding = r.discard(&mut charge, 0, now);
+    tokio::pin!(discarding);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut discarding)
+            .await
+            .is_err(),
+        "the discard ran while the remote key was locked by an upload"
+    );
+    assert_eq!(r.deleted(), 0, "and it deleted nothing while blocked");
+
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(20), discarding)
+        .await
+        .expect("releasing the key lock must let the discard proceed")
+        .expect("the discard itself succeeds");
+    assert_eq!(r.deleted(), 1);
 }
