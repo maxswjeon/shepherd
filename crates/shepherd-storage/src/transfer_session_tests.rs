@@ -41,6 +41,10 @@ impl Rig {
     }
 
     fn session(&self) -> TransferSession {
+        self.session_with_part_size(PART)
+    }
+
+    fn session_with_part_size(&self, part_size: u64) -> TransferSession {
         let body = self.source.body();
         let source = SourceIdentity {
             file_id: FileId::new(1),
@@ -56,7 +60,7 @@ impl Rig {
             self.key.clone(),
             source,
             &self.adapter,
-            PART,
+            part_size,
         )
         .expect("plan")
     }
@@ -75,6 +79,54 @@ impl Rig {
             .expect("load")
             .expect("a session must have been persisted before the crash")
     }
+}
+
+/// Every per-part checkpoint goes through `save_part`, not a whole-session
+/// `save`.
+///
+/// `upload_pending` checkpoints once per acknowledged part, and the durable
+/// store replaces its ENTIRE part set on a `save` — so routing the hot loop
+/// through `save` makes checkpoint work quadratic in the part count. On the
+/// 3,200-part 50 GB transfer the plan sizes for, that is ~5.1 million part
+/// inserts under `synchronous = FULL` to record 3,200 events.
+///
+/// Asserted at the seam rather than by timing: this double has nothing cheaper
+/// than a full save, so the only thing observable — and the only thing that
+/// matters here — is WHICH method the driver reaches for.
+#[tokio::test]
+async fn each_acknowledged_part_is_checkpointed_singly() {
+    let rig = Rig::new(false);
+    let mut s = rig.session();
+    let out = rig.driver().run(&mut s).await.expect("run");
+
+    assert_eq!(out.parts_sent, 4, "the fixture is four parts");
+    assert_eq!(
+        rig.store.part_saves(),
+        4,
+        "one single-part checkpoint per acknowledged part"
+    );
+
+    // The remaining writes are the state transitions, which are exactly what a
+    // whole-session save is for. Their count is a property of the STATE
+    // MACHINE, so it must not move when the part count doubles — which is the
+    // difference between a constant and the per-part save this replaced.
+    let whole = rig.store.saves() - rig.store.part_saves();
+
+    let fine = Rig::new(false);
+    let mut s = fine.session_with_part_size(PART / 2);
+    let out2 = fine.driver().run(&mut s).await.expect("run");
+    assert_ne!(
+        out2.parts_sent, out.parts_sent,
+        "a smaller part size must actually produce a different part count, or \
+         this comparison measures nothing"
+    );
+    assert_eq!(fine.store.part_saves(), out2.parts_sent as usize);
+    assert_eq!(
+        fine.store.saves() - fine.store.part_saves(),
+        whole,
+        "whole-session saves must be a property of the state machine, not of \
+         the part count"
+    );
 }
 
 #[tokio::test]

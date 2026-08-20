@@ -55,6 +55,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use shepherd_catalog::file_repo::{Enrollment, FileRepo};
 use shepherd_catalog::job_repo::JobClass;
 use shepherd_catalog::target_repo::TargetRepo;
@@ -261,6 +262,54 @@ impl ShepherdApi for Session {
         let volume = shepherd_catalog::volume::volume_id(&path).ok();
 
         let mut warnings = Vec::new();
+
+        // A root nested under an existing one, or containing one.
+        //
+        // `RootAddResult::warnings` has documented this notice since the type
+        // was written — "a root nested under an existing one" — and nothing
+        // produced it. Two roots over the same files means two catalog rows per
+        // file: `status` and `search` count them twice, and a later rule or tier
+        // pass is handed the same file as two independent candidates.
+        //
+        // Compared on canonical paths where they resolve, because a symlinked
+        // spelling of the same tree is the same tree and only one of the two
+        // would otherwise ever match. `Path::starts_with` compares COMPONENTS,
+        // so `/data/photos-old` is not inside `/data/photos` — the substring
+        // mistake this codebase has made before.
+        //
+        // Warned, not refused: overlapping roots are a legitimate thing to want
+        // (a whole home directory plus a project inside it, with different
+        // ignore patterns), and §4.9 gives no basis for refusing them. The user
+        // hears it while standing in front of the command that caused it.
+        let mine = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        for other in self.cat(move |cat| list_roots(cat, false))? {
+            let raw = PathBuf::from(&other.path);
+            let theirs = std::fs::canonicalize(&raw).unwrap_or(raw);
+            if theirs == mine {
+                // The same path re-added; `enroll_root` reports that itself.
+                continue;
+            }
+            if mine.starts_with(&theirs) {
+                warnings.push(format!(
+                    "this root is inside the already-registered root `{}` (id {}). Both will \
+                     be scanned, so every file under this one gets a catalog row per root — \
+                     counted twice in `status` and `search`, and offered twice to later rule \
+                     and tier passes. Remove one, or exclude this path from the other with an \
+                     ignore pattern.",
+                    other.path, other.root_id
+                ));
+            } else if theirs.starts_with(&mine) {
+                warnings.push(format!(
+                    "the already-registered root `{}` (id {}) is inside this one. Both will \
+                     be scanned, so every file under it gets a catalog row per root — counted \
+                     twice in `status` and `search`, and offered twice to later rule and tier \
+                     passes. Remove one, or exclude that path from this root with an ignore \
+                     pattern.",
+                    other.path, other.root_id
+                ));
+            }
+        }
+
         if !atime_mode.supports_destructive_age_rule() {
             warnings.push(format!(
                 "this root's atime is `{}`, so a rule matching on last access cannot be \
@@ -475,49 +524,69 @@ impl ShepherdApi for Session {
         Ok(RootListResult { roots: rows })
     }
 
+    /// # One operation, because the refusal is about what the delete will find
+    ///
+    /// Custody rows are the only address of bytes that no longer exist locally,
+    /// and `--forget` cascades them away. Existence, the custody count, the
+    /// refusal and the delete are therefore a **single** writer operation in a
+    /// single transaction.
+    ///
+    /// Splitting them — which is what this did — does not fail loudly. The
+    /// writer actor serializes operations, not pairs of them, so an ordinary
+    /// queued catalog write fits between the count and the delete. Once tiering
+    /// is live, a completion landing in that window turns a file into `remote`
+    /// after the refusal has already passed on a count of zero, and the delete
+    /// then removes the row that was the file's only remaining address.
     fn root_remove(&mut self, req: RootRemoveRequest) -> Result<RootRemoveResult, RpcError> {
         let id = RootId::new(req.root_id);
-        let exists = self.cat(move |cat| FileRepo::new(cat).get_root(id))?;
-        if exists.is_none() {
-            return Err(RpcError::new(
+        let forget = req.forget_catalog;
+        let force = req.force;
+
+        match self.cat(move |cat| remove_root(cat, id, forget, force))? {
+            RootRemoval::NotFound => Err(RpcError::new(
                 ErrorCode::NotFound,
                 format!("no scan root with id {}", req.root_id),
-            ));
-        }
-
-        // Custody rows are the only address of bytes that no longer exist
-        // locally. Counting them before dropping anything is what makes the
-        // refusal possible.
-        let custody = self.cat(move |cat| count_custody_rows(cat, id))?;
-        if req.forget_catalog && custody > 0 && !req.force {
-            return Err(RpcError::new(
+            )),
+            RootRemoval::RefusedCustody { custody } => Err(RpcError::new(
                 ErrorCode::Refused,
                 format!(
                     "{custody} file(s) under this root are tiered and hold custody records — \
                      the catalog is their only address. Dropping those rows loses the files. \
                      Restore them first, or pass --force if you accept that."
                 ),
-            ));
+            )),
+            RootRemoval::Done { dropped, custody } => Ok(RootRemoveResult {
+                root_id: req.root_id,
+                catalog_rows_dropped: dropped,
+                custody_rows_dropped: if forget { custody } else { 0 },
+            }),
         }
-
-        let forget = req.forget_catalog;
-        let dropped = self.cat(move |cat| remove_root(cat, id, forget))?;
-        Ok(RootRemoveResult {
-            root_id: req.root_id,
-            catalog_rows_dropped: dropped,
-            custody_rows_dropped: if forget { custody } else { 0 },
-        })
     }
 
     // --- scan -------------------------------------------------------------
 
     fn scan_start(&mut self, req: ScanStartRequest) -> Result<ScanStartResult, RpcError> {
         let roots = match req.root_id {
+            // `root_summary` rather than `get_root`, for the `enabled` flag
+            // alone. `root.remove` without `--forget` keeps the row and clears
+            // that flag, so `get_root` still answers for a root the user has
+            // deregistered — and `load_scan_input` refuses it later, which
+            // means the job was accepted, reported in `roots_started`, and then
+            // burned its retry budget out of band. The no-id branch below has
+            // always got this right, through `list_roots(.., false)`.
             Some(id) => {
                 let rid = RootId::new(id);
-                let found = self.cat(move |cat| FileRepo::new(cat).get_root(rid))?;
-                match found {
-                    Some(_) => vec![id],
+                match self.cat(move |cat| root_summary(cat, rid))? {
+                    Some(r) if r.enabled => vec![id],
+                    Some(_) => {
+                        return Err(RpcError::new(
+                            ErrorCode::Refused,
+                            format!(
+                                "scan root {id} was removed: it is deregistered and is not a \
+                                 scan target. Re-add it with `root add` to scan it again."
+                            ),
+                        ));
+                    }
                     None => {
                         return Err(RpcError::new(
                             ErrorCode::NotFound,
@@ -989,6 +1058,13 @@ fn deny_any_component(
     })
 }
 
+/// The refusal's predicate, read outside any transaction.
+///
+/// Test-only since the refusal moved inside `remove_root`'s transaction — the
+/// tests keep it as an independent oracle: a count taken through a different
+/// path than the one under test is what makes "the row is still there" mean
+/// something.
+#[cfg(test)]
 fn count_custody_rows(cat: &mut Catalog, root: RootId) -> Result<u64, CatalogError> {
     let n: i64 = cat.conn().query_row(
         "SELECT COUNT(*) FROM file WHERE root_id = ?1 AND state IN ('stub', 'remote')",
@@ -1014,8 +1090,34 @@ fn count_custody_rows(cat: &mut Catalog, root: RootId) -> Result<u64, CatalogErr
 /// it (its `WHERE` already respects `enabled`), `scan.start` with no root skips
 /// it for the same reason, and `scan_exec` refuses it by name if a job for it is
 /// still queued. `--forget` remains the operation that destroys, and it says so.
-fn remove_root(cat: &mut Catalog, root: RootId, forget: bool) -> Result<u64, CatalogError> {
+fn remove_root(
+    cat: &mut Catalog,
+    root: RootId,
+    forget: bool,
+    force: bool,
+) -> Result<RootRemoval, CatalogError> {
     let tx = cat.conn_mut().transaction()?;
+
+    let present = tx
+        .query_row(
+            "SELECT 1 FROM scan_root WHERE id = ?1",
+            rusqlite::params![root.get()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !present {
+        return Ok(RootRemoval::NotFound);
+    }
+
+    // Counted here, inside the transaction that will do the deleting, so the
+    // refusal is decided on the rows the delete is about to touch. Returning
+    // early rolls the transaction back; nothing has been written.
+    let custody = custody_count(&tx, root)?;
+    if forget && custody > 0 && !force {
+        return Ok(RootRemoval::RefusedCustody { custody });
+    }
+
     let dropped = if forget {
         let n = tx.execute(
             "DELETE FROM file WHERE root_id = ?1",
@@ -1034,7 +1136,32 @@ fn remove_root(cat: &mut Catalog, root: RootId, forget: bool) -> Result<u64, Cat
         0
     };
     tx.commit()?;
-    Ok(dropped)
+    Ok(RootRemoval::Done { dropped, custody })
+}
+
+/// What `root.remove` did, decided in the same transaction that would do it.
+#[derive(Debug, PartialEq, Eq)]
+enum RootRemoval {
+    NotFound,
+    /// `--forget` would have deleted rows that are a tiered file's only remote
+    /// address. Nothing was written.
+    RefusedCustody {
+        custody: u64,
+    },
+    Done {
+        dropped: u64,
+        custody: u64,
+    },
+}
+
+/// The refusal's predicate, against an open transaction.
+fn custody_count(tx: &rusqlite::Transaction<'_>, root: RootId) -> Result<u64, CatalogError> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM file WHERE root_id = ?1 AND state IN ('stub', 'remote')",
+        rusqlite::params![root.get()],
+        |r| r.get(0),
+    )?;
+    Ok(n as u64)
 }
 
 fn root_summary(cat: &mut Catalog, id: RootId) -> Result<Option<RootSummary>, CatalogError> {
@@ -1553,6 +1680,7 @@ mod tests {
                         ctime: Timestamp::from_nanos(1),
                         atime: None,
                         blake3: None,
+                        ino: None,
                     },
                     // These tests are not about generations; the sweep that
                     // reads this column is a separate concern.
@@ -1681,7 +1809,10 @@ mod tests {
             )
             .unwrap();
 
-        let dropped = remove_root(&mut cat, root, false).unwrap();
+        let RootRemoval::Done { dropped, .. } = remove_root(&mut cat, root, false, false).unwrap()
+        else {
+            panic!("an unforced removal without --forget cannot be refused")
+        };
 
         assert_eq!(dropped, 0, "nothing was asked to be forgotten");
         assert_eq!(
@@ -1705,14 +1836,69 @@ mod tests {
         assert!(!all[0].enabled, "and it must be disabled: {:?}", all[0]);
     }
 
+    /// The custody refusal must be decided by the operation that does the
+    /// deleting, not by an earlier one.
+    ///
+    /// `root_remove` counted custody rows in one writer operation and deleted
+    /// in another. The writer actor serializes operations, not *pairs* of them,
+    /// so an ordinary queued catalog write — a tiering completion turning a
+    /// file into `remote` — fits between the two. The refusal then passes on
+    /// evidence that is already stale, and the unforced delete cascades away a
+    /// row that is the sole address of that file's remote bytes.
+    ///
+    /// The interleaving is written out literally rather than raced: this is the
+    /// sequence `root_remove` performs, with the concurrent write placed where
+    /// it is allowed to land.
+    #[test]
+    fn a_custody_row_that_appears_after_the_count_is_still_protected() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let root = seed(&mut cat, "/data", &["a.txt"]);
+
+        // Step 1, as `root_remove` does it: the refusal's own predicate.
+        assert_eq!(
+            count_custody_rows(&mut cat, root).unwrap(),
+            0,
+            "nothing is tiered yet, so the refusal sees nothing to protect"
+        );
+
+        // Between the two writer operations: a tiering completion.
+        cat.conn_mut()
+            .execute(
+                "UPDATE file SET state = 'remote' WHERE rel_path = 'a.txt'",
+                [],
+            )
+            .unwrap();
+
+        // Step 2, with the decision already taken on the stale count.
+        let outcome = remove_root(&mut cat, root, true, false).unwrap();
+
+        assert_eq!(
+            outcome,
+            RootRemoval::RefusedCustody { custody: 1 },
+            "the deletion must re-decide on what it is about to delete"
+        );
+        assert_eq!(
+            file_count(&mut cat, root),
+            1,
+            "the only address of this file's remote bytes was deleted behind a refusal \
+             that had already passed"
+        );
+    }
+
     /// Removing twice without `--forget` stays Ok and still keeps the rows, so
     /// a user who soft-removed can still escalate to `--forget` afterwards.
     #[test]
     fn a_second_removal_without_forget_is_idempotent() {
         let mut cat = Catalog::open_in_memory().unwrap();
         let root = seed(&mut cat, "/data", &["a.txt"]);
-        remove_root(&mut cat, root, false).unwrap();
-        assert_eq!(remove_root(&mut cat, root, false).unwrap(), 0);
+        remove_root(&mut cat, root, false, false).unwrap();
+        assert_eq!(
+            remove_root(&mut cat, root, false, false).unwrap(),
+            RootRemoval::Done {
+                dropped: 0,
+                custody: 0
+            }
+        );
         assert_eq!(file_count(&mut cat, root), 1);
     }
 
@@ -1724,7 +1910,10 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         let root = seed(&mut cat, "/data", &["a.txt", "b.txt"]);
 
-        let dropped = remove_root(&mut cat, root, true).unwrap();
+        let RootRemoval::Done { dropped, .. } = remove_root(&mut cat, root, true, false).unwrap()
+        else {
+            panic!("no custody rows, so nothing to refuse")
+        };
 
         assert_eq!(dropped, 2, "both rows were dropped and both were reported");
         assert_eq!(file_count(&mut cat, root), 0);

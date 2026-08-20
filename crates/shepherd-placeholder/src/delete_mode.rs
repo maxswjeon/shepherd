@@ -284,7 +284,33 @@ impl PlaceholderProvider for DeleteModeProvider {
 
         // Step 2.
         match rename_noreplace(path, &staged) {
-            Ok(true) => {}
+            Ok(true) => {
+                // A cross-directory rename is two directory changes, and
+                // neither is durable until its directory is. A power loss can
+                // persist the removal from the source directory without the new
+                // entry in the staging directory, at which point the file's only
+                // local bytes are reachable from neither name — while the intent
+                // says it was staged and `list_staged`, which is all recovery
+                // has, finds nothing.
+                //
+                // The staging directory is synced FIRST on purpose. If the
+                // machine dies between the two, the surviving state is the entry
+                // existing under both names, which recovery handles; the other
+                // order leaves exactly the hole this closes.
+                if let Err(e) = sync_dir(&dir).and_then(|()| match path.parent() {
+                    Some(parent) => sync_dir(parent),
+                    None => Ok(()),
+                }) {
+                    // Durability could not be established, so this must not be
+                    // reported as staged. §4.10.4 is abort-forward-never: put
+                    // the file back before saying so.
+                    let _ = rename_noreplace(&staged, path);
+                    return Err(ProviderError::Io {
+                        path: dir.display().to_string(),
+                        detail: format!("staging rename is not durable: {e}"),
+                    });
+                }
+            }
             Ok(false) => {
                 return Err(ProviderError::NotFeasible {
                     path: path.display().to_string(),
@@ -383,6 +409,30 @@ fn conflict_name(original: &Path) -> PathBuf {
     original.with_file_name(name)
 }
 
+/// Every directory this process has fsync'd, for the test that the staging
+/// rename is made durable. A rename's durability is not observable from the
+/// filesystem afterwards, so the call itself is what gets asserted on.
+#[cfg(test)]
+pub(crate) static SYNCED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// fsync a directory, so an entry created or removed in it survives a crash.
+///
+/// Opening a directory read-only and fsync'ing the descriptor is the portable
+/// POSIX way to do this, and it is what both ext4 and APFS document. It is
+/// unix-only because the non-unix `rename_noreplace` above is a refusal: there
+/// is no staging to make durable there.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    SYNCED_DIRS.lock().unwrap().push(dir.to_path_buf());
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
 fn libc_eexist() -> i32 {
     libc::EEXIST
@@ -468,6 +518,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The staging rename is made durable in **both** directories.
+    ///
+    /// A cross-directory rename removes an entry from one directory and creates
+    /// one in another, and on a filesystem where rename durability requires a
+    /// directory fsync a crash can persist only the removal. The intent then
+    /// records the file as staged while `list_staged` — the only thing recovery
+    /// reads — finds nothing, and the file's sole local bytes are reachable from
+    /// neither name.
+    ///
+    /// Durability is not observable from the filesystem after the fact, so the
+    /// fsync calls themselves are what this asserts on. `contains` rather than
+    /// an exact list: the recorder is process-wide and other tests run beside
+    /// this one.
+    #[test]
+    fn staging_syncs_both_directories() {
+        let t = Tmp::new("dursync");
+        let nested = t.0.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let f = nested.join("only-copy.bin");
+        std::fs::write(&f, b"the only local copy").unwrap();
+
+        let Some(staged) =
+            staged_or_refused(DeleteModeProvider::new().stage_for_destruction(&t.0, &f))
+        else {
+            return;
+        };
+
+        let synced = SYNCED_DIRS.lock().unwrap().clone();
+        let staging_dir = staged.staged.parent().unwrap().to_path_buf();
+        assert!(
+            synced.contains(&staging_dir),
+            "the staging directory was never fsync'd, so the new entry may not \
+             survive a crash: {synced:?}"
+        );
+        assert!(
+            synced.contains(&nested),
+            "the original's parent was never fsync'd, so the removal may not \
+             survive a crash: {synced:?}"
+        );
     }
 
     #[test]

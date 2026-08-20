@@ -165,6 +165,115 @@ async fn a_session_round_trips_through_a_real_file() {
     assert_eq!(back.parts[0].offset, 0);
 }
 
+/// A per-part checkpoint writes ONE row, and the accumulated set survives it.
+///
+/// `save` replaces the whole part set on every call, and `upload_pending` calls
+/// the store once per acknowledged part — so recording N events cost N(N+1)/2
+/// part inserts. On the 3,200-part 50 GB upload the plan sizes for, that is
+/// about 5.1 million inserts under `synchronous = FULL`, and the checkpointing
+/// can cost more than the transfer.
+///
+/// Both halves are asserted, because the cheap version of this fix is the
+/// dangerous one: writing only the changed part is worthless if the earlier
+/// receipts stop being readable, since resume reads exactly those to decide
+/// what it may skip. So the parts are checkpointed one at a time and the whole
+/// set is then loaded back from a REOPENED store.
+#[tokio::test]
+async fn checkpointing_a_part_writes_only_that_part_and_keeps_the_rest() {
+    let dir = TempDir::new("save-part");
+    let db = dir.join("catalog.db");
+    let src = dir.join("a.bin");
+    std::fs::write(&src, BODY).expect("write source");
+    let item = item_for(&src);
+
+    let job = JobId::new(77);
+    seed(&db, job, item.target, item.file);
+
+    {
+        let store = CatalogSessionStore::open(&db).expect("open");
+        let adapter = MemAdapter::content_addressed();
+        let mut s = TransferSession::plan(
+            job,
+            item.target,
+            item.remote_key.clone(),
+            SourceIdentity {
+                file_id: item.file,
+                rel_path: item.path.clone(),
+                size: item.size,
+                mtime: Timestamp::from_nanos(7),
+                fs_id: FsId::new("vol-1:ino-9"),
+                blake3: item.blake3,
+            },
+            &adapter,
+            4,
+        )
+        .expect("plan");
+        s.state = TransferState::Uploading;
+        s.upload_id = Some(OpaqueToken::new("upload-abc"));
+        store.save(&s).await.expect("save the planned session");
+
+        // Four parts, checkpointed one at a time exactly as `upload_pending`
+        // does — each `save_part` call after the part before it is already
+        // durable.
+        for part_no in 1..=4u32 {
+            s.parts.push(PartCheckpoint {
+                part_no,
+                offset: u64::from(part_no - 1) * 4,
+                len: 4,
+                local_blake3: Blake3Hash::from_bytes([part_no as u8; 32]),
+                etag: Some(OpaqueToken::new(format!("etag-{part_no}"))),
+                checksum: None,
+            });
+            store.save_part(&s, part_no).await.expect("save_part");
+
+            // The rows written so far are exactly the parts checkpointed so
+            // far — no more, and none lost.
+            let conn = rusqlite::Connection::open(&db).expect("open for count");
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM transfer_part", [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(
+                rows,
+                i64::from(part_no),
+                "checkpointing part {part_no} must leave one row per checkpointed part"
+            );
+        }
+    } // <- the store and its connection are gone
+
+    let store = CatalogSessionStore::open(&db).expect("reopen");
+    let back = store
+        .load(job)
+        .await
+        .expect("load")
+        .expect("a row survived");
+
+    assert_eq!(
+        back.parts.len(),
+        4,
+        "resume reads these to decide what it may skip; a lost receipt re-sends \
+         a part, and a wrong one skips a part that never landed"
+    );
+    for (i, p) in back.parts.iter().enumerate() {
+        let n = i as u32 + 1;
+        assert_eq!(p.part_no, n);
+        assert_eq!(p.etag, Some(OpaqueToken::new(format!("etag-{n}"))));
+        assert_eq!(p.local_blake3, Blake3Hash::from_bytes([n as u8; 32]));
+        assert_eq!(p.len, 4);
+    }
+
+    // And re-checkpointing a part already on disk updates it rather than
+    // adding a second row — the PRIMARY KEY the upsert targets.
+    let mut again = back;
+    again.parts[0].etag = Some(OpaqueToken::new("etag-1-retried"));
+    store.save_part(&again, 1).await.expect("re-checkpoint");
+    let reloaded = store.load(job).await.expect("load").expect("still there");
+    assert_eq!(reloaded.parts.len(), 4);
+    assert_eq!(
+        reloaded.parts[0].etag,
+        Some(OpaqueToken::new("etag-1-retried"))
+    );
+}
+
 #[tokio::test]
 async fn an_absent_session_loads_as_none_rather_than_an_error() {
     let dir = TempDir::new("absent");
@@ -401,6 +510,7 @@ fn scan_stat(i: usize) -> FileStat {
         ctime: Timestamp::from_nanos(1),
         atime: None,
         blake3: None,
+        ino: None,
     }
 }
 

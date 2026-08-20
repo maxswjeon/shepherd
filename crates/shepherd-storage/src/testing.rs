@@ -535,6 +535,8 @@ pub struct MemStore {
 struct MemStoreInner {
     saved: HashMap<i64, TransferSession>,
     saves: usize,
+    /// How many of those arrived through `save_part` rather than `save`.
+    part_saves: usize,
     /// Fail the Nth `save` (1-based) and every later one, modelling a process
     /// death: nothing after that point ever became durable.
     die_at_save: Option<usize>,
@@ -556,6 +558,16 @@ impl MemStore {
         i.die_at_save = None;
         i.saves = 0;
     }
+
+    /// Durable writes attempted, by either route.
+    pub fn saves(&self) -> usize {
+        self.inner.lock().expect("poisoned").saves
+    }
+
+    /// How many of those were single-part checkpoints.
+    pub fn part_saves(&self) -> usize {
+        self.inner.lock().expect("poisoned").part_saves
+    }
 }
 
 #[async_trait::async_trait]
@@ -573,6 +585,14 @@ impl TransferSessionStore for MemStore {
         }
         i.saved.insert(session.job_id.get(), session.clone());
         Ok(())
+    }
+
+    /// Counted, then handled exactly as `save` — this double has nothing
+    /// cheaper, and the crash injection must not be able to tell the two routes
+    /// apart or `die_at_save` would stop landing where the tests aim it.
+    async fn save_part(&self, session: &TransferSession, _part_no: u32) -> StorageResult<()> {
+        self.inner.lock().expect("poisoned").part_saves += 1;
+        self.save(session).await
     }
 
     async fn load(&self, job_id: JobId) -> StorageResult<Option<TransferSession>> {

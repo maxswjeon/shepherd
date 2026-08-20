@@ -6,6 +6,7 @@
 //! walk ──► denylist (prunes directories)
 //!      ──► ignore   (user patterns, .gitignore semantics)
 //!      ──► floors   (AC-8 eligibility)
+//!      ──► FileStat { blake3: None     ino: None,
 //!      ──► FileStat { blake3: None }  ──► catalog
 //!                                     ──► `hash` job class, later
 //! ```

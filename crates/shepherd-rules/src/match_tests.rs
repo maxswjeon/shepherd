@@ -19,6 +19,7 @@ fn file(rel: &str, size: u64, age_days: i64) -> FileStat {
         ctime: t,
         atime: Some(t),
         blake3: None,
+        ino: None,
     }
 }
 
@@ -361,6 +362,46 @@ fn the_age_signal_follows_the_documented_fallback_order() {
     assert_eq!(
         m.matches(&f, &c).age_signal,
         Some(AccessSignalSource::Mtime)
+    );
+}
+
+/// In a compound `any`, the branch that actually matched names the signal.
+///
+/// `age_field` was resolved once at compile time as the *first* age predicate
+/// in the tree, which answers "which predicate is written first", not "which
+/// one selected this file". For `any: [mtime…, ctime…]` where only the ctime
+/// branch is true, the preview said `Mtime` — a timestamp that provably cannot
+/// have driven the match, since it is one day old under a 365-day predicate.
+///
+/// This is the same class as the ctime mislabel below, and the `Ctime` variant
+/// added for that one does not reach it: the selection happens before
+/// `resolve_signal` is ever asked.
+#[test]
+fn a_compound_rule_reports_the_branch_that_actually_matched() {
+    let mut f = file("a", 1, 0);
+    f.mtime = Timestamp::from_nanos(now().as_nanos() - DAY);
+    f.ctime = Timestamp::from_nanos(now().as_nanos() - 400 * DAY);
+    f.atime = Some(Timestamp::from_nanos(now().as_nanos() - DAY));
+
+    let m = compile(serde_json::json!({
+        "any": [
+            { "mtime_older_than_days": 365 },
+            { "ctime_older_than_days": 365 },
+        ]
+    }));
+
+    let out = m.matches(&f, &ctx(AtimeMode::Relatime, &[]));
+    assert!(out.matched, "the ctime branch is 400 days old");
+    assert_eq!(
+        out.age_signal,
+        Some(AccessSignalSource::Ctime),
+        "mtime is one day old and cannot have satisfied a 365-day predicate; \
+         the signal named must be the one that did"
+    );
+    assert_eq!(
+        m.age_signal_for(&f, &ctx(AtimeMode::Relatime, &[])),
+        Some(AccessSignalSource::Ctime),
+        "and the two paths must not disagree"
     );
 }
 

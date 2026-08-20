@@ -66,13 +66,23 @@ pub fn fs_id(path: &Path, volume_id: &str) -> Result<FsId> {
             path: path.display().to_string(),
             detail: e.to_string(),
         })?;
-        Ok(FsId::new(format!("{volume_id}:{}", md.ino())))
+        Ok(fs_id_from_ino(volume_id, md.ino()))
     }
     #[cfg(not(unix))]
     {
         let _ = (path, volume_id);
         Err(VolumeError::Unsupported(std::env::consts::OS))
     }
+}
+
+/// The same packing, from an inode already in hand.
+///
+/// The scan reads `st_ino` while it is walking, and the catalog write happens
+/// inside the single-writer actor, which must not touch the filesystem. One
+/// function so the two producers cannot disagree about the format — a mismatch
+/// there is silent, and `FileLocks` keys on this string.
+pub fn fs_id_from_ino(volume_id: &str, ino: u64) -> FsId {
+    FsId::new(format!("{volume_id}:{ino}"))
 }
 
 #[cfg(target_os = "linux")]

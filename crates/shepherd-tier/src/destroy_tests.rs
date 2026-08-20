@@ -826,6 +826,262 @@ async fn a_failing_unlink_restores_rather_than_orphaning_the_file() {
     );
 }
 
+// --- an ambiguous remote DELETE ---------------------------------------------
+
+/// A [`RemoteGate`] whose DELETE errors without saying whether it landed.
+///
+/// This is the ordinary S3 failure, not an exotic one: the request is sent, the
+/// provider applies it, and the acknowledgement is lost to a reset or a
+/// gateway timeout. The SDK surfaces an error either way, so the error alone
+/// cannot tell a caller which side of the irreversible step it is on.
+struct AmbiguousDelete {
+    /// What the DELETE actually did, as the provider sees it afterwards.
+    gone: bool,
+    /// Whether the resolving HEAD can answer at all.
+    head_answers: bool,
+    /// The version the key answers with when it is still there.
+    version: &'static str,
+    /// When set, the DELETE is refused rather than being ambiguous — the
+    /// provider stating that it did not act.
+    precondition_failed: bool,
+    heads: std::sync::atomic::AtomicUsize,
+}
+
+impl AmbiguousDelete {
+    fn new(gone: bool, head_answers: bool) -> Self {
+        Self {
+            gone,
+            head_answers,
+            version: "v9",
+            precondition_failed: false,
+            heads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    /// Still there, but as a version the guard did not name.
+    fn replaced(version: &'static str) -> Self {
+        Self {
+            version,
+            ..Self::new(false, true)
+        }
+    }
+    fn refused() -> Self {
+        Self {
+            precondition_failed: true,
+            ..Self::new(false, true)
+        }
+    }
+    fn heads(&self) -> usize {
+        self.heads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl RemoteGate for AmbiguousDelete {
+    async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
+        self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self.head_answers {
+            return Err(DestroyError::Storage("the provider is unreachable".into()));
+        }
+        Ok((!self.gone).then(|| ObjectMeta {
+            key: key.clone(),
+            size: 4,
+            version: Some(shepherd_core::ObjectVersion::new(self.version)),
+            etag: None,
+            whole_object_checksum: None,
+        }))
+    }
+
+    async fn remove_object(&self, key: &ObjectKey, _guard: &VersionGuard) -> Result<()> {
+        if self.precondition_failed {
+            return Err(DestroyError::PreconditionFailed {
+                key: key.as_str().to_owned(),
+                detail: "the object is not the version this was authorised against".into(),
+            });
+        }
+        Err(DestroyError::Storage(
+            "connection reset after the request was sent".into(),
+        ))
+    }
+}
+
+fn v9() -> VersionGuard {
+    VersionGuard::Version(shepherd_core::ObjectVersion::new("v9"))
+}
+
+/// The DELETE landed and the acknowledgement did not come back.
+///
+/// The bytes are gone — irreversibly — so §4.10.4 owes a record. Asserting on
+/// the **audit log** rather than on the return value is the point: propagating
+/// the provider error was already what this did, and it left no evidence that
+/// the object had been destroyed at all.
+#[tokio::test]
+async fn a_lost_delete_acknowledgement_is_still_audited() {
+    let f = fixture("discard-lost-ack", AttestationMode::Version);
+    let remote = AmbiguousDelete::new(true, true);
+
+    execute_remote_discard(
+        IntentId::new(11),
+        &remote,
+        &f.key,
+        &v9(),
+        &f.audit,
+        "version",
+        Timestamp::from_nanos(5),
+    )
+    .await
+    .expect("the object is gone and the record is written; that is the operation succeeding");
+
+    assert_eq!(remote.heads(), 1, "the outcome must actually be resolved");
+    let audit = f.audit.read_all();
+    assert_eq!(
+        audit.len(),
+        1,
+        "an object was destroyed with no surviving evidence"
+    );
+    assert!(audit[0].contains("\"intent\":11"), "{}", audit[0]);
+    assert!(
+        !f.audit.is_halted(),
+        "the outcome was resolved, so there is nothing to halt for"
+    );
+}
+
+/// The DELETE did not land: the object is still there.
+///
+/// A pre-operation failure — a refused connection, a 403 — is not ambiguous.
+/// Nothing irreversible happened, so nothing is owed a record and halting every
+/// other destruction would be an outage manufactured from a retryable error.
+#[tokio::test]
+async fn a_delete_that_never_landed_is_neither_audited_nor_halting() {
+    let f = fixture("discard-no-op", AttestationMode::Version);
+    let remote = AmbiguousDelete::new(false, true);
+
+    let err = execute_remote_discard(
+        IntentId::new(12),
+        &remote,
+        &f.key,
+        &v9(),
+        &f.audit,
+        "version",
+        Timestamp::from_nanos(5),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, DestroyError::Storage(_)), "{err}");
+    assert!(
+        f.audit.read_all().is_empty(),
+        "nothing was destroyed, so nothing may be audited as destroyed"
+    );
+    assert!(!f.audit.is_halted(), "a retryable failure is not a halt");
+}
+
+/// The DELETE is ambiguous and the outcome **cannot** be resolved.
+///
+/// This is the case the global halt exists for: an irreversible operation may
+/// have happened and the record cannot be completed. Letting the next
+/// destruction proceed is exactly what §4.10.4 forbids.
+#[tokio::test]
+async fn an_unresolvable_delete_halts_subsequent_destruction() {
+    let f = fixture("discard-unresolved", AttestationMode::Version);
+    let remote = AmbiguousDelete::new(true, false);
+
+    let err = execute_remote_discard(
+        IntentId::new(13),
+        &remote,
+        &f.key,
+        &v9(),
+        &f.audit,
+        "version",
+        Timestamp::from_nanos(5),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, DestroyError::Storage(_)), "{err}");
+    assert!(
+        f.audit.is_halted(),
+        "destruction may not continue past an unresolved irreversible step"
+    );
+    assert!(
+        f.audit.check_not_halted().is_err(),
+        "and the halt has to be the one every other destruction reads"
+    );
+}
+
+/// A HEAD that answers with a DIFFERENT version settles nothing.
+///
+/// `head` reports the CURRENT version only. Under `VersionGuard::Version` a
+/// mismatch is consistent with two opposite histories: the guarded version was
+/// deleted and an older one is now current, or another writer replaced the
+/// object before the DELETE was ever applied. Reading it as "the delete landed"
+/// forges a record for a destruction that may not have happened; reading it as
+/// "it did not" drops an irreversible one. Neither is available, so this is the
+/// halt.
+#[tokio::test]
+async fn a_head_that_answers_with_another_version_is_not_a_resolution() {
+    let f = fixture("discard-replaced", AttestationMode::Version);
+    let remote = AmbiguousDelete::replaced("v10");
+
+    let err = execute_remote_discard(
+        IntentId::new(14),
+        &remote,
+        &f.key,
+        &v9(),
+        &f.audit,
+        "version",
+        Timestamp::from_nanos(5),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, DestroyError::Storage(_)), "{err}");
+    assert!(
+        f.audit.read_all().is_empty(),
+        "a destruction that cannot be established must not be recorded as one"
+    );
+    assert!(
+        f.audit.is_halted(),
+        "and an unresolved irreversible step halts subsequent destruction"
+    );
+}
+
+/// A refused precondition is not ambiguous, and must not halt.
+///
+/// The provider refusing on the guard is the provider stating that it did not
+/// act — the one thing a lost acknowledgement can never state. Flattened into
+/// the generic storage error it became indistinguishable from ambiguity, and
+/// the resolver would then either forge a record or halt every other
+/// destruction because a guard did its job.
+#[tokio::test]
+async fn a_refused_precondition_neither_records_nor_halts() {
+    let f = fixture("discard-precondition", AttestationMode::Version);
+    let remote = AmbiguousDelete::refused();
+
+    let err = execute_remote_discard(
+        IntentId::new(15),
+        &remote,
+        &f.key,
+        &v9(),
+        &f.audit,
+        "version",
+        Timestamp::from_nanos(5),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, DestroyError::PreconditionFailed { .. }),
+        "the refusal must reach the caller as itself: {err}"
+    );
+    assert_eq!(
+        remote.heads(),
+        0,
+        "there is nothing to resolve, so nothing may be asked"
+    );
+    assert!(f.audit.read_all().is_empty());
+    assert!(!f.audit.is_halted(), "a working guard is not an incident");
+}
+
 // --- the halt is GLOBAL, which means it has to be a gate --------------------
 
 /// A [`RemoteGate`] that parks inside the closing HEAD until it is released.

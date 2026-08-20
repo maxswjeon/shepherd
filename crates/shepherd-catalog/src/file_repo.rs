@@ -479,15 +479,36 @@ impl<'a> FileRepo<'a> {
         }
         let nk = root.norm_key(&stat.rel_path);
         let (name, ext) = split_name(&stat.rel_path);
+        // §4.4's `<stable-volume-id>:<inode>`, built from the inode the WALK
+        // read and the root's recorded volume id.
+        //
+        // Nothing populated this column. It is what upload and destruction lock
+        // on (`FileLocks`, and `LocalDestroyRequest::fs_id` says so in
+        // capitals), and what tells a rename from a replacement — a NULL there
+        // is a lock that protects nothing and a rename indistinguishable from a
+        // delete-plus-create. `None` only where the root has no stable volume
+        // id, which `root.add` already warns about, or on a platform with no
+        // inode.
+        let fs_id = root
+            .volume_id
+            .as_deref()
+            .zip(stat.ino)
+            .map(|(vol, ino)| crate::volume::fs_id_from_ino(vol, ino).as_str().to_owned());
         self.0.conn_mut().execute(
             "INSERT INTO file
                  (root_id, rel_path, name, ext, size, mtime, ctime, atime,
-                  norm_key, first_seen_at, blake3, state, last_seen_gen, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'local', ?12, ?10)
+                  norm_key, first_seen_at, blake3, state, last_seen_gen, updated_at,
+                  fs_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'local', ?12, ?10, ?13)
              ON CONFLICT(root_id, rel_path) DO UPDATE SET
                  name = excluded.name, ext = excluded.ext, size = excluded.size,
                  mtime = excluded.mtime, ctime = excluded.ctime, atime = excluded.atime,
                  norm_key = excluded.norm_key, updated_at = excluded.updated_at,
+                 -- COALESCE, not a bare assignment: a scan of a root whose
+                 -- volume id could not be determined carries NULL, and letting
+                 -- that overwrite a good identity would silently unprotect a
+                 -- file that had one.
+                 fs_id = COALESCE(excluded.fs_id, file.fs_id),
                  -- last_seen_gen IS in this list, and that is the whole point
                  -- of it. The reconciling sweep is
                  -- `SET state='missing' WHERE last_seen_gen < :this_scan`, so a
@@ -558,6 +579,7 @@ impl<'a> FileRepo<'a> {
                 now.as_nanos(),
                 stat.blake3.map(|h| h.as_bytes().to_vec()),
                 generation,
+                fs_id,
             ],
         )?;
         Ok(())
@@ -723,6 +745,7 @@ mod tests {
             ctime: Timestamp::from_nanos(1),
             atime: None,
             blake3: None,
+            ino: None,
         }
     }
 

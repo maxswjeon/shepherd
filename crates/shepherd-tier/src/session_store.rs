@@ -218,6 +218,33 @@ impl TransferSessionStore for CatalogSessionStore {
         }
     }
 
+    /// One part, one row, one transaction.
+    ///
+    /// `save` replaces the whole part set — deliberately, because
+    /// `restart_attempt` has to clear receipts a forgotten provider session
+    /// left behind. Ordinary progress is the opposite case: exactly one
+    /// checkpoint changed, and rewriting the other 3,199 to record it is what
+    /// made a 50 GB upload do ~5.1 million inserts.
+    ///
+    /// Nothing on the session row is touched. `state` deliberately is not — a
+    /// part landing is not a state transition, and the transitions are exactly
+    /// what `save` exists to write atomically with the part set — and neither
+    /// is `updated_at`, which `save` binds to the source's mtime and is
+    /// therefore the same value on every call of a given session.
+    async fn save_part(&self, session: &TransferSession, part_no: u32) -> StorageResult<()> {
+        match &self.backend {
+            Backend::Owned(m) => {
+                let mut cat = m.lock().unwrap_or_else(|e| e.into_inner());
+                save_part_blocking(&mut cat, session, part_no)
+            }
+            Backend::Actor(w) => {
+                let s = session.clone();
+                w.with(move |cat| save_part_blocking(cat, &s, part_no))
+                    .map_err(writer_err)?
+            }
+        }
+    }
+
     async fn load(&self, job_id: JobId) -> StorageResult<Option<TransferSession>> {
         match &self.backend {
             Backend::Owned(m) => {
@@ -349,6 +376,63 @@ fn save_blocking(cat: &mut Catalog, session: &TransferSession) -> StorageResult<
         // `shepherd-catalog`, so this commit really is on disk.
         tx.commit().map_err(sqlite)?;
     }
+    Ok(())
+}
+
+/// The single-part write, against a borrowed catalog.
+///
+/// Free function for the same reason `save_blocking` is one: both backends must
+/// run identical SQL, or the owned path and the daemon path drift into
+/// disagreeing about what a checkpoint means.
+fn save_part_blocking(
+    cat: &mut Catalog,
+    session: &TransferSession,
+    part_no: u32,
+) -> StorageResult<()> {
+    let Some(p) = session.parts.iter().find(|p| p.part_no == part_no) else {
+        return Err(StorageError::Provider {
+            provider: "catalog",
+            op: "transfer_part".into(),
+            detail: format!("part {part_no} is not in the session being checkpointed"),
+        });
+    };
+
+    let tx = cat.conn_mut().transaction().map_err(sqlite)?;
+
+    let session_row: i64 = tx
+        .query_row(
+            "SELECT id FROM transfer_session WHERE job_id = ?1",
+            [session.job_id.get()],
+            |r| r.get(0),
+        )
+        .map_err(sqlite)?;
+
+    // `(session_id, part_no)` is the table's PRIMARY KEY, so this upsert has a
+    // constraint to target — unlike `save`'s session row, whose `job_id` did
+    // not, and which is why that one is an explicit UPDATE-then-INSERT.
+    tx.execute(
+        "INSERT INTO transfer_part
+           (session_id, job_id, upload_id, part_no, etag, bytes,
+            local_blake3, attempt_epoch)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(session_id, part_no) DO UPDATE SET
+             upload_id = excluded.upload_id, etag = excluded.etag,
+             bytes = excluded.bytes, local_blake3 = excluded.local_blake3,
+             attempt_epoch = excluded.attempt_epoch",
+        rusqlite::params![
+            session_row,
+            session.job_id.get(),
+            session.upload_id.as_ref().map(|t| t.as_opaque()),
+            i64::from(p.part_no),
+            p.etag.as_ref().map(|e| e.as_opaque()),
+            p.len as i64,
+            p.local_blake3.as_bytes().to_vec(),
+            i64::from(session.attempt_epoch),
+        ],
+    )
+    .map_err(sqlite)?;
+
+    tx.commit().map_err(sqlite)?;
     Ok(())
 }
 

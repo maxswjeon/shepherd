@@ -294,11 +294,24 @@ pub fn walk(
                 atime: md.accessed().ok().map(|t| sys_time(Some(t))),
                 // §6: hashing is its own job class, never a scan prerequisite.
                 blake3: None,
+                ino: ino_of(&md),
             });
         }
     }
 
     Ok(out)
+}
+
+/// The inode from metadata already read, never a second `stat`.
+#[cfg(unix)]
+fn ino_of(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(md.ino())
+}
+
+#[cfg(not(unix))]
+fn ino_of(_md: &std::fs::Metadata) -> Option<u64> {
+    None
 }
 
 /// The deny decision for the walk root, over **both** names it has.

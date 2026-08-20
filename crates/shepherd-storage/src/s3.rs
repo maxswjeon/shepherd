@@ -685,14 +685,14 @@ impl StorageAdapter for S3Adapter {
             .send()
             .await
             .map_err(|e| Self::map_err("list_objects_v2", prefix, e))?;
-        Ok(ListPage {
-            keys: out
-                .contents()
+        list_page(
+            out.is_truncated().unwrap_or(false),
+            out.next_continuation_token(),
+            out.contents()
                 .iter()
                 .filter_map(|o| o.key().map(ObjectKey::new))
                 .collect(),
-            next: out.next_continuation_token().map(OpaqueToken::new),
-        })
+        )
     }
 
     /// User data. Callable only from `shepherd-tier::destroy` (§4.1 rule 4).
@@ -1633,8 +1633,62 @@ mod probe_tests {
     }
 }
 
+/// One listing page, refusing a truncation that carries no way to continue.
+///
+/// `is_truncated` and `next_continuation_token` are two separate fields and a
+/// provider can set the first without the second. Reading only the token maps
+/// that to `next: None`, which every caller — `replica::read_chain` above all —
+/// is entitled to read as "the listing is exhaustive". A partial pointer set
+/// then resolves as though it were whole, producing stale recovery state or a
+/// chain gap that is reported as the *bucket's* fault rather than the
+/// response's.
+///
+/// `list_parts` in this same file already refuses this. This is the same
+/// refusal, one function over, where it was missing.
+fn list_page(
+    truncated: bool,
+    token: Option<&str>,
+    keys: Vec<ObjectKey>,
+) -> StorageResult<ListPage> {
+    let next = token.map(OpaqueToken::new);
+    if truncated && next.is_none() {
+        return Err(StorageError::Provider {
+            provider: "s3",
+            op: "list_objects_v2".into(),
+            detail: "response was truncated but carried no continuation token".into(),
+        });
+    }
+    Ok(ListPage { keys, next })
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A truncated listing with no continuation token is malformed provider
+    /// evidence, not an exhaustive page.
+    ///
+    /// The two fields are independent, and mapping only the token to `next`
+    /// turned "there is more and I cannot tell you where" into "that was all".
+    /// `replica::read_chain` stops on `next: None`, so a partial pointer set
+    /// resolves as a complete one — stale recovery state, or a chain gap
+    /// blamed on the bucket instead of the response.
+    #[test]
+    fn a_truncated_listing_without_a_token_is_refused() {
+        let keys = vec![ObjectKey::new("p/objects/aa")];
+
+        let err = list_page(true, None, keys.clone())
+            .expect_err("a truncated page with nowhere to continue is not exhaustive");
+        assert!(
+            matches!(err, StorageError::Provider { op, .. } if op == "list_objects_v2"),
+            "the refusal must name the operation"
+        );
+
+        // The two pages that ARE well-formed still pass through.
+        let last = list_page(false, None, keys.clone()).expect("an untruncated page is the last");
+        assert!(last.next.is_none());
+        let more = list_page(true, Some("tok"), keys).expect("truncated WITH a token continues");
+        assert!(more.next.is_some());
+    }
     use super::*;
 
     #[test]

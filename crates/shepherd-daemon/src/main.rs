@@ -197,10 +197,17 @@ fn cmd_run() -> Result<(), String> {
     // Before any worker runs: a job left `running` by a crash must be resolved
     // while nothing else is claiming, and a `destroy` job must be quarantined
     // rather than requeued (§4.10.4).
-    match recover(&daemon.writer) {
-        Ok(recovered) => report_recovery(&recovered),
-        Err(e) => tracing::warn!(error = %e, "could not run crash recovery"),
-    }
+    //
+    // A failure here is FATAL, unlike the index rebuild below. This was a
+    // warning followed by an ordinary start, which is the one outcome the
+    // ordering exists to prevent: the pool comes up and accepts new work while
+    // crash-stranded jobs are still `running` — destroy jobs among them, the
+    // ones §4.10.4 requires to be quarantined before anything else claims.
+    // Every invariant this call establishes would then be unestablished for the
+    // whole life of the daemon, and nothing would try again.
+    let recovered = recover(&daemon.writer)
+        .map_err(|e| format!("crash recovery failed, refusing to start workers: {e}"))?;
+    report_recovery(&recovered);
 
     warn_about_lingering();
 

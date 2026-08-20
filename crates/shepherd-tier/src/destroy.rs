@@ -49,7 +49,7 @@ use shepherd_core::ObjectKey;
 use shepherd_core::{Blake3Hash, FsId, IntentId, Timestamp};
 use shepherd_placeholder::provider::{PlaceholderProvider, Staged};
 use shepherd_scan::floors::{self, FloorContext, FloorInput, FloorPolicy};
-use shepherd_storage::adapter::{ObjectMeta, StorageAdapter, VersionGuard};
+use shepherd_storage::adapter::{ObjectMeta, StorageAdapter, StorageError, VersionGuard};
 
 use crate::audit::{AuditLog, AuditRecord};
 use crate::revalidate::{ClosingCheck, DestroyRefusal, Location};
@@ -78,6 +78,17 @@ pub enum DestroyError {
     ContentChanged { expected: String, actual: String },
     #[error("storage: {0}")]
     Storage(String),
+    /// The provider refused because the guard did not hold — the object is not
+    /// the version (or the content) the destruction was authorised against.
+    ///
+    /// Kept distinct from [`DestroyError::Storage`] because it is the one
+    /// provider failure that is *knowably* pre-operation: the refusal is the
+    /// provider saying it did not act. Flattened into `Storage` it became
+    /// indistinguishable from a lost acknowledgement, and
+    /// [`resolve_ambiguous_delete`] would then treat a refusal as an outcome to
+    /// resolve.
+    #[error("precondition failed for {key}: {detail}")]
+    PreconditionFailed { key: String, detail: String },
     #[error("io: {0}")]
     Io(String),
 }
@@ -377,7 +388,15 @@ impl RemoteGate for &dyn StorageAdapter {
         // by the `#![allow]` at the top of this file.
         StorageAdapter::delete_object(*self, key, guard)
             .await
-            .map_err(|e| DestroyError::Storage(e.to_string()))
+            .map_err(|e| match e {
+                // NOT flattened: a failed precondition is the provider stating
+                // that it did not act, and that is the one thing an ambiguous
+                // DELETE can never state. See `DestroyError::PreconditionFailed`.
+                StorageError::PreconditionFailed { key, detail } => {
+                    DestroyError::PreconditionFailed { key, detail }
+                }
+                other => DestroyError::Storage(other.to_string()),
+            })
     }
 }
 
@@ -405,8 +424,150 @@ pub async fn execute_remote_discard(
     // costs.
     let permit = audit.admit().await?;
 
-    remote.remove_object(key, guard).await?;
+    if let Err(e) = remote.remove_object(key, guard).await {
+        // A refused precondition is not ambiguous: the provider says it did not
+        // act. Nothing irreversible happened, so nothing is owed a record and
+        // halting every other destruction would be an outage manufactured out
+        // of a guard doing its job.
+        if matches!(e, DestroyError::PreconditionFailed { .. }) {
+            drop(permit);
+            return Err(e);
+        }
+        return resolve_ambiguous_delete(
+            e,
+            intent,
+            remote,
+            key,
+            guard,
+            audit,
+            permit,
+            attestation,
+            now,
+        )
+        .await;
+    }
 
+    permit.append(&AuditRecord {
+        at: now,
+        intent,
+        kind: "remote",
+        path: key.as_str().to_owned(),
+        size: 0,
+        blake3: None,
+        attestation: attestation.to_owned(),
+        target_keys: vec![key.as_str().to_owned()],
+        reconstructed: false,
+    })?;
+    Ok(())
+}
+
+/// Decide what an errored DELETE means, while the permit is still held.
+///
+/// # Why the error alone is not the answer
+///
+/// A failed `unlink(2)` is knowable: it either removed the directory entry or
+/// it did not, and the errno says which. A failed `DeleteObject` is not. The
+/// request goes out, the provider applies it, and the acknowledgement is lost
+/// to a reset, a gateway timeout, or a 500 raised after the delete marker was
+/// already written. The SDK surfaces an error in every one of those cases, so
+/// treating the error as "nothing happened" — which is what a bare `?` here
+/// did — silently drops the permit on an operation that may have been
+/// irreversible, leaving no record and no halt.
+///
+/// # The three outcomes
+///
+/// The object's own state is the only thing that can settle it, so this asks:
+///
+/// * **gone** — the DELETE landed. Irreversible, so §4.10.4 owes it a record,
+///   and the permit is still held precisely so it can be written now. The
+///   provider error is not returned: the operation this function was asked to
+///   perform demonstrably happened and is now audited.
+/// * **still there** — a pre-operation failure (refused connection, 403,
+///   precondition). Nothing irreversible happened, nothing is owed, and the
+///   error goes back to the caller to retry. Halting here would manufacture an
+///   outage out of a retryable error.
+/// * **cannot tell** — the case the global halt exists for. An irreversible
+///   step may have happened and its record cannot be completed, so subsequent
+///   destruction stops until a human or a repair routine settles it.
+///
+/// Under [`VersionGuard::Version`] the comparison is against the **version**,
+/// not merely the key's presence: on a versioned bucket the guarded version can
+/// be gone while an older one still answers a plain HEAD, and reading that as
+/// "still there" would put an irreversible delete back in the unaudited case
+/// this exists to close.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_ambiguous_delete(
+    err: DestroyError,
+    intent: IntentId,
+    remote: &impl RemoteGate,
+    key: &ObjectKey,
+    guard: &VersionGuard,
+    audit: &AuditLog,
+    permit: crate::audit::DestroyPermit<'_>,
+    attestation: &str,
+    now: Timestamp,
+) -> Result<()> {
+    let unresolved = |audit: &AuditLog, permit, why: String| {
+        let detail = format!(
+            "remote destruction of {} failed ambiguously ({err}) and the outcome could not \
+             be resolved: {why}",
+            key.as_str()
+        );
+        // Set while the permit is still held, so the halt is in place before
+        // any other destruction can be admitted.
+        audit.halt_for_recovery(&detail);
+        drop(permit);
+        DestroyError::Storage(detail)
+    };
+
+    match remote.head_meta(key).await {
+        // Gone. Fall through to the record below.
+        Ok(None) => {}
+
+        Ok(Some(meta)) => match guard {
+            // The key is the guard, and the key still answers: nothing was
+            // deleted. No record is owed, and holding every other destruction
+            // while this one is retried would be wrong.
+            VersionGuard::ContentAddressed { .. } => {
+                drop(permit);
+                return Err(err);
+            }
+            VersionGuard::Version(v) if meta.version.as_ref() == Some(v) => {
+                drop(permit);
+                return Err(err);
+            }
+            // The guarded version is not the current one — and that settles
+            // NOTHING. `head` answers about the current version only, so on a
+            // versioned bucket `v` may still exist as a noncurrent version, and
+            // the object may equally have been replaced by another writer
+            // before the DELETE was applied. Reading this as "the delete
+            // landed" would append a record for a destruction that may not have
+            // happened; reading it as "it did not" would drop an irreversible
+            // one. It is exactly the case the global halt exists for.
+            VersionGuard::Version(v) => {
+                return Err(unresolved(
+                    audit,
+                    permit,
+                    format!(
+                        "the guard named version {} and the key now answers with {:?}, which \
+                         does not establish whether the guarded version was deleted",
+                        v.as_opaque(),
+                        meta.version.as_ref().map(|got| got.as_opaque()),
+                    ),
+                ));
+            }
+        },
+
+        Err(head_err) => {
+            return Err(unresolved(audit, permit, head_err.to_string()));
+        }
+    }
+
+    tracing::warn!(
+        key = %key.as_str(),
+        error = %err,
+        "the remote DELETE reported an error but the object is gone; auditing it as destroyed"
+    );
     permit.append(&AuditRecord {
         at: now,
         intent,

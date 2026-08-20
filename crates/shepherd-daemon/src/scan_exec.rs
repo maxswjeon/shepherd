@@ -59,6 +59,14 @@ use crate::state::Daemon;
 /// ponytail: fixed batch of 500; tune only against a measured scan profile.
 const UPSERT_BATCH: usize = 500;
 
+/// Whether `path` is `ancestor` or lives under it, on canonical paths where
+/// they resolve. `Path::starts_with` compares components, so a shared prefix
+/// like `state-old` is not "under" `state`.
+fn under(path: &std::path::Path, ancestor: &std::path::Path) -> bool {
+    let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    real(path).starts_with(real(ancestor))
+}
+
 /// Emit a progress event no more often than this many files.
 const PROGRESS_EVERY: usize = 2_000;
 
@@ -130,7 +138,28 @@ impl Executor for ScanExecutor {
         }
 
         let path = std::path::PathBuf::from(&root.path);
-        let deny = DenyList::builtin();
+        // The daemon's own state directory, denied by path.
+        //
+        // The builtin list only knows `.shepherd-staging`. Under the common
+        // `$HOME` root the state directory sits inside the tree being walked,
+        // so the walk catalogued the live `catalog.db` and its `-wal`/`-shm`
+        // companions and any `secrets.json` — self-referential rows that move
+        // under their own scan, and worse, candidates a later rule pass could
+        // hash and tier.
+        //
+        // Skipped when the root is AT or INSIDE the state directory. The
+        // exclusion exists to keep the daemon's internals out of a scan of the
+        // user's data; when the root is under the state directory the deny
+        // would prune the walk root itself, and a pruned root is reported as
+        // "could not be read" — an unreadable-root refusal manufactured out of
+        // an exclusion, which is the one thing the check below must never see
+        // spuriously.
+        let state_dir = &self.daemon.paths.state_dir;
+        let deny = if under(&path, state_dir) {
+            DenyList::builtin()
+        } else {
+            DenyList::builtin().with_extra_path(state_dir)
+        };
         let ignores = IgnoreSet::new(&path, &patterns)
             .map_err(|e| format!("root {root_id} has an unusable ignore pattern: {e}"))?;
 

@@ -180,16 +180,36 @@ impl Matcher {
     }
 
     pub fn matches(&self, file: &FileStat, ctx: &MatchContext<'_>) -> MatchOutcome {
-        let matched = eval_predicate(&self.root, file, ctx);
+        let (matched, signal) = eval_predicate(&self.root, file, ctx);
         MatchOutcome {
             matched,
-            age_signal: self.age_field.map(|f| resolve_signal(f, file, ctx).1),
+            age_signal: signal.or_else(|| self.fallback_signal(file, ctx)),
         }
     }
 
     /// Which signal this rule's age predicate rests on, for
     /// `RuleBody::age_signal`. `None` when the rule has no age predicate.
+    ///
+    /// Answers through the same evaluation as [`Self::matches`], because
+    /// `Engine::run` refuses on a preview/run signal difference and two paths
+    /// that resolve it differently would be a refusal that fires on nothing.
     pub fn age_signal_for(
+        &self,
+        file: &FileStat,
+        ctx: &MatchContext<'_>,
+    ) -> Option<AccessSignalSource> {
+        eval_predicate(&self.root, file, ctx)
+            .1
+            .or_else(|| self.fallback_signal(file, ctx))
+    }
+
+    /// The rule-level answer, for a file that matched nothing.
+    ///
+    /// No branch authorized the match, so no branch can name the signal — but
+    /// `None` would read as "this rule has no age predicate", which is a
+    /// different statement. Nothing is acted on for a non-match, so naming the
+    /// rule's first age predicate is the honest remainder.
+    fn fallback_signal(
         &self,
         file: &FileStat,
         ctx: &MatchContext<'_>,
@@ -239,7 +259,65 @@ fn resolve_signal(
     }
 }
 
-fn eval_predicate(p: &Predicate, file: &FileStat, ctx: &MatchContext<'_>) -> bool {
+/// Evaluate, and report the age signal of the branch that **authorized** the
+/// match.
+///
+/// The second half is the point. `age_field` was resolved once at compile time
+/// as the first age predicate in the tree, which answers "which one is written
+/// first" — a different question from "which one selected this file". In
+/// `any: [mtime…, ctime…]` where only the ctime branch is true, that named a
+/// timestamp that provably could not have driven the match, and `Engine::run`'s
+/// refusal on a preview/run signal difference compares exactly these labels.
+///
+/// * `Any` — the branch that matched, so the first `Some` among the matching
+///   ones.
+/// * `All` — every branch contributed; the first age signal among them is the
+///   one the rule rests on, and there is no narrower true answer.
+/// * `Not` — an age predicate inside a negation did not authorize anything by
+///   being old, so it names nothing.
+fn eval_predicate(
+    p: &Predicate,
+    file: &FileStat,
+    ctx: &MatchContext<'_>,
+) -> (bool, Option<AccessSignalSource>) {
+    match p {
+        Predicate::All(ps) => {
+            let mut signal = None;
+            for sub in ps {
+                let (ok, s) = eval_predicate(sub, file, ctx);
+                if !ok {
+                    return (false, None);
+                }
+                signal = signal.or(s);
+            }
+            (true, signal)
+        }
+        Predicate::Any(ps) => {
+            for sub in ps {
+                let (ok, s) = eval_predicate(sub, file, ctx);
+                if ok {
+                    return (true, s);
+                }
+            }
+            (false, None)
+        }
+        Predicate::Not(inner) => (!eval_predicate(inner, file, ctx).0, None),
+        Predicate::OlderThan { field, days } => {
+            let (at, signal) = resolve_signal(*field, file, ctx);
+            let age_nanos = ctx.now.as_nanos().saturating_sub(at.as_nanos());
+            // A file whose timestamp is in the FUTURE has a negative age and
+            // must not read as ancient. §4.12's `first_seen_at` is the real
+            // remedy; refusing to match here is the fail-safe direction.
+            let matched =
+                age_nanos > 0 && (age_nanos as u128) >= (*days as u128) * 86_400_000_000_000u128;
+            (matched, matched.then_some(signal))
+        }
+        other => (eval_simple(other, file, ctx), None),
+    }
+}
+
+/// The predicates that carry no age signal.
+fn eval_simple(p: &Predicate, file: &FileStat, ctx: &MatchContext<'_>) -> bool {
     match p {
         Predicate::Ext(exts) => {
             let name = file.rel_path.rsplit(['/', '\\']).next().unwrap_or("");
@@ -256,18 +334,11 @@ fn eval_predicate(p: &Predicate, file: &FileStat, ctx: &MatchContext<'_>) -> boo
         Predicate::PathGlob(g) => g.is_match(file.rel_path.replace('\\', "/")),
         Predicate::MinSize(n) => file.size >= *n,
         Predicate::MaxSize(n) => file.size <= *n,
-        Predicate::OlderThan { field, days } => {
-            let (at, _) = resolve_signal(*field, file, ctx);
-            let age_nanos = ctx.now.as_nanos().saturating_sub(at.as_nanos());
-            // A file whose timestamp is in the FUTURE has a negative age and
-            // must not read as ancient. §4.12's `first_seen_at` is the real
-            // remedy; refusing to match here is the fail-safe direction.
-            age_nanos > 0 && (age_nanos as u128) >= (*days as u128) * 86_400_000_000_000u128
-        }
         Predicate::Tag(t) => ctx.tags.iter().any(|x| x == t),
-        Predicate::All(ps) => ps.iter().all(|p| eval_predicate(p, file, ctx)),
-        Predicate::Any(ps) => ps.iter().any(|p| eval_predicate(p, file, ctx)),
-        Predicate::Not(p) => !eval_predicate(p, file, ctx),
+        // Handled by `eval_predicate`, which is the only caller.
+        Predicate::OlderThan { .. } | Predicate::All(_) | Predicate::Any(_) | Predicate::Not(_) => {
+            eval_predicate(p, file, ctx).0
+        }
     }
 }
 

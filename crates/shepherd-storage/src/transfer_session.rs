@@ -324,6 +324,28 @@ impl TransferSession {
 #[async_trait::async_trait]
 pub trait TransferSessionStore: Send + Sync {
     async fn save(&self, session: &TransferSession) -> StorageResult<()>;
+
+    /// Checkpoint the ONE part that just changed.
+    ///
+    /// `upload_pending` calls this after every acknowledged part, so its cost
+    /// is paid `part_count` times per transfer. A whole-session `save` there is
+    /// quadratic: the store replaces the entire accumulated part set on each
+    /// call, so a 3,200-part 50 GB upload performs about 5.1 million part
+    /// inserts to record 3,200 events, and the checkpoint work can outweigh the
+    /// transfer it is checkpointing.
+    ///
+    /// The default is a full `save`, which is correct and merely slow — a store
+    /// with nothing cheaper does not have to implement this, and no store can
+    /// be wrong by not implementing it.
+    ///
+    /// Wholesale replacement still belongs to `save`: `restart_attempt` clears
+    /// every receipt, and a partial write there would leave receipts from a
+    /// provider session that no longer exists, which resume would trust.
+    async fn save_part(&self, session: &TransferSession, part_no: u32) -> StorageResult<()> {
+        let _ = part_no;
+        self.save(session).await
+    }
+
     async fn load(&self, job_id: JobId) -> StorageResult<Option<TransferSession>>;
 }
 
@@ -675,7 +697,10 @@ impl<'a> TransferDriver<'a> {
             cp.local_blake3 = local_blake3;
             cp.etag = Some(receipt.etag);
             cp.checksum = receipt.checksum;
-            self.store.save(session).await?;
+            // One part, not the whole set: this runs once per part, and a
+            // whole-session save here makes checkpointing quadratic in the part
+            // count. See `TransferSessionStore::save_part`.
+            self.store.save_part(session, part_no).await?;
 
             outcome.bytes_uploaded += range.len;
             outcome.parts_sent += 1;

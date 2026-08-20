@@ -28,7 +28,7 @@
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -53,15 +53,37 @@ pub enum ServerError {
     Bind { path: String, detail: String },
 }
 
+/// Name a file type for the refusal message, so the operator knows what is
+/// in the way without having to `stat` it themselves.
+fn describe_file_type(ft: std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if ft.is_symlink() {
+        "a symbolic link"
+    } else if ft.is_dir() {
+        "a directory"
+    } else if ft.is_file() {
+        "a regular file"
+    } else if ft.is_fifo() {
+        "a FIFO"
+    } else if ft.is_block_device() || ft.is_char_device() {
+        "a device node"
+    } else {
+        "not a socket"
+    }
+}
+
 /// Bind the listener, creating the directory and clearing a stale socket.
 ///
 /// Three things that each cause a confusing failure if skipped:
 ///
 /// * **the parent directory** may not exist on a first run;
 /// * **a stale socket file** from a killed daemon makes `bind` fail with
-///   `EADDRINUSE` even though nothing is listening. It is removed only after a
-///   connect attempt proves nothing is there — blindly unlinking would let a
-///   second daemon steal a live socket out from under the first;
+///   `EADDRINUSE` even though nothing is listening. It is removed only after
+///   two things are true: the path is a socket node, and a connect attempt
+///   proves nothing is there. Both are load-bearing — skipping the connect
+///   would let a second daemon steal a live socket out from under the first,
+///   and skipping the type check would delete whatever `SHEPHERD_SOCKET`
+///   happened to name, because a regular file refuses connections too;
 /// * **the mode**, set before accepting, because it is the entire authorization
 ///   model.
 pub fn bind(path: &Path) -> Result<UnixListener, ServerError> {
@@ -79,14 +101,25 @@ pub fn bind(path: &Path) -> Result<UnixListener, ServerError> {
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
 
-    if path.exists() {
+    // `symlink_metadata`, not `exists`/`metadata`: a symlink here is not a
+    // socket node we may unlink, and a dangling one makes `exists` answer false
+    // while `bind` still fails with `EADDRINUSE`.
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if !md.file_type().is_socket() {
+            return Err(err(format!(
+                "{} already exists and is not a socket ({}); \
+                 refusing to delete it — remove it yourself or point the socket elsewhere",
+                path.display(),
+                describe_file_type(md.file_type()),
+            )));
+        }
         match UnixStream::connect(path) {
             Ok(_) => {
                 return Err(err(
                     "another shepherdd is already listening on this socket".into()
                 ));
             }
-            // Nothing answered: the file is a leftover from a killed daemon.
+            // A socket node that answers nothing: a leftover from a killed daemon.
             Err(_) => {
                 std::fs::remove_file(path)
                     .map_err(|e| err(format!("cannot clear the stale socket: {e}")))?;
@@ -483,6 +516,31 @@ mod tests {
         d.join("daemon.sock")
     }
 
+    /// `bind` will not delete something that is not a socket.
+    ///
+    /// The unlink exists for one case: a socket node left behind by a killed
+    /// daemon. `connect` failing does not prove the path *is* that — a regular
+    /// file never accepts a connection either, so a mistyped `SHEPHERD_SOCKET`
+    /// pointing at a document took the same branch and destroyed it.
+    ///
+    /// The assertion is on the **bytes still being there**, not on the error:
+    /// `bind` returning `Err` was already true before the fix, after the file
+    /// had been removed.
+    #[test]
+    fn bind_refuses_to_unlink_a_non_socket_path() {
+        let path = tmp_socket("nonsock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"a document the user cares about").unwrap();
+
+        let e = bind(&path).expect_err("a regular file is not a stale socket");
+
+        assert_eq!(
+            std::fs::read(&path).ok().as_deref(),
+            Some(&b"a document the user cares about"[..]),
+            "bind deleted a non-socket path: {e}"
+        );
+    }
+
     /// A client whose subscription overflows **observes** the disconnect.
     ///
     /// This is the half that makes the fix worth anything. The hub unregistering
@@ -637,12 +695,19 @@ mod tests {
 
     /// A killed daemon leaves a socket file behind. Without this, every restart
     /// after a hard kill fails with EADDRINUSE and looks like a port conflict.
+    ///
+    /// The leftover is made the way a kill makes one — bind a listener and drop
+    /// it, which closes the fd but leaves the socket **node** on disk. It used
+    /// to be a `write` of ordinary bytes, which passed for the wrong reason:
+    /// the code could not tell that from a document, and neither could this.
     #[test]
     fn a_stale_socket_file_is_cleared() {
         let path = tmp_socket("stale");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"not really a socket").unwrap();
-        let listener = bind(&path).expect("a leftover file must not block startup");
+        drop(UnixListener::bind(&path).expect("bind the socket a killed daemon left"));
+        assert!(path.exists(), "dropping a listener leaves the node behind");
+
+        let listener = bind(&path).expect("a stale socket must not block startup");
         drop(listener);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }

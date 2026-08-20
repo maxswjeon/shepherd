@@ -169,6 +169,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
                     ctime: now,
                     atime: None,
                     blake3: h,
+                    ino: None,
                 },
                 1,
                 now,

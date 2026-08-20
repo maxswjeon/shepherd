@@ -510,6 +510,318 @@ fn roots_can_be_added_listed_and_removed() {
     );
 }
 
+/// A real scan writes each file's `<volume-id>:<inode>` identity.
+///
+/// The column existed and nothing wrote it. `file.fs_id` is what upload and
+/// destruction serialize on (`FileLocks`, and `LocalDestroyRequest::fs_id`
+/// documents in capitals that the CATALOG's value is the one to pass), and it
+/// is what tells a rename from a delete-plus-create. A NULL there is a lock
+/// that collides with nothing on the irreversible path.
+///
+/// Asserted against the inode this test reads itself, not merely against
+/// "not null": a value of the right shape built from the wrong number would
+/// pass that and protect nothing.
+#[test]
+fn a_scan_records_the_filesystem_identity_of_every_file() {
+    let d = Daemon::start("fsid");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-fsid");
+    write_file(&root_dir, "a.txt", "hello");
+    write_file(&root_dir, "nested/b.txt", "world");
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    scan_and_expect(&mut c, root_id, 2);
+
+    let conn = rusqlite::Connection::open_with_flags(
+        d.dir.join("catalog.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let volume: Option<String> = conn
+        .query_row(
+            "SELECT volume_id FROM scan_root WHERE id = ?1",
+            [root_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let volume = volume.expect("the harness's filesystem must report a stable volume id");
+
+    for rel in ["a.txt", "nested/b.txt"] {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT CAST(fs_id AS TEXT) FROM file WHERE root_id = ?1 AND rel_path = ?2",
+                rusqlite::params![root_id, rel],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(root_dir.join(rel)).unwrap().ino()
+        };
+        assert_eq!(
+            stored.as_deref(),
+            Some(format!("{volume}:{ino}").as_str()),
+            "`{rel}` must carry the identity the lock and the rename check read"
+        );
+    }
+}
+
+/// Enrolling a root that overlaps an existing one warns, in both directions.
+///
+/// `RootAddResult::warnings` has always documented "a root nested under an
+/// existing one" as one of its notices, and nothing produced it: the enrollment
+/// path never compared the new path against the registered ones. Both roots are
+/// then scanned, so every file in the overlap gets a catalog row per root —
+/// double-counted in `status` and `search`, and handed to later rule and tier
+/// passes as two independent candidates for the same bytes.
+#[test]
+fn enrolling_an_overlapping_root_warns_in_both_directions() {
+    let d = Daemon::start("overlap");
+    let mut c = d.connect();
+
+    let outer = d.dir.join("corpus-overlap");
+    let inner = outer.join("project");
+    let sibling = d.dir.join("corpus-overlap-notes");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+
+    let first = c.call(
+        "root.add",
+        serde_json::json!({"path": outer.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let outer_id = first["root"]["root_id"].as_i64().unwrap();
+    assert!(
+        !warnings_of(&first).iter().any(|w| w.contains("inside")),
+        "the first root overlaps nothing: {first}"
+    );
+
+    // Nested UNDER the registered one.
+    let nested = c.call(
+        "root.add",
+        serde_json::json!({"path": inner.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    assert!(
+        warnings_of(&nested)
+            .iter()
+            .any(|w| w.contains("this root is inside") && w.contains(&outer_id.to_string())),
+        "a root inside a registered one must say so: {nested}"
+    );
+
+    // A sibling that merely shares a path PREFIX is not an overlap.
+    let unrelated = c.call(
+        "root.add",
+        serde_json::json!({"path": sibling.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    assert!(
+        !warnings_of(&unrelated).iter().any(|w| w.contains("inside")),
+        "`corpus-overlap-notes` is not inside `corpus-overlap`: {unrelated}"
+    );
+
+    // And the other direction: a new root that CONTAINS a registered one.
+    let containing = c.call(
+        "root.add",
+        serde_json::json!({"path": d.dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    assert!(
+        warnings_of(&containing)
+            .iter()
+            .any(|w| w.contains("is inside this one")),
+        "a root containing registered ones must say so: {containing}"
+    );
+}
+
+fn warnings_of(result: &serde_json::Value) -> Vec<String> {
+    result["warnings"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| w.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Crash recovery failing is a startup failure, not a warning.
+///
+/// `recover` resolves jobs a crash left `running` and quarantines `destroy`
+/// jobs before anything else can claim them (§4.10.4). Logging the failure and
+/// starting anyway leaves those jobs stranded in `running` for the whole life
+/// of the daemon — while the pool comes up and accepts new work — and nothing
+/// ever tries again. The index rebuild immediately after it *is* deliberately
+/// non-fatal; this one is the opposite case and now says so.
+///
+/// The failure is injected by dropping the `job` table from a catalog the
+/// daemon has already migrated. `schema_migration` still records version 1, so
+/// the next start opens the catalog cleanly and fails inside recovery — which
+/// is precisely the layer under test.
+#[test]
+fn a_daemon_whose_crash_recovery_fails_refuses_to_start() {
+    let dir = std::env::temp_dir().join(format!("shepherdd-e2e-{}-norecover", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("daemon.sock");
+
+    // One ordinary start, to get a migrated catalog.
+    {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_shepherdd"))
+            .arg("run")
+            .env("SHEPHERD_STATE_DIR", &dir)
+            .env("SHEPHERD_SOCKET", &socket)
+            .spawn()
+            .expect("spawn shepherdd");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && UnixStream::connect(&socket).is_err() {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = std::fs::remove_file(&socket);
+
+    let conn = rusqlite::Connection::open(dir.join("catalog.db")).unwrap();
+    conn.execute_batch("DROP TABLE job").unwrap();
+    drop(conn);
+
+    // Spawned and waited on with a deadline rather than `output()`: a daemon
+    // that wrongly starts runs forever, and this must fail rather than hang.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shepherdd"))
+        .arg("run")
+        .env("SHEPHERD_STATE_DIR", &dir)
+        .env("SHEPHERD_SOCKET", &socket)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn shepherdd");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(s) => break Some(s),
+            None if Instant::now() >= deadline => break None,
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    let listening = UnixStream::connect(&socket).is_ok();
+    // Killed BEFORE stderr is drained: a daemon that wrongly started never
+    // closes the pipe, and reading to EOF first would hang instead of failing.
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut said = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        use std::io::Read;
+        let _ = err.read_to_string(&mut said);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let status = status.expect("the daemon kept running with crash recovery unrun");
+    assert!(
+        !status.success(),
+        "the daemon exited 0 with crash recovery unrun: {said}"
+    );
+    assert!(
+        said.contains("crash recovery"),
+        "the exit must name what failed: {said}"
+    );
+    assert!(!listening, "nothing may be listening after a refused start");
+}
+
+/// A root that contains the daemon's own state directory must not catalogue it.
+///
+/// `$HOME` is the root a user is most likely to register, and the state
+/// directory lives under it. The builtin deny-list knows only
+/// `.shepherd-staging`, so the walk catalogued the live `catalog.db` and its
+/// `-wal`/`-shm` companions — rows that change under their own scan — and any
+/// `secrets.json`, which a later rule pass could then hash and tier.
+///
+/// The daemon is started with its socket outside the state directory so the
+/// registered root can be the *enclosing* directory: that is the real shape of
+/// the problem, a state directory nested inside a scanned tree.
+#[test]
+fn a_scan_does_not_catalogue_the_daemons_own_state_directory() {
+    let d = Daemon::start_with_socket_outside_the_state_dir("scan-statedir");
+    let mut c = d.connect();
+
+    // One real user file, beside the state directory the daemon is using.
+    write_file(&d.dir, "docs/a.txt", "hello");
+    assert!(
+        d.dir.join("state/catalog.db").exists(),
+        "the harness must actually have put the catalog inside the tree being scanned"
+    );
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": d.dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+
+    // Exactly the one file the user put there. `catalog.db`, `catalog.db-wal`,
+    // `catalog.db-shm` and the socket are all inside the root.
+    scan_and_expect(&mut c, root_id, 1);
+
+    let hits = c.call(
+        "search",
+        serde_json::json!({"query": "catalog", "limit": 50}),
+    );
+    assert_eq!(
+        hits["hits"].as_array().map(Vec::len),
+        Some(0),
+        "the daemon's own catalog must not be a file in the catalog: {hits}"
+    );
+}
+
+/// An explicit `scan.start --root-id` on a deregistered root must be refused,
+/// not reported as started.
+///
+/// `root.remove` without `--forget` keeps the `scan_root` row and clears
+/// `enabled`, so `get_root` still answers for it. The no-id branch already
+/// respects that — it lists with `include_disabled = false`. The explicit
+/// branch did not, so the id was reported in `roots_started`, a job was
+/// enqueued, and `load_scan_input` refused it later: the call claimed success
+/// and the work failed out of band, burning the job's retry budget on a root
+/// the user had removed.
+#[test]
+fn an_explicit_scan_of_a_deregistered_root_is_refused() {
+    let d = Daemon::start("scan-disabled");
+    let mut c = d.connect();
+
+    let root_dir = d.dir.join("corpus-disabled");
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+
+    c.call("root.remove", serde_json::json!({"root_id": root_id}));
+
+    let err = c.call_err("scan.start", serde_json::json!({"root_id": root_id}));
+    assert_eq!(
+        err.kind(),
+        Some(shepherd_proto::ErrorCode::Refused),
+        "a deregistered root is not a scan target: {err:?}"
+    );
+
+    // And nothing may have been queued for it.
+    let status = c.call("status", serde_json::json!({}));
+    assert_eq!(
+        status["jobs_pending"]
+            .as_array()
+            .map(|rows| rows
+                .iter()
+                .filter(|r| r["class"] == serde_json::json!("scan"))
+                .count())
+            .unwrap_or(0),
+        0,
+        "a refused start must not leave a job behind: {status}"
+    );
+}
+
 /// The default `root.remove` deregisters a root. It must not delete its catalog.
 ///
 /// `file.root_id` is `INTEGER NOT NULL REFERENCES scan_root(id) ON DELETE

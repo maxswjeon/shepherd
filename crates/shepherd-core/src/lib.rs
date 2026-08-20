@@ -112,6 +112,15 @@ pub struct FileStat {
     /// §4.12's `atime_mode` detection decides that per root.
     pub atime: Option<Timestamp>,
     pub blake3: Option<Blake3Hash>,
+    /// The inode, as the walk's own `stat` reported it.
+    ///
+    /// Carried from the walk rather than re-`stat`ed at write time for two
+    /// reasons: the writer actor must not do filesystem I/O, and a second
+    /// `stat` by path would be a different file if the path was replaced in
+    /// between — which is precisely the event this identity exists to detect.
+    /// `None` on platforms with no inode, and on any entry whose metadata could
+    /// not be read.
+    pub ino: Option<u64>,
 }
 
 impl FileStat {
@@ -139,6 +148,7 @@ mod tests {
             ctime: Timestamp::from_nanos(1),
             atime: None,
             blake3: None,
+            ino: None,
         };
         assert!(!f.is_hash_bearing());
         f.blake3 = Some(Blake3Hash::from_bytes([0u8; 32]));

@@ -90,6 +90,11 @@ pub struct DenyList {
     file_exts: Vec<(&'static str, DenyReason)>,
     /// User additions, kept separate so `builtin()` stays auditable.
     extra_names: BTreeSet<String>,
+    /// Absolute paths denied by identity rather than by name, for directories
+    /// only known at run time — the daemon's own state directory above all.
+    /// Kept separate from `abs_prefixes` for the same auditability reason, and
+    /// because those are `&'static`.
+    extra_paths: Vec<String>,
 }
 
 impl Default for DenyList {
@@ -159,6 +164,7 @@ impl DenyList {
                 ("sparsebundle", VmImage),
             ],
             extra_names: BTreeSet::new(),
+            extra_paths: Vec::new(),
         }
     }
 
@@ -171,11 +177,38 @@ impl DenyList {
             abs_prefixes: Vec::new(),
             file_exts: Vec::new(),
             extra_names: BTreeSet::new(),
+            extra_paths: Vec::new(),
         }
     }
 
     pub fn with_extra_dir(mut self, name: impl Into<String>) -> Self {
         self.extra_names.insert(name.into());
+        self
+    }
+
+    /// Deny one absolute path and everything under it.
+    ///
+    /// By path, not by name: the daemon's state directory has no distinctive
+    /// basename, and denying `shepherd` everywhere would exclude a user's own
+    /// directory of that name from their own backup.
+    ///
+    /// Canonicalized when it can be, because the walk reports the path it
+    /// reached the directory by. A symlinked state directory that cannot be
+    /// resolved falls back to the literal path — matching the raw form is
+    /// strictly better than matching nothing.
+    ///
+    /// ponytail: string prefix comparison, like `abs_prefixes`. A bind mount or
+    /// a hard-linked directory reaches the same inode by a path this will not
+    /// match; identity comparison via `dev`/`ino` is the upgrade if that turns
+    /// up in practice.
+    pub fn with_extra_path(mut self, path: &Path) -> Self {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        for p in [path.to_path_buf(), resolved] {
+            let norm = p.to_string_lossy().replace('\\', "/");
+            if !norm.is_empty() && !self.extra_paths.contains(&norm) {
+                self.extra_paths.push(norm);
+            }
+        }
         self
     }
 
@@ -202,6 +235,11 @@ impl DenyList {
         for (prefix, why) in &self.abs_prefixes {
             if path_has_prefix(&norm, prefix) {
                 return Some(*why);
+            }
+        }
+        for prefix in &self.extra_paths {
+            if path_has_prefix(&norm, prefix) {
+                return Some(DenyReason::ShepherdInternal);
             }
         }
         None
@@ -252,6 +290,37 @@ mod tests {
         assert_eq!(
             d.deny_dir("node_modules", &p("/home/u/proj/node_modules")),
             Some(DenyReason::PackageCache)
+        );
+    }
+
+    /// The daemon's state directory is denied by PATH, and nothing else is.
+    ///
+    /// Under a `$HOME` root the state directory is inside the tree being
+    /// walked, so without this the walk catalogued the live `catalog.db`, its
+    /// WAL companions and any `secrets.json`. Denying the *name* would have
+    /// been the cheaper fix and the wrong one: a user's own directory called
+    /// `shepherd` would have vanished from their own backup.
+    #[test]
+    fn an_extra_path_denies_that_directory_and_only_that_one() {
+        let state = p("/home/u/.local/state/shepherd");
+        let d = DenyList::builtin().with_extra_path(&state);
+
+        assert_eq!(
+            d.deny_dir("shepherd", &state),
+            Some(DenyReason::ShepherdInternal)
+        );
+        assert_eq!(
+            d.deny_dir("sessions", &p("/home/u/.local/state/shepherd/sessions")),
+            Some(DenyReason::ShepherdInternal),
+            "everything under it too"
+        );
+
+        // A directory of the same NAME elsewhere is the user's own.
+        assert_eq!(d.deny_dir("shepherd", &p("/home/u/code/shepherd")), None);
+        // And a sibling that merely shares a prefix is not under it.
+        assert_eq!(
+            d.deny_dir("shepherd-notes", &p("/home/u/.local/state/shepherd-notes")),
+            None
         );
     }
 
