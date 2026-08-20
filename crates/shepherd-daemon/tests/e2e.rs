@@ -2638,10 +2638,24 @@ fn a_snapshot_required_resume_is_reported_before_any_event() {
         let deadline = Instant::now() + Duration::from_secs(8);
         while !scanner_stop.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(250));
-            if let Ok(s) = UnixStream::connect(&socket) {
-                drop(s);
+            if UnixStream::connect(&socket).is_err() {
+                break; // the daemon is gone; the subscription has what it needs
+            }
+            // `Client` panics on a connection that closes mid-call, which is
+            // exactly what `subscribe_until_eof` does to the daemon when it has
+            // seen enough. This thread is a best-effort event generator, not an
+            // assertion, so its panic must not fail the test — and the hook is
+            // silenced so the expected one does not print a backtrace that
+            // reads like a failure.
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let sent = std::panic::catch_unwind(|| {
                 let mut c = Client::connect(&socket);
                 let _ = c.raw("scan.start", serde_json::json!({"root_id": root_id}));
+            });
+            std::panic::set_hook(previous);
+            if sent.is_err() {
+                break;
             }
         }
     });
