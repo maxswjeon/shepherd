@@ -1570,8 +1570,8 @@ not 6 (a double charge).
 
 [[ac.evidence]]
 package = "shepherd-tier"
-test = "discard::tests::an_exhausted_charge_refuses_before_anything_is_deleted"
-proves = "the TOCTOU direction the finding named: the charge is reserved and persisted BEFORE the deletion it pays for, so a record-after-delete fix — which would ship the second bug the finding describes — fails here. Asserts on the FACT (`deleted() == 1`), not on the error, and dies when `spend()` is moved after the delete"
+test = "discard::tests::an_executed_episode_charges_the_window_exactly_once_per_object"
+proves = "the TOCTOU direction the finding named: the charge is reserved and PERSISTED before the deletion it pays for — `ledger.used()` is asserted at the full episode size immediately after `reserve_discard` returns and before any object is touched — so a record-after-delete fix, which would ship the second bug the finding describes, fails here. It then deletes all three and asserts the window still holds exactly three, which is what stops a double charge passing. CITATION REPAIRED: this row named `an_exhausted_charge_refuses_before_anything_is_deleted`, which 4521243 deleted when the charge became a permission for a named candidate set rather than a count; the citation was not updated with it, so the row was asserting nothing"
 
 [[ac.evidence]]
 package = "shepherd-tier"
@@ -2175,9 +2175,9 @@ proves = "the property §9 names, by the leg that actually bites. NOTE the row's
 
 [[guard.evidence]]
 package = "shepherd-catalog"
-test = "volume::remount_tests::the_fallback_identity_is_explicitly_not_remount_stable"
+test = "volume::remount_tests::the_fallback_refuses_a_device_path_source"
 ignored = true
-proves = "the negative, so the fallback cannot be quietly treated as interchangeable with the UUID-derived identity: volume_id_fallback IS asserted to change across the same remount"
+proves = "the negative that gives leg 2 its meaning, RENAMED AND RE-AIMED in 8ae4b39. It used to assert that volume_id_fallback returned two DIFFERENT identities across the same remount and called that acceptable because the value carried a `src:` label. It is not acceptable: nothing consuming the column branches on the label, so a loop-backed root was enrolled as `src:ext4:/dev/loopN`, came back as `/dev/loopM`, and every reconstructed fs_id quietly stopped matching its catalog row — the label documented the hazard instead of preventing it. The fallback now REFUSES any source named at mount time, and the old assertion survives inside the test as its justification: the two identities it would have minted are still shown to differ, which is why neither is offered. The device-node change is asserted as a PRECONDITION, so a run whose re-attachment reused the same loop number fails saying the simulation failed rather than reporting an unearned green"
 
 [[guard]]
 id = "G-1-ATIME"
