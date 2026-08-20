@@ -418,6 +418,31 @@ impl<'a> ChainWriter<'a> {
         // the hash the caller would compare against is derived from those same
         // local bytes, so hashing alone would be asking the write to vouch for
         // itself.
+        // The SIZE first, then the bytes.
+        //
+        // A range read of the expected length returns the expected PREFIX, so
+        // an adapter that stored the correct JSON followed by extra bytes
+        // passed the comparison below — while `read_chain`, which HEADs the
+        // object and reads all of it, later rejects the trailing bytes in
+        // `serde_json::from_slice`. The head would already have advanced, and
+        // later publications would chain from a pointer recovery can never
+        // parse. Checking the prefix alone is checking the half the writer
+        // chose to look at.
+        let stored_len = self
+            .adapter
+            .head(pointer_key.as_key())
+            .await?
+            .map(|m| m.size);
+        if stored_len != Some(body.len() as u64) {
+            return Err(ChainError::Storage(StorageError::ContentMismatch {
+                key: pointer_key.as_key().as_str().to_owned(),
+                expected: format!("{} bytes as written", body.len()),
+                actual: match stored_len {
+                    Some(n) => format!("{n} bytes stored"),
+                    None => "absent immediately after a successful create".to_string(),
+                },
+            }));
+        }
         let stored = self
             .adapter
             .get_range(

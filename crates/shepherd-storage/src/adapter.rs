@@ -463,6 +463,33 @@ pub trait StorageAdapter: Send + Sync + fmt::Debug {
     /// [`verify_full_content`].
     async fn get_range(&self, key: &ObjectKey, range: ByteRange) -> StorageResult<Bytes>;
 
+    /// Read one range of a SPECIFIC version.
+    ///
+    /// # Why verification cannot use the mutable key
+    ///
+    /// Under mechanism A the transfer pins an `ObjectVersion` and the closing
+    /// custody check trusts it, so the bytes that were hashed must be the bytes
+    /// that version holds. Reading by key hashes whatever is current, and
+    /// "current" is not a property of a version — it is a property of the
+    /// moment.
+    ///
+    /// Two HEADs around the read do not close it. A versioned store permits
+    /// publishing a correct version B and then deleting B *by id*, which
+    /// exposes the previous, wrong version A again under A's original id: both
+    /// HEADs return A, every byte hashed came from B, and the session pins an A
+    /// nothing verified. Only naming the version in the read itself rules that
+    /// out.
+    ///
+    /// Providers without versioning answer [`StorageError::Unsupported`], and
+    /// callers there use [`Self::get_range`] — under mechanism B the key is
+    /// content-addressed and immutable, so the moment and the version coincide.
+    async fn get_range_versioned(
+        &self,
+        key: &ObjectKey,
+        version: &ObjectVersion,
+        range: ByteRange,
+    ) -> StorageResult<Bytes>;
+
     /// One page of a prefix listing. Callers must loop until
     /// [`ListPage::next`] is `None`.
     async fn list(&self, prefix: &str, page: Option<&OpaqueToken>) -> StorageResult<ListPage>;
@@ -494,6 +521,22 @@ pub async fn verify_full_content(
     size: u64,
     chunk: u64,
 ) -> StorageResult<()> {
+    verify_full_content_of(adapter, key, None, expected, size, chunk).await
+}
+
+/// [`verify_full_content`], pinned to one version where the target has them.
+///
+/// `version` is what makes the hash a statement about the bytes a custody
+/// record will name, rather than about whatever was current while the ranges
+/// were being read. See [`StorageAdapter::get_range_versioned`].
+pub async fn verify_full_content_of(
+    adapter: &dyn StorageAdapter,
+    key: &ObjectKey,
+    version: Option<&ObjectVersion>,
+    expected: Blake3Hash,
+    size: u64,
+    chunk: u64,
+) -> StorageResult<()> {
     // A RUNTIME refusal, not a `debug_assert!`. The assertion is compiled out
     // of a release build, and a zero chunk there is not a wrong answer but an
     // infinite one: every iteration requests a zero-length range, `offset`
@@ -513,7 +556,14 @@ pub async fn verify_full_content(
     let mut offset = 0u64;
     while offset < size {
         let len = chunk.min(size - offset);
-        let bytes = adapter.get_range(key, ByteRange { offset, len }).await?;
+        let bytes = match version {
+            Some(v) => {
+                adapter
+                    .get_range_versioned(key, v, ByteRange { offset, len })
+                    .await?
+            }
+            None => adapter.get_range(key, ByteRange { offset, len }).await?,
+        };
         if bytes.len() as u64 != len {
             return Err(StorageError::ContentMismatch {
                 key: key.as_str().to_owned(),

@@ -735,6 +735,40 @@ impl StorageAdapter for S3Adapter {
         Ok(body.into_bytes())
     }
 
+    async fn get_range_versioned(
+        &self,
+        key: &ObjectKey,
+        version: &ObjectVersion,
+        range: ByteRange,
+    ) -> StorageResult<Bytes> {
+        // `version_id`, which is what makes this a read of a VERSION rather
+        // than of whatever is current. See the trait docs for why verification
+        // cannot use the mutable key.
+        let out = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key.as_str())
+            .version_id(version.as_opaque())
+            .range(format!(
+                "bytes={}-{}",
+                range.offset,
+                range.offset + range.len - 1
+            ))
+            .send()
+            .await
+            .map_err(|e| Self::map_err("get_range_versioned", key.as_str(), e))?;
+        let body = out
+            .body
+            .collect()
+            .await
+            .map_err(|e| StorageError::Transient {
+                op: "get_range_versioned".into(),
+                detail: e.to_string(),
+            })?;
+        Ok(body.into_bytes())
+    }
+
     async fn list(&self, prefix: &str, page: Option<&OpaqueToken>) -> StorageResult<ListPage> {
         let mut req = self
             .client

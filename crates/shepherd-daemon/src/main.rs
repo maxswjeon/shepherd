@@ -118,8 +118,18 @@ Service installation is intentionally not an IPC method — see the module docs.
 fn secure_state_dir(dir: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    // CREATE owner-only, or VERIFY — never seize. The socket directory learned
+    // this one round earlier and the state directory is the same hazard through
+    // a different environment variable: `SHEPHERD_STATE_DIR=/tmp` as root
+    // passes the ownership check below (root owns `/tmp`) and the chmod then
+    // makes the mode check pass too, locking every other user and service out.
+    //
+    // `create_dir_all_tracked` already reports which levels it made, which is
+    // exactly the distinction needed: those are ours by construction and may be
+    // tightened; anything that was already there is checked and refused.
     let created =
         create_dir_all_tracked(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let we_made_it = created.iter().any(|p| p == dir);
 
     // SAFETY: `geteuid` is always successful per POSIX — it cannot fail, has no
     // error return, and touches no memory we own.
@@ -136,8 +146,11 @@ fn secure_state_dir(dir: &std::path::Path) -> Result<(), String> {
         ));
     }
 
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("cannot restrict {} to 0700: {e}", dir.display()))?;
+    // Only a directory THIS call created is tightened.
+    if we_made_it {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot restrict {} to 0700: {e}", dir.display()))?;
+    }
 
     let mode = std::fs::metadata(dir)
         .map_err(|e| format!("cannot inspect {}: {e}", dir.display()))?
@@ -146,8 +159,12 @@ fn secure_state_dir(dir: &std::path::Path) -> Result<(), String> {
         & 0o777;
     if mode != 0o700 {
         return Err(format!(
-            "{} is mode {mode:04o} after being set to 0700. The catalog will not be opened \
-             under a directory whose permissions the filesystem does not enforce",
+            "{} is mode {mode:04o}, and the catalog will not be opened under a directory \
+             other accounts can read — it holds the user's complete file inventory and the \
+             custody rows that are a tiered file's only remote address. This daemon will NOT \
+             chmod a directory it did not create: doing that to `/run` or `/tmp` locks out \
+             every other user on the machine. Point `SHEPHERD_STATE_DIR` at a dedicated \
+             directory, which will be created `0700`, or tighten this one yourself",
             dir.display()
         ));
     }
@@ -594,16 +611,27 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// The case that actually shipped: the directory already exists, created by
-    /// an earlier run under a `022` umask. Accepting it as found is what leaves
-    /// the catalog readable to every account on the host, so it is tightened
-    /// rather than tolerated.
+    /// An existing world-readable state directory is REFUSED — not tightened,
+    /// and not tolerated.
+    ///
+    /// ORACLE CHANGED, and the change is the remedy rather than the property.
+    /// This asserted that such a directory was chmodded to `0700`, because
+    /// accepting it as found leaves the catalog readable to every account on
+    /// the host. That half still holds. What does not is doing it by force:
+    /// `SHEPHERD_STATE_DIR=/tmp` as root passes the ownership check — root owns
+    /// `/tmp` — and the chmod then makes the mode check pass too, locking every
+    /// other user and service out of the machine's shared directory. The socket
+    /// directory learned this one round earlier through the same reasoning.
+    ///
+    /// So a directory this daemon did not create is checked and refused with
+    /// the remedy named. A directory an earlier RUN created is unaffected: this
+    /// daemon makes them `0700`.
     ///
     /// The foreign-ownership refusal above it has no test: a directory owned by
     /// another uid cannot be created without privileges a test suite must not
     /// have. It is stated here rather than left as an apparent oversight.
     #[test]
-    fn an_existing_group_and_world_readable_state_directory_is_tightened() {
+    fn an_existing_world_readable_state_directory_is_refused() {
         let d = tmp("loose");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -613,9 +641,23 @@ mod tests {
             "the fixture itself has to be loose, or this test asserts nothing"
         );
 
-        secure_state_dir(&d).unwrap();
+        let err = secure_state_dir(&d).expect_err("a shared directory must not be seized");
+        assert!(
+            err.contains("did not create"),
+            "the refusal must explain why it will not just fix the mode: {err}"
+        );
+        assert_eq!(
+            mode_of(&d),
+            0o755,
+            "and it must not have been chmodded on the way to refusing"
+        );
 
-        assert_eq!(mode_of(&d), 0o700, "state directory is {:04o}", mode_of(&d));
+        // THE ACCEPTING DIRECTION: a dedicated child, which the daemon creates
+        // owner-only. This is what an operator does after reading the refusal.
+        let child = d.join("shepherd");
+        secure_state_dir(&child).expect("a dedicated child is created and secured");
+        assert_eq!(mode_of(&child), 0o700);
+
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -422,7 +422,22 @@ impl Executor for ScanExecutor {
         // A failure fails the JOB rather than being logged and swallowed: a
         // "successful" scan whose results are unsearchable is the completion
         // this project keeps having to walk back.
+        // A failure INVALIDATES the installed index as well as failing the job.
+        //
+        // Failing the job alone left the pre-scan arena installed, and
+        // `Daemon::index` has no freshness check — it hands out whatever is
+        // there. Every file this scan committed was then missing from `search`,
+        // indefinitely once the retries ran out, while hydration itself was
+        // perfectly healthy. That is a search answering confidently from a
+        // catalog that no longer exists, which is the one thing an absent index
+        // is honest about and a stale one is not.
+        //
+        // The watermark is taken the same way `root_remove` takes it, under the
+        // ticket lock, so a rebuild that pinned AFTER this scan's batches
+        // committed already reflects them and survives.
+        let (_, scanned_at) = self.daemon.with_catalog_mutation(|| ());
         let entries = self.daemon.rebuild_index().map_err(|e| {
+            self.daemon.invalidate_index(scanned_at);
             format!("refreshing the metadata index after scanning root {root_id}: {e}")
         })?;
 

@@ -107,10 +107,19 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
     }
 
     let md = std::fs::metadata(dir).map_err(|e| format!("cannot stat {}: {e}", dir.display()))?;
-    let me = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
-    if let Some(me) = me
-        && md.uid() != me
-    {
+    // `geteuid`, not `/proc/self`. `/proc` is Linux, this module is `cfg(unix)`,
+    // and a missing `/proc` made the lookup return `None` — which SKIPPED the
+    // ownership check entirely on macOS. Root binding inside another user's
+    // existing `0700` directory then passed both remaining tests, and that user
+    // could unlink the socket and answer privileged clients in its place. An
+    // authorization check that disables itself where it cannot read a Linux
+    // filesystem is worse than one that is absent, because the code reads as
+    // though it is present.
+    //
+    // SAFETY: `geteuid` is infallible per POSIX — no error return, no memory
+    // touched. Same call `secure_state_dir` already makes.
+    let me = unsafe { libc::geteuid() };
+    if md.uid() != me {
         return Err(format!(
             "{} is owned by uid {} and this daemon runs as {me}; the socket's directory must \
              be ours, or another user can unlink the socket and answer in its place",
@@ -118,6 +127,47 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
             md.uid()
         ));
     }
+    // Every ANCESTOR, not only the leaf.
+    //
+    // The checks above describe the directory the pathname resolves to today.
+    // A symlinked ancestor another account controls — `/tmp/link` pointing at
+    // our own `0700` directory — passes all of them, and can then be retargeted
+    // at a directory holding the attacker's socket. Clients follow the
+    // CONFIGURED path, so they reach the attacker while the leaf this validated
+    // is still ours and still `0700`.
+    //
+    // Refused rather than resolved: `canonicalize` would validate the target
+    // and leave the same link free to move afterwards, which is the residual
+    // that makes this a check rather than a guarantee. The complete form is
+    // opening the directory and binding relative to that descriptor, which is
+    // the `openat` work in #3 — this refuses the arrangement that makes the
+    // window reachable by anyone but us.
+    let mut walked = std::path::PathBuf::new();
+    for part in dir.components() {
+        walked.push(part);
+        let Ok(link_md) = std::fs::symlink_metadata(&walked) else {
+            continue;
+        };
+        if link_md.file_type().is_symlink() {
+            return Err(format!(
+                "{} is a symbolic link on the way to the socket directory. Whoever controls \
+                 that link controls where clients connect — they can point it elsewhere after \
+                 this check and answer as the daemon — so a socket path is required to be \
+                 free of links",
+                walked.display()
+            ));
+        }
+        if link_md.uid() != me && link_md.uid() != 0 {
+            return Err(format!(
+                "{} is owned by uid {} on the way to the socket directory, and neither this \
+                 daemon ({me}) nor root. An account that can rename a component of this path \
+                 can move the socket out from under every client that follows it",
+                walked.display(),
+                link_md.uid()
+            ));
+        }
+    }
+
     let mode = md.permissions().mode() & 0o777;
     if mode != 0o700 {
         return Err(format!(

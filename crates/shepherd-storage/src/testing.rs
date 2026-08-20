@@ -533,6 +533,31 @@ impl StorageAdapter for MemAdapter {
         Ok(b.slice(start..end))
     }
 
+    /// The fake keeps ONE body per key plus the version it was stored under, so
+    /// a versioned read is the current body when the ids match and a refusal
+    /// when they do not.
+    ///
+    /// That is the property the driver depends on: a read naming version A
+    /// while the key now holds B must not silently hand back B's bytes, which
+    /// is exactly the ABA the unversioned read could not see.
+    async fn get_range_versioned(
+        &self,
+        key: &ObjectKey,
+        version: &ObjectVersion,
+        range: ByteRange,
+    ) -> StorageResult<Bytes> {
+        {
+            let inner = self.lock();
+            let stored = inner.objects.get(key.as_str()).and_then(|(_, v)| v.clone());
+            if stored.as_ref() != Some(version) {
+                return Err(StorageError::NotFound {
+                    key: format!("{} @ {}", key.as_str(), version.as_opaque()),
+                });
+            }
+        }
+        self.get_range(key, range).await
+    }
+
     async fn list(&self, prefix: &str, _page: Option<&OpaqueToken>) -> StorageResult<ListPage> {
         let mut inner = self.lock();
         inner.list_calls += 1;

@@ -73,7 +73,7 @@ use shepherd_core::{
 
 use crate::adapter::{
     AttestationMode, ByteRange, CreatePrecondition, OpaqueToken, PartReceipt, StorageAdapter,
-    StorageError, StorageResult, verify_full_content,
+    StorageError, StorageResult, verify_full_content_of,
 };
 use crate::multipart::{
     DEFAULT_PART_SIZE, PartAction, PartCheckpoint, PartPlan, Reconciliation, reconcile_parts,
@@ -885,42 +885,44 @@ impl<'a> TransferDriver<'a> {
                 actual: format!("{} bytes", meta.size),
             });
         }
-        verify_full_content(
+        // Hashed BY VERSION where the target has them.
+        //
+        // Two HEADs around an unversioned read were the previous shape and they
+        // do not close it: a versioned store permits publishing a correct
+        // version B and then deleting B *by id*, which exposes the previous,
+        // wrong version A again under A's original id. Both HEADs return A,
+        // every byte hashed came from B, and the session pins an A nothing
+        // verified — after which the closing custody check passes over bytes
+        // that were never read. Naming the version in the read is the only
+        // thing that rules it out.
+        //
+        // Under mechanism B there is no version to name and none is needed: the
+        // key is content-addressed and immutable, so what is current and what
+        // was hashed cannot diverge.
+        let mode = self.adapter.probe_attestation_mode().await?;
+        let pinned = (mode == AttestationMode::Version)
+            .then(|| meta.version.clone())
+            .flatten();
+        verify_full_content_of(
             self.adapter,
             &session.remote_key,
+            pinned.as_ref(),
             session.source.blake3,
             session.source.size,
             self.verify_chunk,
         )
         .await?;
 
-        let mode = self.adapter.probe_attestation_mode().await?;
         session.attestation_mode = Some(mode);
         if mode == AttestationMode::Version {
-            // The pinned version must be the one whose bytes were HASHED.
-            //
-            // `meta.version` came from the HEAD taken before the full read, and
-            // `verify_full_content` fetches ranges by the UNVERSIONED key. If
-            // the object changed in between and the newer bytes happened to
-            // hash correctly, the session committed while pinning a version
-            // nothing had read — and if that older version later became current
-            // again, the closing HEAD would match and authorize a destruction
-            // whose only pinned remote bytes are wrong.
-            //
-            // A second HEAD closes it rather than narrowing it: a version id is
-            // minted per PUT, so an id unchanged across the read PROVES no PUT
-            // landed in between. Restoring an old version produces a new id, so
-            // there is no there-and-back that this cannot see.
-            let after = self.adapter.head(&session.remote_key).await?;
-            let after_version = after.and_then(|m| m.version);
-            if after_version != meta.version {
-                return Err(StorageError::ContentMismatch {
-                    key: session.remote_key.as_str().to_owned(),
-                    expected: format!("version {:?} throughout verification", meta.version),
-                    actual: format!("version {after_version:?} after it"),
-                });
-            }
-            session.object_version = meta.version;
+            // The version pinned is the one the bytes were read from, by
+            // construction — `verify_full_content_of` named it in every range
+            // request. There is nothing left to compare afterwards, which is
+            // the difference between this and the second-HEAD shape it
+            // replaces: that one asked whether anything had *appeared* to
+            // change, and an ABA sequence answers no while being exactly the
+            // change that matters.
+            session.object_version = pinned;
         }
         Ok(())
     }
