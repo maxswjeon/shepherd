@@ -697,14 +697,29 @@ async fn a_source_edited_between_part_reads_publishes_nothing() {
          poisons it for every future retry. Published {:?}",
         rig.adapter.object(&rig.key)
     );
-    assert_eq!(
-        s.state,
-        TransferState::Uploading,
-        "the run must fail before `Completing`, not strand the session in `Verifying`"
-    );
     assert!(
         matches!(err, StorageError::ContentMismatch { .. }),
         "expected the read-stream hash to fail closed, got {err:?}"
+    );
+
+    // The session is FINISHED, not merely stopped before `Completing`.
+    //
+    // This mismatch is terminal — replanning the changed file picks a different
+    // content-addressed key, so nothing ever revisits this one — and the parts
+    // already uploaded would otherwise accrue storage until the bucket's
+    // lifecycle rules noticed. `Uploading` was the old assertion and it only
+    // said the run had not gone too far; it did not say the multipart session
+    // had been cleaned up, and it had not been.
+    assert_eq!(
+        s.state,
+        TransferState::Aborted(AbortOutcome::Clean),
+        "a terminal source mismatch must abandon its multipart session, not leave it \
+         mid-flight for nobody to collect"
+    );
+    assert_eq!(
+        rig.adapter.live_upload_count(),
+        0,
+        "and the abandonment has to reach the provider, not just the state machine"
     );
 }
 

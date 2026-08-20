@@ -112,14 +112,20 @@ pub struct FileStat {
     /// §4.12's `atime_mode` detection decides that per root.
     pub atime: Option<Timestamp>,
     pub blake3: Option<Blake3Hash>,
-    /// The inode, as the walk's own `stat` reported it.
+    /// The inode, as the walk's own `stat` reported it — **and only where it is
+    /// meaningful against the ROOT's volume id.**
     ///
     /// Carried from the walk rather than re-`stat`ed at write time for two
     /// reasons: the writer actor must not do filesystem I/O, and a second
     /// `stat` by path would be a different file if the path was replaced in
     /// between — which is precisely the event this identity exists to detect.
-    /// `None` on platforms with no inode, and on any entry whose metadata could
-    /// not be read.
+    ///
+    /// `None` on platforms with no inode, on any entry whose metadata could not
+    /// be read, and on any entry that lives on a NESTED MOUNT: the catalog
+    /// pairs this with the root's `volume_id`, and an inode is unique only
+    /// within its own filesystem, so a nested-mount inode would collide with a
+    /// root-filesystem one under a single `fs_id`. See
+    /// `shepherd_scan::walk::on_root_volume`.
     pub ino: Option<u64>,
 }
 

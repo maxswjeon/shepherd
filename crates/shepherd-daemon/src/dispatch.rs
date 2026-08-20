@@ -766,6 +766,31 @@ impl ShepherdApi for Session {
             ));
         }
 
+        // The wire type is `u64` and SQLite's integer is `i64`, so a size above
+        // `i64::MAX` used to wrap to a NEGATIVE parameter — and the result was
+        // not "no matches" but the OPPOSITE of what was asked: `min_size:
+        // u64::MAX` matched every file, `max_size: u64::MAX` matched none.
+        // Refused rather than clamped: a filter nothing can satisfy is a caller
+        // bug, and answering it with a full result set is the worst way to say
+        // so.
+        for (name, value) in [
+            ("min_size", req.filters.min_size),
+            ("max_size", req.filters.max_size),
+        ] {
+            if let Some(v) = value
+                && i64::try_from(v).is_err()
+            {
+                return Err(RpcError::new(
+                    ErrorCode::Invalid,
+                    format!(
+                        "`filters.{name}` is {v}, which is above the largest size the catalog \
+                         can represent ({}). No file can match it.",
+                        i64::MAX
+                    ),
+                ));
+            }
+        }
+
         // §4.6's vector side is Phase 5. Degrading and *saying so* is what the
         // proto's `degraded` field exists for; a silent downgrade would make a
         // metadata-only answer look like a semantic one.
@@ -1548,12 +1573,27 @@ fn list_roots(cat: &mut Catalog, include_disabled: bool) -> Result<Vec<RootSumma
 /// and checkpoint, and a parallel progress table would be a second place for
 /// the same fact to be wrong.
 fn scan_states(cat: &mut Catalog, root_id: Option<i64>) -> Result<Vec<ScanState>, CatalogError> {
+    // The root filter is applied in SQL, BEFORE the limit.
+    //
+    // Filtering afterwards meant the 200-row tail was taken across every root:
+    // a root whose last scan sat behind 200 newer jobs for other roots was cut
+    // before its own filter ran, and `scan.status {root_id}` answered with an
+    // empty list for a root that plainly has scan history. The unfiltered form
+    // has the same shape — roots outside the tail simply vanish — so the limit
+    // now applies per requested root rather than globally.
+    //
+    // `json_extract` because `root_id` lives in `payload_json` and is not a
+    // column; the bundled SQLite ships JSON1.
     let mut stmt = cat.conn().prepare(
         "SELECT payload_json, checkpoint_json, state, created_at, updated_at, last_error
-         FROM job WHERE class = 'scan' ORDER BY id DESC LIMIT 200",
+         FROM job
+         WHERE class = 'scan'
+           AND (?1 IS NULL OR json_extract(payload_json, '$.root_id') = ?1)
+         ORDER BY id DESC
+         LIMIT 200",
     )?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(rusqlite::params![root_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,

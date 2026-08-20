@@ -712,6 +712,26 @@ impl<'a> TransferDriver<'a> {
         // published, while refusing is still recoverable.
         let read_back = Blake3Hash::from_bytes(*read_back.finalize().as_bytes());
         if read_back != session.source.blake3 {
+            // The multipart session is ABANDONED here, durably, before the
+            // error goes back.
+            //
+            // This mismatch is terminal, not retryable, and replanning the
+            // changed file picks a different content-addressed key — so no
+            // later `adopt_or_reap` visit ever reaches this key again and the
+            // parts already uploaded accrue storage for as long as the bucket's
+            // lifecycle rules allow, which on a 50 GB transfer is not a rounding
+            // error. Returning the error without a transition simply forgot
+            // about them.
+            //
+            // `AbortPending` is persisted BEFORE the abort is attempted, which
+            // is what makes it survive a crash in the middle: `run`'s
+            // `AbortPending` arm finishes it on the next pass, and
+            // `finish_abort` reports `Ambiguous` rather than `Clean` when it
+            // could not confirm, so a sweep revisits it.
+            self.advance(session, TransferState::AbortPending).await?;
+            let out = self.finish_abort(session).await;
+            self.advance(session, TransferState::Aborted(out)).await?;
+
             return Err(StorageError::ContentMismatch {
                 key: session.source.rel_path.clone(),
                 expected: format!("blake3 {}", session.source.blake3.to_hex()),

@@ -253,6 +253,20 @@ fn write_and_verify(
     f.set_modified(to_system_time(manifest.core.mtime))
         .map_err(io)?;
 
+    // A SECOND sync, for the metadata this time.
+    //
+    // The `sync_all` above made the BYTES durable, before the mode and mtime
+    // were applied. On a filesystem where inode metadata needs its own fsync, a
+    // power loss after this function reports success can leave the right bytes
+    // under a reverted mode or mtime — and the in-memory read-back below would
+    // have passed, because it reads what the kernel holds rather than what
+    // survived. A reverted mtime is not cosmetic either: it can immediately
+    // requalify the file for the age-based rule that tiered it.
+    //
+    // Through the handle, like everything else here, so it cannot land on a
+    // file this restore did not create.
+    f.sync_all().map_err(io)?;
+
     // Read back through the SAME handle, for the same reason. A pathname
     // read-back verifies the bytes and metadata of whatever the name resolves
     // to at that instant, so a replacement that happens to match the manifest

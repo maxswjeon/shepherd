@@ -175,6 +175,10 @@ pub fn walk(
     let mut seen: HashSet<DirId> = HashSet::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
 
+    // The root's own filesystem, for the nested-mount check on every entry
+    // below. See `on_root_volume`.
+    let root_dev = std::fs::metadata(root).ok().and_then(|md| dev_of(&md));
+
     if let Some(id) = dir_id(root) {
         seen.insert(id);
     }
@@ -294,7 +298,7 @@ pub fn walk(
                 atime: md.accessed().ok().map(|t| sys_time(Some(t))),
                 // §6: hashing is its own job class, never a scan prerequisite.
                 blake3: None,
-                ino: ino_of(&md),
+                ino: ino_of(&md).filter(|_| on_root_volume(&md, root_dev)),
             });
         }
     }
@@ -312,6 +316,46 @@ fn ino_of(md: &std::fs::Metadata) -> Option<u64> {
 #[cfg(not(unix))]
 fn ino_of(_md: &std::fs::Metadata) -> Option<u64> {
     None
+}
+
+/// This entry's `st_dev`, for the nested-mount check.
+#[cfg(unix)]
+fn dev_of(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(md.dev())
+}
+
+#[cfg(not(unix))]
+fn dev_of(_md: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// Whether this entry lives on the same filesystem as the scan root.
+///
+/// The catalog pairs an inode with the ROOT's `volume_id` to form `fs_id`, and
+/// an inode is unique only within its own filesystem. A registered root that
+/// crosses into a nested mount therefore produced two different files with the
+/// same `<root-volume>:<inode>` — colliding the very lock that serializes
+/// upload against destruction — while the nested file lost the remount-stable
+/// identity it was supposed to have.
+///
+/// So a nested-mount entry reports **no inode**, and the catalog records no
+/// `fs_id` for it. Half an identity is worse than none: `fs_id` is what
+/// `FileLocks` keys on and what tells a rename from a replacement, and a value
+/// that names a different file is a lock that protects the wrong thing. A NULL
+/// there fails closed — the destroy path requires the catalog's `fs_id`.
+///
+/// The file is still catalogued, listed and searchable; only its identity is
+/// withheld. Giving nested mounts a real identity means resolving each file's
+/// own volume id, which is `volume::volume_id` per mount point rather than per
+/// root — a §4.9 change, not a walker one.
+fn on_root_volume(md: &std::fs::Metadata, root_dev: Option<u64>) -> bool {
+    match (dev_of(md), root_dev) {
+        (Some(d), Some(r)) => d == r,
+        // No device numbers on this platform: nothing to contradict, and
+        // `ino_of` already answers `None` there.
+        _ => true,
+    }
 }
 
 /// The deny decision for the walk root, over **both** names it has.
@@ -956,6 +1000,64 @@ mod tests {
             }
             other => panic!("expected one Unreadable, got {other:?}"),
         }
+    }
+
+    /// A file on a NESTED MOUNT reports no inode, so the catalog records no
+    /// `fs_id` for it.
+    ///
+    /// The catalog pairs this inode with the ROOT's `volume_id`, and an inode
+    /// is unique only within its own filesystem — so a root that crosses into
+    /// another mount produced two different files with one
+    /// `<root-volume>:<inode>`, colliding the lock that serializes upload
+    /// against destruction, while the nested file lost the remount-stable
+    /// identity it was supposed to have.
+    ///
+    /// Driven against a real mount boundary where one is available and skipped
+    /// where it is not: `/proc` is a different filesystem on every Linux host
+    /// and needs no privileges to observe. The check under test is a `st_dev`
+    /// comparison, so any second filesystem exercises it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_on_a_nested_mount_carries_no_inode() {
+        let t = Tmp::new("nested-mount");
+        t.file("own.txt", b"mine");
+
+        let root_dev = dev_of(&std::fs::metadata(&t.0).unwrap()).unwrap();
+        let proc_dev = match std::fs::metadata("/proc/self/status") {
+            Ok(md) => dev_of(&md).unwrap(),
+            // No /proc: nothing to compare against.
+            Err(_) => return,
+        };
+        if proc_dev == root_dev {
+            return; // the fixture and /proc share a filesystem: nothing to test
+        }
+
+        // The root's own file keeps its inode.
+        let out = go(&t, &DenyList::builtin());
+        let own = out
+            .files
+            .iter()
+            .find(|f| f.rel_path.ends_with("own.txt"))
+            .expect("the root's own file is walked");
+        assert!(
+            own.ino.is_some(),
+            "a file on the root's own filesystem must carry its identity"
+        );
+
+        // And the predicate itself refuses a foreign device, which is the one
+        // decision the catalog depends on.
+        let foreign = std::fs::metadata("/proc/self/status").unwrap();
+        assert!(
+            !on_root_volume(&foreign, Some(root_dev)),
+            "an entry on another filesystem must not be stamped with the root's volume"
+        );
+        assert!(
+            on_root_volume(
+                &std::fs::metadata(t.0.join("own.txt")).unwrap(),
+                Some(root_dev)
+            ),
+            "and one on the root's own filesystem must be"
+        );
     }
 
     /// The accepting direction, and the lead's explicit prohibition: registering

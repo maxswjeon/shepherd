@@ -65,7 +65,7 @@ impl Daemon {
     /// test supplies a target's credentials without writing a keyfile — and it
     /// exercises the real resolution path rather than bypassing it.
     fn start_with_env(tag: &str, env: &[(&str, &str)]) -> Daemon {
-        let dir = std::env::temp_dir().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
+        let dir = fixture_root().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // The state directory is a CHILD of the harness directory, not the
         // harness directory itself. Every test builds its corpus at
@@ -104,7 +104,7 @@ impl Daemon {
     /// the catalog helpers above, which look for `catalog.db` directly under
     /// `dir`, are not usable on a daemon started this way.
     fn start_with_socket_outside_the_state_dir(tag: &str) -> Daemon {
-        let dir = std::env::temp_dir().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
+        let dir = fixture_root().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
@@ -191,7 +191,7 @@ impl Daemon {
     /// finding it is then the client's problem — which is what the finding is
     /// about.
     fn start_with_only_a_state_dir(tag: &str) -> Daemon {
-        let dir = std::env::temp_dir().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
+        let dir = fixture_root().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Where `Paths::resolve` will put it, stated by the test rather than
@@ -712,7 +712,7 @@ fn warnings_of(result: &serde_json::Value) -> Vec<String> {
 /// is precisely the layer under test.
 #[test]
 fn a_daemon_whose_crash_recovery_fails_refuses_to_start() {
-    let dir = std::env::temp_dir().join(format!("shepherdd-e2e-{}-norecover", std::process::id()));
+    let dir = fixture_root().join(format!("shepherdd-e2e-{}-norecover", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("daemon.sock");
@@ -2001,6 +2001,22 @@ fn scan_and_expect(c: &mut Client, root_id: i64, expect: u64) {
     );
 }
 
+/// Where fixtures live: the build directory, **not** `std::env::temp_dir()`.
+///
+/// Every root these tests register goes through AC-7's deny list, and on macOS
+/// `$TMPDIR` is `/var/folders/…`, whose canonical form is `/private/var/…` —
+/// which that list denies as a `SystemPath`, correctly. While the deny decision
+/// canonicalized only symlinked LEAVES the whole suite got away with it; the
+/// moment it canonicalized properly, every macOS root was refused. A fixture
+/// that lands inside a denied system tree makes the suite answer about the
+/// runner's temp directory rather than about the product.
+///
+/// `CARGO_TARGET_TMPDIR` is Cargo's own answer to this and is set for
+/// integration tests.
+fn fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+}
+
 fn write_file(dir: &Path, rel: &str, body: &str) {
     let p = dir.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -2806,7 +2822,7 @@ fn shepctl_drives_a_real_daemon_end_to_end() {
 /// remediation command and this test would go flaky.
 #[test]
 fn shepherdd_doctor_works_with_no_daemon_running() {
-    let dir = std::env::temp_dir().join(format!("shepherdd-e2e-offline-{}", std::process::id()));
+    let dir = fixture_root().join(format!("shepherdd-e2e-offline-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let home = dir.join("home");
@@ -2924,7 +2940,7 @@ fn shepherdd_doctor_works_with_no_daemon_running() {
 #[cfg(target_os = "linux")]
 #[test]
 fn shepherdd_doctor_reports_the_daemon_as_registered_when_a_unit_file_exists() {
-    let dir = std::env::temp_dir().join(format!("shepherdd-e2e-registered-{}", std::process::id()));
+    let dir = fixture_root().join(format!("shepherdd-e2e-registered-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let home = dir.join("home");
     let config = home.join(".config");
@@ -4522,7 +4538,7 @@ fn an_unqualified_shepctl_reaches_a_daemon_configured_by_state_dir() {
 /// still fail with exit 3 and name what it tried.
 #[test]
 fn shepctl_still_reports_unreachable_when_no_daemon_is_listening() {
-    let dir = std::env::temp_dir().join(format!("shepctl-nodaemon-{}", std::process::id()));
+    let dir = fixture_root().join(format!("shepctl-nodaemon-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 

@@ -353,18 +353,52 @@ impl PlaceholderProvider for DeleteModeProvider {
         unlink_durably(&staged.staged)
     }
 
+    /// # The move-back is durable before it is reported
+    ///
+    /// This is abort-forward-never's last step, and its whole promise is that
+    /// the file is BACK. A cross-directory rename is two directory changes, so
+    /// a power loss after a successful move-back can persist the removal of the
+    /// staging entry without the new entry at the original name — and this
+    /// function has already told the caller the file was recovered, while
+    /// neither path holds it after the reboot. `list_staged`, recovery's only
+    /// view, no longer sees it either.
+    ///
+    /// Both branches sync, and both sync the DESTINATION first: a crash between
+    /// the two then leaves the file reachable under both names, which recovery
+    /// handles, rather than under neither.
     fn restore_staged(&self, staged: Staged) -> Result<RestoreOutcome> {
+        let staging = staged.staged.parent().map(Path::to_path_buf);
+        let sync_both = |dest: &Path| -> Result<()> {
+            if let Some(parent) = dest.parent() {
+                sync_dir(parent).map_err(|e| ProviderError::Io {
+                    path: parent.display().to_string(),
+                    detail: format!("the move-back is not durable: {e}"),
+                })?;
+            }
+            if let Some(staging) = &staging {
+                sync_dir(staging).map_err(|e| ProviderError::Io {
+                    path: staging.display().to_string(),
+                    detail: format!("the move-back is not durable: {e}"),
+                })?;
+            }
+            Ok(())
+        };
+
         // Move-back is itself RENAME_NOREPLACE: the original path may have been
         // reoccupied while the file was staged, and overwriting whatever is
         // there would destroy a file the user created.
         match rename_noreplace(&staged.staged, &staged.original) {
-            Ok(true) => Ok(RestoreOutcome::Restored {
-                path: staged.original.clone(),
-            }),
+            Ok(true) => {
+                sync_both(&staged.original)?;
+                Ok(RestoreOutcome::Restored {
+                    path: staged.original.clone(),
+                })
+            }
             Ok(false) | Err(_) => {
                 let conflict = conflict_name(&staged.original);
                 match rename_noreplace(&staged.staged, &conflict) {
                     Ok(true) => {
+                        sync_both(&conflict)?;
                         tracing::error!(
                             original = %staged.original.display(),
                             restored_to = %conflict.display(),
@@ -722,6 +756,53 @@ mod tests {
             syncs_of(&dir) > before,
             "the staging directory was not fsync'd after the unlink, so the removal may \
              not survive the crash the audit record will"
+        );
+    }
+
+    /// The move-back is durable before it is reported as a restore.
+    ///
+    /// This is abort-forward-never's last step, and its promise is that the
+    /// file is BACK. A cross-directory rename is two directory changes, so
+    /// without both syncs a power loss can persist the removal from staging
+    /// without the entry at the original name — after the caller has already
+    /// been told the file was recovered, and after `list_staged` stopped
+    /// seeing it.
+    #[test]
+    fn restoring_a_staged_file_syncs_both_directories() {
+        let t = Tmp::new("restoresync");
+        let nested = t.0.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let f = nested.join("only-copy.bin");
+        std::fs::write(&f, b"the only local copy").unwrap();
+        let p = DeleteModeProvider::new();
+        let Some(staged) = staged_or_refused(p.stage_for_destruction(&t.0, &f)) else {
+            return;
+        };
+        let staging = staged.staged.parent().unwrap().to_path_buf();
+
+        // Counted, not cleared: staging already synced both of these once, and
+        // the recorder is process-wide. See `the_staged_unlink_syncs_its_directory`.
+        let syncs_of = |d: &PathBuf| {
+            SYNCED_DIRS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == d)
+                .count()
+        };
+        let (before_dest, before_staging) = (syncs_of(&nested), syncs_of(&staging));
+
+        let out = p.restore_staged(staged).expect("the move-back succeeds");
+        assert!(matches!(out, RestoreOutcome::Restored { .. }), "{out:?}");
+        assert!(f.exists(), "and the file really is back");
+
+        assert!(
+            syncs_of(&nested) > before_dest,
+            "the destination's parent was not fsync'd, so the restored name may not survive"
+        );
+        assert!(
+            syncs_of(&staging) > before_staging,
+            "the staging directory was not fsync'd, so the removal may not survive"
         );
     }
 
