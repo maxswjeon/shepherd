@@ -521,6 +521,16 @@ fn roots_can_be_added_listed_and_removed() {
 /// Asserted against the inode this test reads itself, not merely against
 /// "not null": a value of the right shape built from the wrong number would
 /// pass that and protect nothing.
+///
+/// # Both branches are assertions
+///
+/// `volume::volume_id` legitimately answers `None` on a mount with no stable
+/// UUID — every GitHub runner, and `root.add` warns about it. This test
+/// therefore asserts the identity where one is available and asserts its
+/// ABSENCE where one is not, rather than demanding a filesystem property CI
+/// does not have. The unconditional contract lives where it can be stated
+/// without the host having an opinion:
+/// `shepherd_catalog::file_repo::tests::ingestion_writes_the_filesystem_identity`.
 #[test]
 fn a_scan_records_the_filesystem_identity_of_every_file() {
     let d = Daemon::start("fsid");
@@ -550,8 +560,6 @@ fn a_scan_records_the_filesystem_identity_of_every_file() {
             |r| r.get(0),
         )
         .unwrap();
-    let volume = volume.expect("the harness's filesystem must report a stable volume id");
-
     for rel in ["a.txt", "nested/b.txt"] {
         let stored: Option<String> = conn
             .query_row(
@@ -560,15 +568,29 @@ fn a_scan_records_the_filesystem_identity_of_every_file() {
                 |r| r.get(0),
             )
             .unwrap();
-        let ino = {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(root_dir.join(rel)).unwrap().ino()
-        };
-        assert_eq!(
-            stored.as_deref(),
-            Some(format!("{volume}:{ino}").as_str()),
-            "`{rel}` must carry the identity the lock and the rename check read"
-        );
+
+        match &volume {
+            Some(volume) => {
+                let ino = {
+                    use std::os::unix::fs::MetadataExt;
+                    std::fs::metadata(root_dir.join(rel)).unwrap().ino()
+                };
+                assert_eq!(
+                    stored.as_deref(),
+                    Some(format!("{volume}:{ino}").as_str()),
+                    "`{rel}` must carry the identity the lock and the rename check read"
+                );
+            }
+            // No stable volume id on this mount, so there is no identity to
+            // record — and half of one would be worse than none: an inode alone
+            // is unique only within a filesystem, so it would collide across
+            // roots and serialize unrelated files.
+            None => assert_eq!(
+                stored, None,
+                "`{rel}` has no stable volume id, so it must carry no identity \
+                 rather than a partial one"
+            ),
+        }
     }
 }
 

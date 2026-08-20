@@ -206,6 +206,21 @@ fn timestamps_round_trip_through_system_time_including_before_the_epoch() {
 /// fidelity comparison — can still fail, and until this was fixed each of those
 /// returned with the file Shepherd had just created still sitting at the
 /// destination.
+///
+/// # Off unix this asserts the GAP, deliberately
+///
+/// `restore::inode_of` answers `None` where the platform has no `(dev, ino)`,
+/// and `discard_failed_attempt` then declines to unlink — a recorded decision,
+/// not an oversight: *"a cleanup that guessed at identity would be worse than
+/// one that declines, because it would unlink by path"*. Windows identity is
+/// Phase 3's (`FILE_ID_INFO` plus the volume serial).
+///
+/// So this asserts the cleanup on unix and asserts that the file is **left**
+/// elsewhere. Asserting the unix outcome on every platform made CI red for a
+/// behaviour the code says in writing it does not provide, which teaches
+/// nothing; asserting nothing there would let the gap close silently and never
+/// be noticed. This fails the day Windows identity lands, which is when someone
+/// should be reading it.
 #[test]
 fn a_failed_restore_leaves_no_wreckage_at_the_chosen_path() {
     let dir = TempDir::new("wreckage");
@@ -215,18 +230,35 @@ fn a_failed_restore_leaves_no_wreckage_at_the_chosen_path() {
     let err = restore_file(&target, b"what actually arrived", &m)
         .expect_err("the bytes do not match the manifest");
 
-    assert!(
-        !target.exists(),
-        "a restore that failed its own fidelity check left {} behind holding \
-         known-invalid data; the error was {err}",
-        target.display()
-    );
+    if cfg!(unix) {
+        assert!(
+            !target.exists(),
+            "a restore that failed its own fidelity check left {} behind holding \
+             known-invalid data; the error was {err}",
+            target.display()
+        );
+    } else {
+        assert!(
+            target.exists(),
+            "the file is expected to be LEFT on a platform that cannot name the inode \
+             it created — if this now cleans up, Phase 3's identity has landed and this \
+             test and `inode_of`'s coverage-gap note both need updating"
+        );
+    }
 }
 
 /// The consequence the finding names, end to end. A retry after a failed
 /// restore must land the file back where it came from — not beside it, and not
 /// with an alert telling the user something of theirs is in the way, when the
 /// only thing in the way is Shepherd's own failed attempt.
+///
+/// Unix only, and the restriction is the point rather than a convenience: the
+/// diversion this asserts against is downstream of the cleanup, so off unix —
+/// where the cleanup declines by design, see the test above — the retry DOES
+/// divert, and that user-visible consequence is exactly what Phase 3's Windows
+/// identity has to buy. Running it there would assert the fix while measuring
+/// the gap.
+#[cfg(unix)]
 #[test]
 fn a_retry_after_a_failed_restore_lands_at_the_original_path() {
     let dir = TempDir::new("retry");

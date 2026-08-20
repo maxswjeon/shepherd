@@ -1282,6 +1282,102 @@ mod tests {
         );
     }
 
+    /// §4.4's `<stable-volume-id>:<inode>` is written by the ingesting upsert.
+    ///
+    /// The column existed and nothing populated it, so every row's `fs_id` was
+    /// NULL — and that value is what `FileLocks` keys on for upload and
+    /// destruction, and what tells a rename from a delete-plus-create. A NULL
+    /// there is a lock that collides with nothing, on the irreversible path.
+    ///
+    /// The exact string is asserted, not merely "not null": a value of the
+    /// right shape built from the wrong number would pass that and protect
+    /// nothing.
+    ///
+    /// Here rather than only end-to-end because the assertion must not depend
+    /// on the host filesystem — `volume::volume_id` legitimately answers `None`
+    /// on a mount with no stable UUID (every GitHub runner), which would make
+    /// an e2e-only test silently untestable exactly where CI runs it.
+    #[test]
+    fn ingestion_writes_the_filesystem_identity() {
+        let (mut cat, root) = fixture();
+        assert_eq!(root.volume_id.as_deref(), Some("uuid:abc"));
+
+        let mut s = stat(root.id, "a.txt");
+        s.ino = Some(4242);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &s, GEN, Timestamp::from_nanos(1))
+            .unwrap();
+
+        let stored: Option<String> = cat
+            .conn()
+            .query_row("SELECT CAST(fs_id AS TEXT) FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("uuid:abc:4242"));
+
+        // A re-scan that could not determine the inode carries NULL, and must
+        // not blank an identity the row already has: `COALESCE` in the
+        // `DO UPDATE`. Letting it through would silently unprotect a file that
+        // was protected a moment ago.
+        let mut blind = stat(root.id, "a.txt");
+        blind.ino = None;
+        blind.size = 99;
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &blind, GEN + 1, Timestamp::from_nanos(2))
+            .unwrap();
+
+        let (stored, size): (Option<String>, i64) = cat
+            .conn()
+            .query_row("SELECT CAST(fs_id AS TEXT), size FROM file", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(size, 99, "the rest of the row still updated");
+        assert_eq!(
+            stored.as_deref(),
+            Some("uuid:abc:4242"),
+            "a scan that could not identify the file must not erase the identity \
+             the lock depends on"
+        );
+    }
+
+    /// A root with no stable volume id records no identity, rather than half of
+    /// one.
+    ///
+    /// `root.add` already warns when the volume id could not be determined.
+    /// Writing `:<inode>` with an empty volume would be worse than NULL: an
+    /// inode alone is unique only within one filesystem, so it would collide
+    /// across roots and the lock would serialize unrelated files.
+    #[test]
+    fn a_root_without_a_volume_id_records_no_identity() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let id = FileRepo::new(&mut cat)
+            .insert_root(
+                "/data",
+                StubMode::Delete,
+                PathCasePolicy::Sensitive,
+                PathNormPolicy::Nfc,
+                AtimeMode::Relatime,
+                None,
+                false,
+                &[],
+                Timestamp::from_nanos(1),
+            )
+            .unwrap();
+        let root = FileRepo::new(&mut cat).get_root(id).unwrap().unwrap();
+
+        let mut s = stat(root.id, "a.txt");
+        s.ino = Some(4242);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &s, GEN, Timestamp::from_nanos(1))
+            .unwrap();
+
+        let stored: Option<String> = cat
+            .conn()
+            .query_row("SELECT CAST(fs_id AS TEXT) FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, None);
+    }
+
     /// The accepting direction, and the one a "never update on conflict" fix
     /// would silently break: an ordinary re-scan carries a HIGHER generation and
     /// must still write everything it saw.

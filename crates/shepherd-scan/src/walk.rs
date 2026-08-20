@@ -417,9 +417,33 @@ mod tests {
 
     struct Tmp(PathBuf);
     impl Tmp {
+        /// A fixture root under the build directory, **not** under
+        /// `std::env::temp_dir()`.
+        ///
+        /// Every test in this module hands its fixture to `DenyList::builtin()`,
+        /// and on macOS `$TMPDIR` is `/var/folders/…`, whose canonical form is
+        /// `/private/var/…` — which that list denies as a `SystemPath`, and
+        /// correctly so. Under a temp-dir fixture the accepting tests then
+        /// failed for a reason that had nothing to do with what they measure,
+        /// and the refusing ones passed for the same wrong reason, which is
+        /// worse: they would have gone on passing with the rule they exist to
+        /// pin deleted.
+        ///
+        /// `target/` is inside the workspace, so it is denied by nothing on any
+        /// of the three platforms, and it is already the directory Cargo hands
+        /// integration tests through `CARGO_TARGET_TMPDIR` — which unit tests
+        /// inside `src/` do not get, hence deriving it here.
         fn new(tag: &str) -> Self {
-            let d =
-                std::env::temp_dir().join(format!("shepherd-walk-{}-{tag}", std::process::id()));
+            let base = match std::env::var_os("CARGO_TARGET_DIR") {
+                Some(dir) => PathBuf::from(dir),
+                None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("target"),
+            };
+            let d = base
+                .join("walk-fixtures")
+                .join(format!("shepherd-walk-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             Tmp(d)
