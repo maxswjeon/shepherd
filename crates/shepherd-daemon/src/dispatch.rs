@@ -702,6 +702,11 @@ impl ShepherdApi for Session {
         let forget = req.forget_catalog;
         let force = req.force;
 
+        // Taken BEFORE the removal, so it names a moment no in-flight rebuild
+        // can have seen past. `invalidate_index` uses it to tell an index that
+        // predates this change from one that already reflects it.
+        let before_removal = self.daemon.index_watermark();
+
         match self.cat(move |cat| remove_root(cat, id, forget, force))? {
             RootRemoval::NotFound => Err(RpcError::new(
                 ErrorCode::NotFound,
@@ -751,7 +756,7 @@ impl ShepherdApi for Session {
                         // absent must never be mistaken for one that found
                         // nothing.
                         Err(e) => {
-                            self.daemon.invalidate_index();
+                            self.daemon.invalidate_index(before_removal);
                             tracing::error!(
                                 error = %e,
                                 root = req.root_id,

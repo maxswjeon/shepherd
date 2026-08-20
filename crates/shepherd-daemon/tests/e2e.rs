@@ -830,6 +830,79 @@ fn a_daemon_whose_crash_recovery_fails_refuses_to_start() {
 /// The daemon is started with its socket outside the state directory so the
 /// registered root can be the *enclosing* directory: that is the real shape of
 /// the problem, a state directory nested inside a scanned tree.
+/// The `index` stream is advertised and must actually carry rebuild progress.
+///
+/// A repo-wide search found no production publisher for `IndexProgress`: a
+/// dashboard subscribed to `index` could not tell an idle index from a rebuild
+/// grinding through ten million rows, or from one that had finished. Same shape
+/// as the `job` stream before it — an advertised capability that emits nothing
+/// is indistinguishable from a quiet system.
+#[test]
+fn a_rebuild_publishes_on_the_advertised_index_stream() {
+    let d = Daemon::start("indexstream");
+    let mut c = d.connect();
+    write_file(&d.dir, "docs/a.txt", "hello");
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": d.dir.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let root_id = added["root"]["root_id"].as_i64().unwrap();
+
+    // Subscribe to `index` alone, from a cursor of 0 so the frames the scan's
+    // rebuild published are replayed rather than raced for.
+    c.call("scan.start", serde_json::json!({"root_id": root_id}));
+    let scan = wait_for_scan(&mut c, root_id);
+    assert!(scan["last_error"].is_null(), "{scan}");
+
+    let epoch = c.call("events.subscribe", serde_json::json!({}))["epoch"]
+        .as_str()
+        .expect("epoch")
+        .to_owned();
+    let sub = c.call(
+        "events.subscribe",
+        serde_json::json!({"streams": ["index"], "resume_from": 0, "resume_epoch": epoch}),
+    );
+    assert_eq!(
+        sub["resume"]["outcome"],
+        serde_json::json!("resumed"),
+        "{sub}"
+    );
+    let replayed = sub["resume"]["replayed"].as_u64().unwrap_or(0);
+    assert!(
+        replayed >= 1,
+        "the index stream carried nothing across a completed rebuild: {sub}"
+    );
+
+    // The terminal frame is what separates "finished" from "stopped".
+    //
+    // There is more than one: the daemon rebuilds at start-up too, and on an
+    // empty catalog that one legitimately reports `rows_indexed: 0`. What must
+    // exist is a done frame for the rebuild that followed the SCAN, so the
+    // count is taken across all of them rather than asserted on the first.
+    let mut done_frames = 0;
+    let mut most_rows = 0u64;
+    for _ in 0..replayed {
+        let frame = c.read_frame();
+        let p = &frame["params"]["payload"];
+        if p["kind"] == serde_json::json!("index_progress") && p["done"] == serde_json::json!(true)
+        {
+            done_frames += 1;
+            most_rows = most_rows.max(p["rows_indexed"].as_u64().unwrap_or(0));
+        }
+    }
+    assert!(
+        done_frames >= 1,
+        "no terminal `done` frame; a subscriber cannot tell a finished rebuild \
+         from one that stopped"
+    );
+    assert!(
+        most_rows >= 1,
+        "every rebuild reported zero rows, so the count is not being carried: \
+         {done_frames} done frame(s)"
+    );
+}
+
 /// Forgetting a root's catalog rows must take them out of the search index.
 ///
 /// The cascade drops the file rows; the index is an in-memory arena built from
@@ -3049,6 +3122,12 @@ fn subscribe_until_eof(d: &Daemon, extra: &[&str]) -> (serde_json::Value, Vec<se
     (envelope, events)
 }
 
+/// The streams `events.subscribe` advertises, as the wire spells them.
+///
+/// Mirrored from `EventStream::ALL` rather than imported so that adding a
+/// stream to the protocol without deciding what publishes to it shows up here.
+const ADVERTISED_STREAMS: &[&str] = &["scan", "job", "index", "tier", "power", "target"];
+
 /// `shepctl events subscribe` must actually render events.
 ///
 /// This is the finding, and it is about a command that reported success while
@@ -3112,10 +3191,15 @@ fn shepctl_events_subscribe_renders_the_events_it_subscribed_to() {
             .unwrap_or_else(|| panic!("an event frame has no `seq`: {e}"));
         assert!(seq > last, "replay went backwards: {events:?}");
         last = seq;
+        // An ALLOWLIST here needs extending every time a stream starts
+        // publishing, and the last two rounds each caught it a round late.
+        // This subscription is unfiltered, so the property is that every frame
+        // belongs to an ADVERTISED stream — the filtering itself is tested by
+        // `a_subscriber_receives_what_it_asked_for_and_nothing_else`.
         let stream = e["stream"].as_str().unwrap_or_default();
         assert!(
-            stream == "scan" || stream == "job",
-            "an unsubscribed stream reached the client: {e}"
+            ADVERTISED_STREAMS.contains(&stream),
+            "a frame arrived on a stream `events.subscribe` does not advertise: {e}"
         );
     }
     assert!(

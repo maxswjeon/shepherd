@@ -13,6 +13,13 @@ use crate::events::EventHub;
 use shepherd_obs::paths::Paths;
 
 /// Everything a connection needs that outlives it.
+/// Rows between `index` progress frames during a rebuild.
+///
+/// Coarse on purpose. At §1's ten million rows a frame per row would fill every
+/// subscriber's bounded queue and get them all disconnected for falling behind,
+/// which is a worse answer than silence.
+const INDEX_PROGRESS_ROWS: u64 = 50_000;
+
 pub struct Daemon {
     pub writer: CatalogWriter,
     pub events: EventHub,
@@ -238,12 +245,28 @@ impl Daemon {
             let mut rows = stmt
                 .query([])
                 .map_err(|e| format!("reading catalog rows: {e}"))?;
+            // The `index` stream is advertised by `events.subscribe`, and
+            // nothing published to it: a dashboard subscribed to it could not
+            // tell an idle index from a rebuild grinding through ten million
+            // rows. An advertised capability that emits nothing is
+            // indistinguishable from a quiet system.
+            //
+            // Every `INDEX_PROGRESS_ROWS`, not every row: at 10M rows a frame
+            // each would drown every other subscriber's queue — `publish` drops
+            // for a subscriber that cannot keep up, and the one thing worse
+            // than no progress is progress that costs somebody else their
+            // subscription.
+            let mut indexed = 0u64;
             while let Some(row) = rows.next().map_err(|e| format!("reading a row: {e}"))? {
                 let id: i64 = row.get(0).map_err(|e| format!("file.id: {e}"))?;
                 let rel_path: String = row.get(1).map_err(|e| format!("file.rel_path: {e}"))?;
                 builder
                     .push(id, &rel_path)
                     .map_err(|e| format!("building the metadata index: {e}"))?;
+                indexed += 1;
+                if indexed.is_multiple_of(INDEX_PROGRESS_ROWS) {
+                    self.publish_index_progress(indexed, expected, false);
+                }
             }
         }
         // Read-only and read-only throughout, so there is nothing to commit;
@@ -254,6 +277,9 @@ impl Daemon {
             .build()
             .map_err(|e| format!("sealing the metadata index: {e}"))?;
         let entries = built.len();
+        // The terminal frame. A subscriber that only ever saw periodic updates
+        // could not tell a finished rebuild from one that stopped.
+        self.publish_index_progress(entries as u64, expected, true);
         // Counted, then compared: a rebuild that silently indexed fewer rows
         // than the catalog holds is a search that silently cannot find them.
         if entries as i64 != expected {
@@ -325,6 +351,22 @@ impl Daemon {
         entries
     }
 
+    /// One `index` progress frame.
+    ///
+    /// `rows_total` is the count the snapshot was pinned against, so it is the
+    /// denominator the rebuild is actually working towards rather than a
+    /// live-changing catalog total.
+    fn publish_index_progress(&self, rows_indexed: u64, expected: i64, done: bool) {
+        self.events.publish(
+            shepherd_proto::event::EventStream::Index,
+            shepherd_proto::event::EventPayload::IndexProgress {
+                rows_indexed,
+                rows_total: u64::try_from(expected).ok(),
+                done,
+            },
+        );
+    }
+
     /// Drop the installed index, so `search` refuses instead of answering from
     /// one that is known to be wrong.
     ///
@@ -354,22 +396,28 @@ impl Daemon {
     /// started after it has a higher one and installs normally. Clearing the
     /// generation instead would have the opposite effect — it would let the
     /// oldest in-flight snapshot win.
-    pub fn invalidate_index(&self) {
+    pub fn invalidate_index(&self, mutated_at: u64) {
         let mut guard = self
             .index
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Taken while the index write lock is held, so no rebuild can slip
-        // between choosing the floor and installing it.
-        guard.floor = {
-            // The ticket a rebuild starting NOW would take. Every snapshot
-            // pinned before this line has a lower one.
-            let ticket = self
-                .snapshot_ticket
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *ticket + 1
-        };
+        // An index built AFTER the mutation already reflects it, whoever built
+        // it. A concurrent scan's rebuild can pin its snapshot after the
+        // removal commits and install while this one is still failing — and
+        // dropping that would throw away a correct index and lock out every
+        // rebuild already in flight, leaving searches refused until some future
+        // scan happened to run. Invalidation is about a STALE index, not about
+        // whichever generation is installed when a failed attempt returns.
+        if guard.generation > mutated_at {
+            tracing::info!(
+                installed = guard.generation,
+                mutated_at,
+                "a newer index already reflects the catalog change; keeping it"
+            );
+            return;
+        }
+        // Only snapshots pinned after the mutation may install from here.
+        guard.floor = guard.floor.max(mutated_at + 1);
         if guard.index.take().is_some() {
             tracing::warn!(
                 floor = guard.floor,
@@ -378,6 +426,18 @@ impl Daemon {
                  have followed it failed. `search` is refused until one succeeds"
             );
         }
+    }
+
+    /// The ticket a snapshot pinned right now would carry.
+    ///
+    /// Taken by a caller BEFORE it mutates the catalog, so it can later say
+    /// which rebuilds could not possibly have seen the change. Every snapshot
+    /// pinned after the mutation has a strictly greater generation.
+    pub fn index_watermark(&self) -> u64 {
+        *self
+            .snapshot_ticket
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The self-checks behind the `doctor` method.
@@ -585,6 +645,43 @@ mod tests {
     /// would notice — not merely that some counter went the right way. A daemon
     /// that installed A's stale snapshot would still have `beta.txt` in SQLite
     /// and would not find it, which is the bug.
+    /// An index that already reflects the change must SURVIVE a failed rebuild.
+    ///
+    /// The removal's own rebuild can fail late while a concurrent scan pins its
+    /// snapshot after the removal committed and installs successfully. Dropping
+    /// whatever happened to be installed when the failed attempt returned threw
+    /// that correct index away AND raised the floor past every rebuild already
+    /// in flight — so searches stayed refused until some future scan happened
+    /// to run. Invalidation is about a stale index, not about whichever
+    /// generation is installed at the moment of failure.
+    #[test]
+    fn a_newer_index_survives_a_failed_rebuild() {
+        let (daemon, dir) = daemon_on_disk("keepnewer");
+        add_root(&daemon, "/data");
+
+        // The watermark the removal would take.
+        let mutated_at = daemon.index_watermark();
+
+        // A concurrent scan pins AFTER the mutation and installs.
+        daemon.rebuild_index().expect("the scan's rebuild installs");
+        assert!(daemon.index().is_ok());
+
+        // Now the removal's own rebuild fails.
+        daemon.invalidate_index(mutated_at);
+        assert!(
+            daemon.index().is_ok(),
+            "an index built after the change already reflects it and must be kept"
+        );
+
+        // And the floor was not raised, so a rebuild already in flight can
+        // still land.
+        let in_flight = daemon.build_snapshot().expect("pin");
+        daemon.install_snapshot(in_flight);
+        assert!(daemon.index().is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A snapshot pinned BEFORE an invalidation must not reinstall afterwards.
     ///
     /// Tickets are issued in snapshot order, not completion order, so a rebuild
@@ -605,7 +702,9 @@ mod tests {
             .expect("an ordinary rebuild installs");
 
         // The catalog changes and the rebuild that should have followed fails.
-        daemon.invalidate_index();
+        // The watermark is taken before the change, as `root_remove` does.
+        let mutated_at = daemon.index_watermark();
+        daemon.invalidate_index(mutated_at);
         assert!(
             daemon.index().is_err(),
             "precondition: `search` must be refused while there is no index"

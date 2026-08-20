@@ -207,7 +207,18 @@ impl Executor for ScanExecutor {
         // stable identity" would — this check is about a path that still
         // resolves and now belongs to a different filesystem, which is
         // precisely the case a deleted root is not.
+        // The device is sampled on BOTH sides of the identity lookup, and the
+        // two must agree.
+        //
+        // Sampling only afterwards left a window of its own: `current_volume_id`
+        // could validate the enrolled filesystem and the sample a moment later
+        // record a replacement's device, so the walk and the post-walk check
+        // would agree with each other about a volume the identity lookup never
+        // saw. Bracketing the lookup makes the recorded device one the
+        // validation actually applies to — if anything moved across it, the
+        // two samples differ and there is no validated device to record.
         let present = std::fs::symlink_metadata(&path).is_ok();
+        let dev_before = present.then(|| device_of(&path)).flatten();
         if present
             && let Some(reason) = volume_refusal(
                 rid,
@@ -218,9 +229,16 @@ impl Executor for ScanExecutor {
         {
             return Err(reason);
         }
-        // The device the check above passed on, remembered so the same question
-        // can be asked again after the walk.
-        let checked_dev = present.then(|| device_of(&path)).flatten();
+        let dev_after = present.then(|| device_of(&path)).flatten();
+        if present && dev_before != dev_after {
+            return Err(format!(
+                "the filesystem at root {root_id} ({}) changed while its identity was being \
+                 verified, so nothing about it has been established. Nothing has been \
+                 committed. Re-run the scan once the mount is stable",
+                root.path
+            ));
+        }
+        let checked_dev = dev_after;
 
         self.publish(root_id, 0, 0, Some(root.path.clone()), false);
 
