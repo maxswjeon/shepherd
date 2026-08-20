@@ -240,6 +240,54 @@ ignored = true
 requires_env = "SHEPHERD_MINIO_ENDPOINT"
 proves = "AC-1's full remote re-read against real MinIO before any destruction"
 
+[[ac.evidence]]
+package = "shepherd-storage"
+test = "s3::probe_tests::two_probes_of_one_algorithm_do_not_share_an_object_key"
+proves = """
+two concurrent `target.add` probes used the SAME fixed per-algorithm
+object key, so one probe's cleanup DELETE could land between another's
+`complete_multipart` and its HEAD — and a missing checksum reads as
+`the provider does not support this algorithm`, a PERMANENT negative minted by a
+transient race. Round 2 fixed the neighbouring version of this (an auth failure
+recorded as non-support); same principle.
+
+Per-invocation nonce `{pid}-{nanos}-{seq}`, matching the discipline
+`identity.rs` and `atime.rs` now use for their own probes. The `{seq}` counter
+is there because exclusive-create was declined — see below — so the name must
+carry the whole guarantee, and a probability is not a guarantee.
+"""
+
+[[ac.evidence]]
+package = "shepherd-storage"
+test = "concurrent_registration_probes_do_not_race_into_a_false_negative"
+ignored = true
+requires_env = "SHEPHERD_MINIO_ENDPOINT"
+proves = """
+the race exercised against a REAL provider, and checked against an
+UNCONTENDED BASELINE rather than against the other probes — two probes that both
+raced into `adopted: none` would agree with each other perfectly, which is the
+trap. Pre-fix, contended runs recorded MinIO — which does support CRC64NVME — as
+`rejected at head`, degrading to CRC32C.
+
+HONESTLY CHARACTERISED: under the pinned-nonce mutation this dies 4 runs in 5.
+It is a probabilistic detector of a timing window, not a deterministic guard —
+the deterministic guarantee is the unit test above, and this test's job is
+proving the window is real rather than theoretical.
+
+DECLINED: `IfAbsent`/exclusive-create, which needs `conditional_create` — this
+probe's whole job is measuring ARBITRARY S3-compatibles, and a registration
+failing over an unrelated precondition feature reports the wrong fact about the
+provider. The catalog probes' motivation does not transfer either: those write
+into a USER's directory where a collision hits real data, while
+`_shepherd/probe/` is Shepherd's own namespace.
+
+NEW TRADEOFF, RECORDED: cross-probe cleanup was what tidied an object left by a
+probe killed between completion and DELETE. That tidying WAS the cross-probe
+deletion being removed, so an orphan now survives until something sweeps the
+prefix — one ~10 MiB object per crashed probe, a storage cost not a correctness
+one.
+"""
+
 [[ac]]
 id = "AC-2"
 owning_gate = "2"
@@ -417,6 +465,117 @@ proves = "the built-in deny-list matches components, never substrings"
 package = "shepherd-tier"
 test = "each_negative_is_excluded_for_its_own_stated_reason"
 proves = "a deny-listed tree is pruned before any rule sees it"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::a_denied_component_as_the_root_is_refused_rather_than_walked"
+proves = """
+THE DENY LIST WAS APPLIED TO EVERY DIRECTORY EXCEPT THE FIRST. The walk
+seeded its stack with the registered root without ever calling `deny_dir` on it,
+so a root that IS a denied tree walked freely — the pre-fix run emitted
+`objects/abc` from a `.git` root. The guard exists to make certain trees
+uncatalogueable, and the one directory it never checked was the one the user
+names.
+"""
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::a_denied_absolute_prefix_as_the_root_is_refused_without_being_opened"
+proves = "the guard runs BEFORE `read_dir`, which is load-bearing twice over: fail-closed, and it makes `/Library/Caches` testable on Linux where the path does not exist. The pre-fix failure shows why placement matters — a guard after the open reports `Unreadable`, not `Denied`"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::a_symlinked_root_pointing_at_a_denied_tree_is_refused"
+proves = """
+the same finding, still reachable after the first fix: an innocent link
+name pointing at a denied tree walked it, because `root.file_name()` reads the
+LINK's name and `read_dir` follows a symlinked root. Closed by deny-checking the
+canonicalized target as well.
+
+SCOPED TO SYMLINKED ROOTS DELIBERATELY, on measurement rather than taste.
+Canonicalizing unconditionally breaks macOS blind: `env::temp_dir()` there is
+`/var/folders/...`, which canonicalizes to `/private/var/...` — a denied
+absolute prefix — refusing the roots of two existing tests on a platform this
+gate cannot run. And it would not close the symlinked-ANCESTOR case anyway,
+because `deny_dir` matches on the final component only. A sliver of extra
+coverage at that cost.
+
+The root is the SOLE symlink this walker follows — every symlinked directory
+inside a walk is `Skip::SymlinkedDir` — so it is the sole link whose target
+needs checking. This completes the existing no-symlink doctrine rather than
+adding a second one.
+"""
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::a_symlinked_root_that_will_not_resolve_is_reported_not_walked"
+proves = "`canonicalize` failing yields `Skip::Unreadable` rather than falling through — `read_dir` can still succeed after `canonicalize` fails, and falling through would leave a window where the walk proceeds on a deny check that never ran. That window is the shape of half this review's findings, closed before it existed"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::an_innocent_symlinked_root_still_walks"
+proves = """
+the acceptance direction, and it is the only test that dies under
+`refuse every symlinked root` — the plausible over-fix, which would break
+registering `/home/me/data -> /mnt/big/data`. Also asserts `rel_path` stays
+relative to the LINK, pinning that canonicalization is for the deny decision
+only and never redefines the walk root.
+
+STATED RESIDUAL: a root reached through a symlinked ANCESTOR still walks.
+Unconditional canonicalization does not close it either; only a component-wise
+check of every canonical component would, which is a wider policy decision than
+this finding. Strictly smaller than the hole closed, documented at `deny_root`.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_denied_root_is_refused_before_any_probe_writes_into_it"
+proves = """
+THE DENY PROMISE WAS BROKEN BY THE REGISTRATION PATH ITSELF.
+`root_add` called `probe_path_policies` and `detect_with_write_probe` — both of
+which WRITE FILES INTO THE ROOT — before anything consulted the deny list. So
+`root.add <repo>/.git` wrote Shepherd's probe files into a tree the policy says
+is never touched, and only afterwards did a scan decline to walk it. Not a
+missing error message: a write into a directory the user never agreed to have
+written to.
+
+THE ASSERTION IS THE DIRECTORY'S MTIME, PINNED WITH `File::set_times`, AND THAT
+MATTERS. The obvious test — assert the directory is empty — PASSES WITH THE
+TRESPASS FULLY IN PLACE, because both probes clean up after themselves
+(`ProbeFiles` unlinks on `Drop`, `probe_atime_advance` unlinks immediately). An
+mtime bumps on create AND on remove, so it is the version that can fail.
+
+MUTATION 2 IS THE PROOF: move the refusal to AFTER the probes and the message
+test STILL PASSES — same `Refused` code, same `version-control` reason — while
+only the mtime assertion dies. The defect was ordering, and a message test
+cannot see ordering.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_denied_root_refusal_names_the_rule_that_refused_it"
+proves = "two distinct DenyReason routes — exact name to `version-control`, foreign-sync name to `foreign-sync-root` — so the operator can tell which rule refused them. `ErrorCode::Refused` rather than `Invalid` because `error.rs:133` names `a deny-list entry` verbatim in Refused's own definition, and because a built-in list nothing in the request can change ought to be non-retryable"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_substring_is_not_a_component_at_registration"
+proves = "round 1's component rule re-tested at the new boundary: `mygit`, `.gitignore` and `my_node_modules` all still register. Registration and scan both go through `DenyList::builtin()` and `deny_dir`, so the two cannot reach different conclusions about what is denied — by construction, not by a test that they agree"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "an_ordinary_root_still_registers_with_its_probes_run_and_its_policies_recorded"
+proves = """
+the acceptance direction as an exact inversion: mtime CHANGED (the
+probes ran), no `could not probe` warning, and `root.list` reports the same
+case/norm/atime policies `root.add` answered with. `refuse everything` would
+disable enrollment entirely while passing both refusal rows above.
+
+FOLLOW-UP RECORDED: this call site mirrors the walker's uncanonicalized check,
+so a root with an innocent name symlinking to a denied tree still reaches the
+probes here. The walker refuses it, so the promise holds and the error merely
+arrives late; adopting the walker's symlink rule at registration is the open
+item.
+"""
 
 [[ac]]
 id = "AC-9"
@@ -627,6 +786,43 @@ package = "shepherd-daemon"
 test = "state::tests::a_rebuild_from_a_newer_snapshot_does_replace_the_index"
 proves = "the acceptance direction: `refuse every swap` kills this while satisfying the row above, so the fix cannot be `never install`"
 
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_ctime_predicate_reports_ctime_as_the_driving_signal"
+proves = """
+every `ctime_older_than_days` match reported its driving signal as
+`Mtime`. The matcher read the right field and the RECORD lied about which
+timestamp authorised the action — and that record is what the operator approves
+a destructive rule against. The fixture makes the mislabel provably wrong: mtime
+is one day old and so cannot satisfy a 365-day predicate, meaning `Mtime` names
+a timestamp that does not drive the match.
+
+WHY THIS IS WORSE THAN A COSMETIC BUG: round 2 made execution refuse when the
+signal drifts from the preview's, on the argument that a preview saying
+`Observed` and a run proceeding on `Atime` is the substitution the whole
+`AtimeMode` apparatus exists to prevent. That refusal is only as good as the
+labels, and one label was a lie.
+"""
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "engine::tests::a_ctime_rule_previews_as_ctime_and_a_preview_labelled_mtime_refuses"
+proves = """
+the upgrade behaviour, asserted rather than discovered: a preview taken
+before this change and executed after it now drifts `Mtime -> Ctime` and
+refuses. Correct and fail-closed, but visible, so it is pinned — and the same
+test asserts a preview taken by THIS build still executes, so the refusal is not
+`refuse everything`.
+
+Checked and recorded: there is NO `match` on `AccessSignalSource` anywhere in
+the workspace, so no wildcard arm can silently mislabel, and the enum is
+deliberately NOT `#[non_exhaustive]` so an external exhaustive match would be a
+compile error rather than a wrong answer. `shepherd_catalog::AccessSignal` is a
+SEPARATE, parallel enum whose schema CHECK admits `observed|atime|mtime` only —
+an obvious `impl From` would compile and fail at runtime; the hazard is
+documented on the enum.
+"""
+
 [[ac]]
 id = "AC-14"
 owning_gate = "2"
@@ -721,6 +917,61 @@ there is one source of truth rather than two that can drift.
 package = "shepherd-tier"
 test = "revalidate::tests::a_verified_location_satisfies_custody"
 proves = "the acceptance direction: flipping the non-Verified arm to `true` kills both rows above and leaves this green, so `never eligible` — which would silently disable tiering while passing every refusal test — cannot masquerade as the fix"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "upload::tests::identity::a_fresh_fingerprint_reports_the_statted_inode_not_the_planned_one"
+proves = """
+THE GUARD COMPARED A VALUE WITH ITSELF. `fingerprint()` statted `size`
+and `mtime` and then copied the caller's planned `fs_id` straight through, so
+`assert_source_unchanged` checked the expected identity against the expected
+identity and could never fail. The pre-fix output is the finding restated as an
+assertion:
+
+    assertion `left != right` failed
+      left:  FsId("vol:1")
+     right:  FsId("vol:1")
+
+Now derived through `shepherd_catalog::volume::fs_id` — the same function round 1
+keyed the destroy lock on, not a second identity.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "upload::tests::identity::a_resume_whose_source_was_swapped_writes_nothing_to_the_target"
+proves = """
+the consequence, produced rather than argued: the inode swapped with
+size and mtime held identical, and the impostor's bytes reached the target under
+the key naming the ORIGINAL's hash. Asserts on the OBJECT'S EXISTENCE, not on
+`is_err()` — pre-fix the call does return an error, just after the object is
+immutable, so every retry rediscovers it and none can replace it
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "upload::tests::identity::an_untouched_resume_still_completes"
+proves = "the acceptance direction, green BEFORE the fix as well, which is the point: a fingerprint returning something fresh each call would satisfy both refusal rows above while refusing every resume and silently breaking AC-2"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "restore::tests::cleanup_removes_only_the_inode_this_attempt_created"
+proves = """
+THE ONLY TEST THAT CATCHES THE PATH-KEYED CLEANUP, and the strongest
+mutation result in this review. A failed restore left partial or known-invalid
+bytes at the destination, so a retry read them as a user-owned conflict and
+restored elsewhere. The fix unlinks only the inode captured FROM THE HANDLE
+immediately after `create_new` — the one moment at which `the inode at this path`
+and `the inode this attempt created` are provably the same thing.
+
+Mutate the cleanup to be path-keyed and EVERY behavioural test still passes;
+only this one fails with `cleanup deleted a file this attempt did not create`. A
+path-keyed cleanup would have shipped looking fully tested.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "restore::tests::a_retry_after_a_failed_restore_lands_at_the_original_path"
+proves = "the finding's stated harm verbatim — pre-fix the retry was diverted to `photo (restored 1).raw` and the user alerted about a conflict that was Shepherd's own failed attempt, not a file of theirs"
 
 [[ac]]
 id = "AC-16"
@@ -1046,6 +1297,46 @@ cross-checks `events_rendered` against the lines that reached stdout, so the
 count cannot be right while the output is empty.
 """
 
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "events::tests::a_subscriber_whose_queue_overflows_is_disconnected"
+proves = """
+a subscriber whose 256-frame queue filled was left REGISTERED with a
+silently dropped frame, holding stale state indefinitely. The code's stated
+recovery — the client notices a sequence gap — CANNOT WORK for a filtered
+subscription, because sequence numbers are global and gaps from unrequested
+streams are normal and documented as such.
+
+DISCONNECT, NOT A MARKER, and the reason is the finding one level up: the queue
+is full precisely because the client is not draining the socket, so a marker
+frame would sit unread BEHIND THE VERY FRAMES IT REPORTS. A notification
+deliverable only through the channel whose congestion it reports is not a
+notification. EOF needs no reader to be true. No wire change; PROTO_VERSION
+stays 1.3.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "server::tests::an_overflowing_subscriber_sees_its_connection_close"
+proves = "proven at the CLIENT end over a real `UnixStream::pair()`, exactly as `shepctl` reads it — SUBSCRIBER_QUEUE valid event frames, then `read_line` returns 0. Not `the daemon set a flag`. Queued frames are delivered before the close deliberately: they are frames the client is entitled to and they shorten the resume"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "server::tests::an_ordinary_end_of_stream_leaves_the_connection_open"
+proves = "the acceptance direction against `disconnect everyone` — a clean end-of-stream leaves the socket writable, asserted by writing from the daemon side AFTER the pump returns and reading it on the client side. An overflow and a clean shutdown both reach the pump as a closed channel; only one may tear down the connection"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "events::tests::a_slow_subscriber_does_not_stall_the_publisher_or_its_peers"
+proves = """
+ORACLE DELIBERATELY CHANGED, recorded here so it is never mistaken for
+an assertion weakened to make a build green. This test previously ended on
+`assert_eq!(hub.subscriber_count(), 2)` under the comment `the slow subscriber is
+still registered — it lost frames, it was not disconnected` — it ASSERTED THE
+DEFECT AS THE DESIRED OUTCOME. Renamed to what it was actually guarding: the
+publisher completes without blocking and the healthy subscriber loses nothing.
+"""
+
 [[ac]]
 id = "AC-57"
 owning_gate = "4"
@@ -1165,6 +1456,32 @@ package = "shepherd-daemon"
 test = "shepctl_still_reports_unreachable_when_no_daemon_is_listening"
 proves = "the acceptance direction, and AC-61's own clause: pointed at a state dir with no daemon, exit 3 still happens and the hint still names the exact path tried"
 
+[[ac.evidence]]
+package = "shepherd-obs"
+test = "paths::tests::an_explicit_socket_override_is_the_only_candidate"
+proves = """
+A REGRESSION FROM THE PREVIOUS ROUND'S OWN FIX. `socket_candidates` was
+made a LIST so a client could find a daemon configured through XDG_STATE_HOME;
+that is right for environment skew and wrong for an explicit override. With
+`SHEPHERD_SOCKET` set but momentarily unavailable, the client fell through to the
+defaults and could send a DESTRUCTIVE command to a different running daemon and
+catalog. The function's own comment already said an override should be
+definitive — code contradicting its own doc, again.
+
+Asserted as EQUALITY, not `first()`: the defect lived entirely in what came
+after the first entry, so a `first()` assertion would have passed throughout.
+"""
+
+[[ac.evidence]]
+package = "shepherd-obs"
+test = "paths::tests::an_explicit_socket_is_a_candidate_even_when_nothing_else_is_named"
+proves = "a SECOND bug the finding did not name, found by hoisting the check: `env -i SHEPHERD_SOCKET=/tmp/x.sock shepctl` returned `[]` — the user names a socket and is told nothing was tried. Arguably worse than the reported fall-through, which at least attempts something"
+
+[[ac.evidence]]
+package = "shepherd-obs"
+test = "paths::tests::without_an_override_the_other_rungs_are_still_tried"
+proves = "the acceptance direction, and it catches the plausible over-fix: `collapse to one candidate always` satisfies both rows above and re-breaks the environment skew this function exists for. Three tests die on it"
+
 [[ac]]
 id = "AC-62"
 owning_gate = "5"
@@ -1260,6 +1577,48 @@ proves = "the TOCTOU direction the finding named: the charge is reserved and per
 package = "shepherd-tier"
 test = "discard::tests::two_episodes_evaluating_against_one_snapshot_cannot_both_reserve"
 proves = "what separates two racers: `evaluate_discard` reads a snapshot and is advisory, `try_charge` is test-and-consume in one step and is the authority. This is the only test that isolates atomicity — the accumulate test is also caught by the advisory check, so it cannot"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::a_candidate_from_another_episode_cannot_be_deleted_with_this_episodes_charge"
+proves = """
+a charge was a COUNT, not a permission for a named object: the episode
+confirmed one candidate, the caller named a different one, and the count-only
+`spend()` authorised its irreversible deletion (`got Ok(())`, `deleted() == 1`).
+`DiscardCharge` now carries the confirmed set itself and `spend` RETURNS the key
+it authorised — `execute_discard` takes no `ObjectKey` at all, so a wrong key
+stopped being something we refuse and became something no caller can express.
+Also asserts `remaining() == 1`, because a refusal that consumed the unit would
+leave the confirmed object undeletable.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::varying_any_single_field_of_a_candidate_refuses_it"
+proves = "membership must be WHOLE-candidate equality. Mutating it to compare `file` alone reports `a candidate differing only in `path` was accepted: Ok(())` — a row whose path drifted from the one the operator read, deleted on the strength of a matching file id"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::the_key_is_derived_from_the_candidate_and_the_targets_prefix"
+proves = """
+the test a suffix check fails: it deletes under a DIFFERENT prefix and
+asserts this target's object — identical hash — survives. An
+`ends_with(<hash hex>)` check would pass every other row here while leaving the
+prefix non-load-bearing, so a foreign-prefix key with the right hash sails
+through. Refused in the design and the reason written at the `DiscardCharge`
+doc.
+
+STATED RESIDUAL: `prefix` is the one component `spend` cannot cross-check,
+because the charge does not know its target's prefix — that is config, not
+`Episode` data. Closing it means persisting the key on the candidate and folding
+it into `candidate_set_hash`; filed as a follow-up rather than done, because the
+finding's stated harm is closed by construction without it.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::an_unhashed_candidate_is_refused_rather_than_naming_a_key_from_nothing"
+proves = "a consistency check today — `plan_tier` already refuses unhashed files so no remote object can exist for one — pinned precisely because that is the kind of `cannot happen` that becomes reachable when someone changes `plan_tier`. It must fail loudly that day rather than derive a key from `None`"
 
 [[guard]]
 id = "PM-3"

@@ -29,7 +29,9 @@
 //! [`Paths::resolve`] is what the daemon binds; [`socket_candidates`] is the
 //! same chain flattened into the list a client tries. They are checked against
 //! each other over the whole environment matrix in this module's tests, and by
-//! construction the first candidate *is* `resolve`'s socket.
+//! construction the first candidate *is* `resolve`'s socket. An explicit
+//! `SHEPHERD_SOCKET` is the one case with no fallbacks at all — see
+//! [`socket_candidates`] for why falling through would be worse than failing.
 
 use std::path::PathBuf;
 
@@ -125,9 +127,30 @@ impl Paths {
 /// the skew above. Duplicates are removed so an error message does not list one
 /// path twice.
 ///
+/// # Except when the socket is named outright, where the list is one long
+///
+/// `SHEPHERD_SOCKET` exists so two daemons can run side by side, and naming one
+/// is precisely a statement that the other must not be reached. Falling through
+/// to the ordinary rungs when it is momentarily unavailable — the daemon
+/// restarting, the path not yet bound — sends the command to whichever *other*
+/// instance is listening, against a different catalog. An error the user can
+/// act on is strictly better than silent success somewhere else, and on a
+/// destructive command the difference is unrecoverable.
+///
+/// This also fixes the sharper half: the override used to be contributed by the
+/// `resolve` arm, so an environment naming a socket and no state directory
+/// (`env -i SHEPHERD_SOCKET=... shepctl`) yielded an **empty** list — the user
+/// named the socket and was told nothing had been tried.
+///
 /// Empty only when the environment names nowhere at all, which is the same
 /// condition [`Paths::resolve`] refuses outright.
 pub fn socket_candidates(env: &Env) -> Vec<PathBuf> {
+    // Checked before anything else, and returned alone. Not merely first:
+    // the defect was entirely in what followed it.
+    if let Some(explicit) = &env.shepherd_socket {
+        return vec![PathBuf::from(explicit)];
+    }
+
     let mut out: Vec<PathBuf> = Vec::new();
     let mut push = |p: PathBuf| {
         if !out.contains(&p) {
@@ -140,8 +163,6 @@ pub fn socket_candidates(env: &Env) -> Vec<PathBuf> {
         push(resolved.socket);
     }
 
-    // An explicit socket overrides everything and is already first if it is
-    // set; nothing else to add for it.
     if let Some(runtime) = &env.xdg_runtime_dir {
         push(PathBuf::from(runtime).join("shepherd/daemon.sock"));
     }
@@ -350,6 +371,80 @@ mod tests {
             seen.dedup();
             assert_eq!(seen.len(), c.len(), "a path is listed twice for {env:?}");
         }
+    }
+
+    /// An explicit `SHEPHERD_SOCKET` is the ONLY candidate.
+    ///
+    /// The override exists so two daemons can run side by side, and the whole
+    /// point of naming one is that the other must not be reached. While this
+    /// function appended the ordinary rungs after it, a client whose named
+    /// socket was momentarily unavailable — the daemon restarting, the file not
+    /// yet bound — fell through to whatever *other* instance was listening
+    /// under `XDG_RUNTIME_DIR`, and ran the command against that daemon's
+    /// catalog instead. Failing to reach the socket you asked for is an error a
+    /// user can act on; silently acting on a different catalog is not, and on a
+    /// destructive command it is unrecoverable.
+    ///
+    /// Asserted as equality, not as `first()`: the bug was entirely in what
+    /// came *after* the first entry, so an assertion on the head of the list
+    /// would have passed throughout.
+    #[test]
+    fn an_explicit_socket_override_is_the_only_candidate() {
+        let e = Env {
+            shepherd_socket: Some("/tmp/x.sock".into()),
+            ..env(
+                Some("/run/user/1000"),
+                Some("/var/lib/x"),
+                Some("/home/sam"),
+            )
+        };
+        assert_eq!(
+            socket_candidates(&e),
+            vec![PathBuf::from("/tmp/x.sock")],
+            "an override that falls through reaches a different daemon's catalog"
+        );
+    }
+
+    /// And it survives an environment `Paths::resolve` refuses.
+    ///
+    /// This is the sharper half. The override was pushed by the `resolve` arm,
+    /// so an environment naming a socket and no state directory — `env -i
+    /// SHEPHERD_SOCKET=... shepctl` — produced an **empty** candidate list: the
+    /// user named the socket and was told nothing had been tried.
+    #[test]
+    fn an_explicit_socket_is_a_candidate_even_when_nothing_else_is_named() {
+        let e = Env {
+            shepherd_socket: Some("/tmp/x.sock".into()),
+            ..Default::default()
+        };
+        assert!(
+            Paths::resolve(&e).is_err(),
+            "no state directory is named, so this process could not be the daemon"
+        );
+        assert_eq!(
+            socket_candidates(&e),
+            vec![PathBuf::from("/tmp/x.sock")],
+            "the user named a socket; the client must at least try it"
+        );
+    }
+
+    /// The accepting direction, so "return one candidate always" cannot pass.
+    ///
+    /// Collapsing the list to a single entry would satisfy both tests above and
+    /// re-break the skew case `socket_candidates` was added for. With **no**
+    /// override set, every rung is still tried.
+    #[test]
+    fn without_an_override_the_other_rungs_are_still_tried() {
+        let e = env(
+            Some("/run/user/1000"),
+            Some("/var/lib/x"),
+            Some("/home/sam"),
+        );
+        assert!(
+            socket_candidates(&e).len() > 1,
+            "no override is set, so the fallbacks must survive; got {:?}",
+            socket_candidates(&e)
+        );
     }
 
     /// The case the finding names, on its own, so a failure reads as the bug.

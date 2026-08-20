@@ -137,6 +137,20 @@ pub struct SourceIdentity {
     pub rel_path: String,
     pub size: u64,
     pub mtime: Timestamp,
+    /// The identity **derived from the statted file**, not the one the caller
+    /// planned with.
+    ///
+    /// These are usually equal and are not the same thing, which is why the
+    /// distinction is written down. `upload.rs::fingerprint` used to copy the
+    /// caller's catalog `fs_id` into every fresh fingerprint while statting the
+    /// size and mtime — so `assert_source_unchanged` compared the expected value
+    /// with itself and could never fail. A path swapped to a different inode
+    /// with the same size and preserved mtime sailed through, and the wrong
+    /// bytes completed under a key naming the right hash.
+    ///
+    /// The **lock** key is the other one: `acquire_both` still takes the
+    /// caller's catalog `fs_id`, for the reason `LocalDestroyRequest::fs_id`
+    /// spells out. Two identities, two purposes; do not collapse them.
     pub fs_id: FsId,
     /// The hash the transfer was planned against. The uploaded object must
     /// read back as exactly this.

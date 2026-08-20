@@ -615,6 +615,237 @@ fn adding_a_root_that_is_not_a_directory_is_refused_before_anything_is_written()
     );
 }
 
+// ---------------------------------------------------------------------------
+// AC-7 at the registration boundary
+// ---------------------------------------------------------------------------
+
+/// Pin a directory's own mtime to a fixed instant, and hand that instant back.
+///
+/// Both probes `root.add` runs create a file **in the root** and take it away
+/// again — `identity::ProbeFiles` unlinks on `Drop`, `atime::probe_atime_advance`
+/// unlinks immediately and works through the descriptor — so by the time the
+/// call returns the directory is empty whether or not it was written to.
+/// "Assert the directory is empty afterwards" therefore passes with the
+/// trespass fully in place, which is why it is not the assertion below.
+///
+/// The directory's own mtime is the fact that outlives the cleanup: creating an
+/// entry bumps it and removing one bumps it again. Pinning it first turns "was
+/// anything written here" into a comparison against a value that nothing but a
+/// write can move, rather than against a creation timestamp that a coarse
+/// filesystem clock might not have advanced past.
+fn pin_dir_mtime(dir: &Path) -> std::time::SystemTime {
+    // Arbitrary, and far enough in the past that no plausible clock lands on it.
+    let pinned = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    let handle = std::fs::File::open(dir).unwrap();
+    handle
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(pinned)
+                .set_modified(pinned),
+        )
+        .unwrap();
+    assert_eq!(
+        dir_mtime(dir),
+        pinned,
+        "the pin has to take, or everything hanging off it proves nothing"
+    );
+    pinned
+}
+
+fn dir_mtime(dir: &Path) -> std::time::SystemTime {
+    std::fs::metadata(dir).unwrap().modified().unwrap()
+}
+
+/// AC-7's deny list exists so certain trees are never touched at all. The
+/// registration path consulted it nowhere.
+///
+/// `root_add` ran `probe_path_policies` and `detect_with_write_probe` — **both
+/// of which create a file in the root** — and only a later scan declined to
+/// walk the tree. So `root.add <repo>/.git` wrote Shepherd's probe files into a
+/// directory the policy promises is never written to, and the deny list's
+/// answer arrived after the write it was supposed to prevent.
+///
+/// The ordering is the whole finding, so the load-bearing assertion here is on
+/// the directory's mtime, not on the error. A refusal moved to after the probes
+/// still returns `Refused` and still leaves the trespass.
+#[test]
+fn a_denied_root_is_refused_before_any_probe_writes_into_it() {
+    let d = Daemon::start("denyroot");
+    let mut c = d.connect();
+
+    let denied = d.dir.join("repo").join(".git");
+    std::fs::create_dir_all(&denied).unwrap();
+    let pinned = pin_dir_mtime(&denied);
+
+    let err = c.call_err(
+        "root.add",
+        serde_json::json!({"path": denied.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+
+    // `Refused`, not `Invalid`: the request was well-formed and the directory
+    // is real. `ErrorCode::Refused` is documented as "legal but refused by
+    // policy: a safety floor, **a deny-list entry**, a user ignore rule" — this
+    // is that entry, named in the taxonomy itself.
+    assert_eq!(
+        err.kind(),
+        Some(shepherd_proto::ErrorCode::Refused),
+        "{}",
+        err.message
+    );
+
+    assert_eq!(
+        dir_mtime(&denied),
+        pinned,
+        "a denied tree must not be written to at all: something created or removed an \
+         entry in it, which is the probes running before the refusal"
+    );
+    assert_eq!(
+        std::fs::read_dir(&denied).unwrap().count(),
+        0,
+        "and no probe file was left behind in it either"
+    );
+    assert_eq!(
+        c.call("status", serde_json::json!({}))["roots"],
+        serde_json::json!(0),
+        "nor was the root registered"
+    );
+}
+
+/// Two roots, two different deny rules, two distinguishable refusals.
+///
+/// The deny list carries `DenyReason` precisely so "why" is answerable; a
+/// refusal that said only "denied" would leave a user unable to tell a `.git`
+/// from another sync engine's tree, and those call for opposite responses —
+/// point Shepherd at the working tree, versus do not point it here at all.
+#[test]
+fn a_denied_root_refusal_names_the_rule_that_refused_it() {
+    let d = Daemon::start("denyreason");
+    let mut c = d.connect();
+
+    let vcs = d.dir.join("proj").join(".git");
+    std::fs::create_dir_all(&vcs).unwrap();
+    let sync = d.dir.join("Mobile Documents").join("com~apple~CloudDocs");
+    std::fs::create_dir_all(&sync).unwrap();
+
+    let vcs_err = c.call_err(
+        "root.add",
+        serde_json::json!({"path": vcs.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    let sync_err = c.call_err(
+        "root.add",
+        serde_json::json!({"path": sync.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+
+    assert!(
+        vcs_err.message.contains("version-control"),
+        "the refusal must name the rule that produced it: {}",
+        vcs_err.message
+    );
+    assert!(
+        sync_err.message.contains("foreign-sync-root"),
+        "the refusal must name the rule that produced it: {}",
+        sync_err.message
+    );
+    // And the path, or a refusal is unattributable when several roots are being
+    // added from one script.
+    assert!(
+        vcs_err.message.contains(vcs.to_str().unwrap()),
+        "{}",
+        vcs_err.message
+    );
+}
+
+/// Round 1 established this inside the deny list itself
+/// (`denylist::tests::a_substring_is_not_a_component`); the registration
+/// boundary is a second place to get it wrong. Matching `.git` as a substring
+/// would refuse to enroll `mygit`, and a directory that cannot be registered is
+/// one whose files are never catalogued — which §4.9 PM-3 calls absence, and
+/// absence is discard-trigger territory.
+#[test]
+fn a_substring_is_not_a_component_at_registration() {
+    let d = Daemon::start("denysubstring");
+    let mut c = d.connect();
+
+    for name in ["mygit", ".gitignore", "my_node_modules"] {
+        let root = d.dir.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        let added = c.call(
+            "root.add",
+            serde_json::json!({"path": root.to_str().unwrap(), "stub_mode": "delete"}),
+        );
+        assert_eq!(
+            added["root"]["path"],
+            serde_json::json!(root.to_str().unwrap()),
+            "`{name}` is the user's own directory, not a deny-list entry: {added}"
+        );
+    }
+
+    assert_eq!(
+        c.call("status", serde_json::json!({}))["roots"],
+        serde_json::json!(3),
+        "all three registered"
+    );
+}
+
+/// The direction this review has caught three times: "refuse everything" passes
+/// every refusal test above while quietly disabling enrollment.
+///
+/// The mtime assertion is the exact inversion of the refusal test's — an
+/// ordinary root **must** be written to, because writing is what probing is.
+/// And a registration that returned early without probing would look identical
+/// on the wire (`path_case_policy` has a platform default that matches the
+/// probed answer here), so the absence of the `assumed` warning is checked too:
+/// that warning appears only when `probe_path_policies` could not run.
+#[test]
+fn an_ordinary_root_still_registers_with_its_probes_run_and_its_policies_recorded() {
+    let d = Daemon::start("denyaccept");
+    let mut c = d.connect();
+
+    let root = d.dir.join("corpus-ordinary");
+    std::fs::create_dir_all(&root).unwrap();
+    let pinned = pin_dir_mtime(&root);
+
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": root.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+
+    assert_ne!(
+        dir_mtime(&root),
+        pinned,
+        "the probes write into the root they measure; an unchanged mtime means `root.add` \
+         registered this root without probing it"
+    );
+
+    let warnings: Vec<String> = added["warnings"]
+        .as_array()
+        .expect("root.add reports warnings")
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.contains("could not probe this root's case and normalization")),
+        "a writable temp directory is probeable; this warning means the probe was skipped \
+         or failed: {warnings:?}"
+    );
+
+    // Probed and *stored*: the values `root.add` answered with are the values
+    // the catalog now holds, which is what every later `norm_key` lookup hangs
+    // off.
+    let listed = c.call("root.list", serde_json::json!({}));
+    let row = &listed["roots"].as_array().unwrap()[0];
+    assert_eq!(row["path"], serde_json::json!(root.to_str().unwrap()));
+    for field in ["path_case_policy", "path_norm_policy", "atime_mode"] {
+        assert_eq!(
+            row[field], added["root"][field],
+            "`{field}` must be recorded as probed: {listed}"
+        );
+        assert!(row[field].is_string(), "`{field}` is missing: {listed}");
+    }
+}
+
 /// §3: Linux is delete-mode only. Accepting `dehydrate` here would enroll a
 /// root whose stub mode nothing on this platform can honour.
 #[cfg(target_os = "linux")]
@@ -3744,5 +3975,124 @@ fn a_root_that_probed_successfully_carries_no_assumed_warning() {
         !warnings.iter().any(|w| w.contains("could not probe")),
         "this root's probe ran; claiming its policies were assumed would make the warning \
          meaningless: {warnings:?}"
+    );
+}
+
+/// Read `root.add`'s warnings as a plain list of strings.
+fn root_add_warnings(c: &mut Client, path: &std::path::Path) -> Vec<String> {
+    let added = c.call(
+        "root.add",
+        serde_json::json!({"path": path.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    added["warnings"]
+        .as_array()
+        .expect("root.add reports warnings")
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// D-12's enrollment feasibility probe does not run, and enrollment says so.
+///
+/// §4.10.1 requires identity-bound staging to be verified **at enrollment**, not
+/// discovered when destruction fails: a root on a filesystem that rejects
+/// `RENAME_NOREPLACE` (FUSE, exFAT) is `destruction_ineligible`, and §4.10.1
+/// permits no detect-only fallback. `PlaceholderProvider::probe_feasibility`
+/// implements that probe and `FileRepo::set_destruction_ineligible` persists its
+/// verdict — and nothing on the registration path calls either, so the column
+/// keeps its schema default of 0 and `ScanRoot::may_destroy` returns `true` for
+/// a root whose originals can never be safely destroyed.
+///
+/// **This build cannot run the probe, and that is deliberate**, so this warning
+/// is the honest floor rather than the fix. `shepherd-daemon` holds no edge to
+/// `shepherd-placeholder`: `xtask/deps-policy.toml` rule 2 makes `shepherd-tier`
+/// its sole dependent, which is what keeps `shepherd-tier::destroy` the only
+/// path to a destructive syscall. Adding the edge to run a *non*-destructive
+/// probe would spend that invariant on the thing it protects against.
+///
+/// It is safe to defer only because the consuming path does not exist either —
+/// `tier.plan`, `tier.run` and `restore` all answer `MethodNotImplemented`, so
+/// `may_destroy` currently authorises nothing. The test below is what makes that
+/// "only because" load-bearing instead of a hope.
+///
+/// This is the same shape as the `assumed` warning above, and deliberately so:
+/// two enrollment-time capability facts, both currently reported to the user
+/// rather than enforced against the catalog.
+#[test]
+fn a_root_is_told_its_destruction_feasibility_was_not_probed() {
+    let d = Daemon::start("feasibility");
+    let mut c = d.connect();
+    let root_dir = d.dir.join("corpus-feasibility");
+    write_file(&root_dir, "a.txt", "a");
+
+    let warnings = root_add_warnings(&mut c, &root_dir);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("destruction feasibility")),
+        "enrollment must disclose that D-12's probe did not run; silence here reads as \
+         'this root can be destroyed from', which is exactly what was never established. \
+         warnings were: {warnings:?}"
+    );
+}
+
+/// **The gate on the deferral above.** Whoever wires tiering must find it.
+///
+/// Asserted as a biconditional, which is what makes it a gate rather than a
+/// note: the unprobed-feasibility warning must be present *exactly* while
+/// tiering is unreachable.
+///
+/// * Serve `tier.plan` while this warning is still all that stands in for the
+///   probe, and this fails — which is the moment the deferral stops being safe,
+///   because `may_destroy` starts authorising real destruction.
+/// * Delete the warning before the probe exists, and this fails too — the
+///   capability gap would go back to being silent.
+///
+/// # What to do when this test fails because you served `tier.plan`
+///
+/// Do not delete this test, and do not relax `deps-policy.toml` rule 2. In
+/// `dispatch.rs::root_add`, at the `insert_root` call:
+///
+/// 1. run `PlaceholderProvider::probe_feasibility` on the root — reachable once
+///    the daemon legitimately holds a `shepherd-tier` edge for tiering itself,
+///    which is the edge Phase 2 adds anyway;
+/// 2. persist the verdict with `FileRepo::set_destruction_ineligible` (already
+///    `pub`, so no catalog change is needed);
+/// 3. **a probe that could not run is not a probe that said yes** — an `Err`
+///    from it must not read as `Supported`. Round 2 fixed exactly that shape
+///    three lines away, where `probe_path_policies`' `assumed` flag was dropped
+///    at the boundary;
+/// 4. assert **both** directions: a root on a filesystem that supports staging
+///    stays `destruction_ineligible = 0`. "Mark everything ineligible" passes
+///    every refusal test while quietly disabling tiering.
+///
+/// Then replace this test with one asserting the persisted column, both ways.
+#[test]
+fn the_unprobed_feasibility_warning_lasts_exactly_as_long_as_tiering_is_unreachable() {
+    let d = Daemon::start("feasgate");
+    let mut c = d.connect();
+
+    let tiering_unreachable = c
+        .call_err(
+            "tier.plan",
+            serde_json::json!({"rule_id": 999_999, "target_id": 999_999}),
+        )
+        .kind()
+        == Some(shepherd_proto::ErrorCode::MethodNotImplemented);
+
+    let root_dir = d.dir.join("corpus-feasgate");
+    write_file(&root_dir, "a.txt", "a");
+    let warnings = root_add_warnings(&mut c, &root_dir);
+    let warns_unprobed = warnings
+        .iter()
+        .any(|w| w.contains("destruction feasibility"));
+
+    assert_eq!(
+        tiering_unreachable, warns_unprobed,
+        "the enrollment-time feasibility verdict is still not persisted, and these two facts \
+         have come apart. tiering unreachable: {tiering_unreachable}; enrollment warns: \
+         {warns_unprobed}. Read this test's doc comment — if you just served `tier.plan`, \
+         `may_destroy` now authorises destruction for roots whose staging support was never \
+         established. warnings were: {warnings:?}"
     );
 }

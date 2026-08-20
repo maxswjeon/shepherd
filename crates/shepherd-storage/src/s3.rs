@@ -922,15 +922,57 @@ where
     })
 }
 
-/// The probe object's key.
+/// The probe object's key, unique to one invocation.
 ///
 /// Under `_shepherd/`, so it is a [`ControlKey`] and can be cleaned up with
 /// `delete_system_object`. `delete_object` is off limits here by §4.1 rule 4 —
 /// `shepherd-tier::destroy` is its sole caller — and that constraint is a
 /// feature rather than an obstacle: a registration probe has no business being
 /// able to reach the verb that destroys user data.
-fn probe_key(alg: ChecksumAlgorithm) -> ControlKey {
-    ControlKey::under(format!("probe/checksum-{}", alg.as_str().to_lowercase()))
+///
+/// # Why the nonce
+///
+/// The key used to be a pure function of the algorithm, so every concurrent
+/// `target.add` against one bucket wrote and deleted **the same object**. One
+/// probe's cleanup `DELETE` landing between another's `complete_multipart` and
+/// its `HEAD` makes the second read a missing object — and a missing checksum
+/// reads as non-support here, which `target.add` persists as `adopted: none`.
+/// A transient race must not mint a durable claim about a provider's
+/// capabilities; that is the same argument that stopped an auth failure being
+/// recorded as non-support. Observed against real MinIO, which supports
+/// CRC64NVME, being recorded as rejecting it.
+///
+/// Same discipline as `shepherd-catalog`'s filesystem probes
+/// (`identity::unique_stem`, `atime::probe_atime_advance`): a per-invocation
+/// name, and delete only what this invocation created.
+fn probe_key(alg: ChecksumAlgorithm, nonce: &str) -> ControlKey {
+    ControlKey::under(format!(
+        "probe/checksum-{}-{nonce}",
+        alg.as_str().to_lowercase()
+    ))
+}
+
+/// `{pid}-{nanos}-{seq}`: unique per process, per call, and per algorithm.
+///
+/// `identity::unique_stem` uses `{pid}-{nanos}` and leans on `create_new`
+/// (`O_CREAT|O_EXCL`) for the guarantee. There is no `O_EXCL` on this side —
+/// `IfAbsent` would tie the *checksum* probe to a provider's *conditional
+/// create* support, and this probe exists to measure arbitrary
+/// S3-compatibles — so the name has to carry the guarantee alone, and the
+/// counter turns "two calls will not land on the same nanosecond" from a
+/// probability into a fact within a process. Across processes the pid does it.
+fn probe_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// One S3 target, probed one algorithm at a time through the **real** upload
@@ -953,7 +995,7 @@ impl ChecksumRoundTrip for S3RoundTrip {
         };
         let adapter = S3Adapter::new(cfg).await.map_err(|e| classify("new", e))?;
 
-        let key = probe_key(alg);
+        let key = probe_key(alg, &probe_nonce());
         let object = key.as_key().clone();
 
         let upload = adapter
@@ -977,10 +1019,16 @@ impl ChecksumRoundTrip for S3RoundTrip {
             }
         }
 
-        // `IfAbsent` would fail on the second registration against the same
-        // bucket, since the probe key is fixed per algorithm. This object is a
-        // scratch control object whose bytes carry no meaning, which is the one
-        // case where overwrite is not a lost fact.
+        // `Unconditional`, and it is a decision rather than a leftover. The key
+        // now carries a per-invocation nonce, so there is nothing to overwrite
+        // and the precondition would buy no safety. It would cost plenty:
+        // `IfAbsent` requires `AdapterCapabilities::conditional_create`, and
+        // this probe's whole job is measuring arbitrary S3-compatibles — a
+        // registration that failed because a provider lacks conditional create
+        // would be reporting the wrong fact about it entirely. `create_new` is
+        // load-bearing in `shepherd-catalog`'s probes because those write into
+        // a USER's directory where a collision hits real data; `_shepherd/`
+        // is Shepherd's own namespace, so that motivation does not transfer.
         if let Err(e) = adapter
             .complete_multipart(
                 &object,
@@ -995,9 +1043,14 @@ impl ChecksumRoundTrip for S3RoundTrip {
         }
 
         let head = adapter.head(&object).await.map_err(|e| classify("head", e));
-        // Clean up whatever the outcome. A failure to delete is not a probe
-        // failure — it leaves one 10 MiB control object behind, which is a
-        // storage cost and not a correctness one.
+        // Clean up whatever the outcome, and — because the key is this
+        // invocation's alone — only this probe's own object. A failure to
+        // delete is not a probe failure: it leaves one 10 MiB control object
+        // behind, a storage cost and not a correctness one. The nonce moves
+        // where that cost lands. A probe killed between `complete` and here
+        // used to be tidied by the next probe of the same algorithm, which is
+        // exactly the cross-probe deletion being removed; now it survives under
+        // `_shepherd/probe/` until something sweeps the prefix.
         let _ = adapter.delete_system_object(&key).await;
         let head = head?;
 
@@ -1341,7 +1394,7 @@ mod probe_tests {
     #[test]
     fn the_probe_object_is_a_control_object() {
         for alg in FULL_OBJECT_PREFERENCE {
-            let k = probe_key(alg);
+            let k = probe_key(alg, &probe_nonce());
             assert!(
                 k.as_key()
                     .as_str()
@@ -1353,11 +1406,53 @@ mod probe_tests {
         }
         // Distinct per algorithm: a shared key would make a second algorithm's
         // HEAD read the first one's object.
+        let nonce = probe_nonce();
         let keys: std::collections::BTreeSet<String> = FULL_OBJECT_PREFERENCE
             .iter()
-            .map(|a| probe_key(*a).as_key().as_str().to_string())
+            .map(|a| probe_key(*a, &nonce).as_key().as_str().to_string())
             .collect();
         assert_eq!(keys.len(), 3);
+    }
+
+    /// Two probes of one algorithm must not write to one object key.
+    ///
+    /// They did: the key was a pure function of the algorithm, so every
+    /// concurrent `target.add` against a bucket shared one control object and
+    /// one probe's cleanup `DELETE` could land between another's
+    /// `complete_multipart` and its `HEAD`. A missing checksum reads as
+    /// non-support here, and `adopted: none` is irreversible per object.
+    #[test]
+    fn two_probes_of_one_algorithm_do_not_share_an_object_key() {
+        let alg = ChecksumAlgorithm::Crc64Nvme;
+        let a = probe_key(alg, &probe_nonce());
+        let b = probe_key(alg, &probe_nonce());
+        assert_ne!(
+            a.as_key().as_str(),
+            b.as_key().as_str(),
+            "a fixed key makes every concurrent probe clean up after every other"
+        );
+
+        // Still a control object, so `delete_system_object` can still reach it
+        // — a nonce that escaped `_shepherd/` would leave the probe unable to
+        // clean up without `delete_object`, which §4.1 rule 4 reserves for
+        // `shepherd-tier::destroy`.
+        for k in [&a, &b] {
+            assert!(
+                ControlKey::new(k.as_key().clone()).is_some(),
+                "{}",
+                k.as_key().as_str()
+            );
+        }
+
+        // The accepting direction: within one invocation the key is stable, so
+        // `complete`, `HEAD` and `DELETE` address the same object. A nonce
+        // minted per *call site* rather than per probe would pass the
+        // assertions above and break the probe outright.
+        let nonce = probe_nonce();
+        assert_eq!(
+            probe_key(alg, &nonce).as_key().as_str(),
+            probe_key(alg, &nonce).as_key().as_str()
+        );
     }
 
     fn provider(detail: &str) -> StorageError {

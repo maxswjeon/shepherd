@@ -326,7 +326,7 @@ fn subscribe_on_connection(
     writer: &Arc<std::sync::Mutex<UnixStream>>,
     id: RequestId,
 ) -> Option<RpcResponse> {
-    let (result, replay, rx) = session.daemon.events.subscribe(
+    let (result, replay, rx, overflowed) = session.daemon.events.subscribe(
         req.streams,
         req.resume_from,
         // A cursor without the epoch it was issued under cannot be told from a
@@ -356,13 +356,7 @@ fn subscribe_on_connection(
             if go_rx.recv().is_err() {
                 return;
             }
-            // Ends when the hub drops the sender (daemon shutdown) or the
-            // socket dies.
-            for frame in rx {
-                if write_frame(&sink, &RpcNotification::new(frame)).is_err() {
-                    break;
-                }
-            }
+            pump_events(rx, &overflowed, &sink, sub);
         })
     {
         tracing::warn!(error = %e, "could not start the event pump");
@@ -382,6 +376,52 @@ fn subscribe_on_connection(
     }
     let _ = go_tx.send(());
     None
+}
+
+/// Drain one subscription onto its socket, and shut the socket down if the
+/// subscription was cut off for falling behind.
+///
+/// # Why EOF, and not another dropped frame
+///
+/// The loop ends for one of three reasons: the hub dropped the sender (daemon
+/// shutdown), the socket died, or this subscriber overflowed its queue and the
+/// hub unregistered it. The first two need nothing from us. The third is the
+/// one the client has to be told about, and `overflowed` is the only thing that
+/// distinguishes it — all three arrive here as a closed channel.
+///
+/// It used to be told nothing: the hub dropped frames and kept the subscription
+/// alive, on the reasoning that the client would notice the sequence gap. For a
+/// filtered subscription it cannot — sequence numbers are global, so gaps from
+/// streams it did not request are normal — and if the burst ends after the drop
+/// there may be no later frame to reveal one anyway. Shutting the socket turns
+/// an ambiguity the client cannot resolve into an EOF it cannot miss.
+///
+/// The queued frames are written first, deliberately. They are frames the
+/// client is entitled to, and delivering them narrows the gap it has to resume
+/// across — at the default buffer capacity, often to nothing.
+fn pump_events(
+    rx: std::sync::mpsc::Receiver<shepherd_proto::event::EventFrame>,
+    overflowed: &AtomicBool,
+    sink: &Arc<std::sync::Mutex<UnixStream>>,
+    sub: u64,
+) {
+    for frame in rx {
+        if write_frame(sink, &RpcNotification::new(frame)).is_err() {
+            // The socket is already gone; there is nothing to shut down and
+            // nothing to tell anyone.
+            return;
+        }
+    }
+    if overflowed.load(Ordering::SeqCst) {
+        tracing::warn!(
+            subscription = sub,
+            "closing this connection: the subscriber fell behind its {} frame queue. It \
+             should resume with its cursor.",
+            crate::events::SUBSCRIBER_QUEUE
+        );
+        let guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = guard.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 /// Write one newline-delimited frame, holding the socket lock for exactly as
@@ -409,6 +449,141 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&d);
         d.join("daemon.sock")
+    }
+
+    /// A client whose subscription overflows **observes** the disconnect.
+    ///
+    /// This is the half that makes the fix worth anything. The hub unregistering
+    /// a subscriber is invisible from the far side of the socket; what the
+    /// client can act on is EOF. So this drives a real `UnixStream` pair and
+    /// reads from the client end, exactly as `shepctl events subscribe` does —
+    /// asserting on what a client sees, not on a flag the daemon set.
+    ///
+    /// The frames still queued are delivered before the close, because they are
+    /// frames the client is entitled to and they shorten the resume it now has
+    /// to perform.
+    #[test]
+    fn an_overflowing_subscriber_sees_its_connection_close() {
+        use crate::events::{EventHub, SUBSCRIBER_QUEUE};
+        use shepherd_proto::event::{EventPayload, EventStream};
+
+        let (daemon_side, client_side) = UnixStream::pair().expect("socketpair");
+        client_side
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .unwrap();
+
+        let hub = EventHub::new(4096, "e1");
+        let (_, _, rx, overflowed) = hub.subscribe(vec![], None, None);
+
+        // Nothing drains `rx`, so this overflows the queue and the hub drops
+        // the subscription.
+        for i in 0..(SUBSCRIBER_QUEUE as u64 + 50) {
+            hub.publish(
+                EventStream::Scan,
+                EventPayload::ScanProgress {
+                    root_id: 1,
+                    files_seen: i,
+                    bytes_seen: i,
+                    current_path: None,
+                    done: false,
+                },
+            );
+        }
+        assert!(
+            overflowed.load(Ordering::SeqCst),
+            "the queue must have overflowed"
+        );
+
+        let sink = Arc::new(std::sync::Mutex::new(daemon_side));
+        let pump_sink = Arc::clone(&sink);
+        let pump = std::thread::spawn(move || pump_events(rx, &overflowed, &pump_sink, 7));
+
+        // What the client sees: some frames, then end of stream.
+        let mut reader = BufReader::new(client_side);
+        let mut frames = 0;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("read");
+            if n == 0 {
+                break; // EOF — the signal the whole change exists to produce.
+            }
+            let v: serde_json::Value = serde_json::from_str(&line).expect("a JSON frame");
+            assert_eq!(v["method"], serde_json::json!("event"), "{line}");
+            frames += 1;
+        }
+        pump.join().unwrap();
+
+        assert!(
+            frames > 0,
+            "the frames already queued are owed to the client and must be delivered first"
+        );
+        assert_eq!(
+            frames, SUBSCRIBER_QUEUE,
+            "exactly the queued frames, then the close"
+        );
+    }
+
+    /// The accepting direction: an ordinary end-of-stream does NOT close the
+    /// socket.
+    ///
+    /// A pump that shut the connection down every time its channel closed would
+    /// satisfy the test above and break every clean daemon shutdown — the
+    /// connection is shared with request/response traffic, so tearing it down
+    /// would kill in-flight calls that have nothing to do with events. Here the
+    /// hub is dropped without any overflow, and the socket must survive it.
+    #[test]
+    fn an_ordinary_end_of_stream_leaves_the_connection_open() {
+        use crate::events::EventHub;
+        use shepherd_proto::event::{EventPayload, EventStream};
+
+        let (daemon_side, client_side) = UnixStream::pair().expect("socketpair");
+        client_side
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .unwrap();
+
+        let hub = EventHub::new(4096, "e1");
+        let (_, _, rx, overflowed) = hub.subscribe(vec![], None, None);
+        hub.publish(
+            EventStream::Scan,
+            EventPayload::ScanProgress {
+                root_id: 1,
+                files_seen: 1,
+                bytes_seen: 1,
+                current_path: None,
+                done: false,
+            },
+        );
+        // Daemon shutdown: the sender goes, the pump's loop ends, and nothing
+        // overflowed.
+        drop(hub);
+
+        let sink = Arc::new(std::sync::Mutex::new(daemon_side));
+        let pump_sink = Arc::clone(&sink);
+        let pump = std::thread::spawn(move || pump_events(rx, &overflowed, &pump_sink, 7));
+        pump.join().unwrap();
+
+        // The socket was not shut down, so this connection can still carry the
+        // request/response traffic it shares with the event stream.
+        let wrote = sink.lock().unwrap().write_all(b"{\"still\":\"here\"}\n");
+        assert!(
+            wrote.is_ok(),
+            "a clean end-of-stream must not tear down the connection: {wrote:?}"
+        );
+
+        let mut reader = BufReader::new(client_side);
+        let mut first = String::new();
+        reader.read_line(&mut first).expect("read");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first).unwrap()["method"],
+            serde_json::json!("event"),
+            "{first}"
+        );
+        let mut second = String::new();
+        reader.read_line(&mut second).expect("read");
+        assert!(
+            second.contains("still"),
+            "the socket is still usable: {second:?}"
+        );
     }
 
     /// The whole authorization model, asserted.

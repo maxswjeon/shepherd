@@ -102,6 +102,11 @@ pub struct WalkOutput {
 /// the catalog is better off knowing a link exists than silently missing it.
 /// Symlinked *directories* are not descended — their contents belong to
 /// whatever they point at, which is either outside the root or already walked.
+///
+/// The deny list is applied to `root` before anything is opened — to the path
+/// as given and, when the root is a symlink, to its target as well. A root that
+/// is itself a denied tree, or points at one, yields no files and one
+/// [`Skip::Denied`]. See [`deny_root`].
 pub fn walk(
     root_id: RootId,
     root: &Path,
@@ -110,6 +115,63 @@ pub fn walk(
     now: Timestamp,
 ) -> std::io::Result<WalkOutput> {
     let mut out = WalkOutput::default();
+
+    // AC-7 applies to the root ITSELF, not only to what is found beneath it.
+    // Seeding the traversal with `root` and consulting `deny_dir` from the
+    // second directory onwards left every denied tree catalogueable by
+    // registering it directly — hand Shepherd a `.git`, a
+    // `com~apple~CloudDocs` or a `/Library/Caches` and the list whose whole
+    // job is to make those uncatalogueable was never asked.
+    //
+    // Checked BEFORE `read_dir`, deliberately: a denied root is not opened at
+    // all, which is the fail-closed direction and also makes the answer
+    // independent of whether the path happens to exist on this machine.
+    //
+    // Reported as a `Skip` rather than returned as an `Err`, matching how a
+    // root that cannot be read is handled — the walker's contract is that a
+    // bad root produces an empty output that says why, not an I/O error.
+    //
+    // A root with no final component (`/`, or a bare relative path) yields an
+    // empty name, which matches no entry in `names` or `suffixes` while the
+    // absolute-prefix comparison still runs. That is the right degradation:
+    // `/` is not itself denied, but a root under `/proc` is.
+    //
+    // The root is also the ONE symlink this walker ever follows. Every
+    // symlinked directory *inside* the walk is reported as
+    // [`Skip::SymlinkedDir`] and never descended, but `read_dir` on a symlinked
+    // root traverses it — so an innocent name pointing at a `.git` walked the
+    // whole tree, which is the same harm the deny list exists to prevent and
+    // not a separate one. Deny-checking the root's target completes the
+    // walker's existing no-symlink doctrine rather than adding a second one.
+    //
+    // Canonicalized for the DENY DECISION ONLY. The walk root stays exactly
+    // what the caller handed in, so `rel_path` and everything downstream are
+    // unchanged — this is a second reading of one path for one purpose, not a
+    // redefinition of the root.
+    let canonical = match std::fs::symlink_metadata(root) {
+        Ok(md) if md.is_symlink() => match std::fs::canonicalize(root) {
+            Ok(c) => Some(c),
+            // A symlinked root whose target will not resolve is not walked on
+            // the strength of a check that never ran. `read_dir` can still
+            // succeed after a failure here, and that window is exactly what
+            // returning rather than falling through closes.
+            Err(e) => {
+                out.skipped.push(Skip::Unreadable {
+                    path: root.to_path_buf(),
+                    detail: format!("cannot resolve symlinked root for the deny check: {e}"),
+                });
+                return Ok(out);
+            }
+        },
+        // Not a symlink, or unstattable. An unstattable root falls through to
+        // `read_dir` and is reported as `Unreadable` there, as it always was.
+        _ => None,
+    };
+    if let Some((path, reason)) = deny_root(deny, root, canonical.as_deref()) {
+        out.skipped.push(Skip::Denied { path, reason });
+        return Ok(out);
+    }
+
     let mut seen: HashSet<DirId> = HashSet::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
 
@@ -239,6 +301,55 @@ pub fn walk(
     Ok(out)
 }
 
+/// The deny decision for the walk root, over **both** names it has.
+///
+/// `literal` is what the caller registered; `canonical` is its resolved target,
+/// present only when the root is a symlink. Both are checked, and the order is
+/// deliberate:
+///
+/// * **Literal first.** A link *named* `.git` pointing at ordinary data is
+///   refused on its own name. The deny list is about names as much as trees —
+///   `.Trash`, `System Volume Information` and `lost+found` are denied for what
+///   the name means, not what the bytes are — and permitting it would regress a
+///   refusal that already held before symlinks were considered at all. The two
+///   directions are not symmetrically expensive either: a wrong refusal costs
+///   one re-registration by the real path, a wrong permit catalogues a tree the
+///   policy promises never to touch.
+/// * **Canonical second**, so an innocent name pointing at a denied tree cannot
+///   buy a walk of it.
+///
+/// The returned path is the one that was actually denied, so the reported
+/// [`Skip::Denied`] names the thing the operator has to look at rather than the
+/// alias they typed.
+///
+/// # What this does NOT close
+///
+/// A root reached through a symlinked *ancestor* — `/tmp/x/sub` where
+/// `x -> /home/u/.git`. Canonicalizing unconditionally would not close it
+/// either: [`DenyList::deny_dir`] matches `names`/`suffixes` against the FINAL
+/// component only, and the final component there is `sub`. Closing it properly
+/// means testing every component of the canonical path, which is a wider policy
+/// decision than this one.
+fn deny_root(
+    deny: &DenyList,
+    literal: &Path,
+    canonical: Option<&Path>,
+) -> Option<(PathBuf, DenyReason)> {
+    if let Some(reason) = deny_as_root(deny, literal) {
+        return Some((literal.to_path_buf(), reason));
+    }
+    let canonical = canonical?;
+    deny_as_root(deny, canonical).map(|reason| (canonical.to_path_buf(), reason))
+}
+
+fn deny_as_root(deny: &DenyList, path: &Path) -> Option<DenyReason> {
+    let component = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    deny.deny_dir(&component, path)
+}
+
 /// Path relative to the root, with separators left exactly as the OS gave them.
 /// Normalization is the catalog's job (§4.9).
 fn rel_path(root: &Path, path: &Path) -> Option<String> {
@@ -318,6 +429,14 @@ mod tests {
     fn go(t: &Tmp, deny: &DenyList) -> WalkOutput {
         let ig = IgnoreSet::empty(&t.0).unwrap();
         walk(RootId::new(1), &t.0, deny, &ig, Timestamp::from_nanos(1)).unwrap()
+    }
+
+    /// Walk an arbitrary path as the registered root, rather than the temp
+    /// directory itself. The deny list's treatment of the root is only
+    /// observable this way.
+    fn go_root(root: &Path, deny: &DenyList) -> WalkOutput {
+        let ig = IgnoreSet::empty(root).unwrap();
+        walk(RootId::new(1), root, deny, &ig, Timestamp::from_nanos(1)).unwrap()
     }
 
     fn go_ignoring(t: &Tmp, patterns: &[&str]) -> WalkOutput {
@@ -543,5 +662,290 @@ mod tests {
         let mut paths: Vec<_> = out.files.iter().map(|f| f.rel_path.clone()).collect();
         paths.sort();
         assert_eq!(paths, vec!["b.txt", "keep.log"]);
+    }
+    /// AC-7 promises certain trees are never catalogued. That promise held only
+    /// for *children*: the traversal was seeded with the root and `deny_dir`
+    /// was consulted from the second directory onwards, so registering the
+    /// denied tree itself walked it in full.
+    ///
+    /// The three shapes are tested separately because they take three different
+    /// routes through `DenyList::deny_dir` — an exact component name, a foreign
+    /// sync-engine name, and an absolute prefix — and one cannot stand for the
+    /// others.
+    #[test]
+    fn a_denied_component_as_the_root_is_refused_rather_than_walked() {
+        let t = Tmp::new("deny-root-component");
+        t.file(".git/objects/abc", b"g");
+        let root = t.0.join(".git");
+
+        let out = go_root(&root, &DenyList::builtin());
+
+        assert!(
+            out.files.is_empty(),
+            "a root that IS the denied tree must yield nothing: {:?}",
+            out.files
+        );
+        assert_eq!(out.dirs_visited, 0, "a denied root must not even be opened");
+        assert_eq!(
+            out.skipped,
+            vec![Skip::Denied {
+                path: root,
+                reason: DenyReason::VersionControl,
+            }],
+            "the refusal is reported, not silent"
+        );
+    }
+
+    /// The foreign-sync case, and the one with the worst failure mode: two sync
+    /// engines both believing they decide whether the bytes are local.
+    #[test]
+    fn a_foreign_sync_tree_registered_as_the_root_is_refused() {
+        let t = Tmp::new("deny-root-sync");
+        t.file("com~apple~CloudDocs/Documents/notes.txt", b"n");
+        let root = t.0.join("com~apple~CloudDocs");
+
+        let out = go_root(&root, &DenyList::builtin());
+
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert_eq!(
+            out.skipped,
+            vec![Skip::Denied {
+                path: root,
+                reason: DenyReason::ForeignSyncRoot,
+            }]
+        );
+    }
+
+    /// The absolute-prefix route. No fixture: the guard runs *before*
+    /// `read_dir`, so the answer does not depend on this machine having a
+    /// `/Library/Caches`. That is also what the assertion pins — a guard placed
+    /// after the open would report `Unreadable` here instead, on the very
+    /// platform where the path is real.
+    #[test]
+    fn a_denied_absolute_prefix_as_the_root_is_refused_without_being_opened() {
+        let root = PathBuf::from("/Library/Caches");
+
+        let out = go_root(&root, &DenyList::builtin());
+
+        assert_eq!(out.dirs_visited, 0);
+        assert_eq!(
+            out.skipped,
+            vec![Skip::Denied {
+                path: root,
+                reason: DenyReason::SystemPath,
+            }]
+        );
+    }
+
+    /// The accepting direction, and the reason it is not optional: a guard that
+    /// refuses every root would pass all three tests above. `denylist::
+    /// a_substring_is_not_a_component` fixed the same mistake one layer down —
+    /// matching is on components, so `mygit` and `.gitignore` are the user's.
+    #[test]
+    fn a_root_that_merely_contains_a_denied_string_still_walks() {
+        let t = Tmp::new("deny-root-substring");
+        t.file("mygit/a.txt", b"a");
+        t.file(".gitignore/b.txt", b"b");
+
+        for name in ["mygit", ".gitignore"] {
+            let root = t.0.join(name);
+            let out = go_root(&root, &DenyList::builtin());
+            assert_eq!(
+                out.files.len(),
+                1,
+                "`{name}` is the user's directory, not a denied one: {:?} {:?}",
+                out.files,
+                out.skipped
+            );
+            assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+            assert_eq!(out.dirs_visited, 1);
+        }
+    }
+    /// The hole the root-component guard did not close, and it is the same
+    /// finding: "the user can register and tier exactly the version-control,
+    /// foreign-sync, or system tree the built-in policy promises never to
+    /// catalogue." An innocent *name* pointing at a denied tree did exactly
+    /// that.
+    ///
+    /// The root is the ONE symlink this walker follows — `read_dir` traverses
+    /// it, while every symlinked directory inside the walk is reported as
+    /// `Skip::SymlinkedDir` and never descended. So it is the one link whose
+    /// target has to meet the deny list.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_pointing_at_a_denied_tree_is_refused() {
+        let t = Tmp::new("deny-root-symlink-vcs");
+        t.file(".git/objects/abc", b"g");
+        let link = t.0.join("innocent");
+        std::os::unix::fs::symlink(t.0.join(".git"), &link).unwrap();
+
+        let out = go_root(&link, &DenyList::builtin());
+
+        assert!(
+            out.files.is_empty(),
+            "an innocent name must not buy a walk of a denied tree: {:?}",
+            out.files
+        );
+        assert_eq!(out.dirs_visited, 0);
+        // The RESOLVED path is reported, not the link: the operator needs to
+        // see what their root actually is.
+        assert_eq!(
+            out.skipped,
+            vec![Skip::Denied {
+                path: std::fs::canonicalize(t.0.join(".git")).unwrap(),
+                reason: DenyReason::VersionControl,
+            }]
+        );
+    }
+
+    /// The foreign-sync shape through the same route.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_pointing_at_a_foreign_sync_tree_is_refused() {
+        let t = Tmp::new("deny-root-symlink-sync");
+        t.file("com~apple~CloudDocs/Documents/notes.txt", b"n");
+        let link = t.0.join("my-cloud");
+        std::os::unix::fs::symlink(t.0.join("com~apple~CloudDocs"), &link).unwrap();
+
+        let out = go_root(&link, &DenyList::builtin());
+
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert_eq!(
+            out.skipped,
+            vec![Skip::Denied {
+                path: std::fs::canonicalize(t.0.join("com~apple~CloudDocs")).unwrap(),
+                reason: DenyReason::ForeignSyncRoot,
+            }]
+        );
+    }
+
+    /// The other direction of the same question: a link *named* `.git` whose
+    /// target is ordinary data. Refused, on the link's own name.
+    ///
+    /// The deny list is about names as much as trees — `.Trash`,
+    /// `System Volume Information` and `lost+found` are denied because of what
+    /// the name means, not what the bytes are. Permitting this would also
+    /// *regress* a refusal that already holds, since the literal check reads
+    /// `root.file_name()` whether or not the root is a link. And the two
+    /// directions are not symmetrically expensive: a wrong refusal costs one
+    /// re-registration by the real path, a wrong permit catalogues a tree the
+    /// policy promises never to touch.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_link_named_for_a_denied_tree_is_refused_on_its_own_name() {
+        let t = Tmp::new("deny-root-symlink-name");
+        t.file("ordinary/a.txt", b"a");
+        let link = t.0.join(".git");
+        std::os::unix::fs::symlink(t.0.join("ordinary"), &link).unwrap();
+
+        let out = go_root(&link, &DenyList::builtin());
+
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert_eq!(
+            out.skipped,
+            vec![Skip::Denied {
+                path: link,
+                reason: DenyReason::VersionControl,
+            }],
+            "the LINK's path is reported: it is the link's own name that was denied"
+        );
+    }
+
+    /// The third shape, and the one that cannot be built here: `canonicalize`
+    /// requires the target to exist, and `/Library/Caches` does not exist on
+    /// Linux. So the decision is exercised directly — which is why it is a
+    /// function rather than an inline block.
+    ///
+    /// This also pins the ordering and both accepting directions in one place.
+    #[test]
+    fn the_root_deny_decision_reads_both_names_and_prefers_the_literal() {
+        let d = DenyList::builtin();
+        let pb = PathBuf::from;
+
+        // Innocent name, denied absolute prefix behind it.
+        assert_eq!(
+            deny_root(&d, &pb("/home/u/cache"), Some(&pb("/Library/Caches"))),
+            Some((pb("/Library/Caches"), DenyReason::SystemPath)),
+            "the resolved target is what gets reported"
+        );
+
+        // Denied name, innocent target: the literal wins, and reports the
+        // literal path.
+        assert_eq!(
+            deny_root(&d, &pb("/home/u/.git"), Some(&pb("/mnt/big/ordinary"))),
+            Some((pb("/home/u/.git"), DenyReason::VersionControl))
+        );
+
+        // Accepting: innocent both ways — the `~/data -> /mnt/big/data` case
+        // that must keep working.
+        assert_eq!(
+            deny_root(&d, &pb("/home/u/data"), Some(&pb("/mnt/big/data"))),
+            None
+        );
+
+        // Accepting: a plain directory has no target to consult.
+        assert_eq!(deny_root(&d, &pb("/home/u/data"), None), None);
+
+        // Round 1's component rule survives the second reading: a substring is
+        // still not a component, on either name.
+        assert_eq!(
+            deny_root(&d, &pb("/home/u/mygit"), Some(&pb("/mnt/mygit"))),
+            None
+        );
+    }
+
+    /// A symlinked root whose target does not resolve. Reported rather than
+    /// walked: `read_dir` can still succeed after `canonicalize` fails, and
+    /// falling through would leave a window where the walk proceeds on the
+    /// strength of a deny check that never ran.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_that_will_not_resolve_is_reported_not_walked() {
+        let t = Tmp::new("deny-root-symlink-dangling");
+        let link = t.0.join("dangling");
+        std::os::unix::fs::symlink(t.0.join("nowhere"), &link).unwrap();
+
+        let out = go_root(&link, &DenyList::builtin());
+
+        assert!(out.files.is_empty());
+        assert_eq!(out.dirs_visited, 0);
+        match &out.skipped[..] {
+            [Skip::Unreadable { path, detail }] => {
+                assert_eq!(path, &link);
+                assert!(
+                    detail.contains("deny check"),
+                    "the reason must name what could not be decided: {detail}"
+                );
+            }
+            other => panic!("expected one Unreadable, got {other:?}"),
+        }
+    }
+
+    /// The accepting direction, and the lead's explicit prohibition: registering
+    /// through a symlink is legitimate and common (`~/data -> /mnt/big/data`).
+    /// "Refuse every symlinked root" would pass all three refusal tests above.
+    #[cfg(unix)]
+    #[test]
+    fn an_innocent_symlinked_root_still_walks() {
+        let t = Tmp::new("deny-root-symlink-ok");
+        t.file("real/a.txt", b"a");
+        t.file("real/sub/b.txt", b"b");
+        let link = t.0.join("data");
+        std::os::unix::fs::symlink(t.0.join("real"), &link).unwrap();
+
+        let out = go_root(&link, &DenyList::builtin());
+
+        let mut paths: Vec<_> = out.files.iter().map(|f| f.rel_path.clone()).collect();
+        paths.sort();
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            paths,
+            vec!["a.txt".to_string(), format!("sub{sep}b.txt")],
+            "skipped={:?}",
+            out.skipped
+        );
+        // The walk root stayed the caller's path, so `rel_path` is relative to
+        // the LINK. Canonicalization is for the deny decision only.
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
     }
 }

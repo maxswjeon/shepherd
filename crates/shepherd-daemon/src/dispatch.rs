@@ -165,6 +165,51 @@ impl ShepherdApi for Session {
             ));
         }
 
+        // AC-7 applies to registration, not only to the walk — and it has to be
+        // consulted HERE, above this line, because everything below it writes.
+        //
+        // `probe_path_policies` and `detect_with_write_probe` each create a file
+        // inside the root. The deny list's promise is that Shepherd never
+        // touches these trees at all, so a build that consulted it only in the
+        // walker had already written its probe files into `/proc` or into a
+        // `.git` by the time a later scan declined to catalogue them. The
+        // refusal was not missing so much as arriving after the trespass it
+        // exists to prevent, which is why the ordering — not the message — is
+        // what `e2e::a_denied_root_is_refused_before_any_probe_writes_into_it`
+        // pins, by asserting the directory's own mtime is untouched.
+        //
+        // `Refused`, not `Invalid`: the request is well-formed and the directory
+        // is real. `ErrorCode::Refused` is documented as "legal but refused by
+        // policy: a safety floor, a deny-list entry, ..." — this is that entry,
+        // named in the taxonomy itself, and it is non-retryable, which a
+        // built-in list nothing in the request can change ought to be.
+        //
+        // `DenyList::builtin()` is the same construction `scan_exec` uses, so
+        // registration and the scan cannot come to different conclusions about
+        // what is denied.
+        //
+        // The component and the path are read exactly as `shepherd_scan::walk`
+        // reads them, with no `canonicalize`: a root whose own name is innocent
+        // but which points at a denied tree still reaches the probes. Deciding
+        // what a symlinked root means is a separate question, and resolving it
+        // here would answer it by accident.
+        let component = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(reason) = shepherd_scan::DenyList::builtin().deny_dir(&component, &path) {
+            return Err(RpcError::new(
+                ErrorCode::Refused,
+                format!(
+                    "`{}` is on Shepherd's built-in deny list as `{}` (AC-7), a list of trees \
+                     Shepherd never catalogues and never writes to. It cannot be registered \
+                     as a scan root.",
+                    req.path,
+                    reason.as_str()
+                ),
+            ));
+        }
+
         // Probed, never assumed — §4.9 exists because retrofitting identity
         // after Phase 2 destroys files is the scenario it prevents.
         let policies = shepherd_catalog::identity::probe_path_policies(&path);
@@ -218,6 +263,47 @@ impl ShepherdApi for Session {
                 policies.norm.as_str()
             ));
         }
+        // The fourth gap in the same shape, and the one still deferred.
+        //
+        // §4.10.1 requires identity-bound staging to be verified AT ENROLLMENT
+        // — a root on a filesystem that rejects `RENAME_NOREPLACE` (FUSE,
+        // exFAT) is `destruction_ineligible`, and §4.10.1 permits no
+        // detect-only fallback. `PlaceholderProvider::probe_feasibility` is
+        // that probe and `FileRepo::set_destruction_ineligible` persists its
+        // verdict; nothing on this path calls either, so the column keeps its
+        // schema default of 0 and `ScanRoot::may_destroy` answers `true` for a
+        // root whose originals could never be safely destroyed.
+        //
+        // WHY THIS IS A WARNING AND NOT THE PROBE. This crate cannot reach
+        // `probe_feasibility`: `xtask/deps-policy.toml` rule 2 makes
+        // `shepherd-tier` the sole dependent of `shepherd-placeholder`, which
+        // is what keeps `shepherd-tier::destroy` the only path to a destructive
+        // syscall. Drawing the edge here to run a *non*-destructive probe would
+        // spend that invariant on the thing it exists to protect against, and
+        // `xtask/src/reachability.rs` cites the daemon's missing tier edge as
+        // evidence — so adding it in a review round would also change what
+        // `gate --phase 2` means.
+        //
+        // WHY DEFERRING IS SAFE, AND FOR EXACTLY HOW LONG. The consuming path
+        // does not exist either: `tier.plan`, `tier.run` and `restore` all
+        // answer `MethodNotImplemented` below, so `may_destroy` authorises
+        // nothing today. That "only because" is held by
+        // `e2e::the_unprobed_feasibility_warning_lasts_exactly_as_long_as_tiering_is_unreachable`,
+        // a biconditional that fails the moment `tier.plan` is served — see its
+        // doc comment for what to implement, and see the `insert_root` call
+        // below for where.
+        //
+        // Deliberately unconditional: no root has been probed, so qualifying it
+        // would be a claim about which ones are fine, and that is precisely
+        // what was never established.
+        warnings.push(
+            "this root's destruction feasibility has not been probed (§4.10.1 D-12): whether \
+             the filesystem supports identity-bound staging is meant to be established at \
+             enrollment, and this build cannot establish it. Nothing is at risk yet — tiering \
+             is not served, so no original can be destroyed — but this root is not yet known \
+             to support staging, and the probe must run before it can be"
+                .into(),
+        );
 
         let stub = match req.stub_mode {
             StubMode::Dehydrate => shepherd_core::StubMode::Dehydrate,
@@ -253,6 +339,28 @@ impl ShepherdApi for Session {
         let hosted_optin = req.hosted_optin;
         let ignore_patterns = req.ignore_patterns.clone();
         let now = self.now();
+        // PHASE 2, HERE: run D-12's enrollment feasibility probe and persist its
+        // verdict, in this closure, immediately after `insert_root` returns.
+        //
+        //   let f = provider.probe_feasibility(&path)?;      // shepherd-placeholder
+        //   FileRepo::new(cat).set_destruction_ineligible(   // already `pub`; no
+        //       root_id,                                     // catalog change needed
+        //       !f.is_supported(),
+        //       reason.as_deref(),
+        //   )?;
+        //
+        // Blocked today only by the deliberate absence of a daemon edge to
+        // `shepherd-placeholder` (deps-policy rule 2) — see the warning pushed
+        // above. Two things to get right when it lands:
+        //
+        //   * An `Err` from the probe is NOT `Supported`. A probe that could not
+        //     run must not read as "destruction is fine"; round 2 fixed exactly
+        //     that shape three warnings up, where `probe_path_policies`' own
+        //     `assumed` flag was being dropped at this boundary.
+        //   * Assert BOTH directions. A root on a filesystem that does support
+        //     staging must still land `destruction_ineligible = 0`, or "mark
+        //     everything ineligible" passes every refusal test while quietly
+        //     disabling tiering.
         let root_id = self.cat(move |cat| {
             FileRepo::new(cat).insert_root(
                 &path_string,
@@ -413,7 +521,8 @@ impl ShepherdApi for Session {
         // the pump thread; this arm exists because the trait requires it and
         // because a `subscribe` arriving outside a connection context (a future
         // in-process caller) still needs a correct answer.
-        let (result, _replay, _rx) = self.hub().subscribe(req.streams, req.resume_from, None);
+        let (result, _replay, _rx, _overflowed) =
+            self.hub().subscribe(req.streams, req.resume_from, None);
         Ok(result)
     }
 

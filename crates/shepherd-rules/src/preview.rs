@@ -40,7 +40,18 @@ use crate::delete_policy::DeleteAction;
 
 /// Which signal actually drove an age match (§4.12's `file.access_signal_src`).
 ///
-/// Fallback order is `Observed → Atime (only where reliable) → Mtime`.
+/// The *access* fallback order is `Observed → Atime (only where reliable) →
+/// Mtime`. [`AccessSignalSource::Ctime`] is not part of that chain and is never
+/// fallen back to — it appears only when a rule names `ctime_older_than_days`,
+/// which reads a timestamp of its own.
+///
+/// # This is NOT `shepherd_catalog::AccessSignal`
+///
+/// That enum is persisted into `file.access_signal_src`, whose schema CHECK
+/// admits `observed | atime | mtime` and nothing else. The two have never been
+/// converted into one another and must not start being converted casually: this
+/// one carries a fourth value, and writing it through would fail the CHECK at
+/// runtime. Widening the column is a schema change, not a cast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessSignalSource {
@@ -51,6 +62,14 @@ pub enum AccessSignalSource {
     Atime,
     /// Last resort.
     Mtime,
+    /// Inode change time, read only by an explicit `ctime_older_than_days`
+    /// predicate.
+    ///
+    /// It exists because reporting these matches as `Mtime` told the operator
+    /// that an mtime rule selected the file when ctime authorized the action —
+    /// and [`crate::engine::Engine::run`] refuses on exactly this difference,
+    /// so a wrong label is a refusal that does not fire.
+    Ctime,
 }
 
 /// What a rule does when it matches.

@@ -368,6 +368,52 @@ fn a_match_driven_by_a_different_signal_is_not_the_match_that_was_approved() {
     }
 }
 
+/// The cross-crate consequence of teaching the matcher to say `Ctime`, pinned
+/// here rather than left to be discovered on upgrade.
+///
+/// A ctime rule's preview used to record `Mtime`, because that is what the
+/// matcher reported. It now records `Ctime`. So a preview taken by the previous
+/// build and executed by this one sees the signal change under a stable file
+/// id, and `Engine::run` refuses it as drift. That is the correct, fail-closed
+/// answer — the operator re-previews — but it is a visible behaviour change on
+/// upgrade, and the shape of it is exactly what this test states.
+#[test]
+fn a_ctime_rule_previews_as_ctime_and_a_preview_labelled_mtime_refuses() {
+    let mut b = tiering();
+    b.match_json = serde_json::json!({ "ext": ["raw"], "ctime_older_than_days": 365 });
+    let e = Engine::new(&b, AtimeMode::Reliable);
+    let c = vec![candidate(1, "Photos/old.raw", 400, 50_000_000)];
+
+    let previewed = e.preview(&c, now()).expect("preview");
+    assert_eq!(
+        previewed.matches[0].signal,
+        AccessSignalSource::Ctime,
+        "the driving signal is the one the matcher read"
+    );
+
+    // The accepting direction first: a preview this build took still executes.
+    e.run(&c, RunMode::Execute, Some(&previewed), now())
+        .expect("a ctime rule must still be executable against its own preview");
+
+    // Now the pre-upgrade record: same rule, same file, signal recorded as
+    // `Mtime` by the build that mislabelled it.
+    let stale = PreviewRecord {
+        matches: vec![PreviewedMatch {
+            file: FileId::new(1),
+            signal: AccessSignalSource::Mtime,
+        }],
+        ..previewed.clone()
+    };
+    match e.run(&c, RunMode::Execute, Some(&stale), now()) {
+        Err(EngineRefusal::PreviewDrifted { drift }) => {
+            assert_eq!(drift.changed.len(), 1, "{drift:?}");
+            assert_eq!(drift.changed[0].previewed.signal, AccessSignalSource::Mtime);
+            assert_eq!(drift.changed[0].current.signal, AccessSignalSource::Ctime);
+        }
+        other => panic!("a pre-upgrade `Mtime` label must refuse, not act, got {other:?}"),
+    }
+}
+
 /// The accepting direction. Without this, "refuse every execution" passes every
 /// refusal test above and the engine can never act again.
 #[test]

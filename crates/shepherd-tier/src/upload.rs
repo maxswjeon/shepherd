@@ -51,14 +51,68 @@ use crate::serialize::FileLocks;
 #[derive(Debug)]
 pub struct FileSource {
     path: PathBuf,
-    fs_id: FsId,
+    /// The **stable** half of the catalog's `fs_id` — the volume identifier.
+    /// Kept because it is the one part of the identity a fresh `stat` cannot
+    /// supply; the inode half is re-read on every fingerprint.
+    volume_id: String,
+    /// The identity the caller planned against. Read **only** on platforms
+    /// where `shepherd_catalog::volume::fs_id` cannot run — see
+    /// [`FileSource::current_fs_id`]. Kept unconditionally so the two builds do
+    /// not have two different structs.
+    #[cfg_attr(unix, allow(dead_code))]
+    planned_fs_id: FsId,
 }
 
 impl FileSource {
+    /// `fs_id` is the catalog's identity for this file, `<volume-id>:<inode>`
+    /// as produced by `shepherd_catalog::volume::fs_id`.
+    ///
+    /// Only its **volume** half is retained. The inode half is deliberately
+    /// discarded: it is the mutable part, and remembering it is what made
+    /// [`Self::fingerprint`] hand the driver's guard the same value on both
+    /// sides of its own comparison.
     pub fn new(path: impl Into<PathBuf>, fs_id: FsId) -> Self {
+        // A catalog `fs_id` is `<volume-id>:<inode>` and the inode is numeric,
+        // so the LAST colon splits it. A value with no colon at all is not one
+        // this constructor can decompose — it is kept whole rather than
+        // silently emptied, which would make every derived identity collide.
+        let volume_id = fs_id
+            .as_str()
+            .rsplit_once(':')
+            .map_or_else(|| fs_id.as_str().to_owned(), |(vol, _ino)| vol.to_owned());
         Self {
             path: path.into(),
-            fs_id,
+            volume_id,
+            planned_fs_id: fs_id,
+        }
+    }
+
+    /// The identity of the file **currently** at [`Self::path`].
+    ///
+    /// Goes through `shepherd_catalog::volume::fs_id` rather than assembling a
+    /// second identity here, for the reason
+    /// [`crate::destroy::LocalDestroyRequest::fs_id`] spells out at length: a
+    /// locally synthesized `<dev>:<ino>` compiles, compares, and protects
+    /// nothing, because it never equals the value the rest of the system uses
+    /// for the same file.
+    fn current_fs_id(&self) -> StorageResult<FsId> {
+        #[cfg(unix)]
+        {
+            shepherd_catalog::volume::fs_id(&self.path, &self.volume_id).map_err(|e| {
+                StorageError::Transient {
+                    op: "identify source".into(),
+                    detail: e.to_string(),
+                }
+            })
+        }
+        // A COVERAGE GAP, stated rather than papered over. `volume::fs_id` is
+        // `cfg(unix)`; on Windows it returns `Unsupported`, so no caller there
+        // can produce a catalog `fs_id` in the first place and this branch is
+        // unreachable in production. It exists so the non-unix legs compile.
+        // Phase 3 owns `FILE_ID_INFO` + volume serial — see `volume.rs`.
+        #[cfg(not(unix))]
+        {
+            Ok(self.planned_fs_id.clone())
         }
     }
 }
@@ -76,10 +130,23 @@ impl SourceReader for FileSource {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| Timestamp::from_nanos(i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)))
             .unwrap_or(Timestamp::EPOCH);
+        // From the file that was just statted, NOT from what the caller
+        // planned with. Copying the planned value here made
+        // `TransferDriver::assert_source_unchanged` compare the caller's
+        // `fs_id` with the caller's `fs_id` — a comparison whose two sides are
+        // the same value, so it could never fail. A path replaced by a
+        // different inode of the same size with a preserved mtime was
+        // therefore invisible to every one of the fingerprint's three fields.
+        //
+        // This is a SECOND stat, and the two can straddle a replacement. That
+        // races only in the fail-closed direction: the path resolves to the
+        // replacement for the later call, so the fingerprint mixes the old
+        // size/mtime with the new inode and disagrees with the session — which
+        // refuses. There is no interleaving that produces agreement.
         Ok(SourceFingerprint {
             size: md.len(),
             mtime,
-            fs_id: self.fs_id.clone(),
+            fs_id: self.current_fs_id()?,
         })
     }
 
@@ -115,13 +182,20 @@ impl SourceReader for FileSource {
 /// the same one, and the plan is persisted so it must be chosen once and then
 /// honoured by every resume. [`shepherd_storage::multipart::DEFAULT_PART_SIZE`] is the ordinary argument.
 ///
-/// `size` and `mtime` are read from the source rather than taken as arguments,
-/// deliberately. The driver's first act is to compare the session's recorded
-/// fingerprint against a fresh one (PM-1's modify-during-upload guard), so a
-/// caller-supplied value that disagreed with the filesystem by even one
-/// nanosecond would abort the transfer before it started. That is the guard
-/// working, but it is a trap in an API: the only correct value is the one the
-/// source reports, so the source reports it.
+/// `size`, `mtime` **and `fs_id`** are read from the source rather than taken
+/// as arguments, deliberately. The driver's first act is to compare the
+/// session's recorded fingerprint against a fresh one (PM-1's
+/// modify-during-upload guard), so a caller-supplied value that disagreed with
+/// the filesystem by even one nanosecond would abort the transfer before it
+/// started. That is the guard working, but it is a trap in an API: the only
+/// correct value is the one the source reports, so the source reports it.
+///
+/// `fs_id` was the exception, and the exception was the defect. The planned
+/// identity was copied into the session *and* into every fresh fingerprint, so
+/// the guard's two sides were the same value and a replaced inode could not be
+/// seen. The `fs_id` **argument** is still the catalog's, because that is what
+/// the lock key must be — see [`crate::destroy::LocalDestroyRequest::fs_id`] —
+/// but only its volume half survives into the identity that gets compared.
 pub async fn upload_item(
     job: JobId,
     item: &TierItem,
@@ -135,7 +209,7 @@ pub async fn upload_item(
     // sites cannot deadlock each other.
     let _guards = locks.acquire_both(&fs_id, &item.remote_key).await;
 
-    let source = FileSource::new(&item.path, fs_id.clone());
+    let source = FileSource::new(&item.path, fs_id);
 
     // Resume if a session survived; plan a fresh one otherwise. The driver
     // handles every crash window from whichever state it finds.
@@ -170,7 +244,12 @@ pub async fn upload_item(
                 rel_path: item.path.clone(),
                 size: fp.size,
                 mtime: fp.mtime,
-                fs_id,
+                // From the fingerprint, for the same reason `size` and `mtime`
+                // are: the session's recorded identity and the fresh one the
+                // driver compares it against must be produced by one procedure,
+                // or the guard compares two different notions of identity and
+                // refuses every upload.
+                fs_id: fp.fs_id.clone(),
                 blake3: item.blake3,
             };
             let s = TransferSession::plan(

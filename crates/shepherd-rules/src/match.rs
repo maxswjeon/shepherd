@@ -210,7 +210,14 @@ fn resolve_signal(
 ) -> (Timestamp, AccessSignalSource) {
     match field {
         TimeField::Mtime => (file.mtime, AccessSignalSource::Mtime),
-        TimeField::Ctime => (file.ctime, AccessSignalSource::Mtime),
+        // Reads `file.ctime`, so it reports `Ctime`. Naming `Mtime` here made
+        // every ctime match tell the operator that an mtime rule selected the
+        // file, which is the signal-provenance contract §4.12 requires the
+        // preview to state — and `Engine::run` refuses execution on exactly a
+        // preview/run signal difference, so the wrong label is a refusal that
+        // never fires. Not part of the access fallback chain below: `ctime` is
+        // asked for by name and always answers for itself.
+        TimeField::Ctime => (file.ctime, AccessSignalSource::Ctime),
         TimeField::Atime => match file.atime {
             // Requested by name, but still only trusted where fidelity is.
             Some(t) if ctx.atime_mode.may_fold_into_observed_access() => {

@@ -198,3 +198,105 @@ fn timestamps_round_trip_through_system_time_including_before_the_epoch() {
         );
     }
 }
+
+// --- a failed attempt leaves nothing behind --------------------------------
+
+/// `create_new` succeeding is not the same fact as the restore succeeding.
+/// Everything after it — the write, the sync, the metadata, the read-back, the
+/// fidelity comparison — can still fail, and until this was fixed each of those
+/// returned with the file Shepherd had just created still sitting at the
+/// destination.
+#[test]
+fn a_failed_restore_leaves_no_wreckage_at_the_chosen_path() {
+    let dir = TempDir::new("wreckage");
+    let target = dir.path("photo.raw");
+    let m = manifest_for(b"what the manifest says", 0o644);
+
+    let err = restore_file(&target, b"what actually arrived", &m)
+        .expect_err("the bytes do not match the manifest");
+
+    assert!(
+        !target.exists(),
+        "a restore that failed its own fidelity check left {} behind holding \
+         known-invalid data; the error was {err}",
+        target.display()
+    );
+}
+
+/// The consequence the finding names, end to end. A retry after a failed
+/// restore must land the file back where it came from — not beside it, and not
+/// with an alert telling the user something of theirs is in the way, when the
+/// only thing in the way is Shepherd's own failed attempt.
+#[test]
+fn a_retry_after_a_failed_restore_lands_at_the_original_path() {
+    let dir = TempDir::new("retry");
+    let target = dir.path("photo.raw");
+    let m = manifest_for(BYTES, 0o644);
+
+    // Attempt one: a corrupt download. Caught by the read-back, as it should
+    // be — the question is what it leaves behind.
+    restore_file(&target, b"a garbled arrival", &m).expect_err("a corrupt download must fail");
+
+    // Attempt two: the bytes arrive intact.
+    let outcome = restore_file(&target, BYTES, &m).expect("the retry must succeed");
+
+    assert!(
+        !outcome.needs_conflict_alert(),
+        "the retry was diverted and the user alerted about a 'conflict' that is \
+         Shepherd's own failed attempt, not a file of theirs — landed at {}",
+        outcome.path()
+    );
+    assert_eq!(
+        outcome.path(),
+        target.to_string_lossy(),
+        "the retry must restore the file to where it came from"
+    );
+    assert_eq!(std::fs::read(&target).expect("read"), BYTES);
+}
+
+/// The cleanup's load-bearing half, exercised directly because the window it
+/// guards cannot be opened from outside `restore_file`.
+///
+/// A cleanup that unlinked by path would delete the file in the first half of
+/// this test — a file this attempt did not create, on the error path of an
+/// operation whose premise is that it never destroys data.
+#[cfg(unix)]
+#[test]
+fn cleanup_removes_only_the_inode_this_attempt_created() {
+    let dir = TempDir::new("inode-bound");
+    let p = dir.path("photo.raw");
+
+    let f = std::fs::File::create_new(&p).expect("create");
+    let ours = inode_of(&f.metadata().expect("fstat")).expect("unix names inodes");
+    drop(f);
+
+    // The name is taken over by somebody else's file, as it can be between a
+    // failed attempt and its cleanup. Built at another name FIRST and renamed
+    // in: an unlink-then-create at the same path lets ext4 hand back the inode
+    // number it just freed, and the test would then be asserting nothing.
+    let theirs_bytes = b"a file the user created in the window";
+    let elsewhere = dir.path("theirs.tmp");
+    std::fs::write(&elsewhere, theirs_bytes).expect("seed");
+    let theirs =
+        inode_of(&std::fs::metadata(&elsewhere).expect("stat")).expect("unix names inodes");
+    assert_ne!(
+        ours, theirs,
+        "precondition: the replacement really is a different inode"
+    );
+    std::fs::rename(&elsewhere, &p).expect("take the name over");
+
+    discard_failed_attempt(&p, Some(ours));
+    assert_eq!(
+        std::fs::read(&p).expect("the replacement must survive"),
+        theirs_bytes,
+        "cleanup deleted a file this attempt did not create"
+    );
+
+    // The accepting direction: the inode the attempt DID create is removed, or
+    // the cleanup is decorative and the wreckage stays.
+    discard_failed_attempt(&p, Some(theirs));
+    assert!(
+        !p.exists(),
+        "the exact inode this attempt created must be removed"
+    );
+}

@@ -32,7 +32,7 @@
 //! destruction, and a second call site would be a second place to forget it.
 
 use shepherd_catalog::job_repo::JobClass;
-use shepherd_core::{IntentId, ObjectKey, TargetId, Timestamp};
+use shepherd_core::{IntentId, ObjectKey, RootId, TargetId, Timestamp};
 use shepherd_placeholder::mock::StubState;
 use shepherd_rules::delete_policy::{
     BreakerState, DiscardDecision, DiscardInputs, PermanentDeleteConfirmation, discard_permitted,
@@ -40,8 +40,9 @@ use shepherd_rules::delete_policy::{
 use shepherd_storage::adapter::VersionGuard;
 
 use crate::audit::AuditLog;
-use crate::breaker::{BreakerLimits, BreakerRefusal, Episode, RateLedger, RateWindow};
+use crate::breaker::{BreakerLimits, BreakerRefusal, Candidate, Episode, RateLedger, RateWindow};
 use crate::destroy::{DestroyError, RemoteGate, execute_remote_discard};
+use crate::plan::derive_object_key;
 
 /// Translate a platform stub state into the fact the policy engine consumes.
 ///
@@ -157,26 +158,48 @@ pub fn evaluate_discard(
     }
 }
 
-/// Proof that the rolling breaker was charged for an episode's deletions.
+/// Proof that the rolling breaker was charged **for these specific objects**.
 ///
-/// **This type is the fix for "the breaker is a check with no subject".**
-/// [`evaluate_discard`] observed available budget and nothing ever consumed it,
-/// so repeated sub-threshold episodes kept reading the same unused window. The
-/// charge is now minted only by [`reserve_discard`], which persists it before
-/// returning, and [`execute_discard`] cannot be called without one — so
-/// "forgot to charge the breaker" is not a reachable state rather than a
-/// convention someone has to remember.
+/// **This type is the fix for "the breaker is a check with no subject", and it
+/// took two rounds to get the subject right.** [`evaluate_discard`] first
+/// observed available budget that nothing ever consumed, so repeated
+/// sub-threshold episodes kept reading the same unused window; the charge is
+/// minted only by [`reserve_discard`], which persists it before returning, and
+/// [`execute_discard`] cannot be called without one. That made "forgot to
+/// charge the breaker" unreachable.
 ///
-/// One unit is spent per object deleted, so a single reservation authorises
-/// exactly the number of deletions it paid for and not one more.
+/// It did **not** make "charged for the wrong object" unreachable. A charge
+/// that only counted authorised any `n` deletions, so a key from another
+/// episode, another target, or an item omitted from [`Episode::candidates`]
+/// spent a unit and destroyed an object no operator ever reviewed — on the one
+/// path that cannot be undone. So the charge now carries the confirmed set
+/// itself, and every unit is drawn against **one named candidate**.
+///
+/// # The key is derived, never accepted
+///
+/// [`Self::spend`] returns the [`ObjectKey`] it authorised, computed from the
+/// candidate's hash and the target's prefix through
+/// [`crate::plan::derive_object_key`] — the single place §4.9 keys are built.
+/// [`execute_discard`] therefore takes no key at all: a caller with no way to
+/// supply one cannot supply a wrong one. Taking a key *and* checking it against
+/// the derivation would have been a second copy of a computed value, which is
+/// the drift shape this crate keeps finding rather than a defence against it.
+///
+/// A `key.ends_with(<hash hex>)` suffix test would be that same mistake twice
+/// over: a second reading of the key's structure, and one that leaves the
+/// prefix non-load-bearing, so an object under a **foreign prefix** with the
+/// right hash would pass. Do not reintroduce it.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use = "an unspent charge has already consumed breaker budget; spend it or drop the episode"]
 pub struct DiscardCharge {
     target: TargetId,
-    root: shepherd_core::RootId,
+    root: RootId,
     at: Timestamp,
-    reserved: u32,
-    spent: u32,
+    /// The COMPLETE set the operator confirmed, copied at reservation time.
+    /// Not a count: a count cannot answer "was *this* object confirmed?".
+    confirmed: Vec<Candidate>,
+    /// Indices into `confirmed` whose unit has been drawn.
+    spent: Vec<usize>,
 }
 
 impl DiscardCharge {
@@ -184,7 +207,7 @@ impl DiscardCharge {
         self.target
     }
 
-    pub fn root(&self) -> shepherd_core::RootId {
+    pub fn root(&self) -> RootId {
         self.root
     }
 
@@ -194,24 +217,87 @@ impl DiscardCharge {
     }
 
     pub fn reserved(&self) -> u32 {
-        self.reserved
+        u32::try_from(self.confirmed.len()).unwrap_or(u32::MAX)
     }
 
     pub fn remaining(&self) -> u32 {
-        self.reserved.saturating_sub(self.spent)
+        self.reserved()
+            .saturating_sub(u32::try_from(self.spent.len()).unwrap_or(u32::MAX))
     }
 
-    /// Consume one unit, for one object about to be deleted.
+    /// Draw this charge's unit for **one named candidate**, and return the key
+    /// that deletion is authorised to name.
     ///
     /// Called by [`execute_discard`] **before** the deletion, never after.
-    fn spend(&mut self) -> Result<(), BreakerRefusal> {
-        if self.remaining() == 0 {
-            return Err(BreakerRefusal::ChargeExhausted {
-                reserved: self.reserved,
+    ///
+    /// Every component is compared, and each is independently load-bearing: the
+    /// target and the root because a charge is scoped to one `(target, root)`
+    /// pair and the ledger's budget is keyed on exactly that; the whole
+    /// candidate because a set membership test on `file` alone would accept a
+    /// row whose path or hash had drifted from the one the operator read.
+    ///
+    /// A refused spend consumes nothing. Nothing was deleted, so there is
+    /// nothing to have paid for.
+    fn spend(
+        &mut self,
+        candidate: &Candidate,
+        target: TargetId,
+        root: RootId,
+        prefix: &str,
+    ) -> Result<ObjectKey, BreakerRefusal> {
+        if target != self.target {
+            return Err(BreakerRefusal::WrongTarget {
+                charged: self.target,
+                attempted: target,
             });
         }
-        self.spent += 1;
-        Ok(())
+        if root != self.root {
+            return Err(BreakerRefusal::WrongRoot {
+                charged: self.root,
+                attempted: root,
+            });
+        }
+
+        // Linear, and deliberately so: `BreakerLimits::max_per_episode` caps a
+        // set at 500, so the scan is bounded by a limit the breaker already
+        // enforces. An index keyed on the candidate is the upgrade if that cap
+        // ever rises.
+        let mut seen = false;
+        let mut free = None;
+        for (i, c) in self.confirmed.iter().enumerate() {
+            if c != candidate {
+                continue;
+            }
+            seen = true;
+            if !self.spent.contains(&i) {
+                free = Some(i);
+                break;
+            }
+        }
+        let Some(idx) = free else {
+            return Err(if seen {
+                BreakerRefusal::AlreadySpent {
+                    file: candidate.file,
+                }
+            } else {
+                BreakerRefusal::NotACandidate {
+                    file: candidate.file,
+                }
+            });
+        };
+
+        // §4.9: a key is `<prefix>/objects/<b3[0:2]>/<b3[2:4]>/<b3>` and nothing
+        // else, so a candidate with no hash names no object. Refusing is a
+        // consistency check today — `plan_tier` will not plan an unhashed file —
+        // and a loud failure the day that changes.
+        let Some(hash) = candidate.blake3 else {
+            return Err(BreakerRefusal::Unhashed {
+                file: candidate.file,
+            });
+        };
+
+        self.spent.push(idx);
+        Ok(derive_object_key(prefix, hash))
     }
 }
 
@@ -266,8 +352,10 @@ pub async fn reserve_discard(
         target: episode.target,
         root: episode.root,
         at: now,
-        reserved: count,
-        spent: 0,
+        // The set itself, not its size. What was charged and what may be
+        // deleted are then one fact rather than two that can disagree.
+        confirmed: episode.candidates.clone(),
+        spent: Vec::new(),
     })
 }
 
@@ -299,25 +387,38 @@ const SENTINEL: TargetId = TargetId::new(0);
 /// spent **before** the deletion is authorised: charging afterwards would leave
 /// every concurrent episode reading a stale window for the duration of the
 /// delete, and charging not at all was the defect this pair of types replaced.
+///
+/// **It takes no `ObjectKey`.** The key is derived by [`DiscardCharge::spend`]
+/// from the candidate the charge authorised and the target's `prefix`, so a
+/// caller has no way to name an object other than the one it is spending for.
+/// The wrong key is not something this function refuses; it is something no
+/// caller can express. See [`DiscardCharge`] for why that is stronger than
+/// accepting a key and checking it.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_discard(
     charge: &mut DiscardCharge,
     intent: IntentId,
     remote: &impl RemoteGate,
-    key: &ObjectKey,
+    candidate: &Candidate,
+    target: TargetId,
+    root: RootId,
+    prefix: &str,
     guard: &VersionGuard,
     audit: &AuditLog,
     attestation: &str,
     now: Timestamp,
 ) -> Result<(), DestroyError> {
     // Before the deletion, never after. The budget was already persisted by
-    // `reserve_discard`; this is the per-object draw against it.
-    charge.spend().map_err(DestroyError::Breaker)?;
+    // `reserve_discard`; this is the per-object draw against it, and it both
+    // authorises the deletion and names what may be deleted.
+    let key = charge
+        .spend(candidate, target, root, prefix)
+        .map_err(DestroyError::Breaker)?;
 
     // One call site. PM-2's requirement is that the discard branch runs through
     // the same intent + audit apparatus as local destruction; a second path
     // here would be a second place to forget the audit record.
-    execute_remote_discard(intent, remote, key, guard, audit, attestation, now).await
+    execute_remote_discard(intent, remote, &key, guard, audit, attestation, now).await
 }
 
 #[cfg(test)]

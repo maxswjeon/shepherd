@@ -364,6 +364,55 @@ fn the_age_signal_follows_the_documented_fallback_order() {
     );
 }
 
+/// A `ctime_older_than_days` predicate reads `file.ctime` — and must SAY so.
+///
+/// It reported `Mtime`, and that is not a cosmetic slip. `Engine::run` refuses
+/// to execute when the signal a match resolves differs from the one the preview
+/// recorded, on the argument that a substitution of signals is exactly what the
+/// `AtimeMode` apparatus exists to prevent. That refusal is only ever as good as
+/// the labels it compares, and this one was a lie: every ctime match ever
+/// previewed told the operator an mtime rule had selected the file.
+///
+/// The fixture makes the mislabel *provably* wrong rather than merely wrong:
+/// mtime is one day old, so it cannot satisfy a 365-day predicate. Naming
+/// `Mtime` as the driving signal names a timestamp that does not drive it.
+#[test]
+fn a_ctime_predicate_reports_ctime_as_the_driving_signal() {
+    let mut f = file("a", 1, 0);
+    f.ctime = Timestamp::from_nanos(now().as_nanos() - 400 * DAY);
+    f.mtime = Timestamp::from_nanos(now().as_nanos() - DAY);
+    f.atime = Some(Timestamp::from_nanos(now().as_nanos() - DAY));
+
+    let m = compile(serde_json::json!({ "ctime_older_than_days": 365 }));
+    let out = m.matches(&f, &ctx(AtimeMode::Relatime, &[]));
+    assert!(out.matched, "ctime is 400 days old");
+    assert_eq!(
+        out.age_signal,
+        Some(AccessSignalSource::Ctime),
+        "the matcher read ctime; the record must not say mtime"
+    );
+    // `age_signal_for` is the path `RuleBody::age_signal` takes, and it must
+    // not disagree with the one the match report took.
+    assert_eq!(
+        m.age_signal_for(&f, &ctx(AtimeMode::Relatime, &[])),
+        Some(AccessSignalSource::Ctime)
+    );
+
+    // The accepting direction, and it is load-bearing: relabelling EVERY
+    // predicate `Ctime` would satisfy the assertions above. The other fields
+    // must keep naming themselves.
+    let mt = compile(serde_json::json!({ "mtime_older_than_days": 1 }));
+    assert_eq!(
+        mt.matches(&f, &ctx(AtimeMode::Relatime, &[])).age_signal,
+        Some(AccessSignalSource::Mtime)
+    );
+    let at = compile(serde_json::json!({ "atime_older_than_days": 1 }));
+    assert_eq!(
+        at.matches(&f, &ctx(AtimeMode::Reliable, &[])).age_signal,
+        Some(AccessSignalSource::Atime)
+    );
+}
+
 #[test]
 fn a_rule_with_no_age_predicate_reports_no_signal() {
     let m = compile(serde_json::json!({ "ext": ["raw"] }));

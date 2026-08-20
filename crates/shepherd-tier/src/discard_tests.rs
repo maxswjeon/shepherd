@@ -39,6 +39,12 @@ fn ready_episode(now: Timestamp) -> Episode {
     e
 }
 
+/// A candidate this episode never enumerated — another episode's object, or an
+/// item a wiring error left out of `Episode::candidates`.
+fn stranger() -> Candidate {
+    candidate(99)
+}
+
 fn inputs<'a>(
     now: &'a ClockReading,
     deferral: Option<&'a Deferral>,
@@ -403,17 +409,28 @@ impl RateLedger for MemLedger {
     }
 }
 
+/// The target's key prefix. Load-bearing: the key `spend` mints is derived
+/// from it, so an object under a different prefix is a different object.
+const PREFIX: &str = "shepherd";
+
+const ROOT: RootId = RootId::new(1);
+const TARGET: TargetId = TargetId::new(1);
+
+/// Candidate `i`, with a REAL hash — a candidate without one names no
+/// content-addressed object and is refused, which is its own test below.
+fn candidate(i: usize) -> Candidate {
+    Candidate {
+        file: FileId::new(i as i64 + 1),
+        path: format!("/root/{i}.raw"),
+        blake3: Some(shepherd_core::Blake3Hash::from_bytes(
+            *blake3::hash(format!("candidate-{i}").as_bytes()).as_bytes(),
+        )),
+    }
+}
+
 fn episode_with(count: usize, now: Timestamp) -> Episode {
-    let mut e = Episode::open(RootId::new(1), TargetId::new(1), now);
-    e.enumerate(
-        (0..count)
-            .map(|i| Candidate {
-                file: FileId::new(i as i64 + 1),
-                path: format!("/root/{i}.raw"),
-                blake3: None,
-            })
-            .collect(),
-    );
+    let mut e = Episode::open(ROOT, TARGET, now);
+    e.enumerate((0..count).map(candidate).collect());
     e.confirm("operator", now, HOUR);
     e
 }
@@ -428,6 +445,10 @@ struct Remote {
 }
 
 impl Remote {
+    /// Seeds one object per candidate, at the key §4.9 says that candidate's
+    /// content lives under — the same derivation `spend` uses, so the test
+    /// remote and the authorisation agree by construction rather than by a
+    /// hand-written table that could drift from it.
     fn new(tag: &str, count: usize) -> Self {
         let dir =
             std::env::temp_dir().join(format!("shepherd-discard-{}-{tag}", std::process::id()));
@@ -436,7 +457,10 @@ impl Remote {
         let adapter = shepherd_storage::testing::MemAdapter::versioned();
         let keys: Vec<_> = (0..count)
             .map(|i| {
-                let k = shepherd_core::ObjectKey::new(format!("objects/ab/cd/obj{i}"));
+                let k = crate::plan::derive_object_key(
+                    PREFIX,
+                    candidate(i).blake3.expect("test candidates are hashed"),
+                );
                 adapter.put_versioned(&k, bytes::Bytes::from_static(b"x"), "v9");
                 k
             })
@@ -454,17 +478,38 @@ impl Remote {
         VersionGuard::Version(shepherd_core::ObjectVersion::new("v9"))
     }
 
+    /// Discard candidate `i`, in the ordinary scope.
     async fn discard(
         &self,
         charge: &mut DiscardCharge,
         i: usize,
         now: Timestamp,
     ) -> std::result::Result<(), DestroyError> {
+        self.discard_as(charge, &candidate(i), TARGET, ROOT, PREFIX, i, now)
+            .await
+    }
+
+    /// Discard whatever the caller names, so a test can vary exactly one
+    /// component and nothing else.
+    #[allow(clippy::too_many_arguments)]
+    async fn discard_as(
+        &self,
+        charge: &mut DiscardCharge,
+        candidate: &Candidate,
+        target: TargetId,
+        root: RootId,
+        prefix: &str,
+        intent: usize,
+        now: Timestamp,
+    ) -> std::result::Result<(), DestroyError> {
         execute_discard(
             charge,
-            shepherd_core::IntentId::new(i as i64 + 1),
+            shepherd_core::IntentId::new(intent as i64 + 1),
             &(&self.adapter as &dyn shepherd_storage::StorageAdapter),
-            &self.keys[i],
+            candidate,
+            target,
+            root,
+            prefix,
             &Self::guard(),
             &self.audit,
             "version",
@@ -668,19 +713,25 @@ async fn two_episodes_evaluating_against_one_snapshot_cannot_both_reserve() {
     );
 }
 
-/// The charge is spent **before** the deletion, so an exhausted one stops the
+/// The charge is spent **before** the deletion, so a refused draw stops the
 /// delete from happening at all. Asserted on the fact — the adapter's delete
 /// count — because an assertion on the error alone would pass even if the
 /// object had been destroyed first and the refusal raised afterwards.
+///
+/// Pre-round-3 this refused with `ChargeExhausted`: the episode had paid for
+/// one deletion and this was the second. That was an arithmetic answer to a
+/// question about identity, and it is why the second object could be *any*
+/// object. Now the refusal names what is actually wrong — candidate 1 is not in
+/// a set that only ever held candidate 0.
 #[tokio::test]
-async fn an_exhausted_charge_refuses_before_anything_is_deleted() {
+async fn an_object_outside_the_confirmed_set_refuses_before_anything_is_deleted() {
     let now = t(20);
     let ledger = MemLedger::new();
     let d = deferral();
     let lim = limits(10);
     let remote = Remote::new("exhausted", 2);
 
-    // Reserved for one object; the episode tries to delete two.
+    // Confirmed for one object; the episode tries to delete two.
     let mut charge = reserve_discard(
         inputs(
             &clock(20),
@@ -705,18 +756,304 @@ async fn an_exhausted_charge_refuses_before_anything_is_deleted() {
     let err = remote
         .discard(&mut charge, 1, now)
         .await
-        .expect_err("a second deletion was never paid for");
+        .expect_err("a second deletion was never confirmed");
     assert!(
         matches!(
             err,
-            DestroyError::Breaker(BreakerRefusal::ChargeExhausted { reserved: 1 })
+            DestroyError::Breaker(BreakerRefusal::NotACandidate { file }) if file == candidate(1).file
         ),
         "{err:?}"
     );
     assert_eq!(
         remote.deleted(),
         1,
-        "the unpaid deletion must not have reached the remote: the charge is spent \
+        "the unconfirmed deletion must not have reached the remote: the charge is spent \
          before the object is destroyed, not after"
+    );
+}
+
+// --- a charge authorises NAMED objects, not a quantity ---------------------
+//
+// Round 2 made "forgot to charge the breaker" unreachable. It did not make
+// "charged for the wrong object" unreachable, and these are the tests for the
+// second half. Every one of them asserts on the adapter's delete count, never
+// on `is_err()`: a refusal raised *after* an irreversible deletion is not a
+// refusal.
+
+/// A helper: a confirmed charge over `count` candidates, with budget to spare.
+async fn charge_for(ledger: &MemLedger, count: usize, now: Timestamp) -> DiscardCharge {
+    let d = deferral();
+    reserve_discard(
+        inputs(
+            &clock(20),
+            Some(&d),
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        ),
+        &episode_with(count, now),
+        &ledger.snapshot(),
+        &limits(10),
+        now,
+        ledger,
+    )
+    .await
+    .expect("both gates permit and the budget is free")
+}
+
+/// **The finding, at its centre.** A candidate from another episode — never in
+/// this episode's set, never read by the operator who confirmed it — must not
+/// be deletable with this episode's charge.
+#[tokio::test]
+async fn a_candidate_from_another_episode_cannot_be_deleted_with_this_episodes_charge() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let remote = Remote::new("foreign", 1);
+    let mut charge = charge_for(&ledger, 1, now).await;
+
+    let got = remote
+        .discard_as(&mut charge, &stranger(), TARGET, ROOT, PREFIX, 0, now)
+        .await;
+
+    assert!(
+        matches!(
+            got,
+            Err(DestroyError::Breaker(BreakerRefusal::NotACandidate { .. }))
+        ),
+        "{got:?}"
+    );
+    assert_eq!(
+        remote.deleted(),
+        0,
+        "an object the operator never reviewed must not be deleted"
+    );
+    assert_eq!(
+        charge.remaining(),
+        1,
+        "a refused draw must not consume the unit the confirmed candidate still needs"
+    );
+}
+
+/// Every field of a candidate is independently load-bearing. A membership test
+/// on `file` alone would accept a row whose path or hash had drifted from the
+/// one the operator actually read.
+#[tokio::test]
+async fn varying_any_single_field_of_a_candidate_refuses_it() {
+    let now = t(20);
+    let confirmed = candidate(0);
+
+    let mut wrong_file = confirmed.clone();
+    wrong_file.file = FileId::new(4242);
+    let mut wrong_path = confirmed.clone();
+    wrong_path.path = "/root/somewhere-else.raw".into();
+    let mut wrong_hash = confirmed.clone();
+    wrong_hash.blake3 = Some(shepherd_core::Blake3Hash::from_bytes(
+        *blake3::hash(b"different content").as_bytes(),
+    ));
+
+    for (field, impostor) in [
+        ("file", wrong_file),
+        ("path", wrong_path),
+        ("blake3", wrong_hash),
+    ] {
+        let ledger = MemLedger::new();
+        let remote = Remote::new(&format!("field-{field}"), 1);
+        let mut charge = charge_for(&ledger, 1, now).await;
+
+        let got = remote
+            .discard_as(&mut charge, &impostor, TARGET, ROOT, PREFIX, 0, now)
+            .await;
+
+        assert!(
+            matches!(
+                got,
+                Err(DestroyError::Breaker(BreakerRefusal::NotACandidate { .. }))
+            ),
+            "a candidate differing only in `{field}` was accepted: {got:?}"
+        );
+        assert_eq!(
+            remote.deleted(),
+            0,
+            "a candidate differing only in `{field}` reached the remote"
+        );
+    }
+}
+
+/// A charge is scoped to one `(target, root)` — the pair the ledger's budget is
+/// keyed on. Varying only the target.
+#[tokio::test]
+async fn a_charge_will_not_pay_for_a_deletion_at_another_target() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let remote = Remote::new("wrong-target", 1);
+    let mut charge = charge_for(&ledger, 1, now).await;
+
+    let got = remote
+        .discard_as(
+            &mut charge,
+            &candidate(0),
+            TargetId::new(2), // the ONLY thing that differs
+            ROOT,
+            PREFIX,
+            0,
+            now,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            got,
+            Err(DestroyError::Breaker(BreakerRefusal::WrongTarget { .. }))
+        ),
+        "{got:?}"
+    );
+    assert_eq!(remote.deleted(), 0);
+}
+
+/// Varying only the root.
+#[tokio::test]
+async fn a_charge_will_not_pay_for_a_deletion_under_another_root() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let remote = Remote::new("wrong-root", 1);
+    let mut charge = charge_for(&ledger, 1, now).await;
+
+    let got = remote
+        .discard_as(
+            &mut charge,
+            &candidate(0),
+            TARGET,
+            RootId::new(2), // the ONLY thing that differs
+            PREFIX,
+            0,
+            now,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            got,
+            Err(DestroyError::Breaker(BreakerRefusal::WrongRoot { .. }))
+        ),
+        "{got:?}"
+    );
+    assert_eq!(remote.deleted(), 0);
+}
+
+/// The prefix is load-bearing too, and this is the test a `key.ends_with(hash)`
+/// suffix check would fail: the hash is right, the object is somebody else's.
+#[tokio::test]
+async fn the_key_is_derived_from_the_candidate_and_the_targets_prefix() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let remote = Remote::new("prefix", 1);
+    let mut charge = charge_for(&ledger, 1, now).await;
+
+    // The same candidate, under a DIFFERENT target's prefix. Nothing exists
+    // there, so the deletion cannot touch the object seeded under `PREFIX`.
+    remote
+        .discard_as(
+            &mut charge,
+            &candidate(0),
+            TARGET,
+            ROOT,
+            "some-other-target",
+            0,
+            now,
+        )
+        .await
+        .expect("the derivation itself does not refuse — it names a different object");
+
+    assert!(
+        remote.adapter.object(&remote.keys[0]).is_some(),
+        "a deletion derived under another prefix must not have reached THIS \
+         target's object, whose hash is identical"
+    );
+}
+
+/// One candidate, one unit. An iteration error that visits the same row twice
+/// would otherwise delete one object twice and leave another alive while the
+/// count still balanced.
+#[tokio::test]
+async fn one_candidate_cannot_be_spent_twice() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let remote = Remote::new("double-spend", 2);
+    let mut charge = charge_for(&ledger, 2, now).await;
+
+    remote.discard(&mut charge, 0, now).await.expect("first");
+    let got = remote.discard(&mut charge, 0, now).await;
+
+    assert!(
+        matches!(
+            got,
+            Err(DestroyError::Breaker(BreakerRefusal::AlreadySpent { .. }))
+        ),
+        "{got:?}"
+    );
+    assert_eq!(
+        remote.deleted(),
+        1,
+        "the second draw on one candidate must not reach the remote"
+    );
+    assert_eq!(
+        charge.remaining(),
+        1,
+        "candidate 1's unit must still be there: a double spend on 0 that consumed \
+         it would leave a confirmed object undeletable"
+    );
+}
+
+/// A candidate with no hash names no content-addressed object (§4.9). Today
+/// `plan_tier` refuses unhashed files so this cannot happen — which is exactly
+/// why it needs a test, so the day `plan_tier` changes this fails loudly
+/// instead of deriving a key from nothing.
+#[tokio::test]
+async fn an_unhashed_candidate_is_refused_rather_than_naming_a_key_from_nothing() {
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let remote = Remote::new("unhashed", 1);
+    let d = deferral();
+
+    // An episode whose confirmed set genuinely contains the unhashed candidate,
+    // so membership passes and only the missing hash is left to refuse it.
+    let unhashed = Candidate {
+        file: FileId::new(1),
+        path: "/root/0.raw".into(),
+        blake3: None,
+    };
+    let mut e = Episode::open(ROOT, TARGET, now);
+    e.enumerate(vec![unhashed.clone()]);
+    e.confirm("operator", now, HOUR);
+
+    let mut charge = reserve_discard(
+        inputs(
+            &clock(20),
+            Some(&d),
+            Some(PermanentDeleteConfirmation::WindowsCfApi),
+        ),
+        &e,
+        &ledger.snapshot(),
+        &limits(10),
+        now,
+        &ledger,
+    )
+    .await
+    .expect("reserve");
+
+    let got = remote
+        .discard_as(&mut charge, &unhashed, TARGET, ROOT, PREFIX, 0, now)
+        .await;
+
+    assert!(
+        matches!(
+            got,
+            Err(DestroyError::Breaker(BreakerRefusal::Unhashed { .. }))
+        ),
+        "{got:?}"
+    );
+    assert_eq!(remote.deleted(), 0);
+    assert_eq!(
+        charge.remaining(),
+        1,
+        "a refusal that consumed the unit would be a silent budget leak"
     );
 }

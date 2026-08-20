@@ -572,6 +572,65 @@ async fn the_registration_probe_adopts_a_checksum_the_provider_actually_round_tr
     }
 }
 
+/// The concurrency the probe has to survive: two `target.add` calls against one
+/// bucket at the same time.
+///
+/// While the probe object's key was a pure function of the algorithm, every
+/// concurrent probe wrote and deleted **the same object**. One probe's cleanup
+/// `DELETE` landing between another's `complete_multipart` and its `HEAD` makes
+/// the second read a missing object — and this code reads a missing checksum as
+/// "the provider does not offer this algorithm". That negative is persisted by
+/// `target.add` as `adopted: none`, which is irreversible per object and costs
+/// 649x on scrub. A transient race must not mint a durable claim about a
+/// provider's capabilities; the same argument that made an auth failure stop
+/// being recorded as non-support.
+///
+/// Ground truth is an **uncontended** probe taken first, rather than agreement
+/// between the concurrent ones: two probes that both raced into `adopted: none`
+/// agree perfectly. It also keeps the test provider-agnostic — a provider that
+/// genuinely supports nothing passes, because the uncontended answer is the one
+/// contention must not change.
+#[tokio::test]
+#[ignore = "requires MinIO, or SHEPHERD_S3_BUCKET for a real endpoint"]
+async fn concurrent_registration_probes_do_not_race_into_a_false_negative() {
+    let (cfg, provider) = probe_target();
+
+    let baseline = shepherd_storage::s3::probe_multipart_checksum(&cfg)
+        .await
+        .expect("the provider must be reachable to run this test at all");
+    println!(
+        "FINDING: uncontended baseline on {provider}: {}",
+        baseline.summary()
+    );
+
+    // Rounds and width both matter: the window is one network round-trip wide,
+    // so a single pair proves very little in either direction.
+    for round in 0..5 {
+        // `tokio::join!` rather than a `futures` dependency: four is enough
+        // width to skew the probes apart, and the crate does not need a new
+        // dependency to say so.
+        let (r0, r1, r2, r3) = tokio::join!(
+            shepherd_storage::s3::probe_multipart_checksum(&cfg),
+            shepherd_storage::s3::probe_multipart_checksum(&cfg),
+            shepherd_storage::s3::probe_multipart_checksum(&cfg),
+            shepherd_storage::s3::probe_multipart_checksum(&cfg),
+        );
+
+        for (i, r) in [r0, r1, r2, r3].into_iter().enumerate() {
+            let p = r.unwrap_or_else(|e| {
+                panic!("round {round} probe {i}: contention must not fail registration: {e}")
+            });
+            assert_eq!(
+                p.adopted,
+                baseline.adopted,
+                "round {round} probe {i}: contention changed the answer.\n                   uncontended: {}\n  contended:   {}",
+                baseline.summary(),
+                p.summary()
+            );
+        }
+    }
+}
+
 /// The other direction, and the one that decides whether a $441/month mistake
 /// becomes permanent: an unreachable endpoint must be an error, never a
 /// recorded "this provider supports nothing".

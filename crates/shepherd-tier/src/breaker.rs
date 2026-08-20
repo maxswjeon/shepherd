@@ -274,14 +274,54 @@ pub enum BreakerRefusal {
         count: u32,
         limit: u32,
     },
-    /// More deletions were attempted than the episode reserved budget for.
+    /// The charge was reserved against a different target.
     ///
-    /// Reaching this means the charge and the executions have drifted apart,
-    /// so it is a refusal rather than an automatic top-up: the budget a human
-    /// confirmed is the budget, and quietly extending it at execution time
-    /// would make the reservation decorative.
-    ChargeExhausted {
-        reserved: u32,
+    /// Its own variant rather than a field of a combined one, so a test that
+    /// varies **only** the target names what it caught. The pair below is the
+    /// same shape for the root.
+    WrongTarget {
+        charged: TargetId,
+        attempted: TargetId,
+    },
+    /// The charge was reserved against a different root.
+    WrongRoot {
+        charged: RootId,
+        attempted: RootId,
+    },
+    /// The object is not one of the candidates whose set the operator
+    /// confirmed.
+    ///
+    /// **This variant replaced `ChargeExhausted`, and the replacement is the
+    /// point.** A count-only charge answered "has this episode deleted more
+    /// than it paid for?" — a question about arithmetic, which a deletion of
+    /// the wrong object passes trivially. The question that matters is "was
+    /// *this* object confirmed?", and only a charge that knows its candidates
+    /// can answer it. Over-deletion is no longer reachable either: a set of `n`
+    /// candidates yields exactly `n` spendable units by construction, so there
+    /// is nothing left for a separate exhaustion refusal to catch.
+    NotACandidate {
+        file: FileId,
+    },
+    /// This candidate's unit has already been spent.
+    ///
+    /// Distinct from [`Self::NotACandidate`] because they are different bugs:
+    /// one is a wiring error reaching outside the confirmed set, the other is
+    /// an iteration error inside it that would delete one object twice while
+    /// leaving another alive.
+    AlreadySpent {
+        file: FileId,
+    },
+    /// The candidate carries no BLAKE3, so no content-addressed key names it.
+    ///
+    /// §4.9 keys are `<prefix>/objects/…/<b3>` and nothing else, so a candidate
+    /// without a hash cannot name a remote object at all. `plan_tier` already
+    /// refuses unhashed files ([`crate::plan::PlanRefusal::Unhashed`]), which
+    /// makes this a consistency check rather than a new restriction — and
+    /// exactly the kind of "cannot happen" that becomes reachable the day
+    /// `plan_tier` changes. It fails loudly instead of deriving a key from
+    /// nothing.
+    Unhashed {
+        file: FileId,
     },
     Cancelled,
 }

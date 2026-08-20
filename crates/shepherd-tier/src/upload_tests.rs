@@ -175,3 +175,215 @@ async fn the_remote_key_lock_is_held_because_dedup_makes_the_mapping_many_to_one
     .await
     .expect("a different key must not block");
 }
+
+// --- the source's identity is READ, not remembered -------------------------
+//
+// POSIX-only, and stated rather than papered over. `shepherd_catalog::volume::
+// fs_id` is `cfg(unix)` and these tests assert on `st_ino` through
+// `MetadataExt`, exactly as `destroy_tests.rs` does. Windows has an equivalent
+// (`FILE_ID_INFO`) and nobody has written it, so the pair is gated rather than
+// half-ported — see `volume.rs`'s Phase 3 note.
+#[cfg(unix)]
+mod identity {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// Deliberately the SAME LENGTH as `BODY`: the size half of the fingerprint
+    /// must not be what notices the swap, or the test proves nothing about the
+    /// identity half.
+    const IMPOSTOR: &[u8] = b"ZZZZZZZZZZ-different-bytes-same-length-abcdefghijkl";
+
+    fn ino_of(p: &std::path::Path) -> u64 {
+        std::fs::metadata(p).expect("stat").ino()
+    }
+
+    /// Replace `path` with a DIFFERENT inode holding `bytes`, preserving the
+    /// original mtime exactly. This is the case the caller-copied `fs_id` could
+    /// not see: size matches, mtime matches, and only the identity differs.
+    fn replace_inode_preserving_size_and_mtime(path: &std::path::Path, bytes: &[u8]) {
+        let md = std::fs::metadata(path).expect("stat original");
+        assert_eq!(
+            md.len(),
+            bytes.len() as u64,
+            "the impostor must be the same size, or size catches it and identity is untested"
+        );
+        let mtime = md.modified().expect("mtime");
+
+        let tmp = path.with_extension("impostor");
+        std::fs::write(&tmp, bytes).expect("write impostor");
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .expect("open impostor");
+        f.set_modified(mtime).expect("set impostor mtime");
+        drop(f);
+        std::fs::rename(&tmp, path).expect("swap in the impostor");
+
+        let after = std::fs::metadata(path).expect("stat replacement");
+        assert_eq!(after.len(), md.len(), "precondition: size is unchanged");
+        assert_eq!(
+            after.modified().expect("mtime"),
+            mtime,
+            "precondition: mtime is unchanged"
+        );
+    }
+
+    /// The defect, at its smallest: a fingerprint that copies the planned
+    /// `fs_id` compares a value with itself and can never disagree.
+    #[tokio::test]
+    async fn a_fresh_fingerprint_reports_the_statted_inode_not_the_planned_one() {
+        let f = TempFile::new("fp-identity", BODY);
+        let before_ino = ino_of(&f.0);
+        let src = FileSource::new(&f.0, FsId::new("vol:1"));
+        let planned = src.fingerprint().await.expect("fingerprint");
+
+        replace_inode_preserving_size_and_mtime(&f.0, IMPOSTOR);
+        assert_ne!(
+            ino_of(&f.0),
+            before_ino,
+            "precondition: the swap really did change the inode"
+        );
+
+        let fresh = src.fingerprint().await.expect("fingerprint");
+
+        // The two cheap halves are blind to this, by construction.
+        assert_eq!(fresh.size, planned.size);
+        assert_eq!(fresh.mtime, planned.mtime);
+
+        assert_ne!(
+            fresh.fs_id, planned.fs_id,
+            "the fingerprint must report the identity of the file it just statted; \
+             reporting the caller's planned `fs_id` makes the driver's guard compare \
+             a value with itself"
+        );
+    }
+
+    /// The accepting direction. A `fingerprint` that returned something fresh
+    /// every call — a counter, a timestamp — would satisfy the test above while
+    /// refusing every legitimate resume.
+    #[tokio::test]
+    async fn an_untouched_file_fingerprints_identically_twice() {
+        let f = TempFile::new("fp-stable", BODY);
+        let src = FileSource::new(&f.0, FsId::new("vol:1"));
+        let a = src.fingerprint().await.expect("fingerprint");
+        let b = src.fingerprint().await.expect("fingerprint");
+        assert_eq!(a, b, "an unchanged file must fingerprint the same twice");
+    }
+
+    /// The consequence, and the reason the fingerprint has to be right: a
+    /// resume whose source was swapped must be refused **before** anything is
+    /// written, not caught by verification after a wrong object is already
+    /// immutable at a content-addressed key.
+    #[tokio::test]
+    async fn a_resume_whose_source_was_swapped_writes_nothing_to_the_target() {
+        let f = TempFile::new("swap-resume", BODY);
+        let hash = hash_file(&f.0).expect("hash");
+        let it = item(&f.0.to_string_lossy(), hash);
+
+        let adapter = MemAdapter::content_addressed();
+        let store = MemStore::new();
+        let locks = FileLocks::new();
+        let job = JobId::new(77);
+
+        // A session that survived a crash, planned against the file as it was.
+        let src = FileSource::new(&f.0, FsId::new("vol:1"));
+        let fp = src.fingerprint().await.expect("fingerprint");
+        let session = TransferSession::plan(
+            job,
+            it.target,
+            it.remote_key.clone(),
+            SourceIdentity {
+                file_id: it.file,
+                rel_path: it.path.clone(),
+                size: fp.size,
+                mtime: fp.mtime,
+                fs_id: fp.fs_id.clone(),
+                blake3: it.blake3,
+            },
+            &adapter,
+            shepherd_storage::multipart::DEFAULT_PART_SIZE,
+        )
+        .expect("plan");
+        store.save(&session).await.expect("save");
+
+        replace_inode_preserving_size_and_mtime(&f.0, IMPOSTOR);
+
+        let err = upload_item(
+            job,
+            &it,
+            &adapter,
+            &store,
+            &locks,
+            FsId::new("vol:1"),
+            shepherd_storage::multipart::DEFAULT_PART_SIZE,
+        )
+        .await
+        .expect_err("a source replaced under the session must not be uploaded");
+
+        // The FACT, not the error: an object at a content-addressed key whose
+        // name does not describe its bytes is immutable and unreapable (D-10),
+        // so "we noticed afterwards" is not the same as "we refused".
+        assert!(
+            adapter.object(&it.remote_key).is_none(),
+            "nothing may reach the target: the wrong bytes would sit forever under a \
+             key that names the RIGHT hash, and every retry would rediscover it — got \
+             an object anyway, with err {err}"
+        );
+    }
+
+    /// The accepting twin of the test above: the identical resume, with no
+    /// swap, must still complete. A guard that refused every resume would pass
+    /// the refusal test and silently break AC-2.
+    #[tokio::test]
+    async fn an_untouched_resume_still_completes() {
+        let f = TempFile::new("no-swap-resume", BODY);
+        let hash = hash_file(&f.0).expect("hash");
+        let it = item(&f.0.to_string_lossy(), hash);
+
+        let adapter = MemAdapter::content_addressed();
+        let store = MemStore::new();
+        let locks = FileLocks::new();
+        let job = JobId::new(78);
+
+        let src = FileSource::new(&f.0, FsId::new("vol:1"));
+        let fp = src.fingerprint().await.expect("fingerprint");
+        let session = TransferSession::plan(
+            job,
+            it.target,
+            it.remote_key.clone(),
+            SourceIdentity {
+                file_id: it.file,
+                rel_path: it.path.clone(),
+                size: fp.size,
+                mtime: fp.mtime,
+                fs_id: fp.fs_id.clone(),
+                blake3: it.blake3,
+            },
+            &adapter,
+            shepherd_storage::multipart::DEFAULT_PART_SIZE,
+        )
+        .expect("plan");
+        store.save(&session).await.expect("save");
+
+        let outcome = upload_item(
+            job,
+            &it,
+            &adapter,
+            &store,
+            &locks,
+            FsId::new("vol:1"),
+            shepherd_storage::multipart::DEFAULT_PART_SIZE,
+        )
+        .await
+        .expect("an untouched source must still resume to completion");
+
+        assert_eq!(
+            outcome.state,
+            shepherd_storage::transfer_session::TransferState::Committed
+        );
+        assert_eq!(
+            adapter.object(&it.remote_key).expect("object").as_ref(),
+            BODY
+        );
+    }
+}

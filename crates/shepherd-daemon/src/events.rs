@@ -13,17 +13,38 @@
 //! epoch is told [`SnapshotReason::EpochChanged`] and re-reads state, rather
 //! than being replayed the wrong events with the right numbers.
 //!
-//! # Slow subscribers do not block the daemon
+//! # Slow subscribers do not block the daemon — they are disconnected
 //!
 //! Each subscription gets a bounded channel. A subscriber that stops draining
-//! it fills up, and further sends to it are **dropped** rather than blocking
-//! the publisher — which would let one stalled UI stall a scan. Dropping is
-//! safe precisely because the sequence numbers make it detectable: the client
-//! sees a gap, and its next resume gets `SnapshotRequired`. A silent drop with
-//! no numbering would be the unsafe version.
+//! it fills up, and the publisher must not block on it — one stalled UI would
+//! otherwise stall a scan.
+//!
+//! It used to keep the subscription alive and drop the frame, on the reasoning
+//! that sequence numbers make the loss detectable: the client sees a gap and
+//! its next resume gets `SnapshotRequired`. **That reasoning does not hold for
+//! a filtered subscription**, which is most of them. Sequence numbers are
+//! global, so a client subscribed to `scan` alone sees gaps whenever anything
+//! else is published — that is normal, and documented as normal in
+//! `shepherd_proto::event`. It therefore cannot tell "I lost frames" from "the
+//! daemon published something I filtered out". And if the burst ends after the
+//! drop there may be no later frame to expose the gap at all, so the client sits
+//! connected, indefinitely, believing stale state.
+//!
+//! So overflow **ends the subscription**. The hub drops the subscriber, which
+//! closes its channel; the connection's pump drains what is still queued,
+//! writes it, and then shuts the socket down. The client observes EOF — an
+//! unambiguous signal, unlike a gap — and recovers by subscribing again with
+//! its cursor. That path works where gap-detection could not: at the default
+//! capacity the buffer (`DEFAULT_EVENT_BUFFER_FRAMES`, 4096) holds sixteen
+//! times the per-subscriber queue, so a reconnect usually replays every missed
+//! frame losslessly, and `EventBuffer::resume` filters by the streams the
+//! client asked for. When it cannot — the buffer is a constructor parameter,
+//! and a small one narrows this — the client is told `SnapshotRequired`
+//! outright. Either way it is told something.
 
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
 use shepherd_proto::event::{
@@ -38,10 +59,11 @@ struct Subscriber {
     id: u64,
     streams: Vec<EventStream>,
     tx: SyncSender<EventFrame>,
-    /// Frames dropped because this subscriber was not keeping up. Diagnostic:
-    /// a nonzero value explains a gap the client will otherwise report as
-    /// corruption.
-    dropped: u64,
+    /// Set when this subscriber's queue overflowed, immediately before it is
+    /// unregistered. Shared with the connection's pump, which is otherwise
+    /// unable to tell an overflow from an ordinary shutdown — both reach it as
+    /// a closed channel, and only one of them should shut the socket down.
+    overflowed: Arc<AtomicBool>,
 }
 
 impl Subscriber {
@@ -115,16 +137,23 @@ impl EventHub {
             }
             match s.tx.try_send(frame.clone()) {
                 Ok(()) => true,
+                // Not keeping up. The frame is lost either way — the queue is
+                // full and the publisher will not block. What is NOT lost is
+                // the client's knowledge that it happened: the subscription
+                // ends here, the flag tells the pump to shut the socket, and
+                // EOF is a signal a filtered subscriber can actually act on
+                // where a sequence gap is not. See the module docs.
+                //
+                // Set before the subscriber is dropped, so the pump cannot
+                // observe the closed channel while the flag still reads false.
                 Err(TrySendError::Full(_)) => {
-                    s.dropped += 1;
-                    if s.dropped == 1 {
-                        tracing::warn!(
-                            subscription = s.id,
-                            "subscriber is not keeping up; dropping frames. It will see a \
-                             sequence gap and can recover with a snapshot."
-                        );
-                    }
-                    true
+                    s.overflowed.store(true, Ordering::SeqCst);
+                    tracing::warn!(
+                        subscription = s.id,
+                        "subscriber is not keeping up; ending its subscription. It will see \
+                         EOF and can resume from its cursor."
+                    );
+                    false
                 }
                 // Receiver gone: the connection closed. Reap it.
                 Err(TrySendError::Disconnected(_)) => false,
@@ -135,14 +164,24 @@ impl EventHub {
 
     /// Register a subscription.
     ///
-    /// Returns the result frame, the frames to replay before live delivery, and
-    /// the receiver the connection pumps.
+    /// Returns the result frame, the frames to replay before live delivery, the
+    /// receiver the connection pumps, and the overflow flag.
+    ///
+    /// The flag is what the pump reads once the channel closes, to distinguish
+    /// "this subscriber fell behind and was cut off" — where the socket must be
+    /// shut down so the client learns of it — from an ordinary shutdown, where
+    /// it must not be.
     pub fn subscribe(
         &self,
         streams: Vec<EventStream>,
         resume_from: Option<Seq>,
         client_epoch: Option<&str>,
-    ) -> (SubscribeResult, Vec<EventFrame>, Receiver<EventFrame>) {
+    ) -> (
+        SubscribeResult,
+        Vec<EventFrame>,
+        Receiver<EventFrame>,
+        Arc<AtomicBool>,
+    ) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -162,11 +201,12 @@ impl EventHub {
         };
 
         let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE);
+        let overflowed = Arc::new(AtomicBool::new(false));
         inner.subscribers.push(Subscriber {
             id,
             streams: streams.clone(),
             tx,
-            dropped: 0,
+            overflowed: Arc::clone(&overflowed),
         });
 
         let result = SubscribeResult {
@@ -180,7 +220,7 @@ impl EventHub {
                 streams
             },
         };
-        (result, replay, rx)
+        (result, replay, rx, overflowed)
     }
 
     /// Live subscriber count, for `status` and tests.
@@ -210,7 +250,7 @@ mod tests {
     #[test]
     fn a_subscriber_receives_what_it_asked_for_and_nothing_else() {
         let hub = EventHub::new(64, "e1");
-        let (_, _, rx) = hub.subscribe(vec![EventStream::Scan], None, None);
+        let (_, _, rx, _) = hub.subscribe(vec![EventStream::Scan], None, None);
 
         hub.publish(EventStream::Scan, scan(1));
         hub.publish(EventStream::Job, scan(2));
@@ -229,7 +269,7 @@ mod tests {
     #[test]
     fn an_empty_stream_list_subscribes_to_everything() {
         let hub = EventHub::new(64, "e1");
-        let (result, _, rx) = hub.subscribe(vec![], None, None);
+        let (result, _, rx, _) = hub.subscribe(vec![], None, None);
         assert_eq!(result.streams, EventStream::ALL.to_vec());
         hub.publish(EventStream::Power, scan(1));
         assert!(rx.try_recv().is_ok());
@@ -241,7 +281,7 @@ mod tests {
         for i in 1..=5 {
             hub.publish(EventStream::Scan, scan(i));
         }
-        let (result, replay, _rx) = hub.subscribe(vec![], Some(Seq(3)), Some("e1"));
+        let (result, replay, _rx, _) = hub.subscribe(vec![], Some(Seq(3)), Some("e1"));
         assert!(matches!(
             result.resume,
             ResumeOutcome::Resumed { replayed: 2, .. }
@@ -261,7 +301,7 @@ mod tests {
         for i in 1..=5 {
             hub.publish(EventStream::Scan, scan(i));
         }
-        let (result, replay, _rx) = hub.subscribe(vec![], Some(Seq(3)), Some("run-1"));
+        let (result, replay, _rx, _) = hub.subscribe(vec![], Some(Seq(3)), Some("run-1"));
         assert!(
             matches!(
                 result.resume,
@@ -285,30 +325,110 @@ mod tests {
         assert!(!a.epoch().is_empty());
     }
 
-    /// A stalled subscriber must not stall the publisher. Dropping is safe
-    /// because the sequence numbers make the gap detectable.
+    /// A stalled subscriber must not stall the publisher, and must not stall
+    /// the *other subscribers* either.
+    ///
+    /// ORACLE CHANGED. This test used to end on `subscriber_count() == 2` under
+    /// the comment "it lost frames, it was not disconnected" — it asserted, as
+    /// the desired outcome, precisely the behaviour the review found to be the
+    /// defect. What it was actually guarding is kept and sharpened here: the
+    /// publisher completes without blocking, and the subscriber that kept up
+    /// loses nothing to its neighbour's stall. Whether the stalled one survives
+    /// is now the subject of its own test, with the opposite answer.
+    ///
+    /// So: if you are here because a subscriber vanished and you are wondering
+    /// whether that was intended — it was. See the module docs for why a
+    /// sequence gap could not carry that news to a filtered subscriber.
     #[test]
-    fn a_slow_subscriber_is_dropped_from_not_blocking_everyone_else() {
+    fn a_slow_subscriber_does_not_stall_the_publisher_or_its_peers() {
         let hub = EventHub::new(4096, "e1");
-        let (_, _, slow) = hub.subscribe(vec![], None, None);
-        let (_, _, fast) = hub.subscribe(vec![], None, None);
+        let (_, _, slow, _) = hub.subscribe(vec![], None, None);
+        let (_, _, fast, fast_overflowed) = hub.subscribe(vec![], None, None);
+
+        let total = SUBSCRIBER_QUEUE as u64 + 50;
+        let mut delivered = 0;
+        for i in 0..total {
+            hub.publish(EventStream::Scan, scan(i));
+            // Keep the fast one drained.
+            if fast.try_recv().is_ok() {
+                delivered += 1;
+            }
+        }
+        // Reaching here at all is the never-blocked assertion.
+        assert_eq!(
+            delivered, total,
+            "a stalled peer must not cost a healthy subscriber a single frame"
+        );
+        assert!(!fast_overflowed.load(Ordering::SeqCst));
+        drop(slow);
+    }
+
+    /// A subscriber whose queue overflows is **disconnected**, not left behind.
+    ///
+    /// The old behaviour kept it registered and relied on the client noticing a
+    /// sequence gap. That recovery cannot work for a filtered subscription:
+    /// sequence numbers are global, so gaps caused by streams the client did
+    /// not request are normal and documented as such — the client has no way to
+    /// tell "I lost frames" from "the daemon published something I filtered
+    /// out". And if the burst ends after the drop, there may be no later frame
+    /// to expose the gap at all. So the subscription is ended, the client sees
+    /// EOF, and it recovers through `subscribe` with its cursor — the path that
+    /// actually works, because `EventBuffer::resume` is filter-aware.
+    #[test]
+    fn a_subscriber_whose_queue_overflows_is_disconnected() {
+        let hub = EventHub::new(4096, "e1");
+        let (_, _, slow, slow_overflowed) = hub.subscribe(vec![], None, None);
+        let (_, _, fast, _) = hub.subscribe(vec![], None, None);
 
         for i in 0..(SUBSCRIBER_QUEUE as u64 + 50) {
             hub.publish(EventStream::Scan, scan(i));
             // Keep the fast one drained.
             let _ = fast.try_recv();
         }
-        // The publisher never blocked, and the slow subscriber is still
-        // registered — it lost frames, it was not disconnected.
-        assert_eq!(hub.subscriber_count(), 2);
+
+        assert!(
+            slow_overflowed.load(Ordering::SeqCst),
+            "the overflow must be recorded, or the pump cannot tell this from a clean shutdown"
+        );
+        assert_eq!(
+            hub.subscriber_count(),
+            1,
+            "the overflowing subscriber must be gone; leaving it registered is the defect"
+        );
         drop(slow);
+    }
+
+    /// The accepting direction, so "disconnect everyone" cannot pass.
+    ///
+    /// A subscriber that keeps up stays registered and keeps receiving. Without
+    /// this, a `publish` that dropped every subscriber on the first `try_send`
+    /// would satisfy the test above and deliver no events at all.
+    #[test]
+    fn a_subscriber_that_keeps_up_is_never_disconnected() {
+        let hub = EventHub::new(4096, "e1");
+        let (_, _, rx, overflowed) = hub.subscribe(vec![], None, None);
+
+        for i in 0..(SUBSCRIBER_QUEUE as u64 * 4) {
+            hub.publish(EventStream::Scan, scan(i));
+            rx.try_recv().expect("a drained subscriber loses nothing");
+        }
+
+        assert!(
+            !overflowed.load(Ordering::SeqCst),
+            "nothing was ever dropped"
+        );
+        assert_eq!(
+            hub.subscriber_count(),
+            1,
+            "a subscriber that kept up must still be subscribed"
+        );
     }
 
     #[test]
     fn a_disconnected_subscriber_is_reaped() {
         let hub = EventHub::new(64, "e1");
         {
-            let (_, _, _rx) = hub.subscribe(vec![], None, None);
+            let (_, _, _rx, _) = hub.subscribe(vec![], None, None);
             assert_eq!(hub.subscriber_count(), 1);
         }
         // The receiver dropped with the scope; the next publish notices.
@@ -319,8 +439,8 @@ mod tests {
     #[test]
     fn subscription_ids_are_distinct() {
         let hub = EventHub::new(64, "e1");
-        let (a, _, _ra) = hub.subscribe(vec![], None, None);
-        let (b, _, _rb) = hub.subscribe(vec![], None, None);
+        let (a, _, _ra, _) = hub.subscribe(vec![], None, None);
+        let (b, _, _rb, _) = hub.subscribe(vec![], None, None);
         assert_ne!(a.subscription_id, b.subscription_id);
     }
 }
