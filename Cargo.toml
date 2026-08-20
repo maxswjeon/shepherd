@@ -117,8 +117,26 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 #
 # `behavior-version-latest` is not optional: without it the SDK panics at client
 # construction rather than failing to compile.
+#
+# `aws-sdk-s3` is taken WITHOUT default features, and the four it does keep are
+# its own `default` list minus one: `rustls`. That name is a legacy alias, not
+# the modern path — `rustls` -> `aws-smithy-runtime/tls-rustls` ->
+# `aws-smithy-http-client/legacy-rustls-ring`, which pulls hyper 0.14, h2 0.3,
+# rustls 0.21, rustls-webpki 0.101 and ring into the SHIPPING closure of
+# `shepherd-daemon` alongside the hyper 1.x / rustls 0.23 stack the SDK
+# actually uses. That dead second stack carries RUSTSEC-2026-0258 (h2 0.3.27 is
+# the last 0.3 release, no backport) and RUSTSEC-2026-0098/0099/0104
+# (rustls-webpki 0.101 is EOL). `default-https-client` is what selects the live
+# connector, so dropping `rustls` removes the dead stack and nothing else.
+# Upgrading does not fix this: 1.142.0 still lists `rustls` in `default`.
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.141", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.141", default-features = false, features = [
+    "behavior-version-latest",
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 
 # `async-trait` rather than native `async fn` in traits: one `target` row
 # selects one adapter at runtime, so `StorageAdapter` must be usable as
