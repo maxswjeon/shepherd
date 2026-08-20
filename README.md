@@ -180,6 +180,19 @@ Two conventions matter more than style here:
 
 ## License
 
-Not yet chosen. Until a `LICENSE` file lands, no permission to use, modify or
-distribute this code is granted — this is stated explicitly rather than left
-ambiguous.
+[GNU Affero General Public License v3.0 or later](LICENSE).
+
+Use it, run it, modify it — for yourself or inside your company, freely and at
+no cost. What AGPL asks in return is that changes come back: if you distribute a
+modified version, or **run one as a network service**, the people using it are
+entitled to its source.
+
+That last clause is why AGPL rather than GPL. Shepherd is the shape of software
+that gets wrapped in a hosted control plane, and under GPLv3 a provider may
+modify it, serve it over a network, and never publish a line — because serving
+is not distributing. AGPL §13 closes that.
+
+The intent is not to restrict personal use. It is that a fork which becomes a
+product should still be a fork you can read.
+
+Contributions are accepted under the same licence.
