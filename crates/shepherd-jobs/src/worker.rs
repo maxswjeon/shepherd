@@ -301,7 +301,7 @@ fn worker_loop(
     observer: &dyn JobObserver,
 ) {
     while !stop.load(Ordering::SeqCst) {
-        match run_one(writer, registry, observer) {
+        match run_one(writer, registry, observer, stop) {
             Ok(true) => {}
             Ok(false) => std::thread::sleep(IDLE_POLL),
             Err(WriterError::Gone) => return,
@@ -321,6 +321,7 @@ pub fn run_one(
     writer: &CatalogWriter,
     registry: &Registry,
     observer: &dyn JobObserver,
+    stop: &AtomicBool,
 ) -> Result<bool, WriterError> {
     // Ask only for classes this build can actually run. Claiming counts an
     // attempt, so claiming-then-returning an unrunnable job burns its retry
@@ -405,7 +406,9 @@ pub fn run_one(
             // `running` with no live path able to claim or recover it. Freeing
             // the disk did not unblock it — only a restart did, because
             // `recover_interrupted` runs at start-up.
-            persist(|| writer.try_with(move |cat| Queue::complete(cat, id, now())))?;
+            persist(stop, || {
+                writer.try_with(move |cat| Queue::complete(cat, id, now()))
+            })?;
             observer.transition(Transition {
                 id,
                 class,
@@ -416,7 +419,7 @@ pub fn run_one(
             });
         }
         Err(message) => {
-            let disposition = persist(|| {
+            let disposition = persist(stop, || {
                 let message = message.clone();
                 let job = job.clone();
                 writer.try_with(move |cat| Queue::fail(cat, &job, &message, now()))
@@ -456,15 +459,15 @@ pub fn run_one(
     Ok(true)
 }
 
-/// How many times a job's FINAL transition is retried before giving up.
+/// The longest gap between attempts at a job's FINAL transition.
 ///
-/// Small: the executor's work is finished and the only thing missing is the row
-/// that records it, so this waits out a transient writer failure rather than
-/// retrying the job.
-const FINAL_TRANSITION_ATTEMPTS: usize = 5;
+/// The backoff grows from `FINAL_TRANSITION_FIRST_BACKOFF` up to this, so a
+/// writer that recovers in milliseconds is not waited on for a second, and one
+/// that is down for an hour is not polled thousands of times.
+const FINAL_TRANSITION_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
-/// The gap between those attempts.
-const FINAL_TRANSITION_BACKOFF: Duration = Duration::from_millis(50);
+/// The first gap.
+const FINAL_TRANSITION_FIRST_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Persist a job's terminal state, retrying a transient writer failure.
 ///
@@ -478,29 +481,51 @@ const FINAL_TRANSITION_BACKOFF: Duration = Duration::from_millis(50);
 /// `running` with no live path able to claim or recover it, so a transiently
 /// full disk stranded a COMPLETED job until the daemon restarted.
 ///
-/// `WriterError::Gone` is not retried: the actor is shut down, and no number of
-/// attempts brings it back. Exhausting the attempts propagates as before, which
-/// leaves the row for start-up recovery — requeued for a retryable class, and
-/// quarantined for `destroy` under §4.10.4.
-fn persist<T>(mut op: impl FnMut() -> Result<T, WriterError>) -> Result<T, WriterError> {
-    let mut last = None;
-    for attempt in 0..FINAL_TRANSITION_ATTEMPTS {
+/// # Why it retries until the daemon stops rather than a fixed number of times
+///
+/// A bounded five attempts over 250ms was the first shape of this and it was
+/// not enough: an operator freeing disk space takes minutes, and giving up
+/// inside that window leaves the row `running` with nothing live able to claim
+/// or recover it — `recover_interrupted` runs only at start-up, so the job
+/// stays stranded for as long as the daemon stays *up*. The bound was
+/// protecting nothing; there is no correct action to take after giving up.
+///
+/// So it retries while the pool is running, with a backoff that grows to
+/// `FINAL_TRANSITION_MAX_BACKOFF`. Two things end it, and both are real
+/// answers: `WriterError::Gone` — the actor is shut down, so no number of
+/// attempts brings it back — and `stop`, which is the daemon shutting down and
+/// is exactly the case start-up recovery exists for.
+fn persist<T>(
+    stop: &AtomicBool,
+    mut op: impl FnMut() -> Result<T, WriterError>,
+) -> Result<T, WriterError> {
+    let mut backoff = FINAL_TRANSITION_FIRST_BACKOFF;
+    let mut attempt = 0u64;
+    loop {
         match op() {
             Ok(v) => return Ok(v),
             Err(WriterError::Gone) => return Err(WriterError::Gone),
             Err(e) => {
+                attempt += 1;
                 tracing::warn!(
-                    attempt = attempt + 1,
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
                     error = %e,
-                    "a job's final transition could not be persisted; retrying before \
-                     leaving the row for start-up recovery"
+                    "a job's final transition could not be persisted; the row stays \
+                     `running` until it lands, and nothing else can claim it"
                 );
-                last = Some(e);
-                std::thread::sleep(FINAL_TRANSITION_BACKOFF);
+                if stop.load(Ordering::SeqCst) {
+                    // Shutting down. The row is left `running`, which is
+                    // precisely the state `recover_interrupted` resolves on the
+                    // next start — a requeue for a retryable class, and the
+                    // §4.10.4 quarantine for `destroy`.
+                    return Err(e);
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(FINAL_TRANSITION_MAX_BACKOFF);
             }
         }
     }
-    Err(last.expect("the loop runs at least once"))
 }
 
 /// The message a panic carried, for the failure the queue records.
@@ -611,13 +636,16 @@ mod tests {
 
         w.try_with(|cat| Queue::enqueue(cat, JobClass::Scan, 0, r#"{"root":1}"#, now()))
             .unwrap();
-        assert!(run_one(&w, &registry, &()).unwrap());
+        assert!(run_one(&w, &registry, &(), &AtomicBool::new(false)).unwrap());
         assert_eq!(&*seen.lock().unwrap(), &[r#"{"root":1}"#.to_string()]);
 
         let depth = w.try_with(|cat| Queue::depth(cat)).unwrap();
         let scan = depth.iter().find(|d| d.class == "scan").unwrap();
         assert_eq!((scan.pending, scan.running, scan.failed), (0, 0, 0));
-        assert!(!run_one(&w, &registry, &()).unwrap(), "queue is drained");
+        assert!(
+            !run_one(&w, &registry, &(), &AtomicBool::new(false)).unwrap(),
+            "queue is drained"
+        );
     }
 
     /// Every committed transition is reported, and reported AFTER it commits.
@@ -656,7 +684,7 @@ mod tests {
 
         w.try_with(|cat| Queue::enqueue(cat, JobClass::Scan, 0, "{}", now()))
             .unwrap();
-        assert!(run_one(&w, &registry, seen.as_ref()).unwrap());
+        assert!(run_one(&w, &registry, seen.as_ref(), &AtomicBool::new(false)).unwrap());
         let depth = w.try_with(|cat| Queue::depth(cat)).unwrap();
         let scan = depth.iter().find(|d| d.class == "scan").unwrap();
         assert_eq!(
@@ -679,7 +707,7 @@ mod tests {
         let seen2 = Arc::new(Recorder::default());
         w.try_with(|cat| Queue::enqueue(cat, JobClass::Scan, 0, "{}", now()))
             .unwrap();
-        assert!(run_one(&w, &registry, seen2.as_ref()).unwrap());
+        assert!(run_one(&w, &registry, seen2.as_ref(), &AtomicBool::new(false)).unwrap());
         assert_eq!(
             seen2.0.lock().unwrap().clone(),
             vec![
@@ -725,7 +753,7 @@ mod tests {
             .try_with(|cat| Queue::enqueue(cat, JobClass::Destroy, 0, "{}", now()))
             .unwrap();
 
-        assert!(run_one(&w, &registry, seen.as_ref()).unwrap());
+        assert!(run_one(&w, &registry, seen.as_ref(), &AtomicBool::new(false)).unwrap());
 
         let row_error = w
             .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(id))
@@ -782,7 +810,7 @@ mod tests {
         // print. Silenced only around the call that provokes it.
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let ran = run_one(&w, &registry, &());
+        let ran = run_one(&w, &registry, &(), &AtomicBool::new(false));
         std::panic::set_hook(hook);
 
         assert!(
@@ -836,7 +864,10 @@ mod tests {
             .unwrap();
 
         for _ in 0..200 {
-            assert!(!run_one(&w, &registry, &()).unwrap(), "nothing is runnable");
+            assert!(
+                !run_one(&w, &registry, &(), &AtomicBool::new(false)).unwrap(),
+                "nothing is runnable"
+            );
         }
         let job = w
             .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(id))
@@ -866,7 +897,7 @@ mod tests {
             .try_with(|cat| Queue::enqueue(cat, JobClass::Hash, 0, "{}", now()))
             .unwrap();
 
-        assert!(run_one(&w, &registry, &()).unwrap());
+        assert!(run_one(&w, &registry, &(), &AtomicBool::new(false)).unwrap());
         let job = w
             .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(hash))
             .unwrap()
@@ -885,7 +916,7 @@ mod tests {
             .try_with(|cat| Queue::enqueue(cat, JobClass::Upload, 0, "{}", now()))
             .unwrap();
 
-        assert!(run_one(&w, &registry, &()).unwrap());
+        assert!(run_one(&w, &registry, &(), &AtomicBool::new(false)).unwrap());
         let job = w
             .try_with(move |cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(id))
             .unwrap()
@@ -975,7 +1006,7 @@ mod tests {
             ));
 
             assert!(
-                run_one(&w, &registry, &()).unwrap(),
+                run_one(&w, &registry, &(), &AtomicBool::new(false)).unwrap(),
                 "the job must be claimable"
             );
             assert_eq!(

@@ -70,16 +70,41 @@ pub enum ServerError {
 /// refusals rather than warnings. A refusal here costs the operator one
 /// `SHEPHERD_SOCKET` change; not refusing costs the whole trust boundary.
 fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-        format!(
-            "cannot make {} owner-only ({e}); the socket's directory is the whole \
-             authorization model (§4.3), and a directory this daemon cannot secure is one \
-             another user can replace the socket in",
-            dir.display()
-        )
-    })?;
+    // CREATE owner-only, or VERIFY — never seize.
+    //
+    // This used to `chmod 0700` whatever the socket's parent happened to be,
+    // and the checks below then passed because the chmod had just made them
+    // pass. Point `SHEPHERD_SOCKET` at `/run/shepherd.sock` or
+    // `/tmp/shepherd.sock` as root and the daemon locked every other user and
+    // service out of `/run` or `/tmp` — the override names a socket FILE, not a
+    // directory Shepherd may take over.
+    //
+    // So the mode is only ever applied to a directory this call creates, where
+    // "ours" is true by construction. `DirBuilder` applies it to every level it
+    // makes, so an intermediate is never briefly world-readable either. An
+    // existing directory is checked and, if it does not already meet the bar,
+    // REFUSED with the remedy named: §4.3's own layout is a dedicated
+    // `shepherd/` child, which this will happily create.
+    let existing = std::fs::symlink_metadata(dir);
+    match &existing {
+        Ok(md) if md.is_dir() => {}
+        Ok(md) => {
+            return Err(format!(
+                "{} is {} and cannot host the socket",
+                dir.display(),
+                describe_file_type(md.file_type())
+            ));
+        }
+        Err(_) => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(|e| format!("cannot create {} as owner-only: {e}", dir.display()))?;
+        }
+    }
 
     let md = std::fs::metadata(dir).map_err(|e| format!("cannot stat {}: {e}", dir.display()))?;
     let me = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
@@ -96,8 +121,12 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
     let mode = md.permissions().mode() & 0o777;
     if mode != 0o700 {
         return Err(format!(
-            "{} is mode {mode:04o} after being set to 0700; the socket's directory must be \
-             owner-only, and a filesystem that will not keep it so cannot host the socket",
+            "{} is mode {mode:04o}, and the socket's directory must be owner-only — anyone \
+             who can write it can unlink the socket and answer in its place. This daemon \
+             will NOT chmod a directory it did not create: doing that to `/run` or `/tmp` \
+             locks out every other user on the machine. Point `SHEPHERD_SOCKET` at a file \
+             inside a dedicated directory, which will be created `0700`, or tighten this one \
+             yourself",
             dir.display()
         ));
     }
@@ -194,8 +223,9 @@ pub fn bind(path: &Path, state_lock: std::fs::File) -> Result<Bound, ServerError
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| err(format!("cannot create {}: {e}", parent.display())))?;
+        // Creation happens INSIDE `secure_socket_dir`, so a directory this
+        // daemon makes is `0700` from its first instant rather than created and
+        // then tightened.
         secure_socket_dir(parent).map_err(err)?;
     }
 
@@ -326,6 +356,27 @@ pub struct Bound {
     _socket_lock: std::fs::File,
 }
 
+/// Connections served at once.
+///
+/// Each is an OS thread blocked on `read_frame`, and nothing else bounded them:
+/// a same-user process that connects repeatedly and never completes the
+/// handshake parked one thread per socket until the daemon ran out, and no
+/// legitimate client could connect. The per-connection subscription cap does
+/// not reach this path — it is reached only by a connection that got as far as
+/// subscribing.
+///
+/// Generous: §4.2 makes this a per-user agent, so the real population is a few
+/// CLI invocations and a UI. What it bounds is a loop.
+const MAX_CONNECTIONS: usize = 64;
+
+/// How long a connection may take to send its `hello`.
+///
+/// The handshake is the first frame on a socket that has just been accepted, so
+/// this is a bound on doing nothing rather than on being slow. Without it a
+/// connection that never speaks holds its thread for the daemon's life, which
+/// is the cheapest way to spend the budget above.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Accept connections until `stop` is set.
 pub fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Arc<AtomicBool>) {
     // A short accept timeout so `stop` is noticed without a self-connect trick.
@@ -333,13 +384,32 @@ pub fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Arc<AtomicBool>)
         .set_nonblocking(true)
         .expect("a Unix listener supports non-blocking mode");
 
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Counted BEFORE the thread exists, and released by the guard
+                // when `handle` returns however it returns. A count taken
+                // inside the thread would be a bound the spawn had already
+                // exceeded.
+                let Some(slot) = ConnectionSlot::take(&live) else {
+                    tracing::warn!(
+                        live = MAX_CONNECTIONS,
+                        "refusing a connection: the daemon is already serving its limit. \
+                         A client that connects without completing the handshake holds a \
+                         thread until it does, so this bounds that rather than the work"
+                    );
+                    // Dropped, which closes the socket. The client sees EOF
+                    // rather than a silent hang, which is the difference
+                    // between a refusal and a leak.
+                    drop(stream);
+                    continue;
+                };
                 let daemon = Arc::clone(&daemon);
                 if let Err(e) = std::thread::Builder::new()
                     .name("shepherd-conn".into())
                     .spawn(move || {
+                        let _slot = slot;
                         if let Err(e) = handle(stream, daemon) {
                             tracing::debug!(error = %e, "connection ended");
                         }
@@ -356,9 +426,47 @@ pub fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Arc<AtomicBool>)
     }
 }
 
+/// A served connection, counted for as long as its thread runs.
+///
+/// A guard rather than a manual increment/decrement pair: `handle` has several
+/// exits — EOF, a write failure, an oversized frame, a propagated `Err` — and a
+/// decrement that has to be remembered at each of them is one that eventually
+/// is not, at which point the daemon stops accepting connections it is not
+/// serving.
+struct ConnectionSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ConnectionSlot {
+    /// One slot, or `None` if the daemon is already at its limit.
+    fn take(live: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        // `fetch_update`, not load-then-store: two accepts racing on a
+        // check-then-increment both pass the check.
+        live.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < MAX_CONNECTIONS).then_some(n + 1)
+        })
+        .ok()
+        .map(|_| ConnectionSlot(Arc::clone(live)))
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Serve one connection.
 fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
+    // A deadline on the HANDSHAKE only. A connection that never sends its first
+    // frame holds this thread for the daemon's life, which is the cheapest way
+    // to exhaust the connection budget; a connection that has said hello is a
+    // client the daemon is serving, and `events.subscribe` legitimately waits
+    // for hours, so the timeout is cleared below rather than kept.
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    // Kept to clear that deadline once the handshake is done. The timeout is a
+    // property of the socket, so this handle and the one inside `writer` are
+    // the same underlying description either way.
+    let deadline_handle = stream.try_clone()?;
     let reader = BufReader::new(stream.try_clone()?);
     // Shared because the event pump writes to the same socket as the responses.
     let writer = Arc::new(std::sync::Mutex::new(stream));
@@ -384,6 +492,11 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
             return Ok(());
         }
     };
+
+    // Handshake done: this is a client, not a squatter. The deadline is
+    // cleared because a subscribed connection is SUPPOSED to sit quiet — it is
+    // waiting for events — and a read timeout would end it.
+    deadline_handle.set_read_timeout(None)?;
 
     let mut session = Session {
         daemon: Arc::clone(&daemon),
@@ -905,7 +1018,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        mkdir_owner_only(&dir);
         let paths = shepherd_obs::paths::Paths {
             state_dir: dir.clone(),
             socket: dir.join("daemon.sock"),
@@ -1024,7 +1137,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        mkdir_owner_only(&dir);
         let paths = shepherd_obs::paths::Paths {
             state_dir: dir.clone(),
             socket: dir.join("daemon.sock"),
@@ -1115,6 +1228,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Create a directory the way the daemon does: owner-only from the start.
+    ///
+    /// These fixtures used to `create_dir_all` at the ambient umask and lean on
+    /// `bind` to tighten it. It no longer does — chmodding a directory it did
+    /// not create is what let `SHEPHERD_SOCKET=/tmp/shepherd.sock` lock out
+    /// `/tmp` — so a fixture that wants a pre-existing socket directory has to
+    /// make one that meets the bar, exactly as an operator would.
+    fn mkdir_owner_only(dir: &Path) {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir);
+    }
+
     /// `bind`, taking the state lock the way `cmd_run` does.
     ///
     /// Production takes the lock first and hands the held file to `bind`, so
@@ -1126,7 +1254,7 @@ mod tests {
         // the lock usually sits in the socket's own directory, which `bind`
         // creates — so the fixture stands in for that step.
         if let Some(parent) = lock_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            mkdir_owner_only(parent);
         }
         super::bind(path, take_state_lock(lock_path)?)
     }
@@ -1203,7 +1331,7 @@ mod tests {
     #[test]
     fn bind_refuses_to_unlink_a_non_socket_path() {
         let path = tmp_socket("nonsock");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        mkdir_owner_only(path.parent().unwrap());
         std::fs::write(&path, b"a document the user cares about").unwrap();
 
         let e = bind(&path, &path.with_extension("lock"))
@@ -1389,6 +1517,54 @@ mod tests {
         );
     }
 
+    /// An existing shared directory is REFUSED, never taken over.
+    ///
+    /// `SHEPHERD_SOCKET` names a socket FILE. Pointing it at `/run/shepherd.sock`
+    /// or `/tmp/shepherd.sock` as root used to chmod the parent to `0700` — and
+    /// the ownership and mode checks then passed because the chmod had just
+    /// made them pass — locking every other user and service out of `/run` or
+    /// `/tmp`. A directory this daemon did not create is checked, not seized.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_shared_directory_is_refused_rather_than_chmodded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tmp_socket("shared-parent");
+        let dir = path.parent().unwrap().to_path_buf();
+        mkdir_owner_only(&dir);
+        // Somebody else's directory, or simply one the operator uses for other
+        // things: group- and world-readable, as `/run` and `/tmp` are.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = bind(&path, &dir.join("d.lock"))
+            .expect_err("a shared directory must not be taken over");
+        assert!(
+            err.to_string().contains("did not create"),
+            "the refusal must explain why it will not just fix the mode: {err}"
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "and it must not have been chmodded on the way to refusing"
+        );
+
+        // THE ACCEPTING DIRECTION: a dedicated child, which the daemon creates
+        // owner-only from its first instant. This is §4.3's own layout.
+        let nested = dir.join("shepherd").join("daemon.sock");
+        let bound = bind(&nested, &dir.join("d.lock")).expect("a dedicated child is created");
+        assert_eq!(
+            std::fs::metadata(nested.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "created owner-only rather than created and then tightened"
+        );
+        drop(bound);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The state lock is takeable before anything else, and refuses a second
     /// holder.
     ///
@@ -1403,7 +1579,7 @@ mod tests {
     #[test]
     fn the_state_lock_is_exclusive_and_precedes_binding() {
         let path = tmp_socket("statelock");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        mkdir_owner_only(path.parent().unwrap());
         let lock_path = path.with_extension("lock");
 
         let first = super::lock_state_dir(&lock_path).expect("the first daemon takes it");
@@ -1460,7 +1636,7 @@ mod tests {
     fn a_socket_directory_that_cannot_be_secured_is_refused() {
         let path = tmp_socket("insecure");
         let dir = path.parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&dir).unwrap();
+        mkdir_owner_only(&dir);
 
         // The accepting direction first: an ordinary owner-only directory binds.
         let ok = bind(&path, &path.with_extension("lock")).expect("an ordinary directory binds");
@@ -1488,9 +1664,16 @@ mod tests {
                 &path.with_extension("lock"),
             )
             .expect_err("a directory this daemon cannot secure must not host the socket");
+            // The reason changed with the fix and is now the STRONGER one: the
+            // daemon no longer tries to chmod a directory it did not create, so
+            // `/proc/sys` is refused for being someone else's rather than for a
+            // chmod that would not stick. Either sentence is a refusal that
+            // names the directory; what must never happen is a bind.
+            let msg = err.to_string();
             assert!(
-                err.to_string().contains("authorization model")
-                    || err.to_string().contains("cannot create"),
+                msg.contains("owned by uid")
+                    || msg.contains("must be owner-only")
+                    || msg.contains("cannot create"),
                 "the refusal must say why the directory is unusable: {err}"
             );
         }
@@ -1515,7 +1698,7 @@ mod tests {
     fn two_state_directories_cannot_share_one_socket() {
         let path = tmp_socket("shared-socket");
         let dir = path.parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&dir).unwrap();
+        mkdir_owner_only(&dir);
 
         // Two DIFFERENT state locks, as two daemons with different
         // `SHEPHERD_STATE_DIR` values would have.
@@ -1560,7 +1743,7 @@ mod tests {
     #[test]
     fn a_stale_socket_file_is_cleared() {
         let path = tmp_socket("stale");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        mkdir_owner_only(path.parent().unwrap());
         drop(UnixListener::bind(&path).expect("bind the socket a killed daemon left"));
         assert!(path.exists(), "dropping a listener leaves the node behind");
 
@@ -1610,7 +1793,7 @@ mod tests {
     #[test]
     fn two_daemons_racing_over_a_stale_socket_cannot_both_bind() {
         let path = tmp_socket("race");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        mkdir_owner_only(path.parent().unwrap());
         // A stale node, exactly as a killed daemon leaves one.
         drop(UnixListener::bind(&path).expect("seed a stale socket"));
 

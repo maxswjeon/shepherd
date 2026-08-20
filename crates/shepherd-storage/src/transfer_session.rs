@@ -897,6 +897,29 @@ impl<'a> TransferDriver<'a> {
         let mode = self.adapter.probe_attestation_mode().await?;
         session.attestation_mode = Some(mode);
         if mode == AttestationMode::Version {
+            // The pinned version must be the one whose bytes were HASHED.
+            //
+            // `meta.version` came from the HEAD taken before the full read, and
+            // `verify_full_content` fetches ranges by the UNVERSIONED key. If
+            // the object changed in between and the newer bytes happened to
+            // hash correctly, the session committed while pinning a version
+            // nothing had read — and if that older version later became current
+            // again, the closing HEAD would match and authorize a destruction
+            // whose only pinned remote bytes are wrong.
+            //
+            // A second HEAD closes it rather than narrowing it: a version id is
+            // minted per PUT, so an id unchanged across the read PROVES no PUT
+            // landed in between. Restoring an old version produces a new id, so
+            // there is no there-and-back that this cannot see.
+            let after = self.adapter.head(&session.remote_key).await?;
+            let after_version = after.and_then(|m| m.version);
+            if after_version != meta.version {
+                return Err(StorageError::ContentMismatch {
+                    key: session.remote_key.as_str().to_owned(),
+                    expected: format!("version {:?} throughout verification", meta.version),
+                    actual: format!("version {after_version:?} after it"),
+                });
+            }
             session.object_version = meta.version;
         }
         Ok(())

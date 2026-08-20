@@ -826,12 +826,34 @@ pub async fn read_chain(adapter: &dyn StorageAdapter) -> StorageResult<ChainReso
     let prefix = format!("{}{CATALOG_PREFIX}", shepherd_core::CONTROL_PREFIX);
     let mut keys: Vec<ObjectKey> = Vec::new();
     let mut page = None;
+    // Every continuation token this listing has used — see the cycle refusal.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         let p = adapter.list(&prefix, page.as_ref()).await?;
         keys.extend(p.keys);
         match p.next {
             // OQ-1 requires pagination exhausted, not first-page.
-            Some(t) => page = Some(t),
+            Some(t) => {
+                // A provider that CYCLES its tokens — A returns B, B returns A
+                // — never repeats its immediate predecessor, so the adapter's
+                // local echo check cannot see it and this loop would page
+                // forever, re-appending the same keys. A refusal rather than a
+                // break: a partial listing read as complete is exactly what
+                // OQ-1 forbids, and this reader is what decides whether a chain
+                // has gaps.
+                if !seen.insert(t.as_opaque().to_owned()) {
+                    return Err(StorageError::Provider {
+                        provider: adapter.capabilities().provider,
+                        op: "read_chain".into(),
+                        detail: format!(
+                            "continuation tokens are cycling on `{prefix}`; the listing \
+                             cannot be exhausted, and a partial one must not be read as \
+                             complete"
+                        ),
+                    });
+                }
+                page = Some(t);
+            }
             None => break,
         }
     }

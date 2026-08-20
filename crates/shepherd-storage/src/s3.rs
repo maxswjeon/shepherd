@@ -403,6 +403,9 @@ impl StorageAdapter for S3Adapter {
     ) -> StorageResult<Vec<PartReceipt>> {
         let mut out = Vec::new();
         let mut marker: Option<String> = None;
+        // Every marker this listing has already requested — see the cycle
+        // refusal below.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             let mut req = self
                 .client
@@ -413,6 +416,7 @@ impl StorageAdapter for S3Adapter {
             // `take`: the marker is consumed by exactly this request, and the
             // truncated branch below always writes the next one back.
             let requested = marker.take();
+            let _ = &requested;
             if let Some(m) = requested.clone() {
                 req = req.part_number_marker(m);
             }
@@ -455,13 +459,17 @@ impl StorageAdapter for S3Adapter {
                 // until it is killed. Bounded by the marker having to move,
                 // rather than by an iteration cap, because a cap would also
                 // truncate a legitimately long listing.
-                if requested.as_deref() == Some(next.as_str()) {
+                // EVERY marker seen, not just the previous one: an endpoint
+                // that alternates A -> B -> A never repeats its immediate
+                // predecessor and would page forever.
+                if !seen.insert(next.clone()) {
                     return Err(StorageError::Provider {
                         provider: "s3",
                         op: "list_parts".into(),
                         detail: format!(
-                            "response was truncated and returned the same continuation marker \
-                             it was given ({next}); paging cannot advance"
+                            "response was truncated and returned a continuation marker \
+                             already used on this listing ({next}); paging is cycling rather \
+                             than advancing"
                         ),
                     });
                 }
@@ -549,6 +557,10 @@ impl StorageAdapter for S3Adapter {
         let mut out = Vec::new();
         let mut key_marker: Option<String> = None;
         let mut id_marker: Option<String> = None;
+        // Every marker pair this listing has already requested — see the cycle
+        // refusal below.
+        let mut seen: std::collections::HashSet<(Option<String>, Option<String>)> =
+            std::collections::HashSet::new();
         loop {
             let mut req = self
                 .client
@@ -560,6 +572,7 @@ impl StorageAdapter for S3Adapter {
             // Kept as `requested_*` so that branch can tell an advancing marker
             // pair from one the provider handed straight back.
             let (requested_key, requested_id) = (key_marker.take(), id_marker.take());
+            let _ = (&requested_key, &requested_id);
             if let Some(k) = requested_key.clone() {
                 req = req.key_marker(k);
             }
@@ -590,14 +603,19 @@ impl StorageAdapter for S3Adapter {
                 // flagged by review here — this is the sibling of the loop that
                 // was, and one function over is exactly where the missing-marker
                 // case had been missing too.
-                if (next_key.as_deref(), next_id.as_deref())
-                    == (requested_key.as_deref(), requested_id.as_deref())
-                {
+                // EVERY pair seen, not just the previous one. An endpoint that
+                // alternates — A returns B, B returns A — never repeats its
+                // immediate predecessor, so an equality check against the last
+                // request walks that cycle forever, appending the same pages.
+                // A set costs one allocation per page against a listing that is
+                // already one network round trip per page.
+                if !seen.insert((next_key.clone(), next_id.clone())) {
                     return Err(StorageError::Provider {
                         provider: "s3",
                         op: "list_multipart_uploads".into(),
-                        detail: "response was truncated and returned the same continuation \
-                                 markers it was given; paging cannot advance"
+                        detail: "response was truncated and returned continuation markers \
+                                 already used on this listing; paging is cycling rather than \
+                                 advancing"
                             .into(),
                     });
                 }
@@ -1035,6 +1053,33 @@ where
 /// sweep is allowed to delete.
 const PROBE_PREFIX: &str = "_shepherd/probe/";
 
+/// How old a probe artifact must be before the sweep may reap it.
+///
+/// A probe is a handful of round trips; anything still in flight is seconds
+/// old. This is the margin that keeps a CONCURRENT registration's artifacts out
+/// of the sweep's reach — two `target.add` calls against one bucket run on
+/// separate connection threads with no bucket-level serialization, so without
+/// it one aborts the other's upload and deletes its object just before the
+/// HEAD, and a healthy provider looks broken.
+const PROBE_REAP_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Whether a probe key is old enough to reap.
+///
+/// The nonce is `{pid}-{nanos}-{seq}`, so the artifact carries its own start
+/// time and the sweep needs no provider timestamps — which is the point, since
+/// `list` returns keys and nothing else. A key this cannot parse is LEFT: an
+/// unrecognised name under this prefix is not one this sweep put there, and
+/// deleting what it does not understand is how a tidy-up becomes a data loss.
+fn probe_is_stale(key: &str, now_nanos: u128) -> bool {
+    let Some(nonce) = key.rsplit('-').nth(1) else {
+        return false;
+    };
+    let Ok(started) = nonce.parse::<u128>() else {
+        return false;
+    };
+    now_nanos.saturating_sub(started) > PROBE_REAP_AFTER.as_nanos()
+}
+
 /// Abort and delete whatever earlier probes left under the probe prefix.
 ///
 /// Best-effort by construction: this is tidying, and a provider that will not
@@ -1047,9 +1092,20 @@ const PROBE_PREFIX: &str = "_shepherd/probe/";
 /// first is worth more.
 async fn sweep_probe_leftovers(adapter: &S3Adapter) {
     let prefix = PROBE_PREFIX;
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     match adapter.list_incomplete_uploads(prefix).await {
         Ok(uploads) => {
             for u in uploads {
+                // Old enough to be nobody's live probe. Two registrations
+                // against one bucket run concurrently on separate connection
+                // threads, and aborting the other one's upload makes a healthy
+                // provider look broken.
+                if !probe_is_stale(u.key.as_str(), now_nanos) {
+                    continue;
+                }
                 if let Err(e) = adapter.abort_multipart(&u.key, &u.upload_id).await {
                     tracing::warn!(
                         key = u.key.as_str(),
@@ -1067,7 +1123,10 @@ async fn sweep_probe_leftovers(adapter: &S3Adapter) {
         ),
     }
 
-    let mut page = None;
+    let mut page: Option<OpaqueToken> = None;
+    // Cycles, not just immediate echoes: `list_page` catches a token handed
+    // straight back, and an alternating provider needs the caller's memory.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         match adapter.list(prefix, page.as_ref()).await {
             Ok(listing) => {
@@ -1081,6 +1140,12 @@ async fn sweep_probe_leftovers(adapter: &S3Adapter) {
                     let Some(control) = ControlKey::new(key.clone()) else {
                         continue;
                     };
+                    // Same age gate as the uploads above: a concurrent probe's
+                    // object deleted just before its own HEAD fails a
+                    // registration that had nothing wrong with it.
+                    if !probe_is_stale(key.as_str(), now_nanos) {
+                        continue;
+                    }
                     if let Err(e) = adapter.delete_system_object(&control).await {
                         tracing::warn!(
                             key = key.as_str(),
@@ -1090,7 +1155,17 @@ async fn sweep_probe_leftovers(adapter: &S3Adapter) {
                     }
                 }
                 match listing.next {
-                    Some(token) => page = Some(token),
+                    Some(token) => {
+                        if !seen.insert(token.as_opaque().to_owned()) {
+                            tracing::warn!(
+                                prefix,
+                                "the provider is cycling its continuation tokens; stopping \
+                                 the probe sweep rather than paging forever"
+                            );
+                            break;
+                        }
+                        page = Some(token);
+                    }
                     None => break,
                 }
             }
@@ -1879,6 +1954,12 @@ fn list_page(
     // handing back the token it was given makes that loop permanent. Caught
     // here rather than in each caller, because "exhaust the pagination" is
     // exactly what every caller is told to do.
+    //
+    // This is the IMMEDIATE echo only. A provider alternating A -> B -> A never
+    // repeats its predecessor, and a pure function has nowhere to remember the
+    // pairs it has already seen — so the loops that call `list` keep a set of
+    // their own. `list_parts` and `list_multipart_uploads` own their loops and
+    // do it there.
     if truncated && token.is_some() && token == requested {
         return Err(StorageError::Provider {
             provider: "s3",

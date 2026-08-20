@@ -46,6 +46,27 @@ use shepherd_proto::{Hello, PROTO_VERSION, PeerInfo, ProtoVersion, RequestId};
 // ---------------------------------------------------------------------------
 
 /// A running daemon in its own state directory, killed on drop.
+/// Make a directory the daemon will accept as a socket parent.
+///
+/// `secure_socket_dir` no longer chmods a directory it did not create — that is
+/// what let `SHEPHERD_SOCKET=/tmp/shepherd.sock` lock out `/tmp` — so a harness
+/// that pre-creates the socket's parent has to create it owner-only, exactly as
+/// an operator would. Production usually does not hit this at all: §4.3 puts
+/// the socket in `$XDG_RUNTIME_DIR/shepherd/`, which the daemon creates itself.
+fn mkdir_socket_parent(dir: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir);
+    // And enforced, because `DirBuilder` is a no-op on a directory that already
+    // exists — several fixtures create the state child first, which makes this
+    // parent at the ambient umask on the way. Chmodding here is the OPERATOR's
+    // action, which is exactly the thing the daemon must no longer do for them.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .expect("make the socket's parent owner-only");
+}
+
 struct Daemon {
     child: Child,
     dir: PathBuf,
@@ -74,6 +95,8 @@ impl Daemon {
         // `root.add` now refuses, and which no real user has. Siblings is the
         // real shape.
         std::fs::create_dir_all(dir.join("state")).unwrap();
+        // The socket's own parent, owner-only — see `mkdir_socket_parent`.
+        mkdir_socket_parent(&dir);
         let socket = dir.join("daemon.sock");
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_shepherdd"));
@@ -114,6 +137,10 @@ impl Daemon {
         // `create_dir_all` produces under the usual `022`.
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        // The STATE directory stays deliberately loose — that is the case under
+        // test — while the socket's own parent meets the bar, which is the
+        // arrangement an operator with a custom socket path has to make.
+        mkdir_socket_parent(&dir);
         let socket = dir.join("daemon.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_shepherdd"))
             .arg("run")
@@ -232,7 +259,7 @@ impl Daemon {
     fn start_with_only_a_state_dir(tag: &str) -> Daemon {
         let dir = fixture_root().join(format!("shepherdd-e2e-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        mkdir_socket_parent(&dir);
         // Where `Paths::resolve` will put it, stated by the test rather than
         // read back from the daemon: if this expectation and the daemon's
         // resolution disagree, `wait_until_listening` fails and says so.
