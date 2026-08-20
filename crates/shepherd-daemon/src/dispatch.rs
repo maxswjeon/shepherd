@@ -317,7 +317,56 @@ impl ShepherdApi for Session {
         // difference — §4.12 forbids guessing it, and `probe_path_policies`
         // just above already writes to this same directory.
         let atime_mode = shepherd_catalog::atime::detect_with_write_probe(&path);
-        let volume = shepherd_catalog::volume::volume_id(&path).ok();
+
+        // The deny decision and the probes are separated by pathname
+        // resolution, so a symlinked ancestor retargeted in between sends the
+        // probes somewhere the deny list never saw. Rechecked here, against the
+        // canonical path that passed.
+        //
+        // What this does and does not buy, stated plainly: the probe files have
+        // already been written by the time this runs, so a retarget lands them
+        // in the new tree either way. What it prevents is ENROLLING that tree —
+        // the lasting harm, since an enrolled root is scanned, catalogued and
+        // eventually tiered — and it turns a silent trespass into a refusal
+        // that names the path. Closing the write itself needs the probes to
+        // take a pinned directory handle and use `openat`, which is a
+        // `shepherd-catalog` API change rather than a check added here.
+        let recanonical = std::fs::canonicalize(&path).ok();
+        if recanonical.as_deref() != canonical.as_deref().or(Some(path.as_path())) {
+            return Err(RpcError::new(
+                ErrorCode::Refused,
+                format!(
+                    "`{}` resolved to {:?} when it was checked against the AC-7 deny list and \
+                     to {:?} by the time it was probed; a path that moves under enrollment is \
+                     refused rather than registered",
+                    req.path,
+                    canonical.as_deref().unwrap_or(path.as_path()),
+                    recanonical.as_deref(),
+                ),
+            ));
+        }
+        // `NoStableId` is a REDIRECT, not a failure, and `.ok()` was throwing
+        // it away. `volume_id` refuses for exactly the filesystems that have no
+        // block device behind them — NFS, CIFS, tmpfs, overlay, FUSE — and its
+        // own error text says to use `volume_id_fallback` and record that the
+        // identity is source-derived. Discarding it enrolled every NAS root
+        // with `volume_id = NULL`, and a NULL volume id means `upsert_file`
+        // can build no `fs_id` at all: no identity-based lock for upload or
+        // destruction, and no rename-versus-replacement decision, for every
+        // file on the roots most likely to hold the archive.
+        //
+        // The fallback's own contract is that `server:/vol` is stable across
+        // remounts in the way `st_dev` is not, and it labels itself with a
+        // different scheme so a human reading the column can tell a weaker
+        // identity from a UUID-backed one. That is the distinction worth
+        // keeping; silently having none is not.
+        let volume = match shepherd_catalog::volume::volume_id(&path) {
+            Ok(id) => Some(id),
+            Err(shepherd_catalog::volume::VolumeError::NoStableId { .. }) => {
+                shepherd_catalog::volume::volume_id_fallback(&path).ok()
+            }
+            Err(_) => None,
+        };
 
         let mut warnings = Vec::new();
 
@@ -390,6 +439,16 @@ impl ShepherdApi for Session {
                 "this root's atime is `{}`, so a rule matching on last access cannot be \
                  trusted to gate destruction here (§4.12)",
                 atime_mode.as_str()
+            ));
+        }
+        if volume.as_deref().is_some_and(|v| !v.starts_with("uuid:")) {
+            warnings.push(format!(
+                "this root's identity is source-derived (`{}`) rather than UUID-backed: it \
+                 has no /dev/disk/by-uuid entry, which is normal for NFS, CIFS, tmpfs and \
+                 overlay. It is stable across remounts in the way `st_dev` is not, and it is \
+                 weaker — if the export is republished under a different source, every file \
+                 row's identity changes with it.",
+                volume.as_deref().unwrap_or_default()
             ));
         }
         if volume.is_none() {

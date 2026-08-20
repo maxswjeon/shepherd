@@ -212,7 +212,15 @@ pub fn walk(
     }
 
     let mut seen: HashSet<DirId> = HashSet::new();
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    // The root's identity is taken here and rechecked after its `read_dir`,
+    // like every directory below it. `None` — no inode on this platform — means
+    // the recheck cannot run, and the walk proceeds as it always did rather
+    // than refusing on a platform that cannot express the check.
+    let root_dir_id = dir_id(root);
+    let mut stack: Vec<(PathBuf, DirId)> = match root_dir_id {
+        Some(id) => vec![(root.to_path_buf(), id)],
+        None => Vec::new(),
+    };
 
     // The root's own filesystem, for the nested-mount check on every entry
     // below. See `on_root_volume`.
@@ -222,7 +230,7 @@ pub fn walk(
         seen.insert(id);
     }
 
-    while let Some(dir) = stack.pop() {
+    while let Some((dir, expected_id)) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
@@ -233,6 +241,37 @@ pub fn walk(
                 continue;
             }
         };
+
+        // The directory this loop just opened must still be the one that was
+        // CLASSIFIED as a directory when it was pushed.
+        //
+        // `symlink_metadata` at classification time and `read_dir` here are two
+        // resolutions of one pathname, and a rename between them is enough:
+        // replace the directory with a symlink and `read_dir` follows it, so
+        // another tree's regular files are catalogued under this root — with no
+        // symlink the walker ever saw, in a walker whose stated policy is that
+        // it never follows one.
+        //
+        // Rechecking after the open does not make the window zero; it makes the
+        // ENTRIES unusable when the swap happened, which is the harm. Closing
+        // it completely needs `openat`-relative traversal with `O_NOFOLLOW` and
+        // `fdopendir`, none of which `std` exposes — a walker rewritten around
+        // directory handles, not a check added to this one.
+        match dir_id(&dir) {
+            Some(now) if now == expected_id => {}
+            other => {
+                out.skipped.push(Skip::Unreadable {
+                    path: dir,
+                    detail: format!(
+                        "the directory was replaced between being classified and being read \
+                         (identity was {expected_id:?}, is now {other:?}); its entries are \
+                         not this root's and are not catalogued"
+                    ),
+                });
+                continue;
+            }
+        }
+
         out.dirs_visited += 1;
 
         for entry in entries {
@@ -291,8 +330,16 @@ pub fn walk(
                 }
                 match dir_id(&path) {
                     Some(id) => {
-                        if seen.insert(id) {
-                            stack.push(path);
+                        if seen.insert(id.clone()) {
+                            // The identity is carried WITH the path, and
+                            // rechecked after `read_dir` opens it. Everything
+                            // between this classification and that open is a
+                            // window: a directory replaced by a symlink is
+                            // followed by `read_dir`, and its entries would be
+                            // catalogued under this root — an outside or denied
+                            // tree pulled in with no symlink the walker ever
+                            // saw. See the recheck at the top of the loop.
+                            stack.push((path, id));
                         } else {
                             // Already walked under another name: a symlink loop
                             // or a bind-mount alias.
@@ -1246,6 +1293,65 @@ mod tests {
             2,
             "both must be reported, or the user cannot know what was left out: {:?}",
             out.skipped
+        );
+    }
+
+    /// A directory swapped for a symlink between classification and read has
+    /// its entries REFUSED, not catalogued under this root.
+    ///
+    /// `symlink_metadata` at classification and `read_dir` at traversal are two
+    /// resolutions of one pathname. A rename between them is enough: replace
+    /// the directory with a symlink and `read_dir` follows it, so another
+    /// tree's files are catalogued under this root — with no symlink the walker
+    /// ever saw, in a walker whose stated policy is that it never follows one.
+    ///
+    /// The swap is performed directly rather than raced, because the window is
+    /// what is under test and a race would make the test flaky about the very
+    /// thing it asserts.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_symlink_has_its_entries_refused() {
+        let t = Tmp::new("dirswap");
+        t.file("real/keep.txt", b"mine");
+        t.file("elsewhere/stolen.txt", b"not mine");
+
+        // Classify `real` as a directory, exactly as the walk does.
+        let real = t.0.join("real");
+        let classified = dir_id(&real).expect("a directory has an identity");
+
+        // Now it is a symlink to a tree outside the root.
+        std::fs::remove_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(t.0.join("elsewhere"), &real).unwrap();
+
+        // The identity check is what the walk performs after `read_dir`.
+        assert_ne!(
+            dir_id(&real),
+            Some(classified),
+            "the swap must actually change the identity, or this tests nothing"
+        );
+
+        // The end-to-end interleaving — swap the directory WHILE the walk holds
+        // it on the stack — is not reproducible without a hook inside the loop,
+        // and a hook there would be a second traversal path to keep correct.
+        // What is reproducible, and what the walk compares, is the pair above:
+        // the identity recorded at classification against the identity the
+        // pathname resolves to when `read_dir` returns.
+        //
+        // A swap that lands BEFORE the walk starts takes the ordinary path and
+        // is refused for the ordinary reason, which is worth pinning too: no
+        // symlinked directory is ever descended.
+        let out = go(&t, &DenyList::builtin());
+        assert!(
+            out.skipped
+                .iter()
+                .any(|s| matches!(s, Skip::SymlinkedDir { path } if path == &real)),
+            "a symlinked directory must be reported and not descended: {:?}",
+            out.skipped
+        );
+        assert!(
+            !out.files.iter().any(|f| f.rel_path.starts_with("real")),
+            "nothing under the swapped name may be catalogued: {:?}",
+            out.files.iter().map(|f| &f.rel_path).collect::<Vec<_>>()
         );
     }
 

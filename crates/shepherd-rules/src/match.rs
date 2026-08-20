@@ -183,7 +183,20 @@ impl Matcher {
         let (matched, signal) = eval_predicate(&self.root, file, ctx);
         MatchOutcome {
             matched,
-            age_signal: signal.or_else(|| self.fallback_signal(file, ctx)),
+            // The fallback applies ONLY to a non-match. A successful match that
+            // returned no signal returned it deliberately: `any: [{ext}, {age}]`
+            // selected by extension, or a `not` around an age predicate, are
+            // both matches that no timestamp authorized. Overriding that with
+            // the rule's first age predicate made the preview claim a
+            // timestamp had — and, worse, made `age_signal` depend on a value
+            // the match never read, so a change in the fallback source can
+            // raise `PreviewDrifted` while the matched set and the authorizing
+            // branch are both unchanged.
+            age_signal: if matched {
+                signal
+            } else {
+                self.fallback_signal(file, ctx)
+            },
         }
     }
 
@@ -198,17 +211,25 @@ impl Matcher {
         file: &FileStat,
         ctx: &MatchContext<'_>,
     ) -> Option<AccessSignalSource> {
-        eval_predicate(&self.root, file, ctx)
-            .1
-            .or_else(|| self.fallback_signal(file, ctx))
+        let (matched, signal) = eval_predicate(&self.root, file, ctx);
+        if matched {
+            signal
+        } else {
+            self.fallback_signal(file, ctx)
+        }
     }
 
-    /// The rule-level answer, for a file that matched nothing.
+    /// The rule-level answer, for a file that matched **nothing**.
     ///
     /// No branch authorized the match, so no branch can name the signal — but
     /// `None` would read as "this rule has no age predicate", which is a
     /// different statement. Nothing is acted on for a non-match, so naming the
     /// rule's first age predicate is the honest remainder.
+    ///
+    /// Never applied to a MATCH. A matching branch that carries no age
+    /// predicate reports `None` because none authorized it, and substituting a
+    /// signal there is the mislabel this whole apparatus exists to prevent —
+    /// in the same shape as the `Mtime`-for-`Ctime` one, one layer up.
     fn fallback_signal(
         &self,
         file: &FileStat,

@@ -197,7 +197,22 @@ impl AuditLog {
             detail: e.to_string(),
         };
         if let Some(parent) = path.parent() {
+            // Every directory `create_dir_all` creates needs ITS OWN parent
+            // fsynced, not just the deepest one. Syncing `parent` alone
+            // publishes the log file's entry inside it and leaves the entry
+            // NAMING that directory unpublished in the level above — so a power
+            // loss can take the whole new directory away, and the only audit
+            // log with it, after a destruction has completed.
+            //
+            // Collected before the create, deepest first, so only the levels
+            // this call actually adds are synced.
+            let created: Vec<&Path> = parent.ancestors().take_while(|a| !a.exists()).collect();
             std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+            for dir in created.iter().rev() {
+                if let Some(above) = dir.parent() {
+                    sync_dir(above).map_err(|e| io(above, e))?;
+                }
+            }
         }
         std::fs::OpenOptions::new()
             .create(true)
@@ -385,7 +400,11 @@ mod tests {
     #[test]
     fn opening_the_log_creates_and_publishes_it() {
         let t = Tmp::new("publish");
-        let p = t.0.join("nested").join("destroy.jsonl");
+        // Two missing levels, not one: `create_dir_all` adds an entry in EACH
+        // of them, and syncing only the deepest leaves the entry naming it
+        // unpublished in the level above — so a power loss takes the whole
+        // directory and the only audit log with it.
+        let p = t.0.join("nested").join("deeper").join("destroy.jsonl");
         assert!(!p.exists());
 
         let log = AuditLog::open(&p).unwrap();

@@ -95,7 +95,15 @@ impl DeleteModeProvider {
     /// that depends on it, which is the ordering that makes it worth anything.
     fn ensure_staging(root: &Path) -> Result<PathBuf> {
         let dir = Self::staging_dir(root);
-        let existed = dir.exists();
+        // Checked BEFORE `create_dir_all`, which answers `EEXIST` for anything
+        // already at the path — a bare "File exists" tells an operator nothing
+        // about a staging path occupied by a regular file or a symlink, which
+        // is the case `secure_staging` exists to refuse.
+        let existed = match std::fs::symlink_metadata(&dir) {
+            Ok(md) if md.is_dir() => true,
+            Ok(_) => return Err(not_a_directory(&dir)),
+            Err(_) => false,
+        };
         std::fs::create_dir_all(&dir).map_err(|e| ProviderError::Io {
             path: dir.display().to_string(),
             detail: e.to_string(),
@@ -109,13 +117,9 @@ impl DeleteModeProvider {
                 ),
             });
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Excludes other users. NOT a boundary against the same UID — see
-            // the module docs.
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
+        // Excludes other users, and ENFORCED — see `secure_staging`. NOT a
+        // boundary against the same UID; the module docs say why.
+        secure_staging(&dir)?;
         Ok(dir)
     }
 }
@@ -569,6 +573,83 @@ fn conflict_name(original: &Path) -> PathBuf {
 #[cfg(test)]
 pub(crate) static SYNCED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
+/// The refusal for a staging path occupied by something that is not a
+/// directory. Shared by the pre-create check and by [`secure_staging`], so the
+/// operator reads the same sentence whichever notices first.
+fn not_a_directory(dir: &Path) -> ProviderError {
+    ProviderError::Io {
+        path: dir.display().to_string(),
+        detail: "the staging path is not a directory; destruction stages the only local copy \
+                 of a file into it and will not do so through something else"
+            .into(),
+    }
+}
+
+/// The staging directory must be a real directory, OURS, and owner-only.
+///
+/// The `chmod` used to be `let _ =`. A root writable by another account lets
+/// that account pre-create `.shepherd-staging` and keep ownership of it, and
+/// destruction then runs inside a directory somebody else controls — which is
+/// not a permissions nicety on this path. Between the held-handle verification
+/// and the pathname unlink, that account can rename or replace the staged
+/// entry, so Shepherd unlinks a substitute and audits the ORIGINAL as
+/// destroyed while its inode was moved elsewhere. It can also disrupt recovery
+/// at will, since `list_staged` reads this directory.
+///
+/// So: the mode is enforced, the entry is required to be a directory rather
+/// than a symlink into one, and the owner is checked. Refusing costs the user a
+/// destruction that does not happen and says why; not refusing costs an audit
+/// record that describes the wrong file.
+#[cfg(unix)]
+fn secure_staging(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let io = |detail: String| ProviderError::Io {
+        path: dir.display().to_string(),
+        detail,
+    };
+
+    // `symlink_metadata`: a symlink pointing at a directory we own is not a
+    // directory we own, and following it is exactly the substitution above.
+    let md = std::fs::symlink_metadata(dir).map_err(|e| io(e.to_string()))?;
+    if !md.is_dir() {
+        return Err(not_a_directory(dir));
+    }
+
+    if let Ok(me) = std::fs::metadata("/proc/self").map(|m| m.uid())
+        && md.uid() != me
+    {
+        return Err(io(format!(
+            "the staging directory is owned by uid {} and this daemon runs as {me}; another \
+             account owning it can replace a staged entry between verification and unlink, so \
+             the audit record would describe a file that was not the one destroyed",
+            md.uid()
+        )));
+    }
+
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| io(format!("cannot make the staging directory owner-only: {e}")))?;
+    let mode = std::fs::metadata(dir)
+        .map_err(|e| io(e.to_string()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o700 {
+        return Err(io(format!(
+            "the staging directory is mode {mode:04o} after being set to 0700; a filesystem \
+             that will not keep it owner-only cannot host staging"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_staging(_dir: &Path) -> Result<()> {
+    // Delete-mode refuses staging off unix anyway — `identity_of` fails closed
+    // there — so there is nothing to secure that is ever used.
+    Ok(())
+}
+
 /// Put a staged file back, and say what happened either way.
 ///
 /// Every failure AFTER the rename has to come through here. The original name
@@ -585,30 +666,71 @@ pub(crate) static SYNCED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex
 /// should not have to wait for a restart to learn where their file went.
 fn unwind_staging(original: &Path, staged: &Path, cause: ProviderError) -> ProviderError {
     match rename_noreplace(staged, original) {
-        Ok(true) => match cause {
-            ProviderError::Io { path, detail } => ProviderError::Io {
-                path,
-                detail: format!("{detail}; the file was put back at {}", original.display()),
-            },
-            other => other,
-        },
-        rolled_back => {
-            tracing::error!(
-                original = %original.display(),
-                staged = %staged.display(),
-                cause = %cause,
-                rollback = ?rolled_back,
-                "STAGED AND STRANDED: staging could not be completed and could not be undone. \
-                 The file's only local copy is in the staging directory and is NOT at its \
-                 original path; startup recovery lists it, and a human should not have to \
-                 wait for that"
-            );
-            ProviderError::StagedAndStranded {
-                original: original.display().to_string(),
-                staged: staged.display().to_string(),
-                detail: format!("{cause}, and the file could not be moved back"),
+        Ok(true) => {
+            // The rollback is itself a cross-directory rename, so it is not
+            // durable until both directories are — the same discipline
+            // `restore_staged` keeps, destination first. Without it, a staging
+            // rename that HAD been made durable can outlive its own undo: after
+            // a power loss the original path is still absent and the file
+            // reappears only in staging, while this call reported "the file was
+            // put back".
+            if let Some(parent) = original.parent()
+                && let Err(e) = sync_dir(parent)
+            {
+                return stranded(
+                    original,
+                    staged,
+                    &cause,
+                    &format!("rollback not durable: {e}"),
+                );
+            }
+            if let Some(staging) = staged.parent()
+                && let Err(e) = sync_dir(staging)
+            {
+                return stranded(
+                    original,
+                    staged,
+                    &cause,
+                    &format!("rollback not durable: {e}"),
+                );
+            }
+            match cause {
+                ProviderError::Io { path, detail } => ProviderError::Io {
+                    path,
+                    detail: format!("{detail}; the file was put back at {}", original.display()),
+                },
+                other => other,
             }
         }
+        rolled_back => stranded(
+            original,
+            staged,
+            &cause,
+            &format!("the file could not be moved back ({rolled_back:?})"),
+        ),
+    }
+}
+
+/// The report for a staging that could neither be completed nor undone.
+///
+/// One function because the two ways of reaching it — a reverse rename that
+/// refused, and one that succeeded without becoming durable — owe the operator
+/// the same thing: both paths named, and loudly, because `list_staged` finding
+/// it at the next restart is a backstop rather than an answer.
+fn stranded(original: &Path, staged: &Path, cause: &ProviderError, detail: &str) -> ProviderError {
+    tracing::error!(
+        original = %original.display(),
+        staged = %staged.display(),
+        cause = %cause,
+        %detail,
+        "STAGED AND STRANDED: staging could not be completed and could not be undone. The \
+         file's only local copy is in the staging directory and is NOT at its original path; \
+         startup recovery lists it, and a human should not have to wait for that"
+    );
+    ProviderError::StagedAndStranded {
+        original: original.display().to_string(),
+        staged: staged.display().to_string(),
+        detail: format!("{cause}, and {detail}"),
     }
 }
 
@@ -1112,6 +1234,59 @@ mod tests {
             syncs_of(&t.0) > before,
             "the registered root was not fsync'd, so the entry naming the new staging \
              directory may not survive the crash the source removal will"
+        );
+    }
+
+    /// A staging directory this daemon cannot secure is REFUSED.
+    ///
+    /// A root writable by another account lets that account pre-create
+    /// `.shepherd-staging` and keep it, and the `chmod` failure used to be
+    /// discarded. Destruction then runs inside a directory somebody else
+    /// controls, and between the held-handle verification and the pathname
+    /// unlink they can replace the staged entry — so Shepherd unlinks a
+    /// substitute and audits the ORIGINAL as destroyed while its inode was
+    /// moved elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_staging_directory_that_cannot_be_secured_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = Tmp::new("stagingsec");
+        let f = t.0.join("doomed.bin");
+        std::fs::write(&f, b"bytes").unwrap();
+        let p = DeleteModeProvider::new();
+
+        // Accepting direction: an ordinary root stages, and leaves the staging
+        // directory owner-only.
+        let Some(staged) = staged_or_refused(p.stage_for_destruction(&t.0, &f)) else {
+            return;
+        };
+        let dir = staged.staged.parent().unwrap().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        p.restore_staged(staged).expect("put it back");
+
+        // A staging path that is NOT a directory. Same shape as a foreign
+        // account substituting one, and the one form a test can build without
+        // a second uid.
+        let t2 = Tmp::new("stagingsec2");
+        let f2 = t2.0.join("doomed.bin");
+        std::fs::write(&f2, b"bytes").unwrap();
+        std::fs::write(DeleteModeProvider::staging_dir(&t2.0), b"not a directory").unwrap();
+
+        let err = p
+            .stage_for_destruction(&t2.0, &f2)
+            .expect_err("staging must not proceed through a non-directory");
+        assert!(
+            format!("{err}").contains("not a directory"),
+            "the refusal must say what is wrong with it: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&f2).unwrap(),
+            b"bytes",
+            "and the file is still where the user left it"
         );
     }
 

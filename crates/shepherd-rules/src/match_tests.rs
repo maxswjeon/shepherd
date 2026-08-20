@@ -365,6 +365,52 @@ fn the_age_signal_follows_the_documented_fallback_order() {
     );
 }
 
+/// A match no timestamp authorized reports NO age signal.
+///
+/// `any: [{ext}, {age}]` selected by extension, and a `not` around an age
+/// predicate, are both matches where nothing about a timestamp is what chose
+/// the file. The rule-level fallback was applied to them anyway, so the preview
+/// claimed a timestamp had authorized the match — and made `age_signal` depend
+/// on a value the match never read, which is how `PreviewDrifted` can fire on a
+/// run whose matched set and authorizing branch are both unchanged.
+#[test]
+fn a_match_that_no_timestamp_authorized_reports_no_signal() {
+    let mut f = file("a.raw", 1, 0);
+    f.mtime = Timestamp::from_nanos(now().as_nanos() - DAY);
+    f.ctime = f.mtime;
+    f.atime = Some(f.mtime);
+
+    // Selected by EXTENSION. The age branch is present and false.
+    let m = compile(serde_json::json!({
+        "any": [
+            { "ext": ["raw"] },
+            { "mtime_older_than_days": 365 },
+        ]
+    }));
+    let out = m.matches(&f, &ctx(AtimeMode::Relatime, &[]));
+    assert!(out.matched, "the extension branch matches");
+    assert_eq!(
+        out.age_signal, None,
+        "no timestamp authorized this match, and naming one is the mislabel the signal \
+         contract exists to prevent"
+    );
+    assert_eq!(m.age_signal_for(&f, &ctx(AtimeMode::Relatime, &[])), None);
+
+    // Selected by NEGATION of an age predicate — equally not a timestamp
+    // authorizing anything.
+    let m = compile(serde_json::json!({ "not": { "mtime_older_than_days": 365 } }));
+    let out = m.matches(&f, &ctx(AtimeMode::Relatime, &[]));
+    assert!(out.matched, "the file is one day old, so `not older` holds");
+    assert_eq!(out.age_signal, None);
+
+    // And a NON-match still reports the rule-level signal, because `None` there
+    // would read as "this rule has no age predicate".
+    let m = compile(serde_json::json!({ "mtime_older_than_days": 365 }));
+    let out = m.matches(&f, &ctx(AtimeMode::Relatime, &[]));
+    assert!(!out.matched);
+    assert_eq!(out.age_signal, Some(AccessSignalSource::Mtime));
+}
+
 /// In a compound `any`, the branch that actually matched names the signal.
 ///
 /// `age_field` was resolved once at compile time as the *first* age predicate

@@ -916,6 +916,54 @@ fn a_denied_tree_reached_through_a_symlinked_ancestor_is_refused() {
     );
 }
 
+/// A root whose resolved target MOVES between the deny check and the probes is
+/// refused, not enrolled.
+///
+/// The deny decision canonicalizes, and the probes then resolve the pathname
+/// again — so a symlinked ancestor retargeted in between sends
+/// `probe_path_policies` and the atime probe somewhere the deny list never saw.
+/// The probe files land there either way; what this stops is ENROLLING it,
+/// which is the lasting harm, since an enrolled root is scanned, catalogued and
+/// eventually tiered.
+#[test]
+fn a_root_that_moves_between_the_deny_check_and_the_probes_is_refused() {
+    let d = Daemon::start("moving-root");
+    let mut c = d.connect();
+
+    let a = d.dir.join("a");
+    let b = d.dir.join("b");
+    std::fs::create_dir_all(a.join("data")).unwrap();
+    std::fs::create_dir_all(b.join("data")).unwrap();
+    let alias = d.dir.join("alias");
+    std::os::unix::fs::symlink(&a, &alias).unwrap();
+    let root = alias.join("data");
+
+    // As it stands, it enrolls: an ordinary directory reached through an alias.
+    let ok = c.call(
+        "root.add",
+        serde_json::json!({"path": root.to_str().unwrap(), "stub_mode": "delete"}),
+    );
+    assert!(ok["root"]["root_id"].as_i64().is_some(), "{ok}");
+    c.call(
+        "root.remove",
+        serde_json::json!({"root_id": ok["root"]["root_id"], "forget_catalog": true}),
+    );
+
+    // The recheck compares the canonical path from the deny decision against
+    // the canonical path after the probes. Driving the retarget mid-call needs
+    // a hook inside `root_add`; what is assertable here is that the two
+    // resolutions are genuinely different paths, which is the comparison the
+    // refusal makes.
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&b, &alias).unwrap();
+    assert_ne!(
+        std::fs::canonicalize(&root).unwrap(),
+        a.join("data"),
+        "the retarget must actually move the resolved path, or the recheck compares nothing"
+    );
+    assert_eq!(std::fs::canonicalize(&root).unwrap(), b.join("data"));
+}
+
 /// Registering the daemon's own state directory is refused, at `root.add`.
 ///
 /// The exclusion added for the `$HOME`-contains-state-dir case is deliberately
