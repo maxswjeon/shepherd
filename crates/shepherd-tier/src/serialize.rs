@@ -46,6 +46,64 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 /// One keyspace: a map from identity string to its async lock.
 type LockMap = Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>;
 
+/// A held lock that gives its map entry back when it is dropped.
+///
+/// # Why the map cannot just keep the entry
+///
+/// It did, and that was a leak with a designed-for size. Every first
+/// acquisition inserted a `String` and an `Arc<AsyncMutex<()>>` and nothing
+/// ever removed either: dropping the returned guard released the *mutex*, not
+/// the map's reference. §1's target is ten million files, `upload_item` takes
+/// a file lock and usually a distinct object-key lock, and the two maps
+/// therefore grew towards twenty million live entries — gigabytes of resident
+/// memory in a daemon meant to run for months, and nothing to reclaim it short
+/// of a restart.
+///
+/// # Why reclaiming is safe
+///
+/// The check is `strong_count == 1` **under the map lock, after this guard's
+/// own `Arc` is gone**: one reference means the map holds the only one, so no
+/// task holds the lock and none is waiting on it, and removing the entry
+/// cannot hand a second task a different mutex for the same identity. A waiter
+/// necessarily cloned the `Arc` under that same map lock before awaiting, so
+/// it is counted. If the entry is removed and a later caller creates a fresh
+/// mutex for that identity, that is correct — nobody was holding the old one.
+pub struct FileLockGuard {
+    /// `Option` so [`Drop`] can drop it EXPLICITLY, before taking the map lock.
+    ///
+    /// This is the load-bearing line of the whole type. `OwnedMutexGuard` holds
+    /// an `Arc` to the same mutex the map does, so reading `strong_count` while
+    /// still holding it would see 2 forever, reclaim nothing, and leave every
+    /// test green. Field drop order would not save it either: `Drop::drop` runs
+    /// before any field is dropped.
+    guard: Option<OwnedMutexGuard<()>>,
+    map: LockMap,
+    id: String,
+}
+
+impl std::fmt::Debug for FileLockGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileLockGuard")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        // `into_inner` rather than `expect`: a panic inside a `Drop` running
+        // during an unwind aborts the process, and a poisoned map is a
+        // `HashMap` that was mid-clone, not a torn one.
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = m.get(&self.id)
+            && Arc::strong_count(entry) == 1
+        {
+            m.remove(&self.id);
+        }
+    }
+}
+
 /// One async lock per file identity.
 ///
 /// The map is behind a sync `Mutex` because it is only ever held long enough to
@@ -66,7 +124,7 @@ impl FileLocks {
     ///
     /// Returns an owned guard so the caller can hold it across `.await` points
     /// — which the destroy path must, since steps 4–6 span a remote HEAD.
-    pub async fn acquire(&self, fs_id: &FsId) -> OwnedMutexGuard<()> {
+    pub async fn acquire(&self, fs_id: &FsId) -> FileLockGuard {
         Self::lock_in(&self.files, fs_id.as_str()).await
     }
 
@@ -75,7 +133,7 @@ impl FileLocks {
     /// A different resource from [`FileLocks::acquire`], and deliberately a
     /// different method taking a different type. `adopt_or_reap` aborts every
     /// live transfer session at a key, which is safe only underneath this.
-    pub async fn acquire_key(&self, key: &ObjectKey) -> OwnedMutexGuard<()> {
+    pub async fn acquire_key(&self, key: &ObjectKey) -> FileLockGuard {
         Self::lock_in(&self.keys, key.as_str()).await
     }
 
@@ -88,15 +146,18 @@ impl FileLocks {
         &self,
         fs_id: &FsId,
         key: &ObjectKey,
-    ) -> (OwnedMutexGuard<()>, OwnedMutexGuard<()>) {
+    ) -> (FileLockGuard, FileLockGuard) {
         let f = self.acquire(fs_id).await;
         let k = self.acquire_key(key).await;
         (f, k)
     }
 
-    async fn lock_in(map: &LockMap, id: &str) -> OwnedMutexGuard<()> {
+    async fn lock_in(map: &LockMap, id: &str) -> FileLockGuard {
         let lock = {
-            let mut m = map.lock().expect("lock map poisoned");
+            // `into_inner` on poison, matching [`FileLockGuard::drop`], which
+            // cannot afford to panic at all. Refusing here while tolerating it
+            // there would mean the reclaim path outlived the acquire path.
+            let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
             let entry = m
                 .entry(id.to_string())
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())));
@@ -108,15 +169,25 @@ impl FileLocks {
             // the *same* mutex, which is the entire point.
             Arc::clone(entry)
         };
-        lock.lock_owned().await
+        let guard = lock.lock_owned().await;
+        FileLockGuard {
+            guard: Some(guard),
+            map: Arc::clone(map),
+            id: id.to_string(),
+        }
     }
 
-    /// How many distinct files have locks. Diagnostic only.
+    /// How many file identities are locked **right now**. Diagnostic only.
+    ///
+    /// Not "how many have ever been locked": entries are reclaimed when their
+    /// last holder drops, so this is bounded by concurrency rather than by the
+    /// number of files the daemon has processed. That is the property
+    /// `a_released_lock_is_reclaimed` asserts.
     pub fn tracked(&self) -> usize {
         self.files.lock().map(|m| m.len()).unwrap_or(0)
     }
 
-    /// How many distinct object keys have locks. Diagnostic only.
+    /// How many object keys are locked right now. Diagnostic only.
     pub fn tracked_keys(&self) -> usize {
         self.keys.lock().map(|m| m.len()).unwrap_or(0)
     }
@@ -127,6 +198,68 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// The entry goes back when the last holder lets go.
+    ///
+    /// The map used to keep every identity it had ever seen. At §1's ten
+    /// million files, with `upload_item` taking a file lock and usually a
+    /// distinct key lock, that is twenty million live entries the daemon never
+    /// reclaims.
+    #[tokio::test]
+    async fn a_released_lock_is_reclaimed() {
+        let locks = FileLocks::new();
+        for n in 0..1_000 {
+            let id = FsId::new(format!("uuid:abc:{n}"));
+            let key = ObjectKey::new(format!("blake3/{n}"));
+            let _guards = locks.acquire_both(&id, &key).await;
+            assert_eq!(locks.tracked(), 1, "one held file lock at a time");
+            assert_eq!(locks.tracked_keys(), 1, "one held key lock at a time");
+        }
+        assert_eq!(
+            (locks.tracked(), locks.tracked_keys()),
+            (0, 0),
+            "a thousand completed operations left entries behind; at ten million \
+             files that is the leak this reclaim exists to close"
+        );
+    }
+
+    /// And it does NOT go back while somebody is waiting for it.
+    ///
+    /// The dangerous half of reclaiming: if the entry were removed while a
+    /// waiter held the same `Arc`, the next caller for that identity would mint
+    /// a *different* mutex and the two would run concurrently — the lock
+    /// present, and a no-op. Asserted through the map, and through
+    /// `two_attempts_on_one_file_do_not_overlap`, which fails outright if a
+    /// handoff ever produces two mutexes.
+    #[tokio::test]
+    async fn an_entry_under_a_waiter_is_not_reclaimed() {
+        let locks = FileLocks::new();
+        let id = FsId::new("uuid:abc:handoff");
+
+        let a = locks.acquire(&id).await;
+        assert_eq!(locks.tracked(), 1);
+
+        let waiting = {
+            let locks = locks.clone();
+            let id = id.clone();
+            tokio::spawn(async move { locks.acquire(&id).await })
+        };
+        // Let the waiter reach `lock_owned`, so its `Arc` is counted.
+        while locks.tracked() != 1 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(a);
+        let b = waiting.await.expect("the waiter takes the lock");
+        assert_eq!(
+            locks.tracked(),
+            1,
+            "the entry was reclaimed out from under the task that now holds it"
+        );
+        drop(b);
+        assert_eq!(locks.tracked(), 0, "and released once nobody holds it");
+    }
 
     #[tokio::test]
     async fn two_attempts_on_one_file_do_not_overlap() {
@@ -241,14 +374,18 @@ mod key_tests {
         let _f = locks.acquire(&FsId::new("uuid:v:9")).await;
         // Holding a file lock must not block unrelated remote work, or a
         // 10M-file corpus would upload one object at a time.
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(200),
-                locks.acquire_key(&ObjectKey::new("p/objects/00/11/abc"))
-            )
-            .await
-            .is_ok()
-        );
+        let taken = tokio::time::timeout(
+            Duration::from_millis(200),
+            locks.acquire_key(&ObjectKey::new("p/objects/00/11/abc")),
+        )
+        .await;
+        assert!(taken.is_ok(), "a held file lock blocked an unrelated key");
+
+        // BOUND, not dropped at the end of the statement above. Entries are
+        // reclaimed the moment their last holder lets go, so a key guard left
+        // as a temporary would be gone before the count below reads it — and
+        // the count is what says both keyspaces are populated and separate.
+        let _key_guard = taken.expect("the key lock is free");
         assert_eq!(locks.tracked(), 1);
         assert_eq!(locks.tracked_keys(), 1);
     }

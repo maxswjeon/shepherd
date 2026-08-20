@@ -66,6 +66,13 @@ pub enum Disposition {
 pub enum Recovery {
     /// Returned to the queue with its checkpoint intact.
     Requeued(JobId),
+    /// Retryable, but out of attempts. Marked `failed` rather than requeued.
+    ///
+    /// Distinct from [`Recovery::Quarantined`], which leaves the row `running`
+    /// on purpose. This one is terminal and shows up under `failed` in
+    /// [`Queue::depth`], which is what "the ceiling was enforced" looks like
+    /// from `status` and `doctor`.
+    Exhausted { id: JobId, why: String },
     /// Left exactly as it was, for a human or a later phase to resolve.
     Quarantined { id: JobId, why: String },
 }
@@ -215,6 +222,15 @@ impl Queue {
     /// Recovered jobs are made ready immediately (`run_after = 0`): the process
     /// has just restarted, so whatever transient condition justified a backoff
     /// is no longer the current state of the world.
+    ///
+    /// **The attempt ceiling is enforced here too, and it has to be.** Claiming
+    /// counts an attempt, so a job the daemon died on for the fifth time is
+    /// left `running` with `attempts == MAX_ATTEMPTS` — the exact state
+    /// [`Queue::fail`] refuses to retry. Requeueing it regardless let the next
+    /// claim take it to six and run it again, and since every crash restarted
+    /// the same loop, a job that reliably crashed the daemon could re-run
+    /// costly upload, restore or scrub work without bound. The ceiling is not a
+    /// tuning knob one recovery path may ignore.
     pub fn recover_interrupted(
         cat: &mut Catalog,
         now: Timestamp,
@@ -222,7 +238,17 @@ impl Queue {
         let stranded = JobRepo::new(cat).interrupted()?;
         let mut out = Vec::with_capacity(stranded.len());
         for job in stranded {
-            if is_retryable(job.class) {
+            if is_retryable(job.class) && job.attempts >= MAX_ATTEMPTS {
+                // Same sentence `fail` uses, so an operator reading `last_error`
+                // sees one language whether the budget ran out through ordinary
+                // failures or through crashes.
+                let why = format!(
+                    "giving up after {} attempts: interrupted by an unclean shutdown",
+                    job.attempts
+                );
+                JobRepo::new(cat).finish(job.id, JobState::Failed, Some(&why), now)?;
+                out.push(Recovery::Exhausted { id: job.id, why });
+            } else if is_retryable(job.class) {
                 JobRepo::new(cat).requeue(
                     job.id,
                     Timestamp::EPOCH,
@@ -414,6 +440,74 @@ mod tests {
             Some(r#"{"parts_done":7}"#),
             "the resume point is the whole point of AC-2"
         );
+    }
+
+    /// Crashing is not a way around the retry ceiling.
+    ///
+    /// Claiming counts an attempt, so a daemon that dies on a job's fifth claim
+    /// leaves it `running` with `attempts == MAX_ATTEMPTS` — the state `fail`
+    /// refuses to retry. Recovery used to check only the class and requeue it,
+    /// so the next claim took it to six and ran it again; a job that reliably
+    /// crashed the daemon re-ran costly upload, restore or scrub work forever.
+    ///
+    /// Driven by claiming the budget away rather than by writing `attempts`
+    /// directly, so the test cannot pass against a ceiling that lives only in
+    /// this test's arithmetic.
+    #[test]
+    fn recovery_does_not_hand_a_crashed_job_a_sixth_attempt() {
+        let mut c = cat();
+        let id = Queue::enqueue(&mut c, JobClass::Upload, 0, "{}", t(0)).unwrap();
+
+        // Four ordinary failures, then a fifth claim the daemon dies during.
+        let mut at = t(0);
+        for _ in 1..MAX_ATTEMPTS {
+            let job = Queue::claim(&mut c, at).unwrap().expect("claimable");
+            let Disposition::Retry { at: next, .. } =
+                Queue::fail(&mut c, &job, "boom", at).unwrap()
+            else {
+                panic!("still inside the budget");
+            };
+            at = next;
+        }
+        let last = Queue::claim(&mut c, at).unwrap().expect("the fifth claim");
+        assert_eq!(
+            last.attempts, MAX_ATTEMPTS,
+            "precondition: the budget is spent, so the next claim would be a sixth"
+        );
+        // ... daemon dies here, with the row left `running` ...
+
+        let recovered = Queue::recover_interrupted(&mut c, t(1_000)).unwrap();
+        match &recovered[..] {
+            [Recovery::Exhausted { id: got, why }] => {
+                assert_eq!(*got, id);
+                assert!(why.contains("giving up after 5 attempts"), "{why}");
+            }
+            other => panic!("expected the ceiling to be enforced, got {other:?}"),
+        }
+        assert!(
+            Queue::claim(&mut c, t(1_000)).unwrap().is_none(),
+            "an exhausted job came back claimable; the ceiling is bypassable by crashing"
+        );
+        let depth = Queue::depth(&c).unwrap();
+        let upload = depth.iter().find(|d| d.class == "upload").unwrap();
+        assert_eq!(
+            (upload.pending, upload.running, upload.failed),
+            (0, 0, 1),
+            "and it is terminal and visible, not left `running` like a quarantine"
+        );
+    }
+
+    /// A job still inside its budget is the accepting direction: the ceiling
+    /// must not turn every crash into a terminal failure.
+    #[test]
+    fn recovery_still_requeues_a_job_with_attempts_left() {
+        let mut c = cat();
+        let id = Queue::enqueue(&mut c, JobClass::Upload, 0, "{}", t(0)).unwrap();
+        Queue::claim(&mut c, t(0)).unwrap();
+
+        let recovered = Queue::recover_interrupted(&mut c, t(10)).unwrap();
+        assert_eq!(recovered, vec![Recovery::Requeued(id)]);
+        assert!(Queue::claim(&mut c, t(10)).unwrap().is_some());
     }
 
     /// The blanket-requeue regression, pinned. A crash-interrupted destroy must

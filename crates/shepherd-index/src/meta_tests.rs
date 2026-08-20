@@ -287,6 +287,40 @@ fn a_cap_bounds_the_result_and_says_so() {
     assert_eq!(capped.ids, all.ids[..10]);
 }
 
+/// A page that is FULL is not a page that was cut short.
+///
+/// The scan used to set the flag the moment `out.len()` reached the cap,
+/// without ever looking for a match beyond it. So a query with exactly `cap`
+/// matches — an unfiltered search with the default limit of 50 and fifty files
+/// — was reported truncated, and `search` told the caller its `total` was a
+/// lower bound when it was the exact count. "Fifty results, and there may be
+/// more" and "fifty results, that is all of them" are different answers and a
+/// user acts on them differently.
+#[test]
+fn exactly_a_full_page_is_not_reported_as_truncated() {
+    let mut b = MetaIndexBuilder::new();
+    for id in 1..=50i64 {
+        b.push(id, &format!("d/report-{id:03}.txt")).unwrap();
+    }
+    let ix = b.build().unwrap();
+
+    let exact = ix.search("report", 50);
+    assert_eq!(exact.ids.len(), 50);
+    assert!(
+        !exact.truncated,
+        "fifty matches under a cap of fifty is the complete answer, not a floor"
+    );
+
+    // The discriminating pair: one more match than the cap, and the flag is
+    // right again. Without this the fix could be "never truncate".
+    let one_short = ix.search("report", 49);
+    assert_eq!(one_short.ids.len(), 49);
+    assert!(
+        one_short.truncated,
+        "forty-nine of fifty really is a truncated page"
+    );
+}
+
 #[test]
 fn the_capped_result_is_the_same_on_every_run() {
     let mut b = MetaIndexBuilder::new();

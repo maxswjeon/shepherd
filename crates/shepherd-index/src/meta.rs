@@ -505,7 +505,20 @@ impl MetaIndex {
             }
             last_pushed = idx;
             out.push(self.ids[idx]);
-            if out.len() >= cap {
+            // One match PAST the cap before claiming truncation, then thrown
+            // away. Stopping AT the cap cannot tell "exactly `cap` matches"
+            // from "more than `cap`", and it answered with the more alarming of
+            // the two: an unfiltered query with the default limit of 50 and
+            // exactly 50 matches came back flagged, so `search` reported
+            // `degraded` and told the caller its `total` was a floor when it
+            // was the exact count.
+            //
+            // The cost is that a segment holding exactly `cap` matches now
+            // scans to its end instead of stopping at the last one. That is the
+            // price of an honest flag, it is bounded by the segment's own
+            // slice, and the loop it runs is a `memmem` stream at SIMD speed.
+            if out.len() > cap {
+                out.truncate(cap);
                 return (out, true);
             }
         }

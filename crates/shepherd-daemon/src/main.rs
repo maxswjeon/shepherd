@@ -118,7 +118,8 @@ Service installation is intentionally not an IPC method — see the module docs.
 fn secure_state_dir(dir: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let created =
+        create_dir_all_tracked(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
     // SAFETY: `geteuid` is always successful per POSIX — it cannot fail, has no
     // error return, and touches no memory we own.
@@ -150,7 +151,78 @@ fn secure_state_dir(dir: &std::path::Path) -> Result<(), String> {
             dir.display()
         ));
     }
+
+    // --- and now make all of that survive a power cut ---------------------
+    //
+    // `create_dir_all` returns once the entries exist in the page cache. On a
+    // filesystem that needs a directory fsync for crash durability — ext4 in
+    // its default `data=ordered`, among others — the directory NAMING a new
+    // entry is not on disk until it is synced, and neither is a mode change,
+    // which lives in the directory's own inode. So a first start could open the
+    // catalog, report writes durable, and lose the whole state directory to a
+    // power cut moments later — or bring it back at the umask's `0755`, which
+    // is the mode this function exists to refuse.
+    //
+    // Two syncs, and both are needed for different reasons: `dir` itself,
+    // because the chmod above changed its inode and because it names whatever
+    // the catalog is about to create inside it; and the parent of every
+    // directory just created, because that is what makes the new name real.
+    // Ordered before the catalog is opened, so nothing is ever reported durable
+    // on top of a directory that is not.
+    sync_dir(dir).map_err(|e| format!("cannot fsync {}: {e}", dir.display()))?;
+    for made in &created {
+        if let Some(parent) = made.parent() {
+            sync_dir(parent).map_err(|e| format!("cannot fsync {}: {e}", parent.display()))?;
+        }
+    }
     Ok(())
+}
+
+/// `create_dir_all`, reporting which directories it actually created.
+///
+/// The list is what [`secure_state_dir`] needs to know which parents to fsync:
+/// syncing every ancestor up to `/` would be wasteful and syncing none is the
+/// defect. Deepest last, which is also creation order.
+///
+/// An `AlreadyExists` from the create is not an error — another process may
+/// have made the same directory between the probe and the call — but it does
+/// mean this process did not create it, so it is dropped from the list rather
+/// than counted.
+#[cfg(unix)]
+fn create_dir_all_tracked(dir: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut missing: Vec<std::path::PathBuf> = Vec::new();
+    let mut cursor = Some(dir);
+    while let Some(p) = cursor {
+        // `try_exists`, not `exists`: a permission error on an ancestor is a
+        // real failure and must not read as "absent", which would send this
+        // into a `create_dir` that fails with a more confusing message.
+        if p.try_exists()? {
+            break;
+        }
+        missing.push(p.to_path_buf());
+        cursor = p.parent().filter(|q| !q.as_os_str().is_empty());
+    }
+
+    let mut created = Vec::with_capacity(missing.len());
+    for p in missing.iter().rev() {
+        match std::fs::create_dir(p) {
+            Ok(()) => created.push(p.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(created)
+}
+
+/// fsync a directory, so an entry created in it survives a crash.
+///
+/// Unix-only by construction: this whole function lives under the same gate as
+/// [`secure_state_dir`], because opening a directory as a file is not something
+/// the Windows API permits. Windows durability is Phase 3's, with the rest of
+/// the platform.
+#[cfg(unix)]
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +337,11 @@ fn report_recovery(recovered: &[Recovery]) {
         match r {
             Recovery::Requeued(id) => {
                 tracing::info!(job = %id, "requeued a job interrupted by an unclean shutdown");
+            }
+            Recovery::Exhausted { id, why } => {
+                // `warn`, not `info`: work the user asked for has stopped
+                // permanently, and nothing will pick it up again.
+                tracing::warn!(job = %id, why, "an interrupted job was out of attempts");
             }
             Recovery::Quarantined { id, why } => {
                 // Deliberately `warn`: this needs a human, and it is the one
@@ -498,5 +575,50 @@ mod tests {
 
         assert_eq!(mode_of(&d), 0o700, "state directory is {:04o}", mode_of(&d));
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A custom `SHEPHERD_STATE_DIR` several levels deep still comes up, and
+    /// every level this process made is reported.
+    ///
+    /// The report is what decides which directories get fsynced, so a level
+    /// missing from it is a level whose *name* is not durable. The fsync
+    /// ordering itself cannot be asserted here — proving it needs a power cut,
+    /// or a filesystem fault injector this suite does not have — so what is
+    /// checked is the input that ordering depends on.
+    #[test]
+    fn every_directory_level_this_process_creates_is_reported() {
+        let root = tmp("deep");
+        let leaf = root.join("a/b/c");
+
+        let created = create_dir_all_tracked(&leaf).unwrap();
+        assert_eq!(
+            created,
+            vec![
+                root.clone(),
+                root.join("a"),
+                root.join("a/b"),
+                root.join("a/b/c"),
+            ],
+            "shallowest first, which is creation order, and none skipped"
+        );
+        assert!(leaf.is_dir());
+
+        // Second call: everything is already there, so this process created
+        // nothing and there is nothing whose name it must publish.
+        assert!(
+            create_dir_all_tracked(&leaf).unwrap().is_empty(),
+            "a directory that already existed was reported as newly created; \
+             its parent would then be fsynced on every single start"
+        );
+
+        // And the whole path through `secure_state_dir`, which is what actually
+        // runs at start-up: nested creation, then the mode, then the syncs.
+        let other_root = tmp("deep2");
+        let other = other_root.join("x/y");
+        secure_state_dir(&other).unwrap();
+        assert_eq!(mode_of(&other), 0o700);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&other_root).ok();
     }
 }
