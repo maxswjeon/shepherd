@@ -105,6 +105,56 @@ impl RpcNotification {
     }
 }
 
+/// The last frame a dropped subscriber receives, before the socket closes.
+///
+/// The daemon closes a connection whose subscriber fell behind its queue,
+/// deliberately, so that EOF means "frames were lost". But EOF also means "the
+/// daemon is shutting down", and a client cannot tell those apart from the
+/// socket alone — so `shepctl events subscribe` reported a stream that had
+/// dropped frames as a clean exit, which is the one outcome a monitoring script
+/// cannot detect.
+///
+/// A notification rather than an error response: there is no request to answer,
+/// and a client that does not know this method ignores it exactly as it ignores
+/// any other unknown notification, which is the additive-evolution rule.
+pub const SUBSCRIPTION_DROPPED_METHOD: &str = "subscription.dropped";
+
+/// The payload of a [`SUBSCRIPTION_DROPPED_METHOD`] notification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SubscriptionDropped {
+    pub subscription_id: u64,
+    /// Why the subscription ended. `queue_overflow` today; a value a client
+    /// does not recognise still means "this subscription ended and events were
+    /// missed".
+    pub reason: String,
+    /// How many frames the subscriber's queue holds, so the message can say
+    /// what was fallen behind.
+    pub queue_capacity: u64,
+}
+
+/// A server-initiated notification that a subscription has been dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DroppedNotification {
+    pub jsonrpc: JsonRpcV2,
+    /// Always [`SUBSCRIPTION_DROPPED_METHOD`].
+    pub method: String,
+    pub params: SubscriptionDropped,
+}
+
+impl DroppedNotification {
+    pub fn queue_overflow(subscription_id: u64, queue_capacity: u64) -> Self {
+        Self {
+            jsonrpc: JsonRpcV2,
+            method: SUBSCRIPTION_DROPPED_METHOD.to_string(),
+            params: SubscriptionDropped {
+                subscription_id,
+                reason: "queue_overflow".into(),
+                queue_capacity,
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared result fragments
 // ---------------------------------------------------------------------------

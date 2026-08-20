@@ -259,8 +259,25 @@ impl ShepherdApi for Session {
                 ));
             }
         };
+        // Case-INSENSITIVE here, unconditionally, and that is not the same
+        // choice `scan_exec` makes.
+        //
+        // The walk knows the root's probed case policy and can be exact. This
+        // boundary cannot: `probe_path_policies` determines that policy by
+        // WRITING into the root, and the whole point of consulting the deny
+        // list above that call is that Shepherd must not write into a denied
+        // tree at all. So the policy is unknown at precisely the moment the
+        // decision has to be made.
+        //
+        // Deciding without it means picking a direction to be wrong in.
+        // Insensitive over-refuses: on a case-sensitive volume a directory
+        // genuinely named `.GIT` is a different directory from `.git` and this
+        // declines to register it. Sensitive under-refuses: on macOS or Windows
+        // `.GIT` IS the `.git`, and registering it puts a version-control tree
+        // under management. The first costs a user one rename and says why; the
+        // second is the safety policy being evaded by pressing shift.
         if let Some((denied, reason)) = deny_registration(
-            &shepherd_scan::DenyList::builtin(),
+            &shepherd_scan::DenyList::builtin().case_insensitive(true),
             &path,
             canonical.as_deref(),
         ) {

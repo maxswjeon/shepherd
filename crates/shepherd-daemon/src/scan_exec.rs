@@ -42,7 +42,7 @@ use std::sync::Arc;
 use rusqlite::OptionalExtension;
 use shepherd_catalog::file_repo::{Availability, FileRepo, ScanRoot};
 use shepherd_catalog::writer::CatalogWriter;
-use shepherd_catalog::{Catalog, CatalogError};
+use shepherd_catalog::{Catalog, CatalogError, PathCasePolicy};
 use shepherd_core::RootId;
 use shepherd_jobs::worker::{Executor, JobContext, now};
 use shepherd_proto::event::{EventPayload, EventStream};
@@ -167,7 +167,12 @@ impl Executor for ScanExecutor {
                 state_dir.display()
             ));
         }
-        let deny = DenyList::builtin().with_extra_path(state_dir);
+        // Case folding follows the ROOT's probed policy: on a case-insensitive
+        // volume `.GIT` is the same directory as `.git`, and a deny-list entry
+        // that can be evaded by pressing shift is not a safety policy.
+        let deny = DenyList::builtin()
+            .case_insensitive(root.case_policy == PathCasePolicy::Insensitive)
+            .with_extra_path(state_dir);
         let ignores = IgnoreSet::new(&path, &patterns)
             .map_err(|e| format!("root {root_id} has an unusable ignore pattern: {e}"))?;
 

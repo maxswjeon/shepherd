@@ -199,27 +199,66 @@ impl PlaceholderProvider for DeleteModeProvider {
     /// it silently replaces, which is the collision the flag exists to prevent.
     fn probe_feasibility(&self, root: &Path) -> Result<Feasibility> {
         let dir = Self::ensure_staging(root)?;
-        let a = dir.join(".probe-a");
-        let b = dir.join(".probe-b");
+
+        // Unique per invocation, and created EXCLUSIVELY.
+        //
+        // Fixed names plus a truncating `write` plus an unconditional
+        // `remove_file` is a destroy-by-writing on a path this module does not
+        // own: a file already at `.probe-a` was overwritten and then deleted.
+        // Two probes of the same root were worse than that — they erased or
+        // renamed each other's fixtures, and the loser can conclude
+        // `RENAME_NOREPLACE` is unimplemented and persist a false
+        // `destruction_ineligible` verdict for the root.
+        //
+        // The tag is pid plus a process-local counter: two invocations in one
+        // process differ by the counter, and two processes cannot share a pid
+        // while both are running.
+        let tag = format!(
+            "{}-{}",
+            std::process::id(),
+            PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let a = dir.join(format!(".probe-{tag}-a"));
+        let b = dir.join(format!(".probe-{tag}-b"));
+        let free = dir.join(format!(".probe-{tag}-c"));
+
+        // Removes only what this invocation actually created. `a` is consumed
+        // by a successful rename, which is why each is tracked separately.
+        let created = std::cell::Cell::new((false, false, false));
         let cleanup = || {
-            let _ = std::fs::remove_file(&a);
-            let _ = std::fs::remove_file(&b);
+            let (ca, cb, cf) = created.get();
+            if ca {
+                let _ = std::fs::remove_file(&a);
+            }
+            if cb {
+                let _ = std::fs::remove_file(&b);
+            }
+            if cf {
+                let _ = std::fs::remove_file(&free);
+            }
         };
 
-        if let Err(e) = std::fs::write(&a, b"probe") {
+        let make = |p: &Path| -> std::io::Result<()> {
+            use std::io::Write;
+            std::fs::File::create_new(p)?.write_all(b"probe")
+        };
+
+        if let Err(e) = make(&a) {
             cleanup();
             return Err(ProviderError::Io {
                 path: a.display().to_string(),
                 detail: e.to_string(),
             });
         }
-        if let Err(e) = std::fs::write(&b, b"probe") {
+        created.set((true, false, false));
+        if let Err(e) = make(&b) {
             cleanup();
             return Err(ProviderError::Io {
                 path: b.display().to_string(),
                 detail: e.to_string(),
             });
         }
+        created.set((true, true, false));
 
         // 1. Onto an OCCUPIED name: must refuse.
         match rename_noreplace(&a, &b) {
@@ -243,11 +282,14 @@ impl PlaceholderProvider for DeleteModeProvider {
             Err(_) => { /* refused, as it must */ }
         }
 
-        // 2. Onto a FREE name: must succeed.
-        let free = dir.join(".probe-c");
-        let _ = std::fs::remove_file(&free);
+        // 2. Onto a FREE name: must succeed. Not pre-deleted — the name is
+        // unique to this invocation, so anything already there is not ours to
+        // remove, and `rename_noreplace` refusing is the correct answer.
         let ok = rename_noreplace(&a, &free);
-        let _ = std::fs::remove_file(&free);
+        if matches!(ok, Ok(true)) {
+            // `a` moved onto `free`: ownership moves with it.
+            created.set((false, true, true));
+        }
         cleanup();
 
         match ok {
@@ -476,6 +518,10 @@ fn conflict_name(original: &Path) -> PathBuf {
 /// filesystem afterwards, so the call itself is what gets asserted on.
 #[cfg(test)]
 pub(crate) static SYNCED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Distinguishes one feasibility probe's fixtures from another's in the same
+/// process. See [`DeleteModeProvider::probe_feasibility`].
+static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Unlink a staged file and make the removal durable.
 ///
@@ -804,6 +850,86 @@ mod tests {
             syncs_of(&staging) > before_staging,
             "the staging directory was not fsync'd, so the removal may not survive"
         );
+    }
+
+    /// The probe neither overwrites nor deletes a file it did not create, and
+    /// two probes of one root do not erase each other's fixtures.
+    ///
+    /// Fixed names plus a truncating `write` plus an unconditional
+    /// `remove_file` destroyed by writing on a path this module does not own —
+    /// and concurrent probes were worse, because the loser can conclude
+    /// `RENAME_NOREPLACE` is unimplemented and persist a false
+    /// `destruction_ineligible` verdict for the whole root.
+    #[test]
+    fn the_feasibility_probe_leaves_foreign_files_alone() {
+        let t = Tmp::new("probe-excl");
+        let p = DeleteModeProvider::new();
+
+        // A file sitting at the OLD fixed probe name, with contents worth
+        // keeping.
+        let staging = DeleteModeProvider::staging_dir(&t.0);
+        std::fs::create_dir_all(&staging).unwrap();
+        for name in [".probe-a", ".probe-b", ".probe-c"] {
+            std::fs::write(staging.join(name), b"a file the probe does not own").unwrap();
+        }
+
+        let f = p.probe_feasibility(&t.0).expect("the probe runs");
+        assert_eq!(
+            f.is_supported(),
+            cfg!(unix),
+            "the verdict itself must not change: {f:?}"
+        );
+
+        for name in [".probe-a", ".probe-b", ".probe-c"] {
+            assert_eq!(
+                std::fs::read(staging.join(name)).ok().as_deref(),
+                Some(&b"a file the probe does not own"[..]),
+                "the probe overwrote or deleted `{name}`, which it did not create"
+            );
+        }
+
+        // And it cleans up after itself: nothing but the three foreign files.
+        let left: Vec<_> = std::fs::read_dir(&staging)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with(".probe-a") || n.len() > ".probe-a".len())
+            .collect();
+        let strays: Vec<_> = left
+            .into_iter()
+            .filter(|n| !matches!(n.as_str(), ".probe-a" | ".probe-b" | ".probe-c"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "the probe left fixtures behind: {strays:?}"
+        );
+    }
+
+    /// Two probes of the same root, at the same time, must both answer for the
+    /// filesystem rather than for each other.
+    #[test]
+    fn concurrent_feasibility_probes_do_not_erase_each_others_fixtures() {
+        let t = Tmp::new("probe-race");
+        let root = t.0.clone();
+        let verdicts: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let root = root.clone();
+                    s.spawn(move || DeleteModeProvider::new().probe_feasibility(&root))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for v in &verdicts {
+            let v = v.as_ref().expect("every probe must complete");
+            assert_eq!(
+                v.is_supported(),
+                cfg!(unix),
+                "a probe answered about another probe's fixtures rather than about the \
+                 filesystem: {v:?}"
+            );
+        }
     }
 
     #[test]

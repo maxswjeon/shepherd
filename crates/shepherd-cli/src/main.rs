@@ -149,24 +149,106 @@ fn stream_events(
     params: serde_json::Value,
     json: bool,
 ) -> Result<serde_json::Value, Failure> {
-    let (result, rendered) = client::subscribe(socket, timeout, params, |event| {
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string(event).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
-            );
-        } else {
-            print!("{}", render_human(event, 0));
-        }
-    })
+    let sub = client::subscribe(
+        socket,
+        timeout,
+        params,
+        // BEFORE the first event, not after the last. `snapshot_required` says
+        // the client's belief about the past is invalid, and a follow command
+        // that only mentioned it once the stream ended would never mention it
+        // at all — the stream ends when the user interrupts it.
+        |result| {
+            if result.get("resume").and_then(|r| r.get("outcome"))
+                == Some(&serde_json::json!("snapshot_required"))
+            {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "warning": "snapshot_required",
+                            "detail": "the resume cursor is unusable; re-read state through \
+                                       the ordinary methods before trusting this stream",
+                            "resume": result.get("resume"),
+                        }))
+                        .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!(
+                        "warning: the resume cursor is unusable ({}). Events from here are \
+                         live, but anything you believe about the past is not — re-read \
+                         state through the ordinary methods.",
+                        result
+                            .get("resume")
+                            .and_then(|r| r.get("reason"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("snapshot_required")
+                    );
+                }
+            }
+        },
+        |event| {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(event)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+                );
+            } else {
+                print!("{}", render_human(event, 0));
+            }
+        },
+    )
     .map_err(|e| rpc_failure(&e))?;
 
     let mut summary = serde_json::Map::new();
-    if let serde_json::Value::Object(map) = result {
+    if let serde_json::Value::Object(map) = sub.result {
         summary.extend(map);
     }
-    summary.insert("events_rendered".into(), serde_json::json!(rendered));
-    Ok(serde_json::Value::Object(summary))
+    summary.insert("events_rendered".into(), serde_json::json!(sub.rendered));
+    summary.insert("last_seq".into(), serde_json::json!(sub.last_seq));
+
+    // The daemon closed the socket, which is the only way this loop ends —
+    // this command stops by being interrupted, never by deciding a
+    // subscription is over. `server::pump_events` closes deliberately when a
+    // subscriber falls behind its queue, so EOF is how "frames were lost,
+    // resume" is signalled. Reporting exit 0 turned that into a silent end to
+    // monitoring, which is the one outcome a `--json` consumer cannot detect.
+    // An ordinary EOF stays exit 0: this is a follow command, and a daemon
+    // shutting down or a user interrupting is how one ends. Only the daemon
+    // SAYING it dropped us is a failure — that is a loss of events, and
+    // reporting it as success is what left a monitoring script unable to tell
+    // that its stream had stopped covering anything.
+    match sub.ended {
+        client::StreamEnd::DaemonClosed => {
+            summary.insert("ended".into(), serde_json::json!("daemon_closed"));
+            Ok(serde_json::Value::Object(summary))
+        }
+        client::StreamEnd::Dropped(params) => Err(Failure {
+            error: CliError::new(
+                "subscription_dropped",
+                format!(
+                    "the daemon dropped this subscription after {} event(s): it fell behind \
+                     its {}-frame queue, and every event after the drained ones was lost",
+                    sub.rendered,
+                    params
+                        .get("queue_capacity")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                ),
+            )
+            .with_hint(match sub.last_seq {
+                Some(seq) => format!(
+                    "resume with `--resume-from {seq}`; if the daemon answers \
+                     `snapshot_required` rather than `resumed`, re-read state through the \
+                     ordinary methods before trusting the stream"
+                ),
+                None => "no event was delivered, so there is no cursor; re-subscribe and \
+                         consume faster, or narrow the streams"
+                    .into(),
+            }),
+            exit: 3,
+        }),
+    }
 }
 
 /// Answer `doctor` from the client when no daemon is listening.

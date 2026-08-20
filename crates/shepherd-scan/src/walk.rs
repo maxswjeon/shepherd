@@ -429,10 +429,33 @@ fn dir_id(path: &Path) -> Option<DirId> {
     std::fs::canonicalize(path).ok().map(DirId::Canonical)
 }
 
+/// A filesystem timestamp as nanoseconds since the epoch, **clamped** rather
+/// than wrapped.
+///
+/// `Duration::as_nanos` is a `u128` and `Timestamp` is an `i64`, so any mtime
+/// after 2262 overflowed the `as i64` cast — and the wrap does not merely
+/// report a wrong date, it reports the OPPOSITE one. A file dated 2300 became
+/// a large negative timestamp, i.e. apparently ancient, and `match.rs` computes
+/// age as `now - at`: an `mtime_older_than_days` rule would then match a
+/// future-dated file and, once tiering is served, authorise destroying it. This
+/// is the same conversion `restore.rs::from_system_time` already got right.
+///
+/// `None` — the platform or the filesystem did not report the time at all —
+/// stays [`Timestamp::EPOCH`], which is a different statement from "before the
+/// epoch" and is what the caller has always meant by it.
 fn sys_time(t: Option<std::time::SystemTime>) -> Timestamp {
-    t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| Timestamp::from_nanos(d.as_nanos() as i64))
-        .unwrap_or(Timestamp::EPOCH)
+    let Some(t) = t else {
+        return Timestamp::EPOCH;
+    };
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => Timestamp::from_nanos(i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)),
+        // Before the epoch. Genuinely old, and saying so is safe in the
+        // direction that matters: an age computed from it is large and
+        // positive, which is what such a file is.
+        Err(e) => {
+            Timestamp::from_nanos(i64::try_from(e.duration().as_nanos()).map_or(i64::MIN, |n| -n))
+        }
+    }
 }
 
 /// Inode change time.
@@ -446,7 +469,14 @@ fn ctime_of(md: &std::fs::Metadata, fallback: Timestamp) -> Timestamp {
     {
         use std::os::unix::fs::MetadataExt;
         let _ = fallback;
-        Timestamp::from_nanos(md.ctime() * 1_000_000_000 + md.ctime_nsec())
+        // Saturating for the same reason `sys_time` clamps: `ctime` is seconds
+        // and the multiply overflows `i64` past 2262, which in release wraps to
+        // a timestamp of the opposite sign.
+        Timestamp::from_nanos(
+            md.ctime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(md.ctime_nsec()),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -1000,6 +1030,38 @@ mod tests {
             }
             other => panic!("expected one Unreadable, got {other:?}"),
         }
+    }
+
+    /// A far-future filesystem timestamp clamps instead of wrapping into the
+    /// past.
+    ///
+    /// `Duration::as_nanos` is a `u128`; `Timestamp` is an `i64`. The `as i64`
+    /// cast turned an mtime after 2262 into a large NEGATIVE value — not a
+    /// wrong date but the opposite one — and `match.rs` computes age as
+    /// `now - at`, so an `mtime_older_than_days` rule would match a
+    /// future-dated file and, once tiering is served, authorise destroying it.
+    #[test]
+    fn a_far_future_timestamp_clamps_rather_than_wrapping_negative() {
+        // Year ~2300, comfortably past the i64-nanosecond ceiling of 2262.
+        let far = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_400_000_000);
+        let t = sys_time(Some(far));
+        assert!(
+            t.as_nanos() > 0,
+            "a file dated 2300 must not read as ancient: {}",
+            t.as_nanos()
+        );
+        assert_eq!(t.as_nanos(), i64::MAX, "and it clamps at the ceiling");
+
+        // The representable range is untouched.
+        let ordinary = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            sys_time(Some(ordinary)).as_nanos(),
+            1_700_000_000_000_000_000
+        );
+
+        // No time at all is still EPOCH, which is a different statement from
+        // "before the epoch".
+        assert_eq!(sys_time(None), Timestamp::EPOCH);
     }
 
     /// A file on a NESTED MOUNT reports no inode, so the catalog records no

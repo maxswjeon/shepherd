@@ -37,8 +37,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use shepherd_proto::request::RpcRequest;
 use shepherd_proto::response::RpcResponse;
 use shepherd_proto::{
-    ErrorCode, Hello, Method, MethodKind, PROTO_VERSION, PeerInfo, RequestId, RpcError,
-    RpcNotification, ShepherdApi, negotiate,
+    ErrorCode, Hello, MAX_FRAME_BYTES, Method, MethodKind, PROTO_VERSION, PeerInfo, RequestId,
+    RpcError, RpcNotification, ShepherdApi, negotiate,
 };
 
 use crate::dispatch::Session;
@@ -170,13 +170,17 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
     // Shared because the event pump writes to the same socket as the responses.
     let writer = Arc::new(std::sync::Mutex::new(stream));
 
-    let mut lines = reader.lines();
+    let mut reader = reader;
 
     // --- handshake --------------------------------------------------------
-    let Some(first) = lines.next() else {
-        return Ok(()); // connected and hung up
+    let first = match read_frame(&mut reader)? {
+        Frame::Line(l) => l,
+        Frame::Eof => return Ok(()), // connected and hung up
+        Frame::TooLarge(n) => {
+            write_frame(&writer, &oversized(n))?;
+            return Ok(());
+        }
     };
-    let first = first?;
     let negotiated = match handshake(&first, &daemon) {
         Ok((reply, negotiated)) => {
             write_frame(&writer, &reply)?;
@@ -194,8 +198,19 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
     };
 
     // --- requests ---------------------------------------------------------
-    for line in lines {
-        let line = line?;
+    loop {
+        let line = match read_frame(&mut reader)? {
+            Frame::Line(l) => l,
+            Frame::Eof => break,
+            // Not resynchronised: finding the next newline after an oversized
+            // frame means reading the rest of it, which is the unbounded read
+            // this exists to refuse. The peer is told why and the connection
+            // ends.
+            Frame::TooLarge(n) => {
+                write_frame(&writer, &oversized(n))?;
+                break;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -207,6 +222,67 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// One frame, or why there is not one.
+enum Frame {
+    Line(String),
+    Eof,
+    /// At least this many bytes arrived with no newline among them.
+    TooLarge(usize),
+}
+
+/// Read one newline-delimited frame, refusing to allocate past
+/// [`MAX_FRAME_BYTES`].
+///
+/// `BufRead::lines` was the whole defect: it grows a `String` until it finds a
+/// newline, so a peer that writes and never terminates a line makes the daemon
+/// allocate without limit — per open connection. Authorization on this socket
+/// is filesystem permissions, so the peer is the same user by construction, but
+/// "same user" includes a buggy script, and the failure mode is the service
+/// dying rather than answering `InvalidRequest`.
+///
+/// `take` bounds the read itself rather than checking a length afterwards,
+/// which would be checking after the allocation it is meant to prevent.
+fn read_frame(reader: &mut BufReader<UnixStream>) -> std::io::Result<Frame> {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    let n = reader
+        .take((MAX_FRAME_BYTES + 1) as u64)
+        .read_until(b'\n', &mut buf)?;
+
+    if n == 0 {
+        return Ok(Frame::Eof);
+    }
+    if buf.last() != Some(&b'\n') {
+        // Either the cap was hit mid-frame, or the peer closed without a
+        // trailing newline. The second is a well-formed final frame.
+        if n > MAX_FRAME_BYTES {
+            return Ok(Frame::TooLarge(n));
+        }
+    } else {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+
+    Ok(Frame::Line(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// The refusal a peer gets instead of an out-of-memory daemon.
+fn oversized(n: usize) -> RpcResponse {
+    RpcResponse::failed(
+        None,
+        RpcError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "a frame exceeded the {MAX_FRAME_BYTES}-byte protocol maximum ({n} bytes read \
+                 with no newline); the connection is closed rather than resynchronised"
+            ),
+        ),
+    )
 }
 
 fn handshake(
@@ -484,6 +560,22 @@ fn pump_events(
              should resume with its cursor.",
             crate::events::SUBSCRIBER_QUEUE
         );
+        // One last frame, BEFORE the shutdown, saying why.
+        //
+        // Closing the socket was already the signal — and it is not a
+        // sufficient one, because a daemon shutting down closes the socket too.
+        // A client could not tell "frames were dropped, resume" from "the
+        // daemon stopped", so `shepctl events subscribe` reported a subscription
+        // that had lost events as a clean exit. Best-effort: if this write
+        // fails the peer is already gone, and the shutdown below is still the
+        // right end.
+        let _ = write_frame(
+            sink,
+            &shepherd_proto::DroppedNotification::queue_overflow(
+                sub,
+                crate::events::SUBSCRIBER_QUEUE as u64,
+            ),
+        );
         let guard = sink.lock().unwrap_or_else(|e| e.into_inner());
         let _ = guard.shutdown(std::net::Shutdown::Both);
     }
@@ -588,9 +680,11 @@ mod tests {
         let pump_sink = Arc::clone(&sink);
         let pump = std::thread::spawn(move || pump_events(rx, &overflowed, &pump_sink, 7));
 
-        // What the client sees: some frames, then end of stream.
+        // What the client sees: some frames, then a notification saying it was
+        // dropped, then end of stream.
         let mut reader = BufReader::new(client_side);
         let mut frames = 0;
+        let mut dropped: Option<serde_json::Value> = None;
         loop {
             let mut line = String::new();
             let n = reader.read_line(&mut line).expect("read");
@@ -598,7 +692,15 @@ mod tests {
                 break; // EOF — the signal the whole change exists to produce.
             }
             let v: serde_json::Value = serde_json::from_str(&line).expect("a JSON frame");
+            if v["method"] == serde_json::json!(shepherd_proto::SUBSCRIPTION_DROPPED_METHOD) {
+                dropped = Some(v);
+                continue;
+            }
             assert_eq!(v["method"], serde_json::json!("event"), "{line}");
+            assert!(
+                dropped.is_none(),
+                "an event arrived after the drop notification: {line}"
+            );
             frames += 1;
         }
         pump.join().unwrap();
@@ -610,6 +712,24 @@ mod tests {
         assert_eq!(
             frames, SUBSCRIBER_QUEUE,
             "exactly the queued frames, then the close"
+        );
+
+        // EOF alone cannot carry the reason: a daemon SHUTTING DOWN closes the
+        // socket too, so a client that saw only the close reported a
+        // subscription that had lost events as a clean exit. The last frame is
+        // what tells the two apart.
+        let dropped = dropped.expect(
+            "the subscriber must be TOLD it was dropped, not merely disconnected — otherwise \
+             this is indistinguishable from the daemon shutting down",
+        );
+        assert_eq!(
+            dropped["params"]["reason"],
+            serde_json::json!("queue_overflow")
+        );
+        assert_eq!(dropped["params"]["subscription_id"], serde_json::json!(7));
+        assert_eq!(
+            dropped["params"]["queue_capacity"],
+            serde_json::json!(SUBSCRIBER_QUEUE as u64)
         );
     }
 

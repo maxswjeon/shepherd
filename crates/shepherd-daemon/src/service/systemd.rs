@@ -87,8 +87,33 @@ TimeoutStopSec=30
 [Install]
 WantedBy=default.target
 ",
-        exe = exe.display()
+        exe = systemd_quote(&exe.display().to_string())
     )
+}
+
+/// Quote a path for a systemd command line.
+///
+/// systemd tokenizes `ExecStart` on whitespace, so an installation under a
+/// directory with a space in it made only the prefix the executable —
+/// `Command /tmp/a is not executable` for `/tmp/a b/shepherdd`. Its own quoting
+/// rules apply: a double-quoted string, with `\\` and `"` backslash-escaped
+/// inside it.
+///
+/// Always quoted rather than only when it contains a space. A conditional
+/// quoter is one more branch to get wrong, systemd accepts a quoted string
+/// everywhere a bare one is legal, and the generated unit reads the same on
+/// every install.
+fn systemd_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// Write the unit file for `exe` to the location `env` resolves, creating
@@ -225,8 +250,27 @@ mod tests {
     #[test]
     fn the_unit_starts_the_daemon_in_run_mode() {
         let t = unit_text(Path::new("/usr/bin/shepherdd"));
-        assert!(t.contains("ExecStart=/usr/bin/shepherdd run"), "{t}");
+        assert!(t.contains(r#"ExecStart="/usr/bin/shepherdd" run"#), "{t}");
         assert!(t.contains("WantedBy=default.target"));
+    }
+
+    /// A path with a space in it must remain ONE argument.
+    ///
+    /// systemd tokenizes `ExecStart` on whitespace, so an unquoted
+    /// `/tmp/a b/shepherdd` made `/tmp/a` the executable and the unit failed
+    /// verification with `Command /tmp/a is not executable`. The user was left
+    /// with a unit file that had been written successfully and could not start.
+    #[test]
+    fn an_executable_path_with_spaces_stays_one_argument() {
+        let t = unit_text(Path::new("/tmp/a b/shepherdd"));
+        assert!(t.contains(r#"ExecStart="/tmp/a b/shepherdd" run"#), "{t}");
+
+        // systemd's own escaping inside a quoted string: backslash and quote.
+        let t = unit_text(Path::new(r#"/tmp/we"ird\path/shepherdd"#));
+        assert!(
+            t.contains(r#"ExecStart="/tmp/we\"ird\\path/shepherdd" run"#),
+            "{t}"
+        );
     }
 
     /// `Restart=always` would fight `systemctl --user stop`.
@@ -367,7 +411,7 @@ mod tests {
 
         assert_eq!(p1, p2, "reinstalling must not move the unit");
         let text = std::fs::read_to_string(&p2).unwrap();
-        assert!(text.contains("ExecStart=/new/shepherdd run"), "{text}");
+        assert!(text.contains(r#"ExecStart="/new/shepherdd" run"#), "{text}");
         assert!(!text.contains("/old/shepherdd"), "{text}");
         assert_eq!(
             std::fs::read_dir(cfg.join("systemd/user")).unwrap().count(),

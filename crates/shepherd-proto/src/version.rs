@@ -83,6 +83,21 @@ use serde::{Deserialize, Serialize};
 ///   epoch it sent; that field has been on the wire since 1.0.
 pub const PROTO_VERSION: ProtoVersion = ProtoVersion::new(1, 3);
 
+/// The largest a single newline-delimited frame may be, in bytes.
+///
+/// §4.3's transport has no length prefix — a frame ends at `\n` — so a reader
+/// that simply looks for one will allocate whatever a peer sends. A local peer
+/// that writes and never terminates a line is then an unbounded allocation per
+/// open connection, and the daemon dies of it rather than answering
+/// `InvalidRequest`. Authorization here is filesystem permissions, so the peer
+/// is by construction the same user — but "same user" includes a buggy script,
+/// and a control-plane daemon that a typo can OOM is not one you leave running.
+///
+/// 1 MiB is far above anything the method table can produce: the largest
+/// request is a `root.add` carrying ignore patterns, or a `target.add` config,
+/// both kilobytes. It is a ceiling, not a budget.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 /// The additive-evolution rules, stated once so they can be quoted in review.
 ///
 /// This is a `&str` rather than prose in a doc comment because

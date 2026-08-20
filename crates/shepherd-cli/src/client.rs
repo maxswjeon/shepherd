@@ -419,14 +419,31 @@ pub fn call(
 /// arrives, not collected and returned at the end. A subscriber that rendered
 /// nothing until the stream closed would be as useless as the one this replaces.
 ///
-/// Returns the `SubscribeResult` the daemon answered with, and how many event
-/// frames were rendered.
+/// Returns the `SubscribeResult`, how many event frames were rendered, and
+/// **how the stream ended**.
+///
+/// # The subscription result is delivered BEFORE the first event
+///
+/// `on_ready` runs the moment the daemon answers, and it is not a convenience.
+/// The result carries `resume.outcome`, which can be
+/// [`ResumeOutcome::SnapshotRequired`] — "your cursor is unusable, everything
+/// you believe about the past is invalid, re-read state before trusting this
+/// stream". Returning it only at the END meant a long-lived subscription never
+/// delivered it at all: the caller processed live events indefinitely without
+/// ever learning its prior state was incomplete.
+///
+/// The events are still forwarded. A follow command that refused to print
+/// until some snapshot had been "handled" would be refusing to do the one thing
+/// it exists for, and this layer has no way to take a snapshot on the caller's
+/// behalf. What it owes is that the warning arrives FIRST and cannot be missed,
+/// which is what the ordering buys.
 pub fn subscribe(
     socket: Option<&str>,
     timeout: Duration,
     params: serde_json::Value,
+    on_ready: impl FnOnce(&serde_json::Value),
     mut on_event: impl FnMut(&serde_json::Value),
-) -> Result<(serde_json::Value, u64), ClientError> {
+) -> Result<Subscription, ClientError> {
     let mut conn = Connection::connect(socket, timeout)?;
     let path = conn.socket().to_string();
     let at = |e: ClientError| match e {
@@ -449,24 +466,83 @@ pub fn subscribe(
     let reply: RpcResponse = parse_frame(conn.read_frame().map_err(&at)?).map_err(&at)?;
     let result = reply.outcome().map_err(ClientError::Rpc)?;
 
+    // Before a single event is forwarded. See this function's docs.
+    on_ready(&result);
+
     // Only now: everything above can legitimately hang and is worth a deadline.
     // Nothing below is — silence is the normal state of a subscription.
     conn.read_without_deadline().map_err(&at)?;
 
     let mut rendered = 0u64;
+    let mut last_seq = None;
+    let mut dropped = None;
     while let Some(frame) = conn.read_frame_or_eof().map_err(&at)? {
         // The daemon sends notifications, which carry `method` and no `id`.
         // Anything else on this socket is not an event and is not ours to
         // render; skipping rather than failing keeps a future frame kind from
         // breaking a running subscriber.
+        // The daemon's explicit "you were dropped" frame, which is the last
+        // thing it writes before closing an overflowed subscriber's socket.
+        // Without it, EOF alone cannot be told apart from an ordinary daemon
+        // shutdown, and a subscription that lost frames looked like a clean end.
+        if frame.get("method").and_then(serde_json::Value::as_str)
+            == Some(shepherd_proto::SUBSCRIPTION_DROPPED_METHOD)
+        {
+            dropped = frame.get("params").cloned();
+            continue;
+        }
         if frame.get("method").and_then(serde_json::Value::as_str) == Some("event")
             && let Some(payload) = frame.get("params")
         {
             rendered += 1;
+            last_seq = payload
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .or(last_seq);
             on_event(payload);
         }
     }
-    Ok((result, rendered))
+
+    // EOF alone is an ordinary end — a daemon shutting down, or the user
+    // interrupting — and this command has always treated that as success.
+    // What it could not do was tell that apart from the daemon dropping a
+    // subscriber that fell behind, which is a LOSS of events and was reported
+    // identically. The terminal frame above is what separates them.
+    Ok(Subscription {
+        result,
+        rendered,
+        last_seq,
+        ended: match dropped {
+            Some(params) => StreamEnd::Dropped(params),
+            None => StreamEnd::DaemonClosed,
+        },
+    })
+}
+
+/// What a finished `subscribe` covered, and how it finished.
+#[derive(Debug, Clone)]
+pub struct Subscription {
+    /// The `SubscribeResult` the daemon answered with. Already handed to
+    /// `on_ready` before any event; returned again so a caller that only wants
+    /// it at the end need not keep it.
+    pub result: serde_json::Value,
+    pub rendered: u64,
+    /// The highest `seq` actually processed — the cursor to resume from.
+    pub last_seq: Option<u64>,
+    pub ended: StreamEnd,
+}
+
+/// Why an event stream stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEnd {
+    /// The socket reached EOF with no explanation: the daemon is shutting down,
+    /// or the connection went away. Nothing says events were missed, and a
+    /// follow command ending this way is an ordinary end.
+    DaemonClosed,
+    /// The daemon said so, in a `subscription.dropped` notification, before
+    /// closing: this subscriber fell behind its queue and the frames after the
+    /// drained ones were never delivered. Carries the notification's params.
+    Dropped(serde_json::Value),
 }
 
 fn parse_frame(value: serde_json::Value) -> Result<RpcResponse, ClientError> {

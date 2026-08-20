@@ -95,6 +95,16 @@ pub struct DenyList {
     /// Kept separate from `abs_prefixes` for the same auditability reason, and
     /// because those are `&'static`.
     extra_paths: Vec<String>,
+    /// Whether component names match without regard to case.
+    ///
+    /// Set from the root's PROBED case policy, never assumed: on a
+    /// case-insensitive volume `.GIT` and `Node_Modules` resolve to the same
+    /// directories as `.git` and `node_modules`, so a bytewise comparison let
+    /// a version-control or package-cache tree through on its spelling alone —
+    /// and a deny-list entry that can be evaded by pressing shift is not a
+    /// safety policy. Left off on case-sensitive roots, where `.GIT` really is
+    /// a different directory and denying it would prune a user's own.
+    case_insensitive: bool,
 }
 
 impl Default for DenyList {
@@ -165,6 +175,7 @@ impl DenyList {
             ],
             extra_names: BTreeSet::new(),
             extra_paths: Vec::new(),
+            case_insensitive: false,
         }
     }
 
@@ -178,7 +189,19 @@ impl DenyList {
             file_exts: Vec::new(),
             extra_names: BTreeSet::new(),
             extra_paths: Vec::new(),
+            case_insensitive: false,
         }
+    }
+
+    /// Match component names without regard to case, for a root whose probed
+    /// policy says the filesystem does.
+    ///
+    /// ASCII folding: every name and suffix on the builtin list is ASCII, so
+    /// there is no non-ASCII spelling of `.git` to miss, and full Unicode
+    /// folding would bring its own surprises to a safety predicate.
+    pub fn case_insensitive(mut self, yes: bool) -> Self {
+        self.case_insensitive = yes;
+        self
     }
 
     pub fn with_extra_dir(mut self, name: impl Into<String>) -> Self {
@@ -216,18 +239,33 @@ impl DenyList {
     ///
     /// `component` is the directory's own name; `abs` its absolute path.
     pub fn deny_dir(&self, component: &str, abs: &Path) -> Option<DenyReason> {
-        if self.extra_names.contains(component) {
+        let eq = |a: &str, b: &str| {
+            if self.case_insensitive {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        let ends_with = |hay: &str, tail: &str| {
+            if self.case_insensitive {
+                hay.len() >= tail.len() && hay[hay.len() - tail.len()..].eq_ignore_ascii_case(tail)
+            } else {
+                hay.ends_with(tail)
+            }
+        };
+
+        if self.extra_names.iter().any(|n| eq(n, component)) {
             return Some(DenyReason::SystemPath);
         }
         for (name, why) in &self.names {
-            if component == *name {
+            if eq(component, name) {
                 return Some(*why);
             }
         }
         for (suffix, why) in &self.suffixes {
             // A component that IS the suffix (a directory literally named
             // ".app") is not a bundle; a bundle is "Something.app".
-            if component.len() > suffix.len() && component.ends_with(suffix) {
+            if component.len() > suffix.len() && ends_with(component, suffix) {
                 return Some(*why);
             }
         }
@@ -322,6 +360,60 @@ mod tests {
             d.deny_dir("shepherd-notes", &p("/home/u/.local/state/shepherd-notes")),
             None
         );
+    }
+
+    /// On a case-insensitive volume, `.GIT` is the `.git`.
+    ///
+    /// macOS and Windows roots resolve `.GIT`, `Node_Modules` and `.Git` to the
+    /// same directories as their lowercase spellings, so a bytewise comparison
+    /// let a version-control or package-cache tree through on nothing but its
+    /// preserved capitalisation — a safety policy evaded by pressing shift.
+    ///
+    /// Both directions are asserted. On a case-SENSITIVE root `.GIT` really is
+    /// a different directory, and denying it would prune one of the user's own.
+    #[test]
+    fn case_folding_follows_the_roots_policy() {
+        let sensitive = DenyList::builtin();
+        let insensitive = DenyList::builtin().case_insensitive(true);
+
+        for (component, path) in [
+            (".GIT", "/home/u/proj/.GIT"),
+            (".Git", "/home/u/proj/.Git"),
+            ("Node_Modules", "/home/u/proj/Node_Modules"),
+            ("NODE_MODULES", "/home/u/proj/NODE_MODULES"),
+        ] {
+            assert_eq!(
+                sensitive.deny_dir(component, &p(path)),
+                None,
+                "`{component}` is a different directory on a case-sensitive root"
+            );
+            assert!(
+                insensitive.deny_dir(component, &p(path)).is_some(),
+                "`{component}` resolves to a denied tree on a case-insensitive root"
+            );
+        }
+
+        // The exact spellings are denied either way.
+        assert!(
+            sensitive
+                .deny_dir(".git", &p("/home/u/proj/.git"))
+                .is_some()
+        );
+        assert!(
+            insensitive
+                .deny_dir(".git", &p("/home/u/proj/.git"))
+                .is_some()
+        );
+
+        // Suffix rules fold too — a macOS bundle is the case that motivates
+        // them, and macOS is where insensitivity lives.
+        assert_eq!(sensitive.deny_dir("Photos.APP", &p("/x/Photos.APP")), None);
+        assert_eq!(
+            insensitive.deny_dir("Photos.APP", &p("/x/Photos.APP")),
+            Some(DenyReason::Bundle)
+        );
+        // And a component that IS the suffix is still not a bundle.
+        assert_eq!(insensitive.deny_dir(".APP", &p("/x/.APP")), None);
     }
 
     /// The lesson this codebase has now learned three times: match on

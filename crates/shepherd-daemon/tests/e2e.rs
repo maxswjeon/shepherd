@@ -825,6 +825,57 @@ fn a_scan_does_not_catalogue_the_daemons_own_state_directory() {
     );
 }
 
+/// An oversized frame is refused, not allocated.
+///
+/// The transport has no length prefix — a frame ends at `\n` — and
+/// `BufRead::lines` grows a `String` until it finds one. A peer that writes and
+/// never terminates a line was therefore an unbounded allocation per open
+/// connection, and the daemon dies of it instead of answering. Authorization
+/// here is filesystem permissions, so the peer is the same user by
+/// construction; "same user" includes a buggy script, and a control-plane
+/// daemon a typo can OOM is not one to leave running.
+///
+/// The assertion that matters is the LAST one: the daemon is still serving
+/// afterwards. A refusal that took the process down with it would satisfy the
+/// first two.
+#[test]
+fn an_oversized_frame_is_refused_and_the_daemon_survives() {
+    let d = Daemon::start("bigframe");
+
+    let mut raw = UnixStream::connect(&d.socket).expect("connect");
+    raw.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    // Well past the 1 MiB maximum, and deliberately with NO newline: the
+    // failure being fixed is the read that never terminates.
+    let blob = vec![b'x'; shepherd_proto::MAX_FRAME_BYTES + 4096];
+    let _ = raw.write_all(&blob);
+    let _ = raw.flush();
+
+    let mut answer = String::new();
+    BufReader::new(raw.try_clone().unwrap())
+        .read_line(&mut answer)
+        .expect("the daemon must answer rather than grow");
+    let frame: serde_json::Value = serde_json::from_str(&answer).expect("a JSON-RPC frame");
+    assert_eq!(
+        frame["error"]["code"], -32600,
+        "an oversized frame is an invalid request: {answer}"
+    );
+    assert!(
+        frame["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("protocol maximum"),
+        "the refusal must say what was exceeded: {answer}"
+    );
+    drop(raw);
+
+    // Still serving.
+    let mut c = d.connect();
+    assert_eq!(
+        c.call("status", serde_json::json!({}))["files_catalogued"],
+        0
+    );
+}
+
 /// A denied tree reached through a symlinked ANCESTOR is refused too.
 ///
 /// The deny decision canonicalized only when the final component was itself a
@@ -2426,6 +2477,94 @@ fn a_resuming_subscription_is_answered_before_the_frames_it_replays() {
     assert!(
         env["data"]["subscription_id"].as_u64().unwrap() >= 1,
         "{env}"
+    );
+}
+
+/// `snapshot_required` reaches the user BEFORE the first event, not after the
+/// last one.
+///
+/// The subscription result carries `resume.outcome`, and
+/// `snapshot_required` means "your cursor is unusable; everything you believe
+/// about the past is invalid". `client::subscribe` returned that result only
+/// when the stream ENDED — and a follow command's stream ends when the user
+/// interrupts it, so on a long-lived subscription the warning was never
+/// delivered at all while live events were forwarded the whole time.
+///
+/// An epoch from a different run is the cheapest way to reach the outcome:
+/// sequence numbers restart on every daemon run, so a cursor from another epoch
+/// cannot be replayed.
+#[test]
+fn a_snapshot_required_resume_is_reported_before_any_event() {
+    let d = Daemon::start("snapreq");
+
+    // Events must actually FLOW during the subscription, or the ordering this
+    // test exists for is not exercised: with an idle daemon the warning is
+    // trivially first because it is the only line.
+    let root_dir = d.dir.join("corpus-snapreq");
+    write_file(&root_dir, "a.txt", "hello");
+    let root_id = {
+        let mut c = d.connect();
+        c.call(
+            "root.add",
+            serde_json::json!({"path": root_dir.to_str().unwrap(), "stub_mode": "delete"}),
+        )["root"]["root_id"]
+            .as_i64()
+            .unwrap()
+    };
+    let socket = d.socket.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let scanner_stop = Arc::clone(&stop);
+    let scanner = std::thread::spawn(move || {
+        // Repeatedly, and only AFTER the subscription is live: these must be
+        // live frames rather than a replay, because `snapshot_required` means
+        // by definition that nothing can be replayed. Looping removes the race
+        // between this thread and `shepctl` finishing its handshake.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !scanner_stop.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            if let Ok(s) = UnixStream::connect(&socket) {
+                drop(s);
+                let mut c = Client::connect(&socket);
+                let _ = c.raw("scan.start", serde_json::json!({"root_id": root_id}));
+            }
+        }
+    });
+
+    let (env, events) = subscribe_until_eof(
+        &d,
+        &[
+            "--resume-from",
+            "1",
+            "--resume-epoch",
+            "a-run-that-never-was",
+        ],
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    scanner.join().expect("the scan trigger");
+
+    assert_eq!(
+        env["data"]["resume"]["outcome"],
+        serde_json::json!("snapshot_required"),
+        "the fixture must actually produce the outcome under test: {env}"
+    );
+
+    // `--json` puts the warning on stdout as its own record, ahead of every
+    // event line. `subscribe_until_eof` collects stdout in order, so position
+    // is the assertion.
+    let first_warning = events
+        .iter()
+        .position(|v| v.get("warning") == Some(&serde_json::json!("snapshot_required")))
+        .unwrap_or_else(|| panic!("the snapshot_required warning was never emitted: {events:?}"));
+    let first_event = events
+        .iter()
+        .position(|v| v.get("seq").is_some())
+        .unwrap_or_else(|| {
+            panic!("no event was rendered, so the ordering is untested: {events:?}")
+        });
+    assert!(
+        first_warning < first_event,
+        "the warning must precede the first event, or a follow command delivers events the \
+         caller has no reason to distrust: {events:?}"
     );
 }
 

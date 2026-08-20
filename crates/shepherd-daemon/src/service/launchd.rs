@@ -44,8 +44,35 @@ pub fn plist_text(exe: &Path) -> String {
 </dict>
 </plist>
 "#,
-        exe = exe.display()
+        exe = xml_escape(&exe.display().to_string())
     )
+}
+
+/// XML-escape a value going into a plist `<string>`.
+///
+/// A path is not a safe literal: an installation under a directory containing
+/// `&` or `<` produced a plist that does not parse, `launchctl bootstrap` then
+/// failed, and `install` recorded that failure as a NOTE while still returning
+/// success — so the user was left with an agent that looks installed and never
+/// starts. Escaping is the fix; the note-not-failure half is a separate
+/// judgement the install path already makes deliberately for the bootstrap
+/// step, since the plist itself is written.
+///
+/// All five predefined entities, not only the three that break `<string>`:
+/// the cost is nil and a partial escaper is the kind that gets copied.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub fn install(exe: &Path) -> Result<Outcome> {
@@ -157,6 +184,29 @@ mod tests {
             "unbalanced dict tags"
         );
         assert_eq!(t.matches("<array>").count(), t.matches("</array>").count());
+    }
+
+    /// An XML metacharacter in the path must not produce a plist that will not
+    /// parse.
+    ///
+    /// `launchctl bootstrap` then fails — and `install` records that as a NOTE
+    /// while still returning success, so the user is left with an agent that
+    /// looks installed and never starts. The malformed file is the cause, so
+    /// the file is where this is fixed.
+    #[test]
+    fn an_executable_path_with_xml_metacharacters_is_escaped() {
+        let t = plist_text(Path::new("/opt/A & B/<shepherdd>"));
+        assert!(
+            t.contains("<string>/opt/A &amp; B/&lt;shepherdd&gt;</string>"),
+            "{t}"
+        );
+        assert!(
+            !t.contains("/opt/A & B/<shepherdd>"),
+            "the raw path must not survive into the document: {t}"
+        );
+        // Still one `<string>` per argument, so the escaping did not disturb
+        // the element structure.
+        assert!(t.contains("<string>run</string>"));
     }
 
     /// `KeepAlive` plus `RunAtLoad` restarts a daemon the user just stopped.

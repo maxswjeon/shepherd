@@ -69,10 +69,13 @@ pub use method::{
     ShepherdApi, registry_canonical_form, registry_fingerprint,
 };
 pub use request::{RequestId, RpcRequest, SubscribeRequest};
-pub use response::{EVENT_NOTIFICATION_METHOD, RpcNotification, RpcResponse};
+pub use response::{
+    DroppedNotification, EVENT_NOTIFICATION_METHOD, RpcNotification, RpcResponse,
+    SUBSCRIPTION_DROPPED_METHOD, SubscriptionDropped,
+};
 pub use version::{
-    COMPATIBILITY_POLICY, Capability, Hello, HelloResult, Negotiated, PROTO_VERSION, PeerInfo,
-    ProtoVersion, UPGRADE_COMMAND, VersionMismatch, capability, negotiate,
+    COMPATIBILITY_POLICY, Capability, Hello, HelloResult, MAX_FRAME_BYTES, Negotiated,
+    PROTO_VERSION, PeerInfo, ProtoVersion, UPGRADE_COMMAND, VersionMismatch, capability, negotiate,
 };
 
 #[cfg(test)]
