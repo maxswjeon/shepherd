@@ -779,9 +779,26 @@ fn row_to_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ScanRoot>> {
     })())
 }
 
+/// Whether this character separates path components on the host.
+///
+/// **`\` is an ordinary character in a Unix filename.** `rel_path` is stored
+/// "with separators left exactly as the OS gave them", so on Windows both
+/// characters really are boundaries and both are treated as such there.
+///
+/// This is the third site to get the same correction, and the one where the
+/// disagreement was visible from outside: a Unix file named `report.txt\final`
+/// was stored with `name = "final"` and `ext = NULL`, so `search.filters.ext`
+/// missed it while the rule matcher — corrected first — read the extension it
+/// actually has. Search and rule preview then described the same file
+/// differently, which is worse than either answer alone.
+#[inline]
+fn is_component_boundary(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
+}
+
 fn split_name(rel_path: &str) -> (String, Option<String>) {
     let name = rel_path
-        .rsplit(['/', '\\'])
+        .rsplit(is_component_boundary)
         .next()
         .unwrap_or(rel_path)
         .to_string();
@@ -797,6 +814,42 @@ fn split_name(rel_path: &str) -> (String, Option<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A backslash is part of a Unix FILENAME, not a component boundary.
+    ///
+    /// The third site to get this correction, and the one where the
+    /// disagreement showed from outside: a file named `report.txt\\final` was
+    /// stored with `name = "final"` and `ext = NULL`, so `search.filters.ext`
+    /// missed it while the rule matcher — corrected first — read the extension
+    /// it actually has. Search and rule preview then described the same file
+    /// differently, which is worse than either answer alone.
+    #[test]
+    fn split_name_follows_the_host_separator() {
+        // `/` is a boundary on every platform.
+        assert_eq!(
+            split_name("docs/report.txt"),
+            ("report.txt".to_string(), Some("txt".to_string()))
+        );
+
+        let odd = "report.txt\\final";
+        if cfg!(windows) {
+            assert_eq!(split_name(odd), ("final".to_string(), None));
+        } else {
+            assert_eq!(
+                split_name(odd),
+                (odd.to_string(), Some("txt\\final".to_string())),
+                "on Unix this is ONE filename, and its extension is what follows \
+                 the last dot in it"
+            );
+        }
+
+        // The dotfile rule is unchanged: a leading dot is not a separator.
+        assert_eq!(
+            split_name("docs/.gitignore"),
+            (".gitignore".to_string(), None)
+        );
+    }
+
     use super::*;
 
     /// A scan generation for tests that are not about generations.

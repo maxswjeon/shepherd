@@ -123,6 +123,14 @@ fn describe_file_type(ft: std::fs::FileType) -> &'static str {
     }
 }
 
+/// Subscriptions one connection may hold at once.
+///
+/// Each costs an OS thread and a bounded channel for the connection's life, so
+/// this is a resource bound rather than a policy. Generous against real use:
+/// `events.subscribe` takes a LIST of streams, so a client wanting everything
+/// needs one subscription, not six — and there are only six streams to ask for.
+const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 8;
+
 /// Take the state directory's singleton lock.
 ///
 /// # Before the catalog is opened, not after
@@ -664,6 +672,39 @@ fn subscribe_on_connection(
     id: RequestId,
     guards: &mut Vec<crate::events::SubscriptionGuard>,
 ) -> Option<RpcResponse> {
+    // BOUNDED BEFORE ANYTHING IS SPAWNED.
+    //
+    // Nothing stopped a client sending `events.subscribe` in a loop on one
+    // connection: each one spawns an OS thread and holds a guard until the
+    // connection closes, and pointing them all at a quiet stream leaves every
+    // thread parked on `recv`. A malfunctioning dashboard could exhaust the
+    // daemon's threads without ever sending an oversized frame, and the next
+    // ordinary connection would fail to get one.
+    //
+    // Per connection rather than globally, deliberately. A global cap makes one
+    // busy client refuse service to every other, which is the failure this is
+    // meant to prevent rather than a milder version of it; a per-connection cap
+    // bounds the client that misbehaves. `MAX_FRAME_BYTES` is the analogous
+    // per-connection bound on the other resource.
+    //
+    // Refused with `Busy`, the same code a failed pump spawn already answers:
+    // from the caller's side both are "this connection cannot take another
+    // subscription right now".
+    if guards.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+        return Some(RpcResponse::failed(
+            Some(id),
+            RpcError::new(
+                ErrorCode::Busy,
+                format!(
+                    "this connection already holds {MAX_SUBSCRIPTIONS_PER_CONNECTION} \
+                     subscriptions, which is the per-connection limit. Each one owns a thread \
+                     for the life of the connection; open a second connection, or subscribe \
+                     to several streams in one request rather than one request per stream"
+                ),
+            ),
+        ));
+    }
+
     let crate::events::Subscription {
         result,
         replay,
@@ -842,6 +883,118 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d);
         d.join("daemon.sock")
+    }
+
+    /// One connection cannot spawn unbounded pump threads.
+    ///
+    /// Every `events.subscribe` costs an OS thread and a bounded channel for
+    /// the life of the connection, and nothing stopped a client sending them in
+    /// a loop. Pointed at a quiet stream, every thread parks on `recv` — so a
+    /// malfunctioning dashboard could exhaust the daemon's threads without ever
+    /// sending an oversized frame, and the next ordinary connection would not
+    /// be served.
+    ///
+    /// Asserted through `handle` over a real socket pair, because the cap is a
+    /// property of the CONNECTION rather than of the hub.
+    #[cfg(unix)]
+    #[test]
+    fn one_connection_cannot_hold_unbounded_subscriptions() {
+        let dir = std::env::temp_dir().join(format!(
+            "shepherd-subcap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = shepherd_obs::paths::Paths {
+            state_dir: dir.clone(),
+            socket: dir.join("daemon.sock"),
+        };
+        let catalog = shepherd_catalog::Catalog::open(&paths.catalog()).unwrap();
+        let actor = shepherd_catalog::writer::CatalogActor::start(catalog, None);
+        let daemon = Daemon::new(actor, crate::events::EventHub::new(64, "test"), paths);
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let conn = std::thread::spawn({
+            let daemon = Arc::clone(&daemon);
+            move || {
+                let _ = handle(server, daemon);
+            }
+        });
+
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut client = client;
+        let mut call = |line: String| -> String {
+            use std::io::Write;
+            client.write_all(line.as_bytes()).unwrap();
+            client.write_all(b"\n").unwrap();
+            let mut buf = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut buf).unwrap();
+            buf
+        };
+
+        let hello = call(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "hello",
+                "params": {
+                    "proto_version": shepherd_proto::PROTO_VERSION,
+                    "client": {"name": "cap-test", "build": "0"},
+                    "capabilities": [],
+                }
+            })
+            .to_string(),
+        );
+        assert!(hello.contains("\"result\""), "handshake failed: {hello}");
+
+        // Up to the cap, each one succeeds — a cap that refused the first
+        // subscription would pass a "must refuse eventually" test while
+        // breaking the feature.
+        for n in 0..MAX_SUBSCRIPTIONS_PER_CONNECTION {
+            let reply = call(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 100 + n, "method": "events.subscribe",
+                    "params": {"streams": ["target"]}
+                })
+                .to_string(),
+            );
+            assert!(
+                reply.contains("subscription_id"),
+                "subscription {n} was refused below the cap: {reply}"
+            );
+        }
+        assert_eq!(
+            daemon.events.subscriber_count(),
+            MAX_SUBSCRIPTIONS_PER_CONNECTION,
+            "the hub must hold exactly the subscriptions that were accepted"
+        );
+
+        // One past it is refused, and the connection survives to say so.
+        let refused = call(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 999, "method": "events.subscribe",
+                "params": {"streams": ["target"]}
+            })
+            .to_string(),
+        );
+        assert!(
+            refused.contains("per-connection limit"),
+            "the refusal must name the reason: {refused}"
+        );
+        assert_eq!(
+            daemon.events.subscriber_count(),
+            MAX_SUBSCRIPTIONS_PER_CONNECTION,
+            "a refused subscribe must not have registered anything"
+        );
+
+        drop(client);
+        drop(reader);
+        conn.join().expect("the connection thread ends at EOF");
+        assert_eq!(
+            daemon.events.subscriber_count(),
+            0,
+            "and all of them are released when the connection closes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The connection, not the pump, is what ends a subscription.

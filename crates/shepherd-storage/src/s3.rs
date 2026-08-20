@@ -412,7 +412,8 @@ impl StorageAdapter for S3Adapter {
                 .upload_id(upload_id.as_opaque());
             // `take`: the marker is consumed by exactly this request, and the
             // truncated branch below always writes the next one back.
-            if let Some(m) = marker.take() {
+            let requested = marker.take();
+            if let Some(m) = requested.clone() {
                 req = req.part_number_marker(m);
             }
             let page = req
@@ -434,8 +435,8 @@ impl StorageAdapter for S3Adapter {
             }
 
             if page.is_truncated().unwrap_or(false) {
-                marker = page.next_part_number_marker().map(str::to_owned);
-                if marker.is_none() {
+                let next = page.next_part_number_marker().map(str::to_owned);
+                let Some(next) = next else {
                     // Truncated but no marker: refuse to silently return a
                     // partial list, which resume would read as "these parts do
                     // not exist".
@@ -444,7 +445,27 @@ impl StorageAdapter for S3Adapter {
                         op: "list_parts".into(),
                         detail: "response was truncated but carried no continuation marker".into(),
                     });
+                };
+                // A marker that does not ADVANCE is the same refusal wearing a
+                // different shape. The adjacent case above is caught because
+                // the marker is absent; this one hands back the marker just
+                // requested, so the loop re-issues an identical request,
+                // appends the same receipts again, and never terminates —
+                // resume never leaves reconciliation and the daemon grows
+                // until it is killed. Bounded by the marker having to move,
+                // rather than by an iteration cap, because a cap would also
+                // truncate a legitimately long listing.
+                if requested.as_deref() == Some(next.as_str()) {
+                    return Err(StorageError::Provider {
+                        provider: "s3",
+                        op: "list_parts".into(),
+                        detail: format!(
+                            "response was truncated and returned the same continuation marker \
+                             it was given ({next}); paging cannot advance"
+                        ),
+                    });
                 }
+                marker = Some(next);
             } else {
                 break;
             }
@@ -536,10 +557,13 @@ impl StorageAdapter for S3Adapter {
                 .prefix(prefix);
             // `take`, as in `list_parts`: consumed by this request, and the
             // truncated branch below writes both markers back unconditionally.
-            if let Some(k) = key_marker.take() {
+            // Kept as `requested_*` so that branch can tell an advancing marker
+            // pair from one the provider handed straight back.
+            let (requested_key, requested_id) = (key_marker.take(), id_marker.take());
+            if let Some(k) = requested_key.clone() {
                 req = req.key_marker(k);
             }
-            if let Some(i) = id_marker.take() {
+            if let Some(i) = requested_id.clone() {
                 req = req.upload_id_marker(i);
             }
             let page = req
@@ -556,8 +580,29 @@ impl StorageAdapter for S3Adapter {
                 }
             }
             if page.is_truncated().unwrap_or(false) {
-                key_marker = page.next_key_marker().map(str::to_owned);
-                id_marker = page.next_upload_id_marker().map(str::to_owned);
+                let (next_key, next_id) = (
+                    page.next_key_marker().map(str::to_owned),
+                    page.next_upload_id_marker().map(str::to_owned),
+                );
+                // The same refusal `list_parts` makes, for the same reason: a
+                // marker pair that does not ADVANCE re-issues an identical
+                // request forever, appending the same uploads each time. Not
+                // flagged by review here — this is the sibling of the loop that
+                // was, and one function over is exactly where the missing-marker
+                // case had been missing too.
+                if (next_key.as_deref(), next_id.as_deref())
+                    == (requested_key.as_deref(), requested_id.as_deref())
+                {
+                    return Err(StorageError::Provider {
+                        provider: "s3",
+                        op: "list_multipart_uploads".into(),
+                        detail: "response was truncated and returned the same continuation \
+                                 markers it was given; paging cannot advance"
+                            .into(),
+                    });
+                }
+                key_marker = next_key;
+                id_marker = next_id;
                 if key_marker.is_none() && id_marker.is_none() {
                     // Truncated but no marker, refused for the same reason
                     // `list_parts` refuses it: the page cannot be continued, so
@@ -687,6 +732,7 @@ impl StorageAdapter for S3Adapter {
             .map_err(|e| Self::map_err("list_objects_v2", prefix, e))?;
         list_page(
             out.is_truncated().unwrap_or(false),
+            page.map(OpaqueToken::as_opaque),
             out.next_continuation_token(),
             out.contents()
                 .iter()
@@ -1816,6 +1862,7 @@ mod probe_tests {
 /// refusal, one function over, where it was missing.
 fn list_page(
     truncated: bool,
+    requested: Option<&str>,
     token: Option<&str>,
     keys: Vec<ObjectKey>,
 ) -> StorageResult<ListPage> {
@@ -1825,6 +1872,20 @@ fn list_page(
             provider: "s3",
             op: "list_objects_v2".into(),
             detail: "response was truncated but carried no continuation token".into(),
+        });
+    }
+    // And a token that does not ADVANCE, which is the same fault one step
+    // further on: the caller loops until `next` is `None`, so a provider
+    // handing back the token it was given makes that loop permanent. Caught
+    // here rather than in each caller, because "exhaust the pagination" is
+    // exactly what every caller is told to do.
+    if truncated && token.is_some() && token == requested {
+        return Err(StorageError::Provider {
+            provider: "s3",
+            op: "list_objects_v2".into(),
+            detail: "response was truncated and returned the same continuation token it was \
+                     given; paging cannot advance"
+                .into(),
         });
     }
     Ok(ListPage { keys, next })
@@ -1845,7 +1906,7 @@ mod tests {
     fn a_truncated_listing_without_a_token_is_refused() {
         let keys = vec![ObjectKey::new("p/objects/aa")];
 
-        let err = list_page(true, None, keys.clone())
+        let err = list_page(true, None, None, keys.clone())
             .expect_err("a truncated page with nowhere to continue is not exhaustive");
         assert!(
             matches!(err, StorageError::Provider { op, .. } if op == "list_objects_v2"),
@@ -1853,9 +1914,24 @@ mod tests {
         );
 
         // The two pages that ARE well-formed still pass through.
-        let last = list_page(false, None, keys.clone()).expect("an untruncated page is the last");
+        let last =
+            list_page(false, None, None, keys.clone()).expect("an untruncated page is the last");
         assert!(last.next.is_none());
-        let more = list_page(true, Some("tok"), keys).expect("truncated WITH a token continues");
+        let more = list_page(true, None, Some("tok"), keys.clone())
+            .expect("truncated WITH a token continues");
+
+        // A token that does not ADVANCE is the same fault one step on: the
+        // caller loops until `next` is `None`, so a provider handing back the
+        // token it was given makes that loop permanent — the page is re-fetched
+        // and re-appended until the daemon is killed.
+        let stuck = list_page(true, Some("tok"), Some("tok"), keys.clone())
+            .expect_err("a non-advancing token must be refused, not paged forever");
+        assert!(
+            stuck.to_string().contains("cannot advance"),
+            "the refusal must say why: {stuck}"
+        );
+        // And advancing normally is unaffected.
+        assert!(list_page(true, Some("tok-1"), Some("tok-2"), keys).is_ok());
         assert!(more.next.is_some());
     }
     use super::*;
