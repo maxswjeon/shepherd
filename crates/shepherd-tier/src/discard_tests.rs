@@ -585,6 +585,28 @@ impl Remote {
         intent: usize,
         now: Timestamp,
     ) -> std::result::Result<(), DestroyError> {
+        self.discard_via(charge, candidate, target, target, root, prefix, intent, now)
+            .await
+    }
+
+    /// [`Self::discard_as`], with the GATE's target stated separately.
+    ///
+    /// The two are the same in every ordinary call and that is the point: the
+    /// scalar target and the connection the DELETE travels over are two
+    /// independent descriptions of "which target", and only one of them decides
+    /// where the object is removed from.
+    #[allow(clippy::too_many_arguments)]
+    async fn discard_via(
+        &self,
+        charge: &mut DiscardCharge,
+        candidate: &Candidate,
+        target: TargetId,
+        gate_target: TargetId,
+        root: RootId,
+        prefix: &str,
+        intent: usize,
+        now: Timestamp,
+    ) -> std::result::Result<(), DestroyError> {
         execute_discard(
             charge,
             // Bound to the DERIVED KEY, which is what `execute_discard`
@@ -604,7 +626,7 @@ impl Remote {
                 0,
                 None,
             ),
-            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &self.adapter),
+            &crate::destroy::TargetGate::new(gate_target, &self.adapter),
             candidate,
             target,
             root,
@@ -1449,4 +1471,59 @@ async fn a_discard_waits_on_the_remote_key_lock() {
         .expect("releasing the key lock must let the discard proceed")
         .expect("the discard itself succeeds");
     assert_eq!(r.deleted(), 1);
+}
+
+/// The DELETE goes to the target that was CHARGED, not to whichever adapter the
+/// caller happened to wire.
+///
+/// `spend` verifies the scalar `target` against the episode, and nothing
+/// compared that scalar with the target the adapter actually reaches. The
+/// existing wrong-target test varies only the scalar and always wraps target 1,
+/// so it could not see this. A charge for A alongside a gate for B deletes the
+/// derived key from B: no policy proof for B, no charge against B's budget, and
+/// an audit record naming A.
+#[tokio::test]
+async fn a_delete_does_not_go_to_a_target_the_charge_did_not_pay_for() {
+    let now = t(1);
+    let ledger = MemLedger::new();
+    let remote = Remote::new("gate-target", 1);
+    let mut charge = charge_for(&ledger, 1, now).await;
+
+    let got = remote
+        .discard_via(
+            &mut charge,
+            &candidate(0),
+            TARGET,
+            // Charged against target 1, wired to target 2.
+            TargetId::new(2),
+            ROOT,
+            PREFIX,
+            0,
+            now,
+        )
+        .await;
+    assert!(
+        matches!(&got, Err(DestroyError::Unbound { detail }) if detail.contains("target 2")),
+        "the refusal must name where the DELETE would have gone: {got:?}"
+    );
+    assert_eq!(remote.deleted(), 0, "and nothing was deleted");
+
+    // AND THE ACCEPTING DIRECTION: the same call with the gate on the charged
+    // target goes through, so the check cannot be satisfied by refusing all of
+    // them.
+    let mut charge = charge_for(&ledger, 1, now).await;
+    remote
+        .discard_via(
+            &mut charge,
+            &candidate(0),
+            TARGET,
+            TARGET,
+            ROOT,
+            PREFIX,
+            0,
+            now,
+        )
+        .await
+        .expect("the charged target's own gate is ordinary");
+    assert_eq!(remote.deleted(), 1);
 }

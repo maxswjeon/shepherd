@@ -123,8 +123,23 @@ impl Gate {
 
 #[async_trait::async_trait]
 impl crate::destroy::RootGate for Gate {
-    async fn destroy_refusal(&self) -> Result<Option<String>> {
-        Ok(self.0.lock().unwrap().clone())
+    async fn hold_open(
+        &self,
+        root: shepherd_core::RootId,
+    ) -> Result<std::result::Result<crate::destroy::RootHold, String>> {
+        // The root is checked, because a gate that ignores it is a gate that
+        // can be asked the wrong question — which is the other half of what
+        // this port exists for.
+        if root != shepherd_core::RootId::new(1) {
+            return Ok(Err(format!(
+                "this gate is for root 1 and was asked about root {}",
+                root.get()
+            )));
+        }
+        match self.0.lock().unwrap().clone() {
+            Some(reason) => Ok(Err(reason)),
+            None => Ok(Ok(crate::destroy::RootHold::nothing_can_change_this_root())),
+        }
     }
 }
 
@@ -402,6 +417,45 @@ async fn a_root_gate_that_closes_during_a_destroy_stops_it_before_the_unlink() {
         f.audit.read_all().is_empty(),
         "nothing irreversible happened, so nothing is owed a record"
     );
+}
+
+/// A gate for another root does not speak for this destruction.
+///
+/// The request carried `root` and `root_gate` independently and the gate was
+/// asked no question at all — so a gate belonging to root B could be attached
+/// to a destruction under root A and answer "open" while A required resync.
+/// `hold_open` takes the root now, so an implementation that looks it up
+/// cannot be asked about the wrong one.
+#[tokio::test]
+async fn a_gate_for_another_root_does_not_authorize_this_destroy() {
+    let f = fixture("wrong-root", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let mut root = f.root.clone();
+    root.id = shepherd_core::RootId::new(2);
+    let req = LocalDestroyRequest {
+        root: &root,
+        ..f.request(&c)
+    };
+
+    let Some(r) = past_the_open_handle_floor(
+        execute_local_destruction(
+            &req,
+            &f.provider,
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+            &f.audit,
+            &f.locks,
+            Timestamp::from_nanos(1),
+        )
+        .await,
+    ) else {
+        return;
+    };
+    let err = r.expect_err("a gate for another root must not authorize this destroy");
+    assert!(
+        matches!(&err, DestroyError::Root(reason) if reason.contains("root 2")),
+        "the refusal must name the root it was asked about: {err}"
+    );
+    assert!(f.path.exists(), "and the file is still there");
 }
 
 /// A file old enough and big enough to clear the floors.

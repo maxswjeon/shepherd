@@ -139,6 +139,50 @@ fn a_fork_is_detected_and_refuses_custody() {
     assert_eq!(r.head, None);
 }
 
+/// One pointer listed twice is one pointer, not a fork.
+///
+/// The dedup comment was already there — "a duplicate self hash is a
+/// byte-identical duplicate record, which is harmless" — and only `by_hash`
+/// acted on it. `children` kept every listing entry, so a paginated LIST whose
+/// pages overlap, or an eventually-consistent provider serving one key twice,
+/// made a perfectly linear chain report a fork. A forked chain is
+/// custody-ineligible, so a listing artefact took the target out of custody.
+#[test]
+fn a_pointer_repeated_by_the_listing_is_not_a_fork() {
+    let g = rec(1, 1, "u1", None);
+    let a = rec(1, 2, "ua", Some(g.self_blake3.clone()));
+
+    // The same two records, with `a` served twice — byte-identical, as an
+    // overlapping page would produce.
+    let r = resolve_chain(&listed(&[g.clone(), a.clone(), a.clone()]));
+    assert!(
+        !matches!(r.status, ChainStatus::Fork { .. }),
+        "a repeated listing entry reported a fork: {:?}",
+        r.status
+    );
+    // A fork has no head, so a head is the positive statement that the chain
+    // resolved to one line. Custody needs more than this (see
+    // `an_unforked_gapless_chain_is_not_automatically_custody_eligible`); what
+    // matters here is that the listing artefact no longer makes the chain
+    // ineligible on its own.
+    assert_eq!(r.head, Blake3Hash::from_hex(&a.self_blake3));
+    assert_eq!(
+        r.records.len(),
+        2,
+        "and the pointer is replayed once, not twice"
+    );
+
+    // AND THE REAL THING still counts: two DIFFERENT records claiming one
+    // predecessor is a fork, and deduplicating by self hash does not hide it.
+    let b = rec(2, 2, "ub", Some(g.self_blake3.clone()));
+    let r = resolve_chain(&listed(&[g, a.clone(), a, b]));
+    assert!(
+        matches!(r.status, ChainStatus::Fork { .. }),
+        "two distinct successors are a fork whatever the listing repeated: {:?}",
+        r.status
+    );
+}
+
 #[test]
 fn two_genesis_records_are_a_fork() {
     let a = rec(1, 1, "ua", None);

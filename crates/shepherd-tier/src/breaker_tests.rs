@@ -59,7 +59,20 @@ fn nothing_executes_before_the_complete_set_is_enumerated() {
     let refusals = e
         .may_execute(&RateWindow::default(), &limits(), now)
         .expect_err("must refuse");
-    assert_eq!(refusals, [BreakerRefusal::SetNotEnumerated]);
+    // Both, because both are true and this predicate reports every failing
+    // conjunct — a held bulk discard is operator-facing, and "blocked, try
+    // again" is not something a human can act on. The state refusal is new:
+    // `may_execute` used to reject only `Cancelled`, so every other state rode
+    // through on leftover confirmation fields.
+    assert_eq!(
+        refusals,
+        [
+            BreakerRefusal::NotConfirmed {
+                state: EpisodeState::Enumerating
+            },
+            BreakerRefusal::SetNotEnumerated
+        ]
+    );
 }
 
 #[test]
@@ -340,4 +353,92 @@ fn every_failing_check_is_reported_not_just_the_first() {
 
     let refusals = e.may_execute(&w, &limits(), t(0)).expect_err("must refuse");
     assert!(refusals.len() >= 3, "{refusals:?}");
+}
+
+/// Only a `Confirmed` episode may execute, and terminal ones stay terminal.
+///
+/// `may_execute` rejected `Cancelled` and nothing else, so an episode in
+/// `Completed`, `Executing`, `Expired` or `Held` still passed on the strength
+/// of the `confirmed_set_blake3` and deadline it was carrying. A retry could
+/// then reserve a fresh charge and run the whole candidate set again — and if
+/// an object had been recreated at one of those keys in the meantime, delete
+/// the replacement under a confirmation that never saw it.
+#[test]
+fn only_a_confirmed_episode_may_execute() {
+    let now = t(0);
+    let mut e = Episode::open(RootId::new(1), TargetId::new(1), now);
+    e.enumerate(candidates(3));
+    assert!(
+        e.confirm("operator", now, 3_600_000_000_000),
+        "confirm from Held"
+    );
+    assert_eq!(e.state, EpisodeState::Confirmed);
+    e.may_execute(&RateWindow::default(), &limits(), now)
+        .expect("a confirmed episode executes");
+
+    // Every other state, with the confirmation fields left exactly as they are.
+    for state in [
+        EpisodeState::Executing,
+        EpisodeState::Completed,
+        EpisodeState::Expired,
+        EpisodeState::Held,
+    ] {
+        let mut moved = e.clone();
+        moved.state = state;
+        let refusals = moved
+            .may_execute(&RateWindow::default(), &limits(), now)
+            .expect_err("only Confirmed may execute");
+        assert!(
+            refusals.contains(&BreakerRefusal::NotConfirmed { state }),
+            "state {state:?} executed on a stale confirmation: {refusals:?}"
+        );
+    }
+}
+
+/// A finished episode is not re-opened by enumerating over it.
+///
+/// `Cancelled` and `Completed` are decisions already made — one by a human, one
+/// by the destructions that ran — and enumerating over either turned a finished
+/// episode back into a live one still carrying its old confirmation fields. A
+/// caller that wants another bulk discard opens another episode; that is what
+/// keeps each one's audit trail its own.
+#[test]
+fn a_terminal_episode_is_not_revived() {
+    let now = t(0);
+    for terminal in [EpisodeState::Cancelled, EpisodeState::Completed] {
+        let mut e = Episode::open(RootId::new(1), TargetId::new(1), now);
+        e.enumerate(candidates(3));
+        e.confirm("operator", now, 3_600_000_000_000);
+        e.state = terminal;
+
+        assert!(
+            !e.enumerate(candidates(5)),
+            "{terminal:?} must not re-enumerate"
+        );
+        assert!(
+            !e.re_enumerate(candidates(5)),
+            "{terminal:?} must not re-enumerate"
+        );
+        assert!(
+            !e.confirm("operator", now, 3_600_000_000_000),
+            "{terminal:?} must not confirm"
+        );
+        assert_eq!(e.state, terminal, "and the state is untouched");
+        assert!(
+            e.may_execute(&RateWindow::default(), &limits(), now)
+                .is_err(),
+            "{terminal:?} must not execute"
+        );
+    }
+
+    // AND THE ACCEPTING DIRECTION: a live episode still re-enumerates, which is
+    // what invalidates a confirmation when the set changes underneath it.
+    let mut e = Episode::open(RootId::new(1), TargetId::new(1), now);
+    e.enumerate(candidates(3));
+    e.confirm("operator", now, 3_600_000_000_000);
+    assert!(
+        e.re_enumerate(candidates(5)),
+        "a confirmed episode re-enumerates"
+    );
+    assert_eq!(e.state, EpisodeState::Held, "and drops back to Held");
 }

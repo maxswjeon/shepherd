@@ -769,6 +769,24 @@ pub fn resolve_chain(bodies: &[(String, PointerRecord)]) -> ChainResolution {
         }
     }
 
+    // ONE RECORD, however many times the listing served it.
+    //
+    // The self hash is the record's identity — it is a hash of the canonical
+    // body — so two entries carrying the same one are the same pointer under
+    // two keys, or the same key served twice. A paginated LIST whose pages
+    // overlap and an eventually-consistent provider both produce that, and
+    // every question below counted the entries rather than the records: the
+    // fork test saw two children of one predecessor, the tip list saw two tips,
+    // and `records` would have replayed the pointer twice. A listing artefact
+    // therefore reported a fork, and a forked chain is custody-ineligible.
+    //
+    // Deduplicated HERE rather than in each of those, because "the same record
+    // twice is one record" is one fact and three copies of it drift.
+    {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        valid.retain(|r| seen.insert(r.self_blake3.clone()));
+    }
+
     // Everything that *borrows* `valid` is scoped to this block, so the borrows
     // are all dead before the ordering pass below takes `valid` mutably. That
     // scope is what pays for the borrowed keys: these three questions are asked
@@ -776,12 +794,14 @@ pub fn resolve_chain(bodies: &[(String, PointerRecord)]) -> ChainResolution {
     // of every hash in the listing. Only the answers escape, and both of those
     // are empty or near-empty in the healthy case.
     let (has_fork, missing, tips) = {
-        // Index by self hash. A duplicate self hash is a byte-identical
-        // duplicate record, which is harmless — the same record listed twice.
+        // Index by self hash. Distinct by construction now: the duplicates a
+        // listing can serve were dropped above.
         let by_hash: BTreeSet<&str> = valid.iter().map(|r| r.self_blake3.as_str()).collect();
 
         // Fork: more than one record claiming the same predecessor (including
-        // more than one genesis).
+        // more than one genesis). `valid` holds distinct records by now, so
+        // "more than one" is two DIFFERENT successors rather than one listed
+        // twice — see the deduplication above.
         let mut children: BTreeMap<Option<&str>, Vec<&PointerRecord>> = BTreeMap::new();
         for r in &valid {
             children

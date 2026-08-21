@@ -527,7 +527,12 @@ struct OpenGate;
 
 #[async_trait::async_trait]
 impl shepherd_tier::destroy::RootGate for OpenGate {
-    async fn destroy_refusal(&self) -> shepherd_tier::destroy::Result<Option<String>> {
-        Ok(None)
+    async fn hold_open(
+        &self,
+        _root: shepherd_core::RootId,
+    ) -> shepherd_tier::destroy::Result<Result<shepherd_tier::destroy::RootHold, String>> {
+        Ok(Ok(
+            shepherd_tier::destroy::RootHold::nothing_can_change_this_root(),
+        ))
     }
 }

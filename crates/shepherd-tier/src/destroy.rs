@@ -47,7 +47,7 @@ use std::time::Duration;
 use shepherd_catalog::file_repo::ScanRoot;
 use shepherd_catalog::intent::{IntentKind, PreparedIntent};
 use shepherd_core::ObjectKey;
-use shepherd_core::{Blake3Hash, FsId, TargetId, Timestamp};
+use shepherd_core::{Blake3Hash, FsId, RootId, TargetId, Timestamp};
 use shepherd_placeholder::provider::{PlaceholderProvider, Staged};
 use shepherd_scan::floors::{self, FloorContext, FloorInput, FloorPolicy};
 use shepherd_storage::adapter::{ObjectMeta, StorageAdapter, StorageError, VersionGuard};
@@ -157,7 +157,7 @@ pub struct LocalDestroyRequest<'a> {
     /// §4.10.2's N-location predicate by [`crate::revalidate::destroy_permitted`].
     pub custodian: &'a Location,
     pub remote_key: &'a ObjectKey,
-    /// Re-read of [`Self::root`]'s gates, taken again before the unlink.
+    /// [`Self::root`]'s gates, HELD across the unlink rather than re-read.
     ///
     /// The snapshot above is what the caller saw when it assembled this; PM-3's
     /// gates are mutable and everything between here and step 6 takes time.
@@ -299,9 +299,12 @@ pub async fn execute_local_destruction(
     // Under the permit, because the permit is what serialises this against
     // every other destruction; refusing here is still a refusal BEFORE anything
     // irreversible, so abort-forward-never applies exactly as it does above.
-    match req.root_gate.destroy_refusal().await {
-        Ok(None) => {}
-        Ok(Some(reason)) => {
+    // HELD, not read. `_root_hold` lives until the end of this function, which
+    // is past the unlink — that binding is the fix, and dropping it earlier
+    // would silently restore the window this closes.
+    let _root_hold = match req.root_gate.hold_open(req.root.id).await {
+        Ok(Ok(hold)) => hold,
+        Ok(Err(reason)) => {
             let e = DestroyError::Root(reason);
             drop(permit);
             restore_or_report(provider, staged, "destruction refused by the root gate", &e);
@@ -311,10 +314,10 @@ pub async fn execute_local_destruction(
         // last check before an irreversible step, so it fails closed.
         Err(e) => {
             drop(permit);
-            restore_or_report(provider, staged, "the root gate could not be re-read", &e);
+            restore_or_report(provider, staged, "the root gate could not be held", &e);
             return Err(e);
         }
-    }
+    };
 
     // --- step 6: the irreversible one ---------------------------------------
     //
@@ -547,8 +550,56 @@ async fn destroy_staged(
 /// this file's tests are its only implementors today.
 #[async_trait::async_trait]
 pub trait RootGate: Send + Sync {
-    /// `None` means destruction is still permitted for this root.
-    async fn destroy_refusal(&self) -> Result<Option<String>>;
+    /// Take the gate for `root` and HOLD it.
+    ///
+    /// `Ok(Err(reason))` is a set gate; `Ok(Ok(hold))` is an open one, and the
+    /// hold must remain alive until the unlink has happened.
+    ///
+    /// # Why a hold rather than a value
+    ///
+    /// The first version returned `Option<String>` — a snapshot, taken and
+    /// released before the caller had even finished matching on it. That is
+    /// better than the request's own stale snapshot and it is not the property
+    /// PM-3 states: a watcher overflow landing between the read and the syscall
+    /// still meets an unlink that has already decided to proceed. The audit
+    /// permit does not help, because it serialises destructions and audit
+    /// writes, not root-state updates.
+    ///
+    /// So the value the gate returns is a GUARD, and the destroy path keeps it
+    /// alive across `destroy_local`. What the guard holds is the
+    /// implementation's business — a transaction, a read lock, a version it
+    /// re-checks on drop — and an implementation that holds nothing is no worse
+    /// than the value this replaced. What the type does is make "the gate is
+    /// open FOR THE DURATION" the thing a caller has to obtain, rather than a
+    /// fact it can read once and assume. Same move as `bind(path, state_lock)`
+    /// making the lock-before-listen ordering a type in this PR's daemon.
+    ///
+    /// `root` is passed rather than implied. The request carries `root` and
+    /// `root_gate` independently, so a gate for root B could be attached to a
+    /// destruction under root A and answer "open" while A requires resync — an
+    /// implementation that looks the root up by this argument cannot be asked
+    /// the wrong question.
+    async fn hold_open(&self, root: RootId) -> Result<std::result::Result<RootHold, String>>;
+}
+
+/// Proof that a root's gates were open, held for as long as it is alive.
+///
+/// Opaque on purpose: the destroy path must not be able to inspect it, only to
+/// keep it. What is inside is whatever the implementation needs to make the
+/// claim true — a live transaction, a read lock, nothing at all for a caller
+/// that has no gate mutations to race.
+pub struct RootHold(#[allow(dead_code)] Box<dyn std::any::Any + Send>);
+
+impl RootHold {
+    pub fn new<T: std::any::Any + Send>(held: T) -> Self {
+        Self(Box::new(held))
+    }
+
+    /// A hold over nothing, for a caller whose root state cannot change under
+    /// it. Named so that using it is a claim rather than an oversight.
+    pub fn nothing_can_change_this_root() -> Self {
+        Self::new(())
+    }
 }
 
 /// The remote operations the destroy path needs, as a narrow port.

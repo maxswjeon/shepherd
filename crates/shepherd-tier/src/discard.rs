@@ -542,6 +542,43 @@ pub async fn execute_discard(
         .spend(candidate, target, root, prefix)
         .map_err(DestroyError::Breaker)?;
 
+    // And the GATE must be the target that was charged.
+    //
+    // `spend` verifies the scalar `target` against the episode, and nothing
+    // compared that scalar with the target the adapter actually reaches. A
+    // caller wiring a charge for A alongside a `TargetGate` for B deletes the
+    // derived key from B — with no policy proof for B, no breaker charge
+    // against B's budget, and an audit record naming A. The scalar and the
+    // connection are two independent descriptions of "which target", and only
+    // one of them decides where the DELETE lands.
+    //
+    // `None` is refused for the reason `execute_local_destruction` refuses it:
+    // a gate that cannot say which target it speaks to is not a weaker answer
+    // than a mismatch, it is the same one.
+    match remote.target() {
+        Some(t) if t == target => {}
+        Some(t) => {
+            return Err(DestroyError::Unbound {
+                detail: format!(
+                    "the charge is against target {} and the DELETE would go to target {}; a \
+                     budget spent on one target does not authorize deleting from another",
+                    target.get(),
+                    t.get()
+                ),
+            });
+        }
+        None => {
+            return Err(DestroyError::Unbound {
+                detail: format!(
+                    "this remote gate cannot say which target it speaks to, so the DELETE \
+                     cannot be bound to the charge against target {}. Wrap the adapter in \
+                     `TargetGate`",
+                    target.get()
+                ),
+            });
+        }
+    }
+
     // The SAME process-wide remote-key lock `upload::upload_item` takes through
     // `acquire_both`. Without it the two operations interleave on one key:
     // a delete landing between an upload's completion and its verification

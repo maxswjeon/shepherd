@@ -383,14 +383,36 @@ impl Episode {
     ///
     /// This is the preflight iteration 1 asserted but never required. Until it
     /// has run there is no set to confirm, and [`Episode::may_execute`] refuses.
-    pub fn enumerate(&mut self, candidates: Vec<Candidate>) {
+    /// Enumerate a candidate set, moving the episode to `Held`.
+    ///
+    /// **Terminal episodes are not revived.** `Cancelled` and `Completed` are
+    /// decisions that have already been made — one by a human, one by the
+    /// destructions that ran — and re-enumerating over either turns a finished
+    /// episode back into a live one carrying its old confirmation fields. A
+    /// caller that wants another bulk discard opens another episode; that is
+    /// what makes each one's audit trail its own.
+    pub fn enumerate(&mut self, candidates: Vec<Candidate>) -> bool {
+        if matches!(
+            self.state,
+            EpisodeState::Cancelled | EpisodeState::Completed
+        ) {
+            return false;
+        }
         self.candidate_set_blake3 = Some(candidate_set_hash(&candidates));
         self.candidates = candidates;
         self.state = EpisodeState::Held;
+        true
     }
 
     /// A human confirmed the set. Binds to the hash as it stands now.
-    pub fn confirm(&mut self, by: impl Into<String>, now: Timestamp, ttl_nanos: i64) {
+    ///
+    /// Only from `Held`, and returns whether it took. Confirming a `Cancelled`
+    /// or `Completed` episode would resurrect it with a fresh deadline, and
+    /// confirming one already `Executing` would re-arm a run in progress.
+    pub fn confirm(&mut self, by: impl Into<String>, now: Timestamp, ttl_nanos: i64) -> bool {
+        if self.state != EpisodeState::Held {
+            return false;
+        }
         self.confirmed_set_blake3 = self.candidate_set_blake3;
         self.confirmed_at = Some(now);
         self.confirmed_by = Some(by.into());
@@ -398,12 +420,15 @@ impl Episode {
             now.as_nanos().saturating_add(ttl_nanos),
         ));
         self.state = EpisodeState::Confirmed;
+        true
     }
 
     /// Re-enumerate. **Invalidates any confirmation**, because the set a human
     /// approved is no longer the set that would be destroyed.
-    pub fn re_enumerate(&mut self, candidates: Vec<Candidate>) {
-        self.enumerate(candidates);
+    pub fn re_enumerate(&mut self, candidates: Vec<Candidate>) -> bool {
+        if !self.enumerate(candidates) {
+            return false;
+        }
         self.confirmed_set_blake3 = None;
         self.confirmed_at = None;
         self.confirmed_by = None;
@@ -411,6 +436,7 @@ impl Episode {
         // Back to Held, never to Confirmed. A hold escalates; it never times
         // out into action.
         self.state = EpisodeState::Held;
+        true
     }
 
     pub fn cancel(&mut self) {
@@ -429,8 +455,30 @@ impl Episode {
     ) -> Result<(), Vec<BreakerRefusal>> {
         let mut refusals = Vec::new();
 
-        if self.state == EpisodeState::Cancelled {
-            refusals.push(BreakerRefusal::Cancelled);
+        // The STATE must be `Confirmed`, not merely "not cancelled".
+        //
+        // Rejecting `Cancelled` alone let every other state through on the
+        // strength of leftover fields: an episode in `Completed`, `Executing`,
+        // `Expired` or even `Held` still carries the `confirmed_set_blake3` and
+        // deadline it was given, so a retry could reserve a fresh charge and
+        // run the whole candidate set again — and if an object had been
+        // recreated at one of those keys in between, delete the replacement
+        // under a confirmation that never saw it.
+        //
+        // An exhaustive match rather than `!=`: a state added later must be
+        // classified deliberately rather than default into "close enough to
+        // confirmed", which is the same convention the destroy predicate and
+        // `governs_this_discard` use.
+        match self.state {
+            EpisodeState::Confirmed => {}
+            EpisodeState::Cancelled => refusals.push(BreakerRefusal::Cancelled),
+            state @ (EpisodeState::Enumerating
+            | EpisodeState::Held
+            | EpisodeState::Executing
+            | EpisodeState::Completed
+            | EpisodeState::Expired) => {
+                refusals.push(BreakerRefusal::NotConfirmed { state });
+            }
         }
 
         let Some(current) = self.candidate_set_blake3 else {
