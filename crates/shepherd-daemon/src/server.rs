@@ -2276,9 +2276,19 @@ mod tests {
     /// exactly.
     #[test]
     fn a_subscriber_that_stops_reading_does_not_pin_the_event_pump() {
-        let (daemon_side, client_side) = UnixStream::pair().unwrap();
+        let (daemon_side, mut client_side) = UnixStream::pair().unwrap();
         daemon_side
             .set_write_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        // The client's read deadline is set HERE, while both ends are freshly
+        // created and connected, not after the pump has shut its side down.
+        // macOS answers `setsockopt` on a socket whose peer is gone with
+        // `EINVAL`, so setting it late passed on Linux and failed on the macOS
+        // runner — the only place that shows it, which is the same shape of gap
+        // as this PR's ancestry rule. It is a guard against hanging if the fix
+        // regresses, and it has to exist before the thing it guards.
+        client_side
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let sink = Arc::new(std::sync::Mutex::new(daemon_side));
         let overflowed = Arc::new(AtomicBool::new(true));
@@ -2330,12 +2340,8 @@ mod tests {
         drop(sink);
         let mut buf = [0u8; 1];
         use std::io::Read;
-        let mut client_side = client_side;
         // Drain whatever did land, then confirm the stream ends rather than
         // blocking on a peer that is still notionally alive.
-        client_side
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
         loop {
             match client_side.read(&mut buf) {
                 Ok(0) => break,
