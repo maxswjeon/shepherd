@@ -528,21 +528,19 @@ pub async fn execute_discard(
     candidate: &Candidate,
     target: TargetId,
     root: RootId,
-    prefix: &str,
     guard: &VersionGuard,
     locks: &FileLocks,
     audit: &AuditLog,
     attestation: &str,
     now: Timestamp,
 ) -> Result<(), DestroyError> {
-    // Before the deletion, never after. The budget was already persisted by
-    // `reserve_discard`; this is the per-object draw against it, and it both
-    // authorises the deletion and names what may be deleted.
-    let key = charge
-        .spend(candidate, target, root, prefix)
-        .map_err(DestroyError::Breaker)?;
-
-    // And the GATE must be the target that was charged.
+    // The GATE decides which target, and where that target's objects live.
+    //
+    // BEFORE `spend`, not after: this is a deterministic refusal that touches
+    // no remote, and spending first consumed the candidate's unit — so a caller
+    // that fixed its wiring and retried met `AlreadySpent` and had the
+    // candidate stranded in a reserved episode. A refusal that costs the caller
+    // its only attempt is a worse refusal than the mistake it catches.
     //
     // `spend` verifies the scalar `target` against the episode, and nothing
     // compared that scalar with the target the adapter actually reaches. A
@@ -552,12 +550,20 @@ pub async fn execute_discard(
     // connection are two independent descriptions of "which target", and only
     // one of them decides where the DELETE lands.
     //
+    // The PREFIX is the same fact one level down, and taking it as its own
+    // argument left the same hole open underneath the target check: two logical
+    // targets can share an adapter and a bucket and be told apart only by their
+    // prefix, so a charge and gate for A could still delete the matching
+    // content object under B's namespace. It comes from the gate now, and the
+    // caller's `prefix` argument is gone rather than checked — one source, not
+    // two that agree.
+    //
     // `None` is refused for the reason `execute_local_destruction` refuses it:
     // a gate that cannot say which target it speaks to is not a weaker answer
     // than a mismatch, it is the same one.
-    match remote.target() {
-        Some(t) if t == target => {}
-        Some(t) => {
+    let prefix = match (remote.target(), remote.prefix()) {
+        (Some(t), Some(p)) if t == target => p,
+        (Some(t), _) if t != target => {
             return Err(DestroyError::Unbound {
                 detail: format!(
                     "the charge is against target {} and the DELETE would go to target {}; a \
@@ -567,17 +573,24 @@ pub async fn execute_discard(
                 ),
             });
         }
-        None => {
+        _ => {
             return Err(DestroyError::Unbound {
                 detail: format!(
-                    "this remote gate cannot say which target it speaks to, so the DELETE \
-                     cannot be bound to the charge against target {}. Wrap the adapter in \
-                     `TargetGate`",
+                    "this remote gate cannot say which target it speaks to and where that \
+                     target's objects live, so the DELETE cannot be bound to the charge \
+                     against target {}. Wrap the adapter in `TargetGate`",
                     target.get()
                 ),
             });
         }
-    }
+    };
+
+    // Before the deletion, never after. The budget was already persisted by
+    // `reserve_discard`; this is the per-object draw against it, and it both
+    // authorises the deletion and names what may be deleted.
+    let key = charge
+        .spend(candidate, target, root, prefix)
+        .map_err(DestroyError::Breaker)?;
 
     // The SAME process-wide remote-key lock `upload::upload_item` takes through
     // `acquire_both`. Without it the two operations interleave on one key:

@@ -251,7 +251,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
             remote_key: &key,
         },
         &DeleteModeProvider::new(),
-        &shepherd_tier::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &adapter),
+        &shepherd_tier::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &adapter),
         &audit,
         &FileLocks::new(),
         now,

@@ -626,11 +626,10 @@ impl Remote {
                 0,
                 None,
             ),
-            &crate::destroy::TargetGate::new(gate_target, &self.adapter),
+            &crate::destroy::TargetGate::new(gate_target, prefix, &self.adapter),
             candidate,
             target,
             root,
-            prefix,
             &Self::guard(),
             &self.locks,
             &self.audit,
@@ -1317,8 +1316,15 @@ async fn the_key_is_derived_from_the_candidate_and_the_targets_prefix() {
     let remote = Remote::new("prefix", 1);
     let mut charge = charge_for(&ledger, 1, now).await;
 
-    // The same candidate, under a DIFFERENT target's prefix. Nothing exists
-    // there, so the deletion cannot touch the object seeded under `PREFIX`.
+    // The same candidate, through a gate configured for a DIFFERENT target's
+    // prefix. Nothing exists there, so the deletion cannot touch the object
+    // seeded under `PREFIX`.
+    //
+    // The prefix now travels ON the gate rather than as its own argument, so
+    // this is a gate built from the wrong configuration rather than a caller
+    // passing a stray string past a correct one. That is the distinction the
+    // change bought: there is one source for "where this target's objects
+    // live", and a caller cannot supply a second that disagrees with it.
     remote
         .discard_as(
             &mut charge,

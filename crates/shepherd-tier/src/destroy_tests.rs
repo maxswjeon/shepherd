@@ -179,7 +179,7 @@ async fn an_intent_prepared_for_another_file_does_not_authorize_this_one() {
     let err = execute_local_destruction(
         &req,
         &f.provider,
-        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.audit,
         &f.locks,
         Timestamp::from_nanos(1),
@@ -215,7 +215,7 @@ async fn custody_verified_against_other_bytes_does_not_authorize_this_destroy() 
     let err = execute_local_destruction(
         &req,
         &f.provider,
-        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.audit,
         &f.locks,
         Timestamp::from_nanos(1),
@@ -243,7 +243,7 @@ async fn a_remote_key_naming_other_bytes_does_not_authorize_this_destroy() {
     let err = execute_local_destruction(
         &req,
         &f.provider,
-        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.audit,
         &f.locks,
         Timestamp::from_nanos(1),
@@ -274,7 +274,7 @@ async fn a_closing_head_sent_to_another_target_does_not_authorize_this_destroy()
     let err = execute_local_destruction(
         &req,
         &f.provider,
-        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.audit,
         &f.locks,
         Timestamp::from_nanos(1),
@@ -340,7 +340,7 @@ async fn a_remote_intent_prepared_for_another_object_does_not_authorize_this_del
             0,
             None,
         ),
-        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.key,
         &guard,
         &f.audit,
@@ -395,7 +395,7 @@ async fn a_root_gate_that_closes_during_a_destroy_stops_it_before_the_unlink() {
         execute_local_destruction(
             &req,
             &f.provider,
-            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -441,7 +441,7 @@ async fn a_gate_for_another_root_does_not_authorize_this_destroy() {
         execute_local_destruction(
             &req,
             &f.provider,
-            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -456,6 +456,89 @@ async fn a_gate_for_another_root_does_not_authorize_this_destroy() {
         "the refusal must name the root it was asked about: {err}"
     );
     assert!(f.path.exists(), "and the file is still there");
+}
+
+/// A replica that vanishes while the destroy waits does not authorize it.
+///
+/// `destroy_staged` asks the closing HEAD, and TWO unbounded waits then sit
+/// between that answer and the unlink: `audit.admit()` takes a process-wide
+/// gate `AuditLog` documents as held across another destruction's network
+/// DELETE, and `hold_open` is another await on top of it. Under contention the
+/// replica that authorised this can disappear inside that gap after its own
+/// HEAD said it was there, and the last local copy would still be unlinked —
+/// the one outcome §4.10.2 exists to prevent.
+///
+/// So the HEAD is asked again immediately before the syscall. This double
+/// answers the first one and loses the object before the second, which is the
+/// gap itself rather than a stand-in for it.
+#[tokio::test]
+async fn a_replica_that_disappears_while_the_destroy_waits_stops_the_unlink() {
+    struct VanishesAfterTheFirstHead<'a> {
+        inner: &'a dyn shepherd_storage::StorageAdapter,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteGate for VanishesAfterTheFirstHead<'_> {
+        fn target(&self) -> Option<shepherd_core::TargetId> {
+            Some(shepherd_core::TargetId::new(1))
+        }
+
+        fn prefix(&self) -> Option<&str> {
+            Some("t")
+        }
+
+        async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
+            if self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return self
+                    .inner
+                    .head(key)
+                    .await
+                    .map_err(|e| DestroyError::Storage(e.to_string()));
+            }
+            // Gone by the second ask.
+            Ok(None)
+        }
+
+        async fn remove_object(&self, _key: &ObjectKey, _guard: &VersionGuard) -> Result<()> {
+            unreachable!("the local destroy path removes no remote object")
+        }
+    }
+
+    let f = fixture("vanishes", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let req = f.request(&c);
+    let remote = VanishesAfterTheFirstHead {
+        inner: &f.adapter,
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let Some(r) = past_the_open_handle_floor(
+        execute_local_destruction(
+            &req,
+            &f.provider,
+            &remote,
+            &f.audit,
+            &f.locks,
+            Timestamp::from_nanos(1),
+        )
+        .await,
+    ) else {
+        return;
+    };
+    let err = r.expect_err("a replica that vanished must not authorize the unlink");
+    assert!(
+        matches!(&err, DestroyError::Refused(_)),
+        "the closing check is what must refuse: {err}"
+    );
+    assert!(
+        f.path.exists(),
+        "and the file is restored from staging, not left in it"
+    );
+    assert!(
+        f.audit.read_all().is_empty(),
+        "nothing irreversible happened, so nothing is owed a record"
+    );
 }
 
 /// A file old enough and big enough to clear the floors.
@@ -553,7 +636,7 @@ impl Fixture {
         execute_local_destruction(
             &self.request(custodian),
             &self.provider,
-            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &self.adapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &self.adapter),
             &self.audit,
             &self.locks,
             Timestamp::from_nanos(1_000_000),
@@ -672,7 +755,7 @@ async fn content_changed_since_verification_aborts_and_restores() {
         execute_local_destruction(
             &req,
             &f.provider,
-            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -710,7 +793,7 @@ async fn identity_mismatch_aborts_and_restores() {
         execute_local_destruction(
             &req,
             &f.provider,
-            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -1011,7 +1094,7 @@ async fn the_destroy_path_stages_a_nested_file_into_the_registered_root() {
         execute_local_destruction(
             &req,
             &f.provider,
-            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -1124,7 +1207,7 @@ async fn remote_discard_deletes_and_audits_through_the_same_apparatus() {
             payload().len() as i64,
             Some(f.hash),
         ),
-        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.key,
         &guard,
         &f.audit,
@@ -1157,7 +1240,7 @@ async fn remote_discard_refuses_while_the_audit_log_is_halted() {
             payload().len() as i64,
             Some(f.hash),
         ),
-        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.key,
         &guard,
         &f.audit,
@@ -1196,7 +1279,7 @@ async fn a_failing_unlink_restores_rather_than_orphaning_the_file() {
         execute_local_destruction(
             &f.request(&c),
             &provider,
-            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -1269,6 +1352,10 @@ impl RemoteGate for AmbiguousDelete {
     // rather than the refusal. The refusal has its own test.
     fn target(&self) -> Option<shepherd_core::TargetId> {
         Some(shepherd_core::TargetId::new(1))
+    }
+
+    fn prefix(&self) -> Option<&str> {
+        Some("t")
     }
 
     async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
@@ -1521,6 +1608,14 @@ struct ParkedRemote<'a> {
     entered: std::sync::Arc<tokio::sync::Notify>,
     /// Awaited there, so the caller chooses when this destroy goes on.
     release: std::sync::Arc<tokio::sync::Notify>,
+    /// Parks the FIRST closing HEAD only.
+    ///
+    /// There are two now: `destroy_staged` asks one, and the unlink is
+    /// preceded by another after the audit permit and the root hold, because
+    /// both of those waits are unbounded and a replica can vanish inside them.
+    /// Parking the second as well would park a destroy that has already been
+    /// released, which is not the interleaving this fixture is describing.
+    parked: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -1531,9 +1626,15 @@ impl RemoteGate for ParkedRemote<'_> {
         Some(shepherd_core::TargetId::new(1))
     }
 
+    fn prefix(&self) -> Option<&str> {
+        Some("t")
+    }
+
     async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
-        self.entered.notify_one();
-        self.release.notified().await;
+        if !self.parked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         self.inner
             .head(key)
             .await
@@ -1604,6 +1705,7 @@ async fn a_destroy_already_admitted_does_not_unlink_after_another_one_halts_the_
         inner: &f.adapter,
         entered: entered.clone(),
         release: release.clone(),
+        parked: std::sync::atomic::AtomicBool::new(false),
     };
     let second_destroy = execute_local_destruction(
         &req2,
@@ -1720,6 +1822,7 @@ async fn two_concurrent_destroys_with_a_healthy_audit_log_both_complete() {
         inner: &f.adapter,
         entered: entered.clone(),
         release: release.clone(),
+        parked: std::sync::atomic::AtomicBool::new(false),
     };
     let second_destroy = execute_local_destruction(
         &req2,

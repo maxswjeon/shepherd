@@ -319,6 +319,35 @@ pub async fn execute_local_destruction(
         }
     };
 
+    // THE CLOSING HEAD AGAIN, adjacent to the unlink this time.
+    //
+    // `destroy_staged` asked it before the two waits below it, and both are
+    // unbounded: `audit.admit()` takes a process-wide gate that `AuditLog`
+    // documents as held across another destruction's network DELETE, and
+    // `hold_open` is another await on top of that. Under contention the replica
+    // that authorised this can therefore vanish in the gap after its own HEAD
+    // said it was there, and the last local copy is still unlinked — which is
+    // the one outcome §4.10.2 exists to prevent.
+    //
+    // Repeated rather than moved: acquiring the permit before step 5 would hold
+    // that process-wide gate across staging and a full local re-hash, which is
+    // the cost `crate::audit` says it is worth avoiding. A HEAD is a round trip
+    // against a re-hash of the whole file, and this one buys the property the
+    // first one only appeared to.
+    //
+    // Both waits are behind it now, and the hold is still alive, so what
+    // remains between this answer and the syscall is straight-line code.
+    if let Err(e) = closing_head(req, remote).await {
+        drop(permit);
+        restore_or_report(
+            provider,
+            staged,
+            "the replica disappeared while this destruction waited",
+            &e,
+        );
+        return Err(e);
+    }
+
     // --- step 6: the irreversible one ---------------------------------------
     //
     // If the unlink itself fails, the destruction has NOT happened — the staged
@@ -513,6 +542,15 @@ async fn destroy_staged(
     }
 
     // --- step 5: the cheap closing HEAD --------------------------------------
+    closing_head(req, remote).await
+}
+
+/// §4.10.2 step 3's closing HEAD: the replica that authorises this destruction
+/// is still there, and still the one that was verified.
+///
+/// Split out because it is asked TWICE, and the second time is the one that
+/// matters. See the call site immediately before the unlink.
+async fn closing_head(req: &LocalDestroyRequest<'_>, remote: &impl RemoteGate) -> Result<()> {
     let meta = remote.head_meta(req.remote_key).await?;
     let check = ClosingCheck {
         mode: req.custodian.attestation,
@@ -521,9 +559,7 @@ async fn destroy_staged(
     };
     check
         .evaluate(req.custodian.object_version.as_ref(), req.expected_size)
-        .map_err(DestroyError::Refused)?;
-
-    Ok(())
+        .map_err(DestroyError::Refused)
 }
 
 /// Re-read a root's destruction gates, as a narrow port.
@@ -617,6 +653,20 @@ impl RootHold {
 /// one call site, and it is still here.
 #[async_trait::async_trait]
 pub trait RemoteGate: Send + Sync {
+    /// The §4.9 key prefix configured for this target, if the gate knows it.
+    ///
+    /// Beside [`Self::target`] because it is the same fact: two logical targets
+    /// can share one adapter and one bucket and be told apart only by their
+    /// prefix, so a gate that knows which target it is must know where that
+    /// target's objects live. Taking the prefix as a separate argument let a
+    /// charge and gate for A delete the matching content object under B's
+    /// prefix — same bucket, same adapter, different namespace, and neither B's
+    /// policy proof nor B's budget involved.
+    ///
+    /// `None` for the same reason [`Self::target`] is: a bare adapter is a
+    /// connection, and the prefix is configuration the catalog holds.
+    fn prefix(&self) -> Option<&str>;
+
     /// Which target this gate speaks to, if it knows.
     ///
     /// The closing HEAD proves an object exists — on whatever target the gate
@@ -648,12 +698,17 @@ pub trait RemoteGate: Send + Sync {
 /// caller says which target this adapter is, once, where it knows.
 pub struct TargetGate<'a> {
     target: TargetId,
+    prefix: &'a str,
     adapter: &'a dyn StorageAdapter,
 }
 
 impl<'a> TargetGate<'a> {
-    pub fn new(target: TargetId, adapter: &'a dyn StorageAdapter) -> Self {
-        Self { target, adapter }
+    pub fn new(target: TargetId, prefix: &'a str, adapter: &'a dyn StorageAdapter) -> Self {
+        Self {
+            target,
+            prefix,
+            adapter,
+        }
     }
 }
 
@@ -661,6 +716,10 @@ impl<'a> TargetGate<'a> {
 impl RemoteGate for TargetGate<'_> {
     fn target(&self) -> Option<TargetId> {
         Some(self.target)
+    }
+
+    fn prefix(&self) -> Option<&str> {
+        Some(self.prefix)
     }
 
     async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
@@ -674,10 +733,15 @@ impl RemoteGate for TargetGate<'_> {
 
 #[async_trait::async_trait]
 impl RemoteGate for &dyn StorageAdapter {
-    /// A bare adapter does not know which target it is — that is a fact the
-    /// catalog holds, not the connection. Local destruction refuses it; remote
-    /// discard, which has no custodian to bind against, does not need it.
+    /// A bare adapter does not know which target it is, nor where that
+    /// target's objects live — both are facts the catalog holds, not the
+    /// connection. Local destruction and bulk discard refuse it; remote
+    /// discard, whose key the caller has already derived, does not need it.
     fn target(&self) -> Option<TargetId> {
+        None
+    }
+
+    fn prefix(&self) -> Option<&str> {
         None
     }
 
