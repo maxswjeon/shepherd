@@ -102,24 +102,8 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
     // ask the one question that does, and a link only we or root can repoint is
     // no weaker than a directory only we or root can rename.
     //
-    // Two walks, because either alone has a hole: the configured path judges
-    // each symlink by the link itself, and the resolved path covers the
-    // directories ABOVE a link's target, which the first walk never names.
-    // `canonicalize` needs the path to exist, so it runs on the deepest
-    // existing ancestor; nothing below that exists to be substituted yet.
-    check_ancestry(dir, me, "the socket directory")?;
-    let mut deepest = dir;
-    while std::fs::symlink_metadata(deepest).is_err() {
-        match deepest.parent() {
-            Some(p) => deepest = p,
-            None => break,
-        }
-    }
-    if let Ok(real) = deepest.canonicalize()
-        && real != deepest
-    {
-        check_ancestry(&real, me, "the socket directory")?;
-    }
+    // Absolutised, then walked twice — see `check_path_ancestry`.
+    check_path_ancestry(dir, me, "the socket directory")?;
 
     // CREATE owner-only, or VERIFY — never seize.
     //
@@ -215,7 +199,52 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
 /// The residual is unchanged and is issue #3's `openat` work: a component we
 /// ourselves own can still move between this check and the bind. Nobody else
 /// can move it, which is what this buys.
-pub fn check_ancestry(path: &Path, me: u32, what: &str) -> std::result::Result<(), String> {
+pub fn check_path_ancestry(path: &Path, me: u32, what: &str) -> std::result::Result<(), String> {
+    // ABSOLUTE first, and this is the whole reason the two walks live behind
+    // one function now.
+    //
+    // `Path::components` on a relative path yields only what is written in it,
+    // so `SHEPHERD_SOCKET=state/daemon.sock` was checked as `state` and
+    // `daemon.sock` and the process's WORKING DIRECTORY was never examined —
+    // nor was anything above it. Start shepherdd in a directory another
+    // account owns and that account can rename the `0700` child this creates
+    // and substitute its own, which is exactly what the walk exists to refuse.
+    // The deepest-existing search did not save it either: it walks `parent()`,
+    // and a relative path's parents run out at the first component.
+    //
+    // `std::path::absolute` rather than `canonicalize`: it prefixes the working
+    // directory without resolving links, which is what the FIRST walk must see
+    // — the configured path as clients will follow it. Resolving is the second
+    // walk's job, and doing it here would collapse the two into one.
+    let absolute = std::path::absolute(path).map_err(|e| {
+        format!(
+            "cannot resolve {} against the working directory: {e}",
+            path.display()
+        )
+    })?;
+
+    check_ancestry(&absolute, me, what)?;
+
+    // And the path it RESOLVES to, which covers the directories above a link's
+    // target — the first walk never names them. `canonicalize` needs the path
+    // to exist, so it runs on the deepest existing ancestor; nothing below that
+    // exists to be substituted yet.
+    let mut deepest = absolute.as_path();
+    while std::fs::symlink_metadata(deepest).is_err() {
+        match deepest.parent() {
+            Some(p) => deepest = p,
+            None => break,
+        }
+    }
+    if let Ok(real) = deepest.canonicalize()
+        && real != deepest
+    {
+        check_ancestry(&real, me, what)?;
+    }
+    Ok(())
+}
+
+fn check_ancestry(path: &Path, me: u32, what: &str) -> std::result::Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
     let mut walked = std::path::PathBuf::new();

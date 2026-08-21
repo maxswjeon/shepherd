@@ -103,6 +103,31 @@ fn custodian(mode: AttestationMode, hash: Blake3Hash) -> Location {
     }
 }
 
+/// A root gate a test can flip mid-destruction.
+///
+/// PM-3's gates are mutable, so what this exercises is the WINDOW: the request
+/// is assembled while the root permits destruction and the gate closes while
+/// the destroy path is staging, hashing and HEADing.
+#[derive(Default)]
+struct Gate(std::sync::Mutex<Option<String>>);
+
+impl Gate {
+    fn open() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+    /// The live gate closes while the snapshot in the request still permits.
+    fn close(&self, reason: &str) {
+        *self.0.lock().unwrap() = Some(reason.to_owned());
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::destroy::RootGate for Gate {
+    async fn destroy_refusal(&self) -> Result<Option<String>> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+}
+
 /// An intent bound to exactly what a request destroys.
 ///
 /// Every request that overrides `path` or `expected_hash` must rebind, because
@@ -323,6 +348,62 @@ async fn a_remote_intent_prepared_for_another_object_does_not_authorize_this_del
     );
 }
 
+/// A PM-3 gate that closes mid-destruction stops the unlink.
+///
+/// The gate was read once, from the caller's snapshot, at the top of
+/// `execute_local_destruction` — before waiting for the file lock and before
+/// staging, hashing through the handle, and the remote HEAD. Every one of those
+/// takes time, and PM-3's gates are mutable: a watcher journal overflow sets
+/// `resync_required` and a volume going away changes `availability`. PM-3 says
+/// destruction stops while the gate is SET, not while it was set when the
+/// request was assembled.
+///
+/// The gate here closes while the destroy path is working, which is the window
+/// itself rather than a stand-in for it.
+#[tokio::test]
+async fn a_root_gate_that_closes_during_a_destroy_stops_it_before_the_unlink() {
+    let f = fixture("gate-closes", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let req = f.request(&c);
+
+    // The SNAPSHOT still permits destruction — `f.root` is untouched, so the
+    // check at the top of the function passes — and the live gate refuses.
+    // Nothing but a re-read can produce a refusal from this arrangement, which
+    // is the property under test, and it needs no timing to provoke.
+    f.gate.close("watcher journal overflowed");
+    assert!(
+        req.root.destroy_refusal().is_none(),
+        "the snapshot must still permit, or this would pass on the stale check"
+    );
+
+    let Some(r) = past_the_open_handle_floor(
+        execute_local_destruction(
+            &req,
+            &f.provider,
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+            &f.audit,
+            &f.locks,
+            Timestamp::from_nanos(1),
+        )
+        .await,
+    ) else {
+        return;
+    };
+    let err = r.expect_err("a gate set during the destroy must stop it");
+    assert!(
+        matches!(&err, DestroyError::Root(reason) if reason.contains("overflowed")),
+        "the refusal must carry the gate's own reason: {err}"
+    );
+    assert!(
+        f.path.exists(),
+        "and the file is still there, restored from staging"
+    );
+    assert!(
+        f.audit.read_all().is_empty(),
+        "nothing irreversible happened, so nothing is owed a record"
+    );
+}
+
 /// A file old enough and big enough to clear the floors.
 fn payload() -> Vec<u8> {
     vec![7u8; 128 * 1024]
@@ -348,6 +429,7 @@ struct Fixture {
     adapter: MemAdapter,
     audit: AuditLog,
     locks: FileLocks,
+    gate: Gate,
     provider: DeleteModeProvider,
 }
 
@@ -380,6 +462,7 @@ fn fixture(tag: &str, mode: AttestationMode) -> Fixture {
         adapter,
         audit,
         locks: FileLocks::new(),
+        gate: Gate::open(),
         provider: DeleteModeProvider::new(),
         tmp,
     }
@@ -408,6 +491,7 @@ impl Fixture {
             floor_policy: policy(),
             custodian,
             remote_key: &self.key,
+            root_gate: &self.gate,
         }
     }
 

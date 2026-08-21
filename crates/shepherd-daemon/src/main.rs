@@ -143,19 +143,20 @@ fn secure_state_dir(dir: &std::path::Path) -> Result<(), String> {
     // Residual unchanged and still #3: a component this daemon itself owns can
     // move between the check and the open. Nobody else can move it.
     let me = unsafe { libc::geteuid() };
-    shepherd_daemon::server::check_ancestry(dir, me, "the state directory")?;
-    let mut deepest = dir;
-    while std::fs::symlink_metadata(deepest).is_err() {
-        match deepest.parent() {
-            Some(p) => deepest = p,
-            None => break,
-        }
-    }
-    if let Ok(real) = deepest.canonicalize()
-        && real != deepest
-    {
-        shepherd_daemon::server::check_ancestry(&real, me, "the state directory")?;
-    }
+    shepherd_daemon::server::check_path_ancestry(dir, me, "the state directory")?;
+
+    // ABSOLUTE from here down, not only for the walk. A relative override made
+    // `created`'s parents run out at the first component, so `parent()` was
+    // `""` and the durability fsync failed with a bare "No such file or
+    // directory" naming nothing — a working directory is a property of the
+    // process, not of the path, and every operation below is about a place on
+    // disk rather than about what the operator typed.
+    let dir = &std::path::absolute(dir).map_err(|e| {
+        format!(
+            "cannot resolve {} against the working directory: {e}",
+            dir.display()
+        )
+    })?;
 
     let created =
         create_dir_all_tracked(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -671,6 +672,75 @@ mod tests {
             .expect("a link this daemon owns must not block startup");
         assert_eq!(mode_of(&real.join("state")), 0o700);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A RELATIVE override is walked from the working directory, not from its
+    /// own first component.
+    ///
+    /// `Path::components` on a relative path yields only what is written in it,
+    /// so `SHEPHERD_STATE_DIR=state` was checked as `state` alone and the
+    /// process's working directory — and everything above it — was never
+    /// examined. Start shepherdd in a directory another account owns and that
+    /// account can rename the `0700` child this creates and substitute its own.
+    /// The deepest-existing search did not save it either: it walks `parent()`,
+    /// and a relative path's parents run out at the first component.
+    #[test]
+    fn a_relative_state_directory_is_walked_from_the_working_directory() {
+        let base = tmp("rel");
+        let open = base.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        // The refusal must come from the ancestor, reached only by resolving
+        // the relative path against the working directory.
+        let guard = WorkingDir::set(&open);
+        let err = secure_state_dir(std::path::Path::new("state"))
+            .expect_err("a relative path under a world-writable directory must be refused");
+        assert!(
+            err.contains("not sticky") && err.contains(open.to_string_lossy().as_ref()),
+            "the refusal must name the ancestor the working directory supplied: {err}"
+        );
+        assert!(
+            !open.join("state").exists(),
+            "and a refused path must be left exactly as it was found"
+        );
+
+        // THE ACCEPTING DIRECTION: the same relative name under a working
+        // directory that is fine.
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+        secure_state_dir(std::path::Path::new("state"))
+            .expect("a relative path under an owner-only directory is ordinary");
+        assert_eq!(mode_of(&open.join("state")), 0o700);
+        drop(guard);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Serialises the process-wide working directory for the test above.
+    ///
+    /// `set_current_dir` is process-global and the test harness is threaded, so
+    /// a bare call would move the ground under every other test in this binary.
+    struct WorkingDir {
+        previous: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl WorkingDir {
+        fn set(to: &std::path::Path) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(to).unwrap();
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for WorkingDir {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
     }
 
     /// A first run creates it, and the ambient umask does not get a vote.

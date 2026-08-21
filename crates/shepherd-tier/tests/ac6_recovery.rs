@@ -228,6 +228,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     let prepared_intent_id = prepared_intent.id();
     let destroyed = execute_local_destruction(
         &LocalDestroyRequest {
+            root_gate: &OpenGate,
             // Minted by the JOURNAL, not fabricated. `PreparedIntent` exists so
             // that "an intent was durably prepared before anything
             // irreversible" is a precondition rather than a comment, and a
@@ -515,4 +516,18 @@ fn the_four_class_split_excludes_derived_and_includes_the_other_two() {
     assert!(bundle_class_of(CustodyClass::Derived).is_none());
     assert!(bundle_class_of(CustodyClass::Custody).is_some());
     assert!(bundle_class_of(CustodyClass::DurableConfig).is_some());
+}
+
+/// A root whose PM-3 gates stay open, which is what this test is about.
+///
+/// Defined here rather than exported from `shepherd-tier`: a public
+/// always-permits `RootGate` is a footgun on the irreversible path, and the
+/// only callers that should ever have one are tests that say so.
+struct OpenGate;
+
+#[async_trait::async_trait]
+impl shepherd_tier::destroy::RootGate for OpenGate {
+    async fn destroy_refusal(&self) -> shepherd_tier::destroy::Result<Option<String>> {
+        Ok(None)
+    }
 }

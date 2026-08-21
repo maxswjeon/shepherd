@@ -977,3 +977,75 @@ impl TransferSessionStore for KillAfter<'_> {
         self.inner.load(job_id).await
     }
 }
+
+/// A session reloaded in `completing` still knows each part's checksum.
+///
+/// The value lived only in memory. A crash after the session was durably
+/// advanced to `completing` — the state whose whole point is that the parts are
+/// already up — lost every provider-issued per-part checksum, and the reloaded
+/// driver starts AT completion: it never runs `upload_pending`, so it never
+/// runs the `list_parts` healing loop that would have re-fetched them. It
+/// completes with `checksum: None` for every part, and a provider that required
+/// the probed checksum answers `InvalidPart`. The one state that could not
+/// re-fetch the value was the one state that needed it.
+#[tokio::test]
+async fn a_completing_session_reloads_the_part_checksums_it_must_echo() {
+    let dir = TempDir::new("completing-checksums");
+    let db = dir.join("catalog.db");
+    let src = dir.join("a.bin");
+    std::fs::write(&src, BODY).expect("write source");
+    let item = item_for(&src);
+
+    let job = JobId::new(77);
+    seed(&db, job, item.target, item.file);
+    {
+        let store = CatalogSessionStore::open(&db).expect("open");
+        let adapter = MemAdapter::content_addressed();
+        let mut s = TransferSession::plan(
+            job,
+            item.target,
+            item.remote_key.clone(),
+            SourceIdentity {
+                file_id: item.file,
+                rel_path: item.path.clone(),
+                size: item.size,
+                mtime: Timestamp::from_nanos(7),
+                fs_id: FsId::new("vol-1:ino-9"),
+                blake3: item.blake3,
+            },
+            &adapter,
+            16,
+        )
+        .expect("plan");
+        s.state = TransferState::Completing;
+        s.upload_id = Some(OpaqueToken::new("upload-xyz"));
+        for (part_no, checksum) in [(1u32, Some("crc32c-part-1")), (2, None)] {
+            s.parts.push(PartCheckpoint {
+                part_no,
+                offset: u64::from(part_no - 1) * 16,
+                len: 16,
+                local_blake3: Blake3Hash::from_bytes([9u8; 32]),
+                etag: Some(OpaqueToken::new(format!("etag-{part_no}"))),
+                checksum: checksum.map(str::to_owned),
+            });
+        }
+        store.save(&s).await.expect("save");
+    }
+
+    let store = CatalogSessionStore::open(&db).expect("reopen");
+    let back = store
+        .load(job)
+        .await
+        .expect("load")
+        .expect("the session is there");
+    assert_eq!(back.state, TransferState::Completing);
+    assert_eq!(
+        back.parts
+            .iter()
+            .map(|p| p.checksum.clone())
+            .collect::<Vec<_>>(),
+        vec![Some("crc32c-part-1".to_owned()), None],
+        "a completing session that cannot echo its part checksums is refused \
+         with `InvalidPart` by every provider that required them"
+    );
+}

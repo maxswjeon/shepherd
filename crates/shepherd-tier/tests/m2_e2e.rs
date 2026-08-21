@@ -543,6 +543,7 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
 
     execute_local_destruction(
         &LocalDestroyRequest {
+            root_gate: &OpenGate,
             intent: shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
                 IntentId::new(1),
                 shepherd_catalog::intent::IntentKind::Local,
@@ -855,4 +856,18 @@ fn each_negative_is_excluded_for_its_own_stated_reason() {
         .find(|f| f.rel_path.ends_with("thumb.raw"))
         .unwrap();
     assert!(thumb.size < 1024 * 1024);
+}
+
+/// A root whose PM-3 gates stay open, which is what this test is about.
+///
+/// Defined here rather than exported from `shepherd-tier`: a public
+/// always-permits `RootGate` is a footgun on the irreversible path, and the
+/// only callers that should ever have one are tests that say so.
+struct OpenGate;
+
+#[async_trait::async_trait]
+impl shepherd_tier::destroy::RootGate for OpenGate {
+    async fn destroy_refusal(&self) -> shepherd_tier::destroy::Result<Option<String>> {
+        Ok(None)
+    }
 }

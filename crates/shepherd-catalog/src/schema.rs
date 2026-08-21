@@ -258,6 +258,25 @@ CREATE TABLE remote_object (
     object_version TEXT,
     checksum_kind  TEXT,                        -- provider-content-hash | etag-opaque | none
 
+    -- The checksum ITSELF, which the kind alone is not.
+    --
+    -- `verify_upload` captures a provider whole-object checksum specifically so
+    -- later scrub passes can compare without egress — it says so, and it is the
+    -- entire reason the upload asks for one. Storing only the kind threw the
+    -- value away the moment the verification result left memory, so after a
+    -- restart the advertised checksum-based scrub had nothing to compare and
+    -- had to re-read every object or, worse, treat the KIND as evidence of
+    -- integrity.
+    --
+    -- `checksum_algorithm` is separate from `checksum_kind` and not a
+    -- duplicate: the kind says where the value came from and what it is worth
+    -- (a real content hash, or an opaque ETag), the algorithm says how to
+    -- reproduce it (crc32c, sha256, …). A scrub needs both — one to decide
+    -- whether comparing is meaningful, the other to compute the comparand.
+    -- Base64 as the provider returned it; compared, never parsed.
+    checksum_algorithm TEXT,
+    checksum_value     TEXT,
+
     -- PM-2 keeps these apart on purpose. A HEAD proves EXISTENCE only; a full
     -- read proves INTEGRITY. Conflating them is how verification decays to
     -- nothing while still reporting green.
@@ -455,6 +474,23 @@ CREATE TABLE transfer_part (
     -- life (see the CHECK note on `transfer_session`).
     local_blake3  BLOB,
 
+    -- The PROVIDER's per-part checksum, echoed back at completion.
+    --
+    -- `CompleteMultipartUpload` must repeat each part's checksum alongside its
+    -- ETag on a checksum-enabled target, or S3-compatible providers reject the
+    -- completion with `InvalidPart` (verified against MinIO). It lived only in
+    -- memory, so a crash after the session was durably advanced to `completing`
+    -- lost every one of them: the reloaded driver starts IN `completing`, never
+    -- runs `upload_pending` or its `list_parts` healing loop, and completes with
+    -- `checksum: None` — a resume that cannot succeed on the targets that need
+    -- it most.
+    --
+    -- Opaque, like the ETag beside it: stored, echoed, never interpreted.
+    -- Cleared with the rest of the receipts by `restart_attempt`, because a
+    -- checksum from a session the provider has forgotten proves nothing about
+    -- the next one.
+    checksum      TEXT,
+
     attempt_epoch INTEGER NOT NULL DEFAULT 0,
     verified_at   INTEGER,
     PRIMARY KEY (session_id, part_no)
@@ -538,9 +574,22 @@ CREATE TABLE discard_rate_window (
     PRIMARY KEY (target_id, root_id, bucket_start)
 );
 
+-- Keyed by the whole deferral identity, NOT by `file_id` alone.
+--
+-- A deferral is validated as belonging to a specific `(file, target, kind)`,
+-- and `file_id PRIMARY KEY` allowed exactly one row per file — so a file
+-- replicated to two targets could not hold independent remote-discard windows,
+-- and a local deferral could not coexist with a remote one. The second insert
+-- either failed or replaced the first, and a pending window disappearing is a
+-- deferral silently expiring early or an operation refused forever.
 CREATE TABLE deferral (
-    file_id               INTEGER PRIMARY KEY REFERENCES file(id) ON DELETE CASCADE,
-    target_id             INTEGER REFERENCES target(id) ON DELETE SET NULL,
+    file_id               INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+    -- CASCADE, not SET NULL. A remote deferral is a window before discarding an
+    -- object ON A TARGET, so it is meaningless once that target is gone — and
+    -- nulling the column instead would collide two deregistered targets' rows
+    -- into one identity, aborting the cascade on the unique index below. A
+    -- LOCAL deferral is NULL here from the start and is untouched by any of it.
+    target_id             INTEGER REFERENCES target(id) ON DELETE CASCADE,
     trigger_kind          TEXT    NOT NULL,      -- local | remote
     deferred_at           INTEGER NOT NULL,
     -- OQ-H (2026-08-16): 14-day default, overridden per delete policy.
@@ -559,6 +608,12 @@ CREATE TABLE deferral (
     CHECK (clock_provenance IS NULL
            OR clock_provenance IN ('ntp-synced','local','unknown'))
 );
+-- The identity, as a UNIQUE INDEX rather than a PRIMARY KEY, because
+-- `target_id` is legitimately NULL for a local deferral and SQLite treats NULLs
+-- in a multi-column PK as distinct — which would make "one local deferral per
+-- file" unenforceable. `IFNULL` collapses that to a value the index can compare.
+CREATE UNIQUE INDEX deferral_identity
+    ON deferral(file_id, trigger_kind, IFNULL(target_id, -1));
 
 -- ---------------------------------------------------------------------------
 -- Phase 5 (T-infer) and settings.  Schema only at Phase 1.

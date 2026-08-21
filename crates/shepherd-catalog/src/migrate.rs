@@ -230,4 +230,108 @@ mod tests {
         let cat = Catalog::open_in_memory().unwrap();
         assert_invariants(cat.conn()).unwrap();
     }
+
+    /// A file can hold one deferral per `(target, kind)`, not one in total.
+    ///
+    /// `file_id PRIMARY KEY` allowed exactly one row per file, while a deferral
+    /// is validated as belonging to a specific `(file, target, kind)`. A file
+    /// replicated to two targets therefore could not hold independent
+    /// remote-discard windows, and a local deferral could not coexist with a
+    /// remote one: the second write either failed or replaced the first, and a
+    /// pending window disappearing is a deferral expiring early or an operation
+    /// refused forever.
+    #[test]
+    fn deferrals_are_keyed_by_file_target_and_kind() {
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.conn()
+            .execute_batch(
+                "INSERT INTO scan_root (id, path, stub_mode, created_at)
+                     VALUES (1, '/data', 'delete', 0);
+                 INSERT INTO file (id, root_id, rel_path, name, size, mtime, ctime,
+                                   norm_key, first_seen_at, updated_at)
+                     VALUES (1, 1, 'a', 'a', 0, 0, 0, 'a', 0, 0);
+                 INSERT INTO target (id, name, adapter) VALUES (1, 'a', 's3'), (2, 'b', 's3');",
+            )
+            .unwrap();
+
+        let add = |target: Option<i64>, kind: &str| {
+            cat.conn().execute(
+                "INSERT INTO deferral (file_id, target_id, trigger_kind, deferred_at,
+                                       wall_clock_deadline)
+                 VALUES (1, ?1, ?2, 0, 0)",
+                rusqlite::params![target, kind],
+            )
+        };
+        add(Some(1), "remote").expect("a window on the first target");
+        add(Some(2), "remote").expect("and an independent one on the second");
+        add(None, "local").expect("and a local deferral alongside both");
+
+        // The identity is still an identity: the same three fields twice is a
+        // duplicate, including the NULL target that a plain multi-column
+        // PRIMARY KEY would have treated as distinct every time.
+        assert!(
+            add(Some(1), "remote").is_err(),
+            "duplicate (file, target, kind)"
+        );
+        assert!(
+            add(None, "local").is_err(),
+            "two local deferrals for one file are the same deferral twice"
+        );
+
+        // Deregistering a target takes its deferrals with it. The window was
+        // about discarding an object ON that target, and nulling the column
+        // instead would collide two deregistered targets into one identity.
+        cat.conn()
+            .execute("DELETE FROM target WHERE id = 1", [])
+            .unwrap();
+        let left: i64 = cat
+            .conn()
+            .query_row("SELECT COUNT(*) FROM deferral", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            left, 2,
+            "target 1's deferral went with it, the others stayed"
+        );
+    }
+
+    /// The whole-object checksum is stored as a VALUE, not only as a kind.
+    ///
+    /// `verify_upload` captures a provider checksum specifically so later scrub
+    /// passes can compare without egress — that is the entire reason the upload
+    /// asks for one. With only `checksum_kind` persisted, the value was lost the
+    /// moment the verification result left memory, so after a restart the
+    /// advertised checksum-based scrub had nothing to compare and had to re-read
+    /// every object, or treat the KIND as evidence of integrity.
+    ///
+    /// `checksum_algorithm` is not a duplicate of `checksum_kind`: the kind says
+    /// what the value is worth (a real content hash, or an opaque ETag), the
+    /// algorithm says how to reproduce it. A scrub needs both.
+    #[test]
+    fn a_remote_object_stores_the_checksum_and_not_only_its_kind() {
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.conn()
+            .execute_batch(
+                "INSERT INTO target (id, name, adapter) VALUES (1, 'a', 's3');
+                 INSERT INTO remote_object
+                     (id, target_id, key, size, checksum_kind, checksum_algorithm, checksum_value)
+                     VALUES (1, 1, 'objects/aa/bb/aabb', 10,
+                             'provider-content-hash', 'crc32c', 'q1B2Yg==');",
+            )
+            .unwrap();
+
+        let (kind, algorithm, value): (String, String, String) = cat
+            .conn()
+            .query_row(
+                "SELECT checksum_kind, checksum_algorithm, checksum_value FROM remote_object",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "provider-content-hash", "what the value is worth");
+        assert_eq!(algorithm, "crc32c", "how to reproduce it");
+        assert_eq!(
+            value, "q1B2Yg==",
+            "and the value itself, which is the point"
+        );
+    }
 }

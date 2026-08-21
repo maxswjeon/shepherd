@@ -157,6 +157,12 @@ pub struct LocalDestroyRequest<'a> {
     /// §4.10.2's N-location predicate by [`crate::revalidate::destroy_permitted`].
     pub custodian: &'a Location,
     pub remote_key: &'a ObjectKey,
+    /// Re-read of [`Self::root`]'s gates, taken again before the unlink.
+    ///
+    /// The snapshot above is what the caller saw when it assembled this; PM-3's
+    /// gates are mutable and everything between here and step 6 takes time.
+    /// See [`RootGate`].
+    pub root_gate: &'a dyn RootGate,
 }
 
 /// Execute §4.10's local destruction for one file.
@@ -279,6 +285,36 @@ pub async fn execute_local_destruction(
             return Err(e.into());
         }
     };
+
+    // PM-3, RE-READ, under the permit and one statement before the syscall.
+    //
+    // The check at the top of this function used the caller's snapshot and is
+    // now as old as everything that has happened since: the file lock was
+    // waited for, the file was staged, its bytes were re-hashed through the
+    // handle and a HEAD went to the provider and came back. A watcher overflow
+    // setting `resync_required`, or a volume going away, lands in that window
+    // and PM-3 stops destruction while the gate is SET — not while it was set
+    // when the request was built.
+    //
+    // Under the permit, because the permit is what serialises this against
+    // every other destruction; refusing here is still a refusal BEFORE anything
+    // irreversible, so abort-forward-never applies exactly as it does above.
+    match req.root_gate.destroy_refusal().await {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            let e = DestroyError::Root(reason);
+            drop(permit);
+            restore_or_report(provider, staged, "destruction refused by the root gate", &e);
+            return Err(e);
+        }
+        // A gate that cannot be read is not a gate that says yes. This is the
+        // last check before an irreversible step, so it fails closed.
+        Err(e) => {
+            drop(permit);
+            restore_or_report(provider, staged, "the root gate could not be re-read", &e);
+            return Err(e);
+        }
+    }
 
     // --- step 6: the irreversible one ---------------------------------------
     //
@@ -485,6 +521,34 @@ async fn destroy_staged(
         .map_err(DestroyError::Refused)?;
 
     Ok(())
+}
+
+/// Re-read a root's destruction gates, as a narrow port.
+///
+/// # Why the snapshot in the request is not enough
+///
+/// `LocalDestroyRequest::root` is a `ScanRoot` the CALLER read, and PM-3's
+/// gates are mutable: a watcher journal overflow sets `resync_required`, a
+/// volume disappearing sets `availability`, and D-12's
+/// `destruction_ineligible` is an operator action. The gate was therefore
+/// checked once, at the top, before waiting for the file lock and before
+/// staging, hashing and the remote HEAD — all of which take time a gate can
+/// change in. PM-3 says destruction stops while the gate is set, not that it
+/// stops if the gate was set when the request was assembled.
+///
+/// So it is re-read under the audit permit, immediately before the unlink,
+/// which is the last moment that can still refuse and the one the permit
+/// serialises against every other destruction.
+///
+/// A read-only port, and deliberately not the journal seam #5 needs: this asks
+/// the catalog a question, and advancing an intent asks it to record an answer.
+/// The wiring that supplies a real implementation lands with the caller that
+/// assembles `LocalDestroyRequest` — nothing in the tree does yet, which is why
+/// this file's tests are its only implementors today.
+#[async_trait::async_trait]
+pub trait RootGate: Send + Sync {
+    /// `None` means destruction is still permitted for this root.
+    async fn destroy_refusal(&self) -> Result<Option<String>>;
 }
 
 /// The remote operations the destroy path needs, as a narrow port.

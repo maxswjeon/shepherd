@@ -356,8 +356,8 @@ fn save_blocking(cat: &mut Catalog, session: &TransferSession) -> StorageResult<
             tx.execute(
                 "INSERT INTO transfer_part
                    (session_id, job_id, upload_id, part_no, etag, bytes,
-                    local_blake3, attempt_epoch)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    local_blake3, checksum, attempt_epoch)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 rusqlite::params![
                     session_row,
                     session.job_id.get(),
@@ -366,6 +366,7 @@ fn save_blocking(cat: &mut Catalog, session: &TransferSession) -> StorageResult<
                     p.etag.as_ref().map(|e| e.as_opaque()),
                     p.len as i64,
                     p.local_blake3.as_bytes().to_vec(),
+                    p.checksum.as_deref(),
                     i64::from(session.attempt_epoch),
                 ],
             )
@@ -413,11 +414,12 @@ fn save_part_blocking(
     tx.execute(
         "INSERT INTO transfer_part
            (session_id, job_id, upload_id, part_no, etag, bytes,
-            local_blake3, attempt_epoch)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+            local_blake3, checksum, attempt_epoch)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
          ON CONFLICT(session_id, part_no) DO UPDATE SET
              upload_id = excluded.upload_id, etag = excluded.etag,
              bytes = excluded.bytes, local_blake3 = excluded.local_blake3,
+             checksum = excluded.checksum,
              attempt_epoch = excluded.attempt_epoch",
         rusqlite::params![
             session_row,
@@ -427,6 +429,7 @@ fn save_part_blocking(
             p.etag.as_ref().map(|e| e.as_opaque()),
             p.len as i64,
             p.local_blake3.as_bytes().to_vec(),
+            p.checksum.as_deref(),
             i64::from(session.attempt_epoch),
         ],
     )
@@ -490,7 +493,7 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
         let mut parts = Vec::new();
         let mut stmt = conn
             .prepare(
-                "SELECT part_no, etag, bytes, local_blake3
+                "SELECT part_no, etag, bytes, local_blake3, checksum
                  FROM transfer_part WHERE session_id = ?1 ORDER BY part_no",
             )
             .map_err(sqlite)?;
@@ -502,11 +505,12 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })
             .map_err(sqlite)?;
         for row in rows {
-            let (part_no, etag, bytes, local) = row.map_err(sqlite)?;
+            let (part_no, etag, bytes, local, checksum) = row.map_err(sqlite)?;
             let part_no = u32::try_from(part_no).unwrap_or_default();
             parts.push(PartCheckpoint {
                 part_no,
@@ -516,17 +520,19 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
                 len: bytes as u64,
                 local_blake3: hash_from(local).unwrap_or(Blake3Hash::from_bytes([0u8; 32])),
                 etag: etag.map(OpaqueToken::new),
-                // Not stored and not derivable: `transfer_part` has no checksum
-                // column, so `None` is what the row genuinely says rather than a
-                // placeholder for a value hiding elsewhere.
+                // PERSISTED now, and the old comment here was wrong about the
+                // gap it dismissed. It said the resume path re-adopts the
+                // checksum from the provider's `list_parts` — true for a resume
+                // that runs `upload_pending`, and a session reloaded in
+                // `completing` never does. It starts AT completion, echoes
+                // `checksum: None` for every part, and a checksum-enabled
+                // provider answers `InvalidPart`: the one state where the value
+                // could not be re-fetched was the one state that needed it.
                 //
-                // What keeps that from being a gap is the resume path: a part
-                // whose etag and size still agree with the provider adopts the
-                // checksum from the provider's own `list_parts` response, which
-                // resume already fetches to verify those two fields. The value
-                // comes back on the same round trip, from the authority that has
-                // to receive it again at completion.
-                checksum: None,
+                // Opaque, like the etag beside it. `restart_attempt` clears both
+                // together, because a receipt from a session the provider has
+                // forgotten proves nothing about the next one.
+                checksum,
             });
         }
 
