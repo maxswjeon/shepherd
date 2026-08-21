@@ -542,6 +542,47 @@ impl Executor for ScanExecutor {
             }
         }
 
+        // RECONCILE: rows this walk did not see are gone from disk.
+        //
+        // `last_seen_gen` is stamped on every file a scan sees and nothing
+        // consumed it — so a file deleted after being catalogued stayed `local`
+        // forever, was re-indexed by every rebuild, and went on being returned
+        // by `search` and counted by `status`.
+        //
+        // The prerequisite this waited for is now met. `upsert_file`'s own note
+        // said the sweep is unsafe while two scans of one root can interleave —
+        // "N's later walk sees F and stamps gen N, M never upserts F at all,
+        // and M's sweep marks F missing while it is on disk" — and named
+        // same-root scan exclusion as what it needed. `scan.start` coalesces a
+        // queued or running scan per root, so there is at most one scan job per
+        // root and that interleaving cannot arise.
+        //
+        // Every skipped path is passed through and everything beneath it is
+        // left alone: a walk that could not read a subtree, or deliberately did
+        // not descend one, has no evidence about what is under there — and
+        // evidence is the only thing that may turn into a state change here.
+        let unobserved: Vec<String> = output
+            .skipped
+            .iter()
+            .filter_map(|s| skip_path(s))
+            .filter_map(|p| {
+                p.strip_prefix(&root.path)
+                    .ok()
+                    .map(|r| r.to_string_lossy().into_owned())
+            })
+            .filter(|r| !r.is_empty())
+            .collect();
+        let root_for_sweep = Arc::clone(&root);
+        let swept = self
+            .writer()
+            .try_with(move |cat| {
+                FileRepo::new(cat).sweep_absent(&root_for_sweep, generation, &unobserved, now())
+            })
+            .map_err(|e| self.abandon(mutated_at, format!("reconciling absent rows: {e}")))?;
+        if swept > 0 {
+            tracing::info!(root = root_id, swept, "marked rows absent from this scan");
+        }
+
         // The metadata index is an in-RAM projection of `file`, so a scan that
         // updated `file` and did not refresh it leaves `search` answering from
         // the pre-scan catalog — which looks exactly like a correct search that
@@ -762,6 +803,25 @@ fn upsert_batch(
         return Err(e.into());
     }
     Ok(())
+}
+
+/// The path a skip is about, if it has one.
+///
+/// Every variant carries one — the walker reports WHERE it did not look, which
+/// is what makes the sweep able to leave those rows alone.
+fn skip_path(skip: &shepherd_scan::walk::Skip) -> Option<&std::path::Path> {
+    use shepherd_scan::walk::Skip;
+    match skip {
+        Skip::Denied { path, .. }
+        | Skip::Cycle { path }
+        | Skip::Ignored { path }
+        | Skip::SymlinkedDir { path }
+        | Skip::Unreadable { path, .. } => Some(path),
+        // A name the catalog cannot represent has no row to protect, and its
+        // parent WAS observed. Listed rather than wildcarded so a variant added
+        // later is a compile error instead of a silent sweep.
+        Skip::Unrepresentable { .. } => None,
+    }
 }
 
 /// A one-line summary of what the walk did not look at.

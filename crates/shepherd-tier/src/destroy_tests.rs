@@ -930,7 +930,17 @@ impl Fixture {
             fs_id: &self.fs_id,
             age: Duration::from_secs(60 * 60 * 24 * 30),
             floor_policy: policy(),
-            custodian,
+            // Through the PREDICATE, not fabricated. A fixture that invented a
+            // `PermittedCustodian` would be exercising the binding checks and
+            // not the precondition — which is exactly the gap that made the
+            // bare `&Location` unsafe.
+            custodian: crate::revalidate::destroy_permitted(
+                std::slice::from_ref(custodian),
+                &[],
+                Timestamp::from_nanos(1_000),
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("the fixture's custodian must satisfy §4.10.2"),
             remote_key: &self.key,
             root_gate: &self.gate,
             intent_gate: &self.journal,

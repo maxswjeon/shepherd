@@ -698,6 +698,77 @@ fn a_scan_of_a_root_already_pending_is_coalesced() {
     );
 }
 
+/// A deleted file stops being catalogued, and one under an unreadable subtree
+/// does not.
+///
+/// `last_seen_gen` is stamped by every scan and nothing consumed it, so a file
+/// deleted after being catalogued stayed `local` forever — re-indexed by every
+/// rebuild, returned by `search`, counted by `status`. The column's own comment
+/// says reconciliation is what it is for.
+///
+/// The second half is the reason it waited: a walk that could not read a
+/// subtree observed nothing beneath it, and a sweep that cannot tell "absent"
+/// from "not looked at" would mark live files missing.
+#[test]
+fn a_scan_reconciles_deleted_files_but_not_unobserved_ones() {
+    let d = Daemon::start("sweep");
+    let mut c = d.connect();
+    let dir = d.dir.join("tree");
+    std::fs::create_dir_all(dir.join("deep")).unwrap();
+    std::fs::write(dir.join("gone.txt"), b"x").unwrap();
+    std::fs::write(dir.join("stays.txt"), b"x").unwrap();
+    std::fs::write(dir.join("deep").join("hidden.txt"), b"x").unwrap();
+
+    let root_id = c.call(
+        "root.add",
+        serde_json::json!({ "path": dir.to_string_lossy(), "stub_mode": "delete" }),
+    )["root"]["root_id"]
+        .as_i64()
+        .expect("root_id");
+    c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    let scan = wait_for_scan(&mut c, root_id);
+    assert!(scan["last_error"].is_null(), "{scan}");
+    assert_eq!(
+        c.call(
+            "search",
+            serde_json::json!({"query": "gone", "mode": "metadata"})
+        )["hits"]
+            .as_array()
+            .map_or(0, Vec::len),
+        1,
+        "the file must be catalogued before it can be reconciled away"
+    );
+
+    // Delete one, and make the other's subtree unreadable so the walk cannot
+    // observe it.
+    std::fs::remove_file(dir.join("gone.txt")).unwrap();
+    let readable = std::fs::metadata(dir.join("deep")).unwrap().permissions();
+    std::fs::set_permissions(dir.join("deep"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    let scan = wait_for_scan(&mut c, root_id);
+    assert!(scan["last_error"].is_null(), "{scan}");
+
+    let hits = |q: &str, c: &mut Client| {
+        c.call(
+            "search",
+            serde_json::json!({"query": q, "mode": "metadata"}),
+        )["hits"]
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    assert_eq!(hits("gone", &mut c), 0, "a deleted file is reconciled away");
+    assert_eq!(hits("stays", &mut c), 1, "and one still there is not");
+    assert_eq!(
+        hits("hidden", &mut c),
+        1,
+        "a file under an UNREADABLE subtree was not observed, so it must not be \
+         marked missing — the sweep cannot tell absent from not-looked-at"
+    );
+
+    std::fs::set_permissions(dir.join("deep"), readable).unwrap();
+}
+
 /// The skew case §4.3 calls the most common one, end to end.
 #[test]
 fn a_major_version_mismatch_is_rejected_with_both_versions_named() {

@@ -80,7 +80,43 @@ pub struct Session {
     pub negotiated: Negotiated,
 }
 
-/// Target names with a registration probe in flight.
+/// Registration probes that may run at once, process-wide.
+///
+/// Each holds one of the server's connection threads for up to the probe
+/// deadline while doing a complete multipart round trip against a bucket. The
+/// per-name reservation stops two requests for ONE name doing that twice; it
+/// says nothing about sixty-four distinct names, which is the whole connection
+/// budget spent on registration while `status` and `search` cannot connect.
+///
+/// Two, because registration is rare and deliberate and the cost of refusing an
+/// extra one is a retry.
+const MAX_CONCURRENT_PROBES: usize = 2;
+
+static PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One in-flight registration probe, released on drop.
+struct ProbePermit;
+
+impl ProbePermit {
+    fn take() -> Option<Self> {
+        PROBES
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| (n < MAX_CONCURRENT_PROBES).then_some(n + 1),
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ProbePermit {
+    fn drop(&mut self) {
+        PROBES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Target names with a registration probe in flight./// Target names with a registration probe in flight.
 ///
 /// One daemon, one process, so a `Mutex<BTreeSet>` is the whole mechanism.
 /// What it stops is two concurrent `target.add` calls for one name each paying
@@ -1238,6 +1274,27 @@ impl ShepherdApi for Session {
                     format!(
                         "a registration for `{name}` is already probing its target; that \
                          probe answers for this one too"
+                    ),
+                ));
+            }
+        };
+
+        // AND A PROCESS-WIDE PERMIT. The name reservation serialises requests
+        // for ONE name and does nothing for sixty-four distinct ones — each of
+        // which holds a connection thread for up to the probe deadline while
+        // doing a full multipart round trip, so ordinary `status`, `search`
+        // and recovery clients cannot connect at all. Registration is rare and
+        // deliberate; starving the rest of the daemon for it is not a trade
+        // worth making even once.
+        let _probe_permit = match ProbePermit::take() {
+            Some(p) => p,
+            None => {
+                return Err(RpcError::new(
+                    ErrorCode::Busy,
+                    format!(
+                        "{MAX_CONCURRENT_PROBES} target registrations are already probing \
+                         their endpoints; each holds a connection for up to the probe \
+                         deadline, so this one is refused rather than joining them"
                     ),
                 ));
             }

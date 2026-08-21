@@ -307,7 +307,21 @@ impl Daemon {
             // This read is what pins the snapshot, and it happens under the
             // ticket lock. See the doc comment.
             let expected: i64 = tx
-                .query_row("SELECT COUNT(*) FROM file", [], |r| r.get(0))
+                // `state <> 'missing'`, matching the row query below. A row
+                // the scan reconciliation marked missing is a file that is no
+                // longer on disk, and indexing it makes `search` keep
+                // returning it — which is the other half of the sweep: marking
+                // the row means nothing while every rebuild puts it back.
+                //
+                // Both statements carry the filter, and they have to: the count
+                // sizes the arena and the consistency check compares them, so a
+                // filter on one alone reports a partial index that is not
+                // partial.
+                .query_row(
+                    "SELECT COUNT(*) FROM file WHERE state <> 'missing'",
+                    [],
+                    |r| r.get(0),
+                )
                 .map_err(|e| format!("counting catalog rows: {e}"))?;
             *ticket += 1;
             (*ticket, expected)
@@ -319,7 +333,7 @@ impl Daemon {
         // return a stable, non-overlapping sequence of pages.
         {
             let mut stmt = tx
-                .prepare("SELECT id, rel_path FROM file ORDER BY id")
+                .prepare("SELECT id, rel_path FROM file WHERE state <> 'missing' ORDER BY id")
                 .map_err(|e| format!("preparing the index rebuild query: {e}"))?;
             let mut rows = stmt
                 .query([])

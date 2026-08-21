@@ -433,7 +433,7 @@ impl DiscardCharge {
 /// releases every other charge.
 pub async fn reserve_discard(
     proofs: &[DiscardInputs<'_>],
-    episode: &Episode,
+    episode: &mut Episode,
     window: &RateWindow,
     limits: &BreakerLimits,
     now: Timestamp,
@@ -449,6 +449,26 @@ pub async fn reserve_discard(
             policy: Vec::new(),
             breaker: vec![r],
         })?;
+
+    // THE EPISODE IS CONSUMED, atomically with minting the charge.
+    //
+    // `may_execute` permits only a `Confirmed` episode, specifically so a
+    // completed or executing set cannot be run again — and this borrowed it
+    // immutably and left the state alone, so the same episode could mint a
+    // second fully spendable charge until its confirmation expired. Under
+    // content attestation, an upload that recreates one of the
+    // content-addressed objects between the two passes is deleted by the first
+    // pass's confirmation, which never saw it.
+    //
+    // `Executing` rather than `Completed`: the units are not resolved yet, and
+    // the transition out of `Executing` belongs to whatever settles them. What
+    // matters here is that it is no longer `Confirmed`, which is the only state
+    // `may_execute` admits.
+    //
+    // After the charge, so a refused budget leaves the episode confirmed and
+    // retryable; before the `DiscardCharge` exists, so no charge is ever handed
+    // out over an episode still in the state that mints them.
+    episode.state = crate::breaker::EpisodeState::Executing;
 
     Ok(DiscardCharge {
         target: episode.target,

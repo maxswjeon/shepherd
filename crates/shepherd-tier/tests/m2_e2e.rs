@@ -569,7 +569,15 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
                 min_size: 1024 * 1024,
                 min_age: Duration::from_secs(0),
             },
-            custodian: &custodian,
+            // Through the predicate, so this test exercises the precondition
+            // rather than asserting it.
+            custodian: shepherd_tier::revalidate::destroy_permitted(
+                std::slice::from_ref(&custodian),
+                &[],
+                now,
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("the fixture's custodian must satisfy §4.10.2"),
             remote_key: &key,
         },
         &DeleteModeProvider::new(),

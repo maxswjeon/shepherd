@@ -701,7 +701,7 @@ fn limits(max_in_window: u32) -> BreakerLimits {
 async fn an_executed_episode_charges_the_window_exactly_once_per_object() {
     let now = t(20);
     let ledger = MemLedger::new();
-    let e = episode_with(3, now);
+    let mut e = episode_with(3, now);
     let remote = Remote::new("charged", 3);
     let ds = deferrals_for(&e);
     let lim = limits(10);
@@ -716,7 +716,7 @@ async fn an_executed_episode_charges_the_window_exactly_once_per_object() {
                 source: ConfirmationSource::WindowsCfApi,
             }),
         ),
-        &e,
+        &mut e,
         &ledger.snapshot(),
         &lim,
         now,
@@ -758,7 +758,7 @@ async fn an_executed_episode_charges_the_window_exactly_once_per_object() {
 async fn a_batch_needs_a_policy_proof_for_every_candidate() {
     let now = t(20);
     let ledger = MemLedger::new();
-    let e = episode_with(3, now);
+    let mut e = episode_with(3, now);
     let lim = limits(10);
     let all = deferrals_for(&e);
 
@@ -774,7 +774,7 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
                 source: ConfirmationSource::WindowsCfApi,
             }),
         ),
-        &e,
+        &mut e,
         &ledger.snapshot(),
         &lim,
         now,
@@ -797,7 +797,7 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
                 source: ConfirmationSource::WindowsCfApi,
             }),
         ),
-        &e,
+        &mut e,
         &MemLedger::new().snapshot(),
         &lim,
         now,
@@ -844,7 +844,7 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
     });
     let refusals = reserve_discard(
         &extra,
-        &e,
+        &mut e,
         &MemLedger::new().snapshot(),
         &lim,
         now,
@@ -876,7 +876,7 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
 #[tokio::test]
 async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
     let now = t(20);
-    let e = episode_with(1, now);
+    let mut e = episode_with(1, now);
     let lim = limits(10);
     let at = clock(20);
 
@@ -905,9 +905,16 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
         )
     }];
     let ledger = MemLedger::new();
-    let refusals = reserve_discard(&wrong_target, &e, &ledger.snapshot(), &lim, now, &ledger)
-        .await
-        .expect_err("target B's proof does not authorize a deletion from target A");
+    let refusals = reserve_discard(
+        &wrong_target,
+        &mut e,
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+    )
+    .await
+    .expect_err("target B's proof does not authorize a deletion from target A");
     assert!(
         refusals.policy.iter().any(|r| matches!(
             r,
@@ -936,7 +943,7 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
         .remove(0)
     }];
     let ledger = MemLedger::new();
-    reserve_discard(&wrong_root, &e, &ledger.snapshot(), &lim, now, &ledger)
+    reserve_discard(&wrong_root, &mut e, &ledger.snapshot(), &lim, now, &ledger)
         .await
         .expect_err("gates describing another root do not vouch for this one");
 
@@ -952,7 +959,7 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
                 source: ConfirmationSource::WindowsCfApi,
             }),
         ),
-        &e,
+        &mut e,
         &ledger.snapshot(),
         &lim,
         now,
@@ -969,7 +976,12 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
 async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
     let now = t(20);
     let ledger = MemLedger::new();
-    let e = episode_with(2, now);
+    // TWO episodes, which is what the name says and what the fixture used to
+    // fake by reserving twice on one. `reserve_discard` consumes the episode
+    // now — a confirmed set mints exactly one charge — so reusing it would be
+    // testing that rule rather than the window.
+    let mut e = episode_with(2, now);
+    let mut second = episode_with(2, now);
     let ds = deferrals_for(&e);
     let lim = limits(3); // two episodes of 2 are individually fine, jointly not
 
@@ -983,7 +995,7 @@ async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
                 source: ConfirmationSource::WindowsCfApi,
             }),
         ),
-        &e,
+        &mut e,
         &ledger.snapshot(),
         &lim,
         now,
@@ -995,15 +1007,15 @@ async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
 
     let refusals = reserve_discard(
         &proofs_for(
-            &e,
+            &second,
             &clock(20),
-            &ds,
+            &deferrals_for(&second),
             Some(PermanentDeleteConfirmation {
                 file: FileId::new(1),
                 source: ConfirmationSource::WindowsCfApi,
             }),
         ),
-        &e,
+        &mut second,
         &ledger.snapshot(),
         &lim,
         now,
@@ -1062,7 +1074,7 @@ async fn two_episodes_evaluating_against_one_snapshot_cannot_both_reserve() {
             "{label}: the snapshot check must pass for both racers"
         );
 
-        let racer = episode_with(2, now);
+        let mut racer = episode_with(2, now);
         let ds = deferrals_for(&racer);
         let got = reserve_discard(
             &proofs_for(
@@ -1074,7 +1086,7 @@ async fn two_episodes_evaluating_against_one_snapshot_cannot_both_reserve() {
                     source: ConfirmationSource::WindowsCfApi,
                 }),
             ),
-            &racer,
+            &mut racer,
             &snapshot,
             &lim,
             now,
@@ -1112,7 +1124,7 @@ async fn an_object_outside_the_confirmed_set_refuses_before_anything_is_deleted(
     let ledger = MemLedger::new();
     let lim = limits(10);
     let remote = Remote::new("exhausted", 2);
-    let one = episode_with(1, now);
+    let mut one = episode_with(1, now);
     let ds = deferrals_for(&one);
 
     // Confirmed for one object; the episode tries to delete two.
@@ -1126,7 +1138,7 @@ async fn an_object_outside_the_confirmed_set_refuses_before_anything_is_deleted(
                 source: ConfirmationSource::WindowsCfApi,
             }),
         ),
-        &one,
+        &mut one,
         &ledger.snapshot(),
         &lim,
         now,
@@ -1170,7 +1182,7 @@ async fn an_object_outside_the_confirmed_set_refuses_before_anything_is_deleted(
 
 /// A helper: a confirmed charge over `count` candidates, with budget to spare.
 async fn charge_for(ledger: &MemLedger, count: usize, now: Timestamp) -> DiscardCharge {
-    let e = episode_with(count, now);
+    let mut e = episode_with(count, now);
     let ds = deferrals_for(&e);
     reserve_discard(
         &proofs_for(
@@ -1182,7 +1194,7 @@ async fn charge_for(ledger: &MemLedger, count: usize, now: Timestamp) -> Discard
                 source: ConfirmationSource::WindowsCfApi,
             }),
         ),
-        &e,
+        &mut e,
         &ledger.snapshot(),
         &limits(10),
         now,
@@ -1434,7 +1446,7 @@ async fn an_unhashed_candidate_is_refused_rather_than_naming_a_key_from_nothing(
                 source: ConfirmationSource::WindowsCfApi,
             }),
         ),
-        &e,
+        &mut e,
         &ledger.snapshot(),
         &limits(10),
         now,

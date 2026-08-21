@@ -754,6 +754,77 @@ impl<'a> FileRepo<'a> {
         Ok(())
     }
 
+    /// Mark rows this scan did not see as `missing`, except beneath paths it
+    /// did not look at.
+    ///
+    /// # The reconciliation `last_seen_gen` exists for
+    ///
+    /// `upsert_file` stamps the generation on every file it sees, and nothing
+    /// consumed it — so a file deleted after being catalogued stayed `local`
+    /// forever, was re-indexed by every rebuild, and went on being returned by
+    /// `search` and counted by `status`. The column's own comment says this is
+    /// what it is for.
+    ///
+    /// # Why the skipped paths are an argument
+    ///
+    /// A walk that could not read a subtree observed nothing beneath it, and a
+    /// sweep cannot tell "absent" from "not looked at" — so every row under a
+    /// skipped path is left exactly as it was. That includes deliberate skips:
+    /// an ignored directory, a denied one, a symlinked directory the walker
+    /// does not descend, a cycle it has already visited. In every case the
+    /// walk has no evidence about what is under there, and evidence is what
+    /// this function turns into a state change.
+    ///
+    /// Filtered in Rust rather than in SQL: the candidate set is the rows this
+    /// scan did NOT see, which on a healthy corpus is small, and prefix-matching
+    /// arbitrary pathnames in `LIKE` needs escaping that is easy to get subtly
+    /// wrong.
+    ///
+    /// Returns how many rows were marked.
+    pub fn sweep_absent(
+        &mut self,
+        root: &ScanRoot,
+        generation: i64,
+        unobserved: &[String],
+        now: Timestamp,
+    ) -> Result<usize> {
+        let candidates: Vec<(i64, String)> = {
+            let mut stmt = self.0.conn().prepare(
+                "SELECT id, rel_path FROM file
+                 WHERE root_id = ?1 AND last_seen_gen < ?2 AND state <> 'missing'",
+            )?;
+            stmt.query_map(params![root.id.get(), generation], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let doomed: Vec<i64> = candidates
+            .into_iter()
+            .filter(|(_, rel)| {
+                !unobserved.iter().any(|skip| {
+                    // The skipped path itself, and anything beneath it. The
+                    // separator matters: `docs` must not swallow `docs-old`.
+                    rel == skip
+                        || rel
+                            .strip_prefix(skip.as_str())
+                            .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+                })
+            })
+            .map(|(id, _)| id)
+            .collect();
+
+        let tx = self.0.conn_mut().savepoint()?;
+        for id in &doomed {
+            tx.execute(
+                "UPDATE file SET state = 'missing', updated_at = ?2 WHERE id = ?1",
+                params![id, now.as_nanos()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(doomed.len())
+    }
+
     /// Look up by the **matching** key. This is what watcher events use.
     ///
     /// Returns every row whose `norm_key` matches, which on a case-sensitive

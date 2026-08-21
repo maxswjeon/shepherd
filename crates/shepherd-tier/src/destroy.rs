@@ -53,7 +53,7 @@ use shepherd_scan::floors::{self, FloorContext, FloorInput, FloorPolicy};
 use shepherd_storage::adapter::{ObjectMeta, StorageAdapter, StorageError, VersionGuard};
 
 use crate::audit::{AuditLog, AuditRecord};
-use crate::revalidate::{ClosingCheck, DestroyRefusal, Location};
+use crate::revalidate::{ClosingCheck, DestroyRefusal, PermittedCustodian};
 use crate::serialize::FileLocks;
 
 #[derive(Debug, thiserror::Error)]
@@ -162,9 +162,21 @@ pub struct LocalDestroyRequest<'a> {
     /// Age, resolved by the caller per §4.12's fallback order.
     pub age: Duration,
     pub floor_policy: FloorPolicy,
-    /// The location authorising this destruction — already checked against
-    /// §4.10.2's N-location predicate by [`crate::revalidate::destroy_permitted`].
-    pub custodian: &'a Location,
+    /// The location authorising this destruction.
+    ///
+    /// A [`PermittedCustodian`], which only
+    /// [`crate::revalidate::destroy_permitted`] can mint. This used to be a
+    /// bare `&Location` with a comment saying it had "already been checked",
+    /// and the checks in this file are about BINDING — target, prefix, hash,
+    /// key — not about custody: a stale location, a `Pending` or `Lost` one,
+    /// one missing its publication receipt, or one on a plugin-backed target
+    /// that is not custody-eligible passes every one of them. Under content
+    /// attestation the closing HEAD then proves only size and existence, so the
+    /// sole local copy is unlinked on the strength of a location the predicate
+    /// would have refused.
+    ///
+    /// A comment is not a check. This is.
+    pub custodian: PermittedCustodian<'a>,
     pub remote_key: &'a ObjectKey,
     /// [`Self::root`]'s gates, HELD across the unlink rather than re-read.
     ///

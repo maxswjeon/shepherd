@@ -139,6 +139,44 @@ pub enum DestroyRefusal {
     ClosingCheckFailed { detail: String },
 }
 
+/// A location this predicate has ACCEPTED, and the only kind
+/// `execute_local_destruction` takes.
+///
+/// # Why a token rather than a `&Location`
+///
+/// The destroy path was handed a bare reference with a doc comment saying it
+/// had "already been checked against §4.10.2's N-location predicate by
+/// `destroy_permitted`". That is a comment, and the path's own checks are about
+/// BINDING — target, prefix, hash, key — not about custody: a location that is
+/// stale, `Pending`, `Lost`, missing its publication receipt, or on a
+/// plugin-backed target that is not custody-eligible passes every one of them.
+/// Under content attestation the closing HEAD then proves only size and
+/// existence, so the sole local copy is unlinked on the strength of a location
+/// the predicate would have refused.
+///
+/// This type cannot be constructed anywhere else — the field is private and
+/// there is no constructor — so "the predicate said yes" becomes something a
+/// caller must OBTAIN rather than something it can assert. Same move as
+/// `PreparedIntent`, for the same reason: a claim in a comment is not a claim
+/// the compiler checks.
+#[derive(Debug, Clone, Copy)]
+pub struct PermittedCustodian<'a>(&'a Location);
+
+impl<'a> PermittedCustodian<'a> {
+    /// The location the predicate accepted.
+    pub fn location(&self) -> &'a Location {
+        self.0
+    }
+}
+
+impl std::ops::Deref for PermittedCustodian<'_> {
+    type Target = Location;
+
+    fn deref(&self) -> &Location {
+        self.0
+    }
+}
+
 /// §4.10.2's N-location destroy predicate.
 ///
 /// ```text
@@ -164,7 +202,7 @@ pub fn destroy_permitted<'a>(
     required: &[TargetId],
     now: Timestamp,
     window: std::time::Duration,
-) -> std::result::Result<&'a Location, DestroyRefusal> {
+) -> std::result::Result<PermittedCustodian<'a>, DestroyRefusal> {
     // ∀ clause first: it is cheaper and its failure is the more informative
     // message.
     for target in required {
@@ -197,6 +235,7 @@ pub fn destroy_permitted<'a>(
     locations
         .iter()
         .find(|l| l.satisfies_custody(now, window))
+        .map(PermittedCustodian)
         .ok_or(DestroyRefusal::NoAttestedCustodian {
             examined: locations.len(),
         })

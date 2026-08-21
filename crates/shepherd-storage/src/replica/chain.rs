@@ -879,16 +879,55 @@ pub fn resolve_chain(bodies: &[(String, PointerRecord)]) -> ChainResolution {
     }
 }
 
-/// Fetch and resolve the whole chain, exhausting pagination.
+/// Ceilings on the catalog listing recovery will read.
+///
+/// OQ-1 requires pagination EXHAUSTED rather than first-page, and exhausting a
+/// listing the provider never ends is not a stronger guarantee — it is a hang.
+/// A chain this build writes is one pointer per publication, so both ceilings
+/// are orders of magnitude above any real one and reaching either means the
+/// listing is not describing a chain this build made.
+const MAX_CHAIN_PAGES: usize = 10_000;
+const MAX_CHAIN_KEYS: usize = 1_000_000;
+
+/// Fetch and resolve the whole chain, exhausting pagination./// Fetch and resolve the whole chain, exhausting pagination.
 pub async fn read_chain(adapter: &dyn StorageAdapter) -> StorageResult<ChainResolution> {
     let prefix = format!("{}{CATALOG_PREFIX}", shepherd_core::CONTROL_PREFIX);
     let mut keys: Vec<ObjectKey> = Vec::new();
     let mut page = None;
     // Every continuation token this listing has used — see the cycle refusal.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pages = 0usize;
     loop {
+        // BOUNDED, both ways. The token-cycle refusal below catches a provider
+        // that repeats itself; it cannot catch one that keeps minting FRESH
+        // tokens, which pages forever, nor one whose listing is simply enormous
+        // — and every key is appended to memory during recovery, which is when
+        // the daemon has least to spare and the least ability to say why it
+        // died.
+        pages += 1;
+        if pages > MAX_CHAIN_PAGES || keys.len() > MAX_CHAIN_KEYS {
+            return Err(StorageError::Provider {
+                provider: adapter.capabilities().provider,
+                op: "read_chain".into(),
+                detail: format!(
+                    "the catalog listing is still going after {pages} pages and {} keys, past \
+                     the {MAX_CHAIN_PAGES}-page and {MAX_CHAIN_KEYS}-key ceilings; a chain \
+                     this build wrote is nowhere near either, so recovery refuses rather \
+                     than reading an unbounded listing into memory",
+                    keys.len()
+                ),
+            });
+        }
+
         let p = adapter.list(&prefix, page.as_ref()).await?;
-        keys.extend(p.keys);
+        // Pointers only. Segment keys share the prefix and are discarded later
+        // anyway, so retaining them was memory spent on rows this function
+        // never looks at.
+        keys.extend(
+            p.keys
+                .into_iter()
+                .filter(|k| RecordKey::parse_pointer(k.as_str()).is_some()),
+        );
         match p.next {
             // OQ-1 requires pagination exhausted, not first-page.
             Some(t) => {
