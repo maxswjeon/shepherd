@@ -75,6 +75,40 @@ pub fn fs_id(path: &Path, volume_id: &str) -> Result<FsId> {
     }
 }
 
+/// A directory's own identity, for a root whose volume may have no id.
+///
+/// `fs_id` needs a volume id because a file's identity has to be unique across
+/// volumes. A registered ROOT is a different question — "is this still the
+/// directory that was enrolled" — and the inode alone answers it: distinct per
+/// directory within a filesystem, and unchanged across a remount, which is the
+/// reason neither form uses `st_dev`.
+///
+/// So the volume qualifies the answer where it is known, and the inode carries
+/// it where it is not. The unqualified form is PREFIXED so it can never compare
+/// equal to a volume-qualified one: a root enrolled before a UUID appeared must
+/// not look like the same root afterwards.
+///
+/// `None` off unix, and where the directory cannot be stat'd. That is the same
+/// posture `fs_id` takes — Windows needs `FILE_ID_INFO` and that lands with the
+/// rest of the platform in Phase 3 — so a caller gets "unknown", never a wrong
+/// answer.
+pub fn directory_identity(path: &Path, volume_id: Option<&str>) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ino = std::fs::metadata(path).ok()?.ino();
+        Some(match volume_id {
+            Some(vol) => fs_id_from_ino(vol, ino).as_str().to_owned(),
+            None => format!("ino-only:{ino}"),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, volume_id);
+        None
+    }
+}
+
 /// The same packing, from an inode already in hand.
 ///
 /// The scan reads `st_ino` while it is walking, and the catalog write happens

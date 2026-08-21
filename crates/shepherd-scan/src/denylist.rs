@@ -227,7 +227,7 @@ impl DenyList {
     pub fn with_extra_path(mut self, path: &Path) -> Self {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         for p in [path.to_path_buf(), resolved] {
-            let norm = p.to_string_lossy().replace('\\', "/");
+            let norm = p.to_normalized_string();
             if !norm.is_empty() && !self.extra_paths.contains(&norm) {
                 self.extra_paths.push(norm);
             }
@@ -278,7 +278,7 @@ impl DenyList {
                 return Some(*why);
             }
         }
-        let norm = abs.to_string_lossy().replace('\\', "/");
+        let norm = abs.to_normalized_string();
         for (prefix, why) in &self.abs_prefixes {
             if path_has_prefix(&norm, prefix, self.case_insensitive) {
                 return Some(*why);
@@ -301,7 +301,7 @@ impl DenyList {
     /// exactly that: one ordinary file, in a directory that can sit inside a
     /// scan root, which the daemon created for itself.
     pub fn deny_file(&self, name: &str, abs: &Path) -> Option<DenyReason> {
-        let norm = abs.to_string_lossy().replace('\\', "/");
+        let norm = abs.to_normalized_string();
         if self
             .extra_paths
             .iter()
@@ -330,6 +330,32 @@ impl DenyList {
 /// one that misses a case variant of a system path, because nothing surfaces
 /// it: the scan reports success, and the absence looks like an empty
 /// directory.
+/// A path as a string with separators folded to `/` — **on Windows only**.
+///
+/// `\` is an ordinary character in a Unix filename, and converting it there
+/// turns `/data/shepherd\notes.txt` into a path beneath a denied
+/// `/data/shepherd`, silently omitting unrelated user data from the scan. The
+/// conversion exists for Windows, where `\` really is a separator and the
+/// comparisons below are written in terms of `/`.
+///
+/// This is the fourth site in this PR to get the same correction, and the
+/// pattern is always the shape: a normalisation written to be portable that is
+/// only correct on one platform.
+trait NormalizedPath {
+    fn to_normalized_string(&self) -> String;
+}
+
+impl NormalizedPath for Path {
+    fn to_normalized_string(&self) -> String {
+        let s = self.to_string_lossy();
+        if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s.into_owned()
+        }
+    }
+}
+
 fn path_has_prefix(path: &str, prefix: &str, fold: bool) -> bool {
     if !fold {
         if path == prefix {
@@ -579,10 +605,23 @@ mod tests {
         );
         // `/proctor` is not `/proc`.
         assert_eq!(d.deny_dir("notes", &p("/proctor/notes")), None);
+        // ON WINDOWS ONLY, and that is the point rather than a portability
+        // dodge: there `\` is a separator and the comparison folds it, so the
+        // system path is recognised. On unix the same string is a single
+        // legal filename, and treating it as a path would be the confusion
+        // that lets a file named `shepherd\notes.txt` count as beneath a
+        // denied `shepherd` directory.
+        #[cfg(windows)]
         assert_eq!(
             d.deny_dir("anything", &p("C:\\Windows\\System32")),
             Some(DenyReason::SystemPath),
             "backslash separators normalise before comparison"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            d.deny_dir("anything", &p("C:\\Windows\\System32")),
+            None,
+            "on unix this is one filename, not three components"
         );
     }
 
@@ -637,5 +676,34 @@ mod tests {
         let d = DenyList::empty();
         assert_eq!(d.deny_dir(".git", &p("/home/u/.git")), None);
         assert_eq!(d.deny_file("disk.vmdk", Path::new("/srv/disk.vmdk")), None);
+    }
+
+    /// A backslash in a Unix filename does not put a file inside a denied
+    /// directory.
+    ///
+    /// The normalisation was unconditional, so `/data/shepherd\notes.txt` —
+    /// one root-level file with an unusual name — folded into
+    /// `/data/shepherd/notes.txt` and was silently omitted from the scan as
+    /// daemon-internal. Unrelated user data, dropped without a word.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_unix_name_is_not_a_denied_prefix() {
+        let d = DenyList::builtin().with_extra_path(&p("/data/shepherd"));
+
+        assert_eq!(
+            d.deny_file("shepherd\\notes.txt", &p("/data/shepherd\\notes.txt")),
+            None,
+            "a backslash is a legal filename character here, not a boundary"
+        );
+        // AND THE REAL PREFIX still denies, so this is not a hole in the other
+        // direction.
+        assert_eq!(
+            d.deny_file("daemon.sock", &p("/data/shepherd/daemon.sock")),
+            Some(DenyReason::ShepherdInternal)
+        );
+        assert_eq!(
+            d.deny_dir("shepherd", &p("/data/shepherd")),
+            Some(DenyReason::ShepherdInternal)
+        );
     }
 }

@@ -497,6 +497,29 @@ impl Executor for ScanExecutor {
         // 10M-file case belongs to `the_m1_demo_holds_at_a_million_files`, which
         // is `#[ignore]`d behind `SHEPHERD_M1_CORPUS` — a corpus this box no
         // longer has. The allocation claim above is reasoning, not a benchmark.
+        // AND THE DIRECTORY, re-asked for the same reason.
+        //
+        // The check before the walk establishes which directory the root named
+        // THEN. `st_dev` below is about the filesystem and agrees with itself
+        // across a retarget to a sibling — which is the whole finding — so a
+        // symlinked root repointed during the walk would have its replacement
+        // tree committed here and the enrolled tree swept as absent.
+        //
+        // Immediately before the commit, so what it establishes is still true
+        // of the rows about to be written.
+        if present
+            && let Some(enrolled) = root.root_fs_id.as_deref()
+            && let Some(seen) = current_root_identity(&path, root.volume_id.as_deref())
+            && enrolled != seen
+        {
+            return Err(format!(
+                "root {root_id} ({}) was enrolled as {enrolled} and resolved to {seen} after \
+                 the walk: the path named a different directory while it was being read. \
+                 Nothing has been committed",
+                root.path
+            ));
+        }
+
         let root = Arc::new(root);
         let mut remaining = output.files.into_iter();
         loop {
@@ -872,17 +895,7 @@ fn upsert_batch(
 /// volume-qualified one: a root enrolled before a UUID appeared must not look
 /// like the same root afterwards.
 fn current_root_identity(path: &std::path::Path, volume_id: Option<&str>) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    let ino = std::fs::metadata(path).ok()?.ino();
-    Some(match volume_id {
-        Some(vol) => shepherd_catalog::volume::fs_id_from_ino(vol, ino)
-            .as_str()
-            .to_owned(),
-        // Unqualified, and prefixed so it can never compare equal to a
-        // volume-qualified id. See the enrollment side for why the inode alone
-        // is still worth recording.
-        None => format!("ino-only:{ino}"),
-    })
+    shepherd_catalog::volume::directory_identity(path, volume_id)
 }
 
 /// The path a skip is about, if it has one.

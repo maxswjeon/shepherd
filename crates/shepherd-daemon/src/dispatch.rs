@@ -484,15 +484,7 @@ impl ShepherdApi for Session {
         //
         // `None` only when the directory cannot be stat'd at all, which is the
         // same "unknown, not wrong" every other identity here uses.
-        let root_identity = std::fs::metadata(&path).ok().map(|md| {
-            let ino = std::os::unix::fs::MetadataExt::ino(&md);
-            match volume.as_deref() {
-                Some(vol) => shepherd_catalog::volume::fs_id_from_ino(vol, ino)
-                    .as_str()
-                    .to_owned(),
-                None => format!("ino-only:{ino}"),
-            }
-        });
+        let root_identity = shepherd_catalog::volume::directory_identity(&path, volume.as_deref());
 
         let mut warnings = Vec::new();
 
@@ -1181,14 +1173,22 @@ impl ShepherdApi for Session {
         // validation explicitly accepts (offsets up to `MAX_OFFSET`) silently
         // answers "no matches" over a corpus full of them.
         //
-        // The floor is `want`, which is exactly what the old unfiltered branch
-        // asked for and is bounded by `MAX_OFFSET + MAX_PAGE` — a deep page
-        // costs a vector of ids rather than an unbounded scan, and a shallow
-        // one still gets the expansion filtering needs.
+        // The ceiling is `want + MAX_CANDIDATES`, not `MAX_CANDIDATES`.
+        //
+        // A flat ceiling truncated the ids before `.skip(offset)` ran, so any
+        // offset past it answered "no matches" to a request the validation
+        // accepts. Clamping to `want` instead fixed that and removed the
+        // headroom: at `offset + limit` above the ceiling the expression is
+        // exactly `want`, so ten thousand leading `missing` matches filter away
+        // and the page comes back empty again — the same defect one step
+        // further out.
+        //
+        // Additive keeps both: the expansion filtering needs, and a bound that
+        // does not depend on how deep the page is. `want` is itself bounded by
+        // `MAX_OFFSET + MAX_PAGE`, so the total is too.
         let cap = want
             .saturating_mul(FILTERED_CANDIDATE_FACTOR)
-            .min(MAX_CANDIDATES)
-            .max(want);
+            .min(want.saturating_add(MAX_CANDIDATES));
 
         let matched = index.search(&req.query, cap.max(1));
 

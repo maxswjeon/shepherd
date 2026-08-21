@@ -54,6 +54,15 @@ const S3_MAX_PART: u64 = 5 * 1024 * 1024 * 1024;
 /// S3 maximum part number.
 const S3_MAX_PARTS: u32 = 10_000;
 
+/// Incomplete multipart uploads this build will enumerate under one prefix.
+///
+/// `adopt_or_reap` reads this listing before every provider session, so it is
+/// on the hot path of every upload — and unlike `list_parts` it counts
+/// SESSIONS rather than parts of one. A bucket holding more abandoned uploads
+/// than this has a lifecycle-policy problem, and adopting one more of them
+/// would not fix it.
+const MAX_INCOMPLETE_UPLOADS: usize = 10_000;
+
 /// Static credentials, for MinIO and for targets whose secrets Shepherd holds
 /// in `shepherd-secrets` rather than in the ambient environment.
 #[derive(Clone)]
@@ -640,6 +649,31 @@ impl StorageAdapter for S3Adapter {
             if let Some(i) = requested_id.clone() {
                 req = req.upload_id_marker(i);
             }
+            // BOUNDED, like its `list_parts` sibling and for the same reason:
+            // the cycle guard below catches a provider that repeats its marker
+            // pair and cannot catch one minting fresh pairs, while `out` and
+            // `seen` both grow on every page. `adopt_or_reap` calls this before
+            // starting a provider session, so an uncooperative endpoint — or a
+            // bucket with an extreme number of abandoned uploads under the
+            // prefix — keeps an upload job allocating until the daemon dies.
+            //
+            // `MAX_INCOMPLETE_UPLOADS` rather than `S3_MAX_PARTS`: this counts
+            // SESSIONS under a prefix, not parts of one, and a bucket with more
+            // abandoned uploads than this has a lifecycle-policy problem that
+            // adopting one more of them will not fix.
+            if out.len() > MAX_INCOMPLETE_UPLOADS {
+                return Err(StorageError::Provider {
+                    provider: "s3",
+                    op: "list_multipart_uploads".into(),
+                    detail: format!(
+                        "the listing under {prefix} is still going after {} incomplete \
+                         uploads, past the {MAX_INCOMPLETE_UPLOADS} ceiling; adoption reads \
+                         this before every session and cannot pay for an unbounded one",
+                        out.len()
+                    ),
+                });
+            }
+
             let page = req
                 .send()
                 .await
