@@ -229,6 +229,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     let destroyed = execute_local_destruction(
         LocalDestroyRequest {
             root_gate: &OpenGate,
+            intent_gate: &SilentJournal,
             file_root: root.id,
             // Minted by the JOURNAL, not fabricated. `PreparedIntent` exists so
             // that "an intent was durably prepared before anything
@@ -535,5 +536,19 @@ impl shepherd_tier::destroy::RootGate for OpenGate {
         Ok(Ok(
             shepherd_tier::destroy::RootHold::nothing_can_change_this_root(),
         ))
+    }
+}
+
+/// An `IntentGate` for a test that is not about §4.4's sequence.
+struct SilentJournal;
+
+#[async_trait::async_trait]
+impl shepherd_tier::destroy::IntentGate for SilentJournal {
+    async fn advance(
+        &self,
+        _id: shepherd_core::IntentId,
+        _to: shepherd_catalog::intent::IntentState,
+    ) -> shepherd_tier::destroy::Result<()> {
+        Ok(())
     }
 }

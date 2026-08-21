@@ -557,8 +557,23 @@ impl Remote {
         }
     }
 
-    fn guard() -> VersionGuard {
-        VersionGuard::Version(shepherd_core::ObjectVersion::new("v9"))
+    /// The location that authorises these discards.
+    ///
+    /// The guard and the audit record's attestation field are both DERIVED
+    /// from this now, so a fixture cannot hand `execute_discard` a guard that
+    /// disagrees with the location it is supposed to be protecting — which is
+    /// what the old `&Self::guard()` argument allowed.
+    fn custodian() -> crate::revalidate::Location {
+        crate::revalidate::Location {
+            target: TARGET,
+            state: crate::revalidate::LocationState::Verified,
+            attestation: shepherd_storage::adapter::AttestationMode::Version,
+            custody_eligible: true,
+            last_full_hash_verified_at: Some(t(0)),
+            publication_receipt_ok: true,
+            object_version: Some(shepherd_core::ObjectVersion::new("v9")),
+            expected_hash: shepherd_core::Blake3Hash::from_bytes([0u8; 32]),
+        }
     }
 
     /// Discard candidate `i`, in the ordinary scope.
@@ -630,10 +645,12 @@ impl Remote {
             candidate,
             target,
             root,
-            &Self::guard(),
+            &Self::custodian(),
             &self.locks,
             &self.audit,
-            "version",
+            // The transitions themselves are asserted in `destroy_tests`; here
+            // the gate only has to exist so the discard path can record them.
+            &NoJournal,
             now,
         )
         .await
@@ -1532,4 +1549,22 @@ async fn a_delete_does_not_go_to_a_target_the_charge_did_not_pay_for() {
         .await
         .expect("the charged target's own gate is ordinary");
     assert_eq!(remote.deleted(), 1);
+}
+
+/// An `IntentGate` that accepts every transition and remembers nothing.
+///
+/// `destroy_tests` owns the assertions about §4.4's sequence; these tests are
+/// about the breaker and the key derivation, and would only be made noisier by
+/// re-asserting it.
+struct NoJournal;
+
+#[async_trait::async_trait]
+impl crate::destroy::IntentGate for NoJournal {
+    async fn advance(
+        &self,
+        _id: shepherd_core::IntentId,
+        _to: shepherd_catalog::intent::IntentState,
+    ) -> std::result::Result<(), DestroyError> {
+        Ok(())
+    }
 }

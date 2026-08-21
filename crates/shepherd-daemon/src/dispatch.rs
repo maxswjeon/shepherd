@@ -80,7 +80,39 @@ pub struct Session {
     pub negotiated: Negotiated,
 }
 
-/// Whether a scan of this root is already queued or running.
+/// Target names with a registration probe in flight.
+///
+/// One daemon, one process, so a `Mutex<BTreeSet>` is the whole mechanism.
+/// What it stops is two concurrent `target.add` calls for one name each paying
+/// for a full multipart probe before one of them loses the insert.
+static REGISTERING: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A held name, released on drop.
+///
+/// RAII because every path out of `target_add` after the probe — a probe
+/// failure, a serialisation failure, a lost recheck, a panic — has to release
+/// it, and a name leaked here would refuse that registration for the daemon's
+/// life.
+struct NameReservation(String);
+
+impl NameReservation {
+    fn take(name: &str) -> Option<Self> {
+        let mut held = REGISTERING.lock().unwrap_or_else(|e| e.into_inner());
+        held.insert(name.to_owned()).then(|| Self(name.to_owned()))
+    }
+}
+
+impl Drop for NameReservation {
+    fn drop(&mut self) {
+        REGISTERING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Whether a scan of this root is already queued or running./// Whether a scan of this root is already queued or running.
 ///
 /// `json_extract` rather than a `LIKE` over the payload: `"root_id":1` is a
 /// prefix of `"root_id":10`, and a substring match would coalesce a scan of
@@ -1186,6 +1218,31 @@ impl ShepherdApi for Session {
             ));
         }
 
+        // ONE REGISTRATION PER NAME AT A TIME.
+        //
+        // The check above and the insert below are separated by a probe that
+        // may run for a minute, so two `target.add` calls for one name both saw
+        // "free", both did the full multipart round trip, and one then lost the
+        // `UNIQUE(name)` race and got a SQLite-shaped `Io` error instead of the
+        // documented duplicate refusal. Sixty-four connection slots could repeat
+        // that work for one name.
+        //
+        // An in-process reservation rather than a placeholder row: the row would
+        // need cleaning up on every failure path including a crash, and the
+        // thing being serialised is one daemon's own concurrent requests.
+        let _reserved = match NameReservation::take(&name) {
+            Some(r) => r,
+            None => {
+                return Err(RpcError::new(
+                    ErrorCode::Busy,
+                    format!(
+                        "a registration for `{name}` is already probing its target; that \
+                         probe answers for this one too"
+                    ),
+                ));
+            }
+        };
+
         let probe = targets::probe_multipart_checksum_blocking(&cfg.to_s3_config(credentials))?;
         // The summary carries the per-algorithm evidence and no credential
         // material — `ChecksumProbe` holds an endpoint and a bucket, never an
@@ -1207,6 +1264,17 @@ impl ShepherdApi for Session {
             // `name` is cloned because `TargetSummary` below still needs it;
             // `credentials_ref` is not read again, so it moves.
             let (n, cref) = (name.clone(), req.credentials_ref);
+            // RECHECKED after the probe. The reservation covers this daemon's
+            // own concurrency; the catalog can still have gained the name from
+            // a path this process does not serialise, and the answer for that
+            // is the documented refusal rather than a constraint violation.
+            let n2 = name.clone();
+            if self.cat(move |c| TargetRepo::new(c).name_exists(&n2))? {
+                return Err(RpcError::new(
+                    ErrorCode::Invalid,
+                    format!("a target named `{name}` is already registered"),
+                ));
+            }
             self.cat(move |c| {
                 TargetRepo::new(c).insert(
                     &n,

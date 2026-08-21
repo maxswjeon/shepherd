@@ -45,9 +45,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use shepherd_catalog::file_repo::ScanRoot;
-use shepherd_catalog::intent::{IntentKind, PreparedIntent};
+use shepherd_catalog::intent::{IntentKind, IntentState, PreparedIntent};
 use shepherd_core::ObjectKey;
-use shepherd_core::{Blake3Hash, FsId, RootId, TargetId, Timestamp};
+use shepherd_core::{Blake3Hash, FsId, IntentId, RootId, TargetId, Timestamp};
 use shepherd_placeholder::provider::{PlaceholderProvider, Staged};
 use shepherd_scan::floors::{self, FloorContext, FloorInput, FloorPolicy};
 use shepherd_storage::adapter::{ObjectMeta, StorageAdapter, StorageError, VersionGuard};
@@ -172,6 +172,10 @@ pub struct LocalDestroyRequest<'a> {
     /// gates are mutable and everything between here and step 6 takes time.
     /// See [`RootGate`].
     pub root_gate: &'a dyn RootGate,
+    /// Where this destruction's §4.4 lifecycle transitions are recorded.
+    ///
+    /// See [`IntentGate`].
+    pub intent_gate: &'a dyn IntentGate,
 }
 
 /// Execute §4.10's local destruction for one file.
@@ -385,6 +389,14 @@ pub async fn execute_local_destruction(
     // remains the backstop (the entry is discoverable via `list_staged`), but
     // recovering in-process while we still hold the context is strictly better
     // than deferring to a pass that has to reconstruct it.
+    // §4.4: the syscall is ABOUT to be issued.
+    //
+    // Before it, so a crash between this and the unlink is distinguishable from
+    // one before either — which is the whole reason the state exists. Recorded
+    // under the permit, alongside everything else that has to survive.
+    let intent_id = req.intent.id();
+    record_transition(req.intent_gate, intent_id, IntentState::SyscallIssued).await;
+
     if let Err(e) = provider.destroy_local(&staged, req.expected_hash) {
         // `DestroyedNotDurable` is the one failure here that is NOT a failure to
         // destroy: the unlink succeeded and only its directory could not be
@@ -410,9 +422,16 @@ pub async fn execute_local_destruction(
                 target_keys: vec![req.remote_key.as_str().to_owned()],
                 reconstructed: false,
             })?;
+            record_transition(req.intent_gate, intent_id, IntentState::OutcomeAmbiguous).await;
             audit.halt_for_recovery(&detail);
             return Err(e.into());
         }
+
+        // The syscall was issued and did not remove anything, which is an
+        // OUTCOME — a known one — and then the intent is aborted, because
+        // nothing irreversible happened and this destruction is over.
+        record_transition(req.intent_gate, intent_id, IntentState::OutcomeKnown).await;
+        record_transition(req.intent_gate, intent_id, IntentState::Aborted).await;
 
         // The permit goes back before the restore: nothing irreversible
         // happened, so there is no record owed and no reason to hold every
@@ -439,7 +458,39 @@ pub async fn execute_local_destruction(
         reconstructed: false,
     })?;
 
+    // §4.4's tail, in the order §4.10.4 requires it: the outcome is known, the
+    // record is written, and the catalog change this destruction implies is the
+    // caller's — so `catalog-committed` is the last one and it is recorded here
+    // because this function is where the sequence is known to have completed.
+    //
+    // After the audit append, never before: `audited` claiming a record that
+    // does not exist is exactly the lie the state is supposed to rule out.
+    record_transition(req.intent_gate, intent_id, IntentState::OutcomeKnown).await;
+    record_transition(req.intent_gate, intent_id, IntentState::Audited).await;
+    record_transition(req.intent_gate, intent_id, IntentState::CatalogCommitted).await;
+
     Ok(())
+}
+
+/// Record a lifecycle transition, reporting a failure rather than raising it.
+///
+/// Every call site is at or after the irreversible step, where there is nothing
+/// to abort to — and refusing to continue would leave the AUDIT record unwritten
+/// as well, trading a journal that is behind for a forensic record that does not
+/// exist. The audit log's own halt is the mechanism for an unrecordable
+/// irreversible step; this trail is finer-grained and sits beside it.
+///
+/// Logged at `error`, because a journal that silently stops advancing is a
+/// recovery path that silently stops working.
+async fn record_transition(gate: &dyn IntentGate, id: IntentId, to: IntentState) {
+    if let Err(e) = gate.advance(id, to).await {
+        tracing::error!(
+            intent = id.get(),
+            to = to.as_str(),
+            error = %e,
+            "could not advance the destroy intent; recovery will read this row as unresolved"
+        );
+    }
 }
 
 /// §4.10.4's abort-forward-never, at every point that has staged a file and then
@@ -644,6 +695,36 @@ async fn closing_head(req: &LocalDestroyRequest<'_>, remote: &impl RemoteGate) -
     check
         .evaluate(req.custodian.object_version.as_ref(), req.expected_size)
         .map_err(DestroyError::Refused)
+}
+
+/// Advance an intent along §4.4's lifecycle, as a narrow port.
+///
+/// # Why this exists at all
+///
+/// `IntentState` has a full successor machine — `prepared → syscall-issued →
+/// outcome-known → audited → catalog-committed`, with `IntentJournal::transition`
+/// validating every move — and nothing called it. A destruction that ran start
+/// to finish therefore left its row in `prepared`, which
+/// `IntentJournal::unresolved` reports as needing recovery: every successful
+/// destroy looked, to recovery, exactly like a crash. Worse in the other
+/// direction, a crash immediately after the unlink was indistinguishable from
+/// one before it, which is the distinction §4.10.4's ordering exists to make.
+///
+/// Filed as #5 when the binding half landed, because the destroy path had no
+/// catalog access; `RootGate` established the shape, and this is the writing
+/// counterpart.
+///
+/// # Failures do not stop the destruction
+///
+/// A transition that cannot be recorded is reported and does not abort: after
+/// the unlink there is nothing to abort TO, and refusing to continue would
+/// leave the audit record unwritten as well — trading a journal that is behind
+/// for a forensic record that does not exist. The audit log's own halt is the
+/// mechanism for an unrecordable irreversible step; this is the finer-grained
+/// trail beside it.
+#[async_trait::async_trait]
+pub trait IntentGate: Send + Sync {
+    async fn advance(&self, id: IntentId, to: IntentState) -> Result<()>;
 }
 
 /// Re-read a root's destruction gates, as a narrow port.
@@ -861,12 +942,14 @@ impl RemoteGate for &dyn StorageAdapter {
 /// the discard branch to go through the same intent + audit apparatus as local
 /// destruction, and a second call site would be a second place for that to be
 /// forgotten.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_remote_discard(
     intent: PreparedIntent,
     remote: &impl RemoteGate,
     key: &ObjectKey,
     guard: &VersionGuard,
     audit: &AuditLog,
+    intent_gate: &dyn IntentGate,
     attestation: &str,
     now: Timestamp,
 ) -> Result<()> {
@@ -891,12 +974,20 @@ pub async fn execute_remote_discard(
     // costs.
     let permit = audit.admit().await?;
 
+    // §4.4, the same sequence the local path records — the omission was in both
+    // entry points, and a lifecycle only one half of the destroy apparatus
+    // advances is a lifecycle recovery cannot read.
+    let intent_id = intent.id();
+    record_transition(intent_gate, intent_id, IntentState::SyscallIssued).await;
+
     if let Err(e) = remote.remove_object(key, guard).await {
         // A refused precondition is not ambiguous: the provider says it did not
         // act. Nothing irreversible happened, so nothing is owed a record and
         // halting every other destruction would be an outage manufactured out
         // of a guard doing its job.
         if matches!(e, DestroyError::PreconditionFailed { .. }) {
+            record_transition(intent_gate, intent_id, IntentState::OutcomeKnown).await;
+            record_transition(intent_gate, intent_id, IntentState::Aborted).await;
             drop(permit);
             return Err(e);
         }
@@ -908,6 +999,7 @@ pub async fn execute_remote_discard(
             guard,
             audit,
             permit,
+            intent_gate,
             attestation,
             now,
         )
@@ -925,6 +1017,10 @@ pub async fn execute_remote_discard(
         target_keys: vec![key.as_str().to_owned()],
         reconstructed: false,
     })?;
+
+    record_transition(intent_gate, intent_id, IntentState::OutcomeKnown).await;
+    record_transition(intent_gate, intent_id, IntentState::Audited).await;
+    record_transition(intent_gate, intent_id, IntentState::CatalogCommitted).await;
     Ok(())
 }
 
@@ -971,9 +1067,11 @@ async fn resolve_ambiguous_delete(
     guard: &VersionGuard,
     audit: &AuditLog,
     permit: crate::audit::DestroyPermit<'_>,
+    intent_gate: &dyn IntentGate,
     attestation: &str,
     now: Timestamp,
 ) -> Result<()> {
+    let intent_id = intent.id();
     let unresolved = |audit: &AuditLog, permit, why: String| {
         let detail = format!(
             "remote destruction of {} failed ambiguously ({err}) and the outcome could not \
@@ -1073,6 +1171,10 @@ async fn resolve_ambiguous_delete(
         target_keys: vec![key.as_str().to_owned()],
         reconstructed: false,
     })?;
+
+    record_transition(intent_gate, intent_id, IntentState::OutcomeKnown).await;
+    record_transition(intent_gate, intent_id, IntentState::Audited).await;
+    record_transition(intent_gate, intent_id, IntentState::CatalogCommitted).await;
     Ok(())
 }
 

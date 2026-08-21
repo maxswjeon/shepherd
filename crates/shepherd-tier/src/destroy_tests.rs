@@ -143,6 +143,32 @@ impl crate::destroy::RootGate for Gate {
     }
 }
 
+/// Records the §4.4 transitions a destruction asks for.
+///
+/// A `Vec`, because the ORDER is the property: `syscall-issued` must precede
+/// the unlink and `audited` must follow the record, and a set could not tell
+/// those apart from the same states in the wrong sequence.
+#[derive(Default)]
+struct Journal(std::sync::Mutex<Vec<shepherd_catalog::intent::IntentState>>);
+
+impl Journal {
+    fn seen(&self) -> Vec<shepherd_catalog::intent::IntentState> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::destroy::IntentGate for Journal {
+    async fn advance(
+        &self,
+        _id: shepherd_core::IntentId,
+        to: shepherd_catalog::intent::IntentState,
+    ) -> Result<()> {
+        self.0.lock().unwrap().push(to);
+        Ok(())
+    }
+}
+
 /// An intent bound to exactly what a request destroys.
 ///
 /// Every request that overrides `path` or `expected_hash` must rebind, because
@@ -344,6 +370,7 @@ async fn a_remote_intent_prepared_for_another_object_does_not_authorize_this_del
         &f.key,
         &guard,
         &f.audit,
+        &f.journal,
         "version",
         Timestamp::from_nanos(5),
     )
@@ -677,6 +704,86 @@ async fn a_root_that_does_not_own_the_file_does_not_authorize_this_destroy() {
     assert!(f.path.exists(), "and the file is still there");
 }
 
+/// A destruction advances its intent through §4.4's lifecycle.
+///
+/// `IntentState` has a full successor machine and NOTHING called
+/// `IntentJournal::transition` — so a destruction that ran start to finish left
+/// its row in `prepared`, which `unresolved()` reports as needing recovery.
+/// Every successful destroy looked, to recovery, exactly like a crash; and a
+/// crash immediately after the unlink was indistinguishable from one before it,
+/// which is the distinction §4.10.4's ordering exists to make.
+///
+/// The ORDER is the property, not the set. `syscall-issued` must precede the
+/// unlink so a crash between them is readable, and `audited` must FOLLOW the
+/// record — claiming a record that does not exist is the lie that state is
+/// supposed to rule out.
+#[tokio::test]
+async fn a_successful_destroy_walks_its_intent_to_catalog_committed() {
+    use shepherd_catalog::intent::IntentState;
+
+    let f = fixture("lifecycle", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+
+    let Some(r) = past_the_open_handle_floor(
+        execute_local_destruction(
+            f.request(&c),
+            &f.provider,
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
+            &f.audit,
+            &f.locks,
+            Timestamp::from_nanos(1),
+        )
+        .await,
+    ) else {
+        return;
+    };
+    r.expect("the destruction succeeds");
+
+    assert_eq!(
+        f.journal.seen(),
+        vec![
+            IntentState::SyscallIssued,
+            IntentState::OutcomeKnown,
+            IntentState::Audited,
+            IntentState::CatalogCommitted,
+        ],
+        "the journal must trace §4.4's sequence, in order"
+    );
+    assert!(!f.path.exists(), "and the file really was destroyed");
+}
+
+/// A destruction that refuses before the syscall records nothing.
+///
+/// The lifecycle is about an operation that STARTED. A refusal at a binding
+/// check has issued nothing, so writing `syscall-issued` for it would tell
+/// recovery to go looking for an unlink that never happened.
+#[tokio::test]
+async fn a_destroy_refused_before_the_syscall_advances_nothing() {
+    let f = fixture("lifecycle-refused", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let req = LocalDestroyRequest {
+        file_root: shepherd_core::RootId::new(9),
+        ..f.request(&c)
+    };
+
+    execute_local_destruction(
+        req,
+        &f.provider,
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("the request is not bound to its proof");
+
+    assert!(
+        f.journal.seen().is_empty(),
+        "a refusal before the syscall recorded {:?}",
+        f.journal.seen()
+    );
+}
+
 /// A file old enough and big enough to clear the floors.
 fn payload() -> Vec<u8> {
     vec![7u8; 128 * 1024]
@@ -703,6 +810,7 @@ struct Fixture {
     audit: AuditLog,
     locks: FileLocks,
     gate: Gate,
+    journal: Journal,
     provider: DeleteModeProvider,
 }
 
@@ -736,6 +844,7 @@ fn fixture(tag: &str, mode: AttestationMode) -> Fixture {
         audit,
         locks: FileLocks::new(),
         gate: Gate::open(),
+        journal: Journal::default(),
         provider: DeleteModeProvider::new(),
         tmp,
     }
@@ -765,6 +874,7 @@ impl Fixture {
             custodian,
             remote_key: &self.key,
             root_gate: &self.gate,
+            intent_gate: &self.journal,
             // The catalog's answer for this fixture's file, which is the
             // fixture's own root.
             file_root: self.root.id,
@@ -1350,6 +1460,7 @@ async fn remote_discard_deletes_and_audits_through_the_same_apparatus() {
         &f.key,
         &guard,
         &f.audit,
+        &f.journal,
         "version",
         Timestamp::from_nanos(5),
     )
@@ -1383,6 +1494,7 @@ async fn remote_discard_refuses_while_the_audit_log_is_halted() {
         &f.key,
         &guard,
         &f.audit,
+        &f.journal,
         "version",
         Timestamp::from_nanos(5),
     )
@@ -1557,6 +1669,7 @@ async fn a_lost_delete_acknowledgement_is_still_audited() {
         &f.key,
         &VersionGuard::ContentAddressed { expect: f.hash },
         &f.audit,
+        &f.journal,
         "content",
         Timestamp::from_nanos(5),
     )
@@ -1599,6 +1712,7 @@ async fn a_delete_that_never_landed_is_neither_audited_nor_halting() {
         &f.key,
         &v9(),
         &f.audit,
+        &f.journal,
         "version",
         Timestamp::from_nanos(5),
     )
@@ -1635,6 +1749,7 @@ async fn an_unresolvable_delete_halts_subsequent_destruction() {
         &f.key,
         &v9(),
         &f.audit,
+        &f.journal,
         "version",
         Timestamp::from_nanos(5),
     )
@@ -1678,6 +1793,7 @@ async fn a_head_that_answers_with_another_version_is_not_a_resolution() {
         &f.key,
         &v9(),
         &f.audit,
+        &f.journal,
         "version",
         Timestamp::from_nanos(5),
     )
@@ -1719,6 +1835,7 @@ async fn a_refused_precondition_neither_records_nor_halts() {
         &f.key,
         &v9(),
         &f.audit,
+        &f.journal,
         "version",
         Timestamp::from_nanos(5),
     )
@@ -2051,6 +2168,7 @@ async fn an_absent_key_under_a_version_guard_is_not_a_resolved_delete() {
         &f.key,
         &v9(),
         &f.audit,
+        &f.journal,
         "version",
         Timestamp::from_nanos(5),
     )

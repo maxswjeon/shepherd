@@ -528,10 +528,14 @@ pub async fn execute_discard(
     candidate: &Candidate,
     target: TargetId,
     root: RootId,
-    guard: &VersionGuard,
+    // The location whose verification authorises this deletion. Replaces the
+    // `guard` and `attestation` string this used to take side by side: both are
+    // DERIVED from it below, because a guard supplied independently is a guard
+    // that can disagree with the location it is supposed to be protecting.
+    custodian: &crate::revalidate::Location,
     locks: &FileLocks,
     audit: &AuditLog,
-    attestation: &str,
+    intent_gate: &dyn crate::destroy::IntentGate,
     now: Timestamp,
 ) -> Result<(), DestroyError> {
     // The GATE decides which target, and where that target's objects live.
@@ -606,10 +610,79 @@ pub async fn execute_discard(
     // exactly what would make it decide wrongly.
     let _key_lock = locks.acquire_key(&key).await;
 
+    // THE GUARD IS DERIVED, not accepted.
+    //
+    // It arrived as its own argument, unchecked against the candidate, the
+    // charge or the location that authorised any of this — so a miswired
+    // caller could pass `ContentAddressed` and issue an UNVERSIONED delete
+    // against a versioned bucket, or pass another location's version and
+    // permanently remove that version while the candidate's verified one
+    // survived. The successful path then audits it, with no closing check to
+    // catch either.
+    //
+    // Under mechanism A the version is required and its absence is a refusal
+    // rather than a downgrade: the location claims to attest by version, so
+    // deleting without one is deleting whatever is current — which is the
+    // object this discard was never authorised to touch.
+    let guard = match custodian.attestation {
+        shepherd_storage::adapter::AttestationMode::Version => {
+            match custodian.object_version.as_ref() {
+                Some(v) => VersionGuard::Version(v.clone()),
+                None => {
+                    return Err(DestroyError::Unbound {
+                        detail: format!(
+                            "the custodian for {} attests by version and records none, so there \
+                         is nothing to guard the DELETE with",
+                            key.as_str()
+                        ),
+                    });
+                }
+            }
+        }
+        // The key is content-addressed and immutable, so the key IS the guard.
+        shepherd_storage::adapter::AttestationMode::Content => VersionGuard::ContentAddressed {
+            expect: candidate.blake3.ok_or_else(|| DestroyError::Unbound {
+                detail: format!(
+                    "the candidate for {} has no hash, and a content-addressed guard is a \
+                     statement about the bytes",
+                    key.as_str()
+                ),
+            })?,
+        },
+        // §4.10.2: a target that cannot attest never authorises a destruction,
+        // and this one is being asked to.
+        shepherd_storage::adapter::AttestationMode::None => {
+            return Err(DestroyError::Unbound {
+                detail: format!(
+                    "the custodian for {} has no attestation mechanism and cannot authorise \
+                     destroying anything",
+                    key.as_str()
+                ),
+            });
+        }
+    };
+
     // One call site. PM-2's requirement is that the discard branch runs through
     // the same intent + audit apparatus as local destruction; a second path
     // here would be a second place to forget the audit record.
-    execute_remote_discard(intent, remote, &key, guard, audit, attestation, now).await
+    execute_remote_discard(
+        intent,
+        remote,
+        &key,
+        &guard,
+        audit,
+        intent_gate,
+        // The audit record's attestation field, from the SAME value the guard
+        // came from, so a record can never describe a mechanism the delete did
+        // not use.
+        match custodian.attestation {
+            shepherd_storage::adapter::AttestationMode::Version => "version",
+            shepherd_storage::adapter::AttestationMode::Content => "content",
+            shepherd_storage::adapter::AttestationMode::None => "none",
+        },
+        now,
+    )
+    .await
 }
 
 #[cfg(test)]

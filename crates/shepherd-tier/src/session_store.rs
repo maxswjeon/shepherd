@@ -541,8 +541,41 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
                         "row has part_count = {raw}, outside 1..={MAX_PARTS} — refusing to \
                          resume a plan this build could not have produced"
                     ),
-                })
+                })?
         };
+
+        // THE LAYOUT, not only the range. A count inside 1..=MAX_PARTS can
+        // still describe a plan `PartPlan::new` would never emit, and the range
+        // check alone reads as though it had settled that.
+        //
+        // `part_count == ceil(src_size / part_size)` is the invariant that
+        // construction maintains — `div_ceil`, so a remainder gets its own
+        // part. A 50 GB source with 16 MiB parts and `part_count = 1` resumes
+        // as a one-part upload, completes 16 MiB of it, and then fails
+        // whole-object verification on every retry forever: the checkpoint is
+        // internally consistent enough to load and cannot ever succeed.
+        //
+        // A zero part size is its own arm because the division would panic, and
+        // because it produces empty ranges rather than wrong ones.
+        if part_size == 0 {
+            return Err(StorageError::Provider {
+                provider: "catalog",
+                op: "transfer_session".into(),
+                detail: "row has part_size = 0, which describes no upload at all".into(),
+            });
+        }
+        let expected = src_size.div_ceil(part_size).max(1);
+        if u64::from(part_count) != expected {
+            return Err(StorageError::Provider {
+                provider: "catalog",
+                op: "transfer_session".into(),
+                detail: format!(
+                    "row has part_count = {part_count} for {src_size} bytes at {part_size} \
+                     bytes per part, which is {expected}; this plan could not have come from \
+                     `PartPlan::new`, and resuming it uploads a prefix that can never verify"
+                ),
+            });
+        }
         let rows = stmt
             .query_map([r.0], |row| {
                 Ok((
@@ -617,7 +650,7 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
             plan: PartPlan {
                 total_size: src_size,
                 part_size,
-                part_count: part_count?,
+                part_count,
             },
             attempt_epoch: u32::try_from(r.12).unwrap_or_default(),
             upload_id: r.9.map(OpaqueToken::new),
