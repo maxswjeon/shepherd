@@ -9,7 +9,7 @@
 //!
 //! * **Preserved at minimum: bytes, `mtime`, and `mode`.** `mtime` is
 //!   preserved **to the resolution the target filesystem can represent**, which
-//!   is 1 ns on POSIX and 100 ns on NTFS — see `MTIME_RESOLUTION_NANOS`. That
+//!   is what the DESTINATION can hold — see `MTIME_GRANULARITIES`. That
 //!   narrowing is deliberate and was forced by measurement rather than chosen:
 //!   NTFS timestamps are FILETIME ticks, so a file tiered on Linux with a
 //!   nanosecond `mtime` cannot be restored bit-identically onto Windows by
@@ -186,9 +186,14 @@ pub enum FidelityBreach {
     /// §4.10.6 exists to prevent. `Unsupported` already reaches the user as a
     /// gap; `Captured`-but-not-applied was the arm with no reader.
     ///
+    /// An EMPTY captured map is NOT this: the capture ran and the class had
+    /// nothing, which is the same "nothing was lost" `Absent` records, and the
+    /// first version of this loop reported it as a breach — failing every
+    /// restore of a perfectly ordinary manifest.
+    ///
     /// This fails the restore rather than warning, which is the same stance
     /// the mode and mtime breaches take: a restore that reports success is a
-    /// claim of fidelity. Nothing produces `Captured` yet — the capture side
+    /// claim of fidelity. Nothing produces a non-empty `Captured` yet — the capture side
     /// is unwired, as `AttrCapture`'s own tests are its only source — so this
     /// costs nothing today and refuses on the first day it would have lied.
     OptionalNotRestored {
@@ -219,7 +224,22 @@ pub enum FidelityBreach {
 /// difference the target COULD have represented and did not — which is the
 /// breach the check exists to catch, and on POSIX the behaviour is unchanged
 /// because the resolution there is 1 ns.
-const MTIME_RESOLUTION_NANOS: i64 = if cfg!(unix) { 1 } else { 100 };
+/// The mtime granularities a destination might actually have, in nanoseconds.
+///
+/// This was `if cfg!(unix) { 1 } else { 100 }`, and the host OS is the wrong
+/// thing to ask. Unix does not imply nanosecond storage: FAT and exFAT mount
+/// perfectly well on Linux and macOS and keep 2-second and 10-millisecond
+/// timestamps, and ext3 and HFS+ keep whole seconds. On any of those,
+/// `set_modified` legitimately quantises the manifest's value, the constant
+/// still said 1 ns, and verification reported a breach — after which cleanup
+/// removed an otherwise perfect restore.
+///
+/// * `1` — ext4 with large inodes, xfs, btrfs, APFS.
+/// * `100` — NTFS, whose timestamps are FILETIME ticks.
+/// * `10_000_000` — exFAT.
+/// * `1_000_000_000` — ext3, HFS+, older UFS.
+/// * `2_000_000_000` — FAT32.
+const MTIME_GRANULARITIES: [i64; 5] = [1, 100, 10_000_000, 1_000_000_000, 2_000_000_000];
 
 /// Whether this platform's filesystems can represent a POSIX `mode` at all.
 ///
@@ -238,13 +258,40 @@ const MTIME_RESOLUTION_NANOS: i64 = if cfg!(unix) { 1 } else { 100 };
 /// a pass is exactly the silent drop it forbids.
 const MODE_IS_REPRESENTABLE: bool = cfg!(unix);
 
-/// Whether a restored mtime is as faithful as the target filesystem allows.
+/// Whether a restored mtime is as faithful as the destination allows.
 ///
-/// Not `abs() < resolution` on a whim: a difference SMALLER than one tick is
-/// the target quantising a value it cannot hold, which is physics. A difference
-/// of one tick or more is data the target could have kept and did not.
+/// # The read-back IS the probe
+///
+/// There is no need to ask the filesystem its resolution, and no portable way
+/// to: what came back through the handle already says what the destination
+/// stored. What is needed is a rule that tells QUANTISATION from ERROR, and
+/// exact landing on a tick boundary is that rule. A value the destination
+/// truncated or rounded to its own granularity is a multiple of it and within
+/// one tick of the original; a restore that wrote the wrong time is neither,
+/// because being off by minutes and landing exactly on a two-second boundary
+/// within two seconds of the manifest is not a thing a wrong write does.
+///
+/// Both conditions, and the boundary one is what keeps this tight. Accepting
+/// anything within one tick of the coarsest granularity would accept two
+/// seconds of drift on a nanosecond filesystem, which is the promise this check
+/// exists to keep rather than to widen.
+///
+/// The identity case is covered by `1`: every integer is a multiple of one, so
+/// the granularity-1 arm passes exactly when the values are equal, and a
+/// nanosecond destination behaves as it always did.
+///
+/// §4.10.6's stated reason for putting mtime in the floor — a restored file
+/// whose mtime is "now" instantly re-matches an age rule — is untouched by any
+/// of this. Two seconds does not re-match an age rule; two hundred days does,
+/// and that still fails every arm.
 fn mtime_is_faithful(expected: Timestamp, actual: Timestamp) -> bool {
-    (expected.as_nanos() - actual.as_nanos()).abs() < MTIME_RESOLUTION_NANOS
+    let (e, a) = (expected.as_nanos(), actual.as_nanos());
+    MTIME_GRANULARITIES
+        .iter()
+        // `rem_euclid`, not `%`: timestamps before 1970 are negative, and `%`
+        // takes the sign of the dividend, so a value exactly on a tick would
+        // fail the boundary test for being negative.
+        .any(|&g| a.rem_euclid(g) == 0 && (e - a).abs() < g)
 }
 
 /// Check a restore against its manifest's floor.
@@ -292,7 +339,19 @@ pub fn verify_restore(
     // lost in the first, and the second is already a declared gap carried
     // through `AttrCapture::is_gap`.
     for (class, capture) in &manifest.optional {
-        if let AttrCapture::Captured { values } = capture {
+        // An EMPTY captured map is not a loss, and reporting it as one was a
+        // regression: `Captured { values: {} }` is a legal manifest — the
+        // capture ran, the class had nothing — and `AttrCapture::is_gap`
+        // already says so. Every restore of such a manifest failed
+        // verification and had its otherwise perfect output cleaned up.
+        //
+        // Skipped here rather than normalised to `Absent` at construction: the
+        // manifest is a sidecar with a pinned serialisation, so rewriting what
+        // `with()` stores would change what old and new builds read from each
+        // other's files for no gain.
+        if let AttrCapture::Captured { values } = capture
+            && !values.is_empty()
+        {
             breaches.push(FidelityBreach::OptionalNotRestored {
                 class: *class,
                 values: values.len(),

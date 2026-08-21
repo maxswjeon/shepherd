@@ -565,7 +565,7 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
             remote_key: &key,
         },
         &DeleteModeProvider::new(),
-        &(&a as &dyn StorageAdapter),
+        &shepherd_tier::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &a),
         &audit,
         &locks,
         now,

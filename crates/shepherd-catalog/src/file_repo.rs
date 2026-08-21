@@ -584,6 +584,20 @@ impl<'a> FileRepo<'a> {
             .optional()?;
         let replaced = match (&prior, &fs_id) {
             (Some((_, Some(was))), Some(now_id)) => was != now_id,
+            // A NESTED MOUNT is a replacement too, through a different door.
+            // `ForeignVolume` is the walker POSITIVELY establishing that what
+            // is at this path now lives on another volume — it is not the
+            // "unknown" case, which is why `clear_fs_id` nulls the column
+            // instead of coalescing it. The row's custody therefore describes
+            // bytes that are not at this path, which is the same defect as a
+            // recreated inode.
+            //
+            // Recovering after an unmount costs one re-verification and no
+            // data: `fs_id` is NULL by then, so re-sighting the original inode
+            // is not "replaced" (an unknown side is never evidence), the digest
+            // was cleared so the file re-hashes, and the location is
+            // re-established from the object that still exists remotely.
+            (Some((_, Some(_))), None) if clear_fs_id => true,
             _ => false,
         };
 
@@ -619,9 +633,28 @@ impl<'a> FileRepo<'a> {
                  -- disk. Both writes or neither, subject to the statement's
                  -- trailing WHERE — see `# Concurrent scans of one root`.
                  last_seen_gen = excluded.last_seen_gen,
-                 -- first_seen_at is NEVER overwritten: §4.12 makes it the
-                 -- min-age floor source where mtime is untrusted or in the
-                 -- future, and a re-scan must not reset a file's apparent age.
+                 -- first_seen_at is never overwritten FOR THE SAME FILE:
+                 -- §4.12 makes it the min-age floor source where mtime is
+                 -- untrusted or in the future, and a re-scan must not reset a
+                 -- file's apparent age.
+                 --
+                 -- ?15 inverts that, and it has to. Age provenance is a claim
+                 -- about an INODE, and a replacement inherited all of it: a
+                 -- file created today at a path that had been there for a year
+                 -- inherited the year, satisfied a destructive age rule
+                 -- immediately, and walked past the minimum-age floor that
+                 -- exists for new files. `last_observed_access` and
+                 -- `access_signal_src` are not in the INSERT list at all, so
+                 -- they persist by omission on the conflict branch — a new
+                 -- file inheriting an access time hundreds of days old — and
+                 -- are reset explicitly here rather than left to it.
+                 first_seen_at = CASE
+                     WHEN ?15 = 1 THEN excluded.first_seen_at
+                     ELSE file.first_seen_at END,
+                 last_observed_access = CASE
+                     WHEN ?15 = 1 THEN NULL ELSE file.last_observed_access END,
+                 access_signal_src = CASE
+                     WHEN ?15 = 1 THEN NULL ELSE file.access_signal_src END,
                  --
                  -- state is preserved for the same shape of reason: a stub or
                  -- a tiered placeholder still stats, so a re-scan that wrote
@@ -1431,11 +1464,12 @@ mod tests {
             .upsert_file(&root, &first, GEN, Timestamp::from_nanos(1))
             .unwrap();
 
-        // Stand in for the tierer (Phase 2/3): a tiered row with a digest and
-        // a verified location.
+        // Stand in for the tierer (Phase 2/3): a tiered row with a digest, a
+        // verified location, and a year of age provenance.
         cat.conn_mut()
             .execute_batch(
-                "UPDATE file SET state = 'remote', blake3 = X'0102';
+                "UPDATE file SET state = 'remote', blake3 = X'0102',
+                     last_observed_access = 5, access_signal_src = 'observed';
                  INSERT INTO target (id, name, adapter) VALUES (1, 't', 's3');
                  INSERT INTO remote_object (id, target_id, key, size)
                      VALUES (1, 1, 'objects/aa/bb/aabb', 10);
@@ -1474,6 +1508,99 @@ mod tests {
             locations, 0,
             "the custody binding is what `destroy_permitted` reads; leaving it \
              attached is a live claim over bytes that are no longer at this path"
+        );
+
+        // AGE PROVENANCE is a claim about an inode, and this is a different
+        // one. Inheriting it lets a file created today satisfy a destructive
+        // age rule immediately and walk past the minimum-age floor that exists
+        // for new files.
+        let (first_seen, access, src): (i64, Option<i64>, Option<String>) = cat
+            .conn()
+            .query_row(
+                "SELECT first_seen_at, last_observed_access, access_signal_src FROM file",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            first_seen, 2,
+            "the new inode is first seen NOW, not a year ago"
+        );
+        assert_eq!(access, None, "and has no access history of its own yet");
+        assert_eq!(src, None);
+    }
+
+    /// A nested mount over a tiered path is a replacement too.
+    ///
+    /// `InodeSighting::ForeignVolume` is the walker POSITIVELY establishing
+    /// that what is at this path lives on another volume — not the "unknown"
+    /// case, which is why it nulls `fs_id` rather than coalescing it. The row
+    /// therefore carried `state='remote'`, the old digest and a verified
+    /// location for bytes that are not at this path, which is the recreated
+    /// inode defect through a different door.
+    ///
+    /// Recovering after an unmount costs one re-verification and no data:
+    /// `fs_id` is NULL by then, so re-sighting the original inode is not a
+    /// replacement (an unknown side is never evidence), and the file re-hashes
+    /// because the digest was cleared.
+    #[test]
+    fn a_nested_mount_over_a_tiered_path_revokes_its_custody() {
+        let (mut cat, root) = fixture();
+        let mut first = stat(root.id, "a.txt");
+        first.ino = InodeSighting::Known(11);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &first, GEN, Timestamp::from_nanos(1))
+            .unwrap();
+        cat.conn_mut()
+            .execute_batch(
+                "UPDATE file SET state = 'remote', blake3 = X'0102';
+                 INSERT INTO target (id, name, adapter) VALUES (1, 't', 's3');
+                 INSERT INTO remote_object (id, target_id, key, size)
+                     VALUES (1, 1, 'objects/aa/bb/aabb', 10);
+                 INSERT INTO object_location (file_id, target_id, remote_object_id, state)
+                     SELECT id, 1, 1, 'verified' FROM file;",
+            )
+            .unwrap();
+
+        let mut mounted = stat(root.id, "a.txt");
+        mounted.ino = InodeSighting::ForeignVolume;
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &mounted, GEN, Timestamp::from_nanos(2))
+            .unwrap();
+
+        let (st, hash, fs_id, locations): (String, Option<Vec<u8>>, Option<String>, i64) = cat
+            .conn()
+            .query_row(
+                "SELECT f.state, f.blake3, f.fs_id, (SELECT COUNT(*) FROM object_location) \
+                 FROM file f",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(st, "local", "what is visible at the path is a local file");
+        assert_eq!(hash, None, "and the old bytes' digest does not describe it");
+        assert_eq!(
+            fs_id, None,
+            "the recorded identity is wrong, not merely unknown"
+        );
+        assert_eq!(
+            locations, 0,
+            "and the custody binding is a live claim over bytes on another volume"
+        );
+
+        // AFTER THE UNMOUNT: the original inode is seen again. Nothing about it
+        // says "replaced", because the recorded side is unknown now — so this
+        // costs a re-hash and a re-verification, not data.
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &first, GEN, Timestamp::from_nanos(3))
+            .unwrap();
+        let fs_id: Option<String> = cat
+            .conn()
+            .query_row("SELECT fs_id FROM file", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            fs_id.is_some(),
+            "re-sighting the original inode must record its identity again"
         );
     }
 

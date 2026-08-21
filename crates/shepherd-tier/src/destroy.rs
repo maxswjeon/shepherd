@@ -47,7 +47,7 @@ use std::time::Duration;
 use shepherd_catalog::file_repo::ScanRoot;
 use shepherd_catalog::intent::{IntentKind, PreparedIntent};
 use shepherd_core::ObjectKey;
-use shepherd_core::{Blake3Hash, FsId, Timestamp};
+use shepherd_core::{Blake3Hash, FsId, TargetId, Timestamp};
 use shepherd_placeholder::provider::{PlaceholderProvider, Staged};
 use shepherd_scan::floors::{self, FloorContext, FloorInput, FloorPolicy};
 use shepherd_storage::adapter::{ObjectMeta, StorageAdapter, StorageError, VersionGuard};
@@ -207,7 +207,7 @@ pub async fn execute_local_destruction(
             req.expected_hash,
         )
         .map_err(|detail| DestroyError::Unbound { detail })?;
-    check_custody_binds(req)?;
+    check_custody_binds(req, remote.target())?;
 
     // Per-file serialization, keyed on identity. Held across every await below.
     //
@@ -383,7 +383,32 @@ fn restore_or_report(
 /// the id-addressed layout outright the day it is wired up, which is a
 /// coupling to today's only caller rather than to §4.9. The leaf is the part
 /// that is about the bytes, and it is the part both layouts agree on.
-fn check_custody_binds(req: &LocalDestroyRequest<'_>) -> Result<()> {
+fn check_custody_binds(req: &LocalDestroyRequest<'_>, gate: Option<TargetId>) -> Result<()> {
+    match gate {
+        Some(t) if t == req.custodian.target => {}
+        Some(t) => {
+            return Err(DestroyError::Unbound {
+                detail: format!(
+                    "the custody proof is for target {} and the closing HEAD would be sent to \
+                     target {}; proving an object exists somewhere else says nothing about \
+                     the replica that authorized this destruction",
+                    req.custodian.target.get(),
+                    t.get()
+                ),
+            });
+        }
+        None => {
+            return Err(DestroyError::Unbound {
+                detail: format!(
+                    "this remote gate cannot say which target it speaks to, so the closing \
+                     HEAD cannot be bound to the custody proof for target {}. Wrap the \
+                     adapter in `TargetGate`",
+                    req.custodian.target.get()
+                ),
+            });
+        }
+    }
+
     if req.custodian.expected_hash != req.expected_hash {
         return Err(DestroyError::Unbound {
             detail: format!(
@@ -477,6 +502,21 @@ async fn destroy_staged(
 /// one call site, and it is still here.
 #[async_trait::async_trait]
 pub trait RemoteGate: Send + Sync {
+    /// Which target this gate speaks to, if it knows.
+    ///
+    /// The closing HEAD proves an object exists — on whatever target the gate
+    /// happens to reach. Nothing tied that to the LOCATION that authorized the
+    /// destruction, so a custody proof from target A could be paired with a
+    /// HEAD against target B: under content attestation any same-sized object
+    /// at a hash-named key on B satisfies it, and the last local copy is
+    /// unlinked without A's replica ever being rechecked — A's may have
+    /// vanished.
+    ///
+    /// `None` is not a skip. `execute_local_destruction` REFUSES a gate that
+    /// cannot name its target, because "I do not know which target answered"
+    /// is not a weaker proof than a mismatch, it is the same one.
+    fn target(&self) -> Option<TargetId>;
+
     /// §4.10.2 step 3's cheap closing HEAD.
     async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>>;
 
@@ -484,8 +524,48 @@ pub trait RemoteGate: Send + Sync {
     async fn remove_object(&self, key: &ObjectKey, guard: &VersionGuard) -> Result<()>;
 }
 
+/// A [`RemoteGate`] that knows which target it speaks to.
+///
+/// The identity travels WITH the gate rather than beside it as another
+/// argument, for the reason [`LocalDestroyRequest::fs_id`] documents about lock
+/// keys: a value passed separately is a value that can be passed wrongly, and
+/// the failure is silent and on the irreversible path. Wrapping is how the
+/// caller says which target this adapter is, once, where it knows.
+pub struct TargetGate<'a> {
+    target: TargetId,
+    adapter: &'a dyn StorageAdapter,
+}
+
+impl<'a> TargetGate<'a> {
+    pub fn new(target: TargetId, adapter: &'a dyn StorageAdapter) -> Self {
+        Self { target, adapter }
+    }
+}
+
+#[async_trait::async_trait]
+impl RemoteGate for TargetGate<'_> {
+    fn target(&self) -> Option<TargetId> {
+        Some(self.target)
+    }
+
+    async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
+        RemoteGate::head_meta(&self.adapter, key).await
+    }
+
+    async fn remove_object(&self, key: &ObjectKey, guard: &VersionGuard) -> Result<()> {
+        RemoteGate::remove_object(&self.adapter, key, guard).await
+    }
+}
+
 #[async_trait::async_trait]
 impl RemoteGate for &dyn StorageAdapter {
+    /// A bare adapter does not know which target it is — that is a fact the
+    /// catalog holds, not the connection. Local destruction refuses it; remote
+    /// discard, which has no custodian to bind against, does not need it.
+    fn target(&self) -> Option<TargetId> {
+        None
+    }
+
     async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
         StorageAdapter::head(*self, key)
             .await
@@ -527,6 +607,20 @@ pub async fn execute_remote_discard(
     attestation: &str,
     now: Timestamp,
 ) -> Result<()> {
+    // The intent must be THIS deletion's. `authorizes` was wired to the local
+    // path alone, so an intent prepared for remote object A accompanied a
+    // DELETE of object B: the audit record then cites A's intent id while the
+    // durable recovery row describes A rather than the object that was
+    // irreversibly removed — a forensic record pointing at the wrong object,
+    // which is worse than none because recovery trusts it.
+    //
+    // Refused before `admit`, so a mismatch is not even charged against the
+    // audit gate. The key is the whole binding and that is sufficient here:
+    // §4.9 keys name the hash, so the key IS the statement about the bytes.
+    intent
+        .authorizes_object(key.as_str())
+        .map_err(|detail| DestroyError::Unbound { detail })?;
+
     // Under the same gate as local destruction, and for the same reason: this
     // path is irreversible too, and a halt that only stopped the branch that set
     // it would not be the global halt §4.10.4 promises. The gate is therefore

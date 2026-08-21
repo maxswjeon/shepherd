@@ -50,7 +50,7 @@ use shepherd_core::{Blake3Hash, CustodyClass, FileStat, ObjectKey, StubMode, Tar
 use shepherd_placeholder::DeleteModeProvider;
 use shepherd_placeholder::provider::FileIdentity;
 use shepherd_scan::{DenyList, FloorPolicy, IgnoreSet, walk};
-use shepherd_storage::adapter::{AttestationMode, StorageAdapter};
+use shepherd_storage::adapter::AttestationMode;
 use shepherd_storage::replica::bundle::{
     BundleEntry, CustodyKey, CustodyRecord, LogicalClock, bundle_class_of, decode_segment,
     encode_segment,
@@ -250,7 +250,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
             remote_key: &key,
         },
         &DeleteModeProvider::new(),
-        &(&adapter as &dyn StorageAdapter),
+        &shepherd_tier::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &adapter),
         &audit,
         &FileLocks::new(),
         now,

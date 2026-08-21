@@ -139,7 +139,7 @@ async fn an_intent_prepared_for_another_file_does_not_authorize_this_one() {
     let err = execute_local_destruction(
         &req,
         &f.provider,
-        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
         &f.audit,
         &f.locks,
         Timestamp::from_nanos(1),
@@ -175,7 +175,7 @@ async fn custody_verified_against_other_bytes_does_not_authorize_this_destroy() 
     let err = execute_local_destruction(
         &req,
         &f.provider,
-        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
         &f.audit,
         &f.locks,
         Timestamp::from_nanos(1),
@@ -203,7 +203,7 @@ async fn a_remote_key_naming_other_bytes_does_not_authorize_this_destroy() {
     let err = execute_local_destruction(
         &req,
         &f.provider,
-        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
         &f.audit,
         &f.locks,
         Timestamp::from_nanos(1),
@@ -215,6 +215,112 @@ async fn a_remote_key_naming_other_bytes_does_not_authorize_this_destroy() {
         "the refusal must say the key is about something else: {err}"
     );
     assert!(f.path.exists(), "and the file is still there");
+}
+
+/// The closing HEAD must ask the target that authorized the destruction.
+///
+/// The binding round 30 added checked the hash and the key and never checked
+/// WHICH target answered. A custody proof from target A paired with a gate
+/// reaching target B satisfies the closing HEAD under content attestation from
+/// any same-sized object at a hash-named key on B — while A's replica, the one
+/// that authorized this, is never rechecked and may have vanished.
+#[tokio::test]
+async fn a_closing_head_sent_to_another_target_does_not_authorize_this_destroy() {
+    let f = fixture("wrong-target", AttestationMode::Content);
+    let mut c = custodian(AttestationMode::Content, f.hash);
+    c.target = shepherd_core::TargetId::new(7);
+    let req = f.request(&c);
+
+    let err = execute_local_destruction(
+        &req,
+        &f.provider,
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("a HEAD against another target must not authorize this destroy");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains("target 7")),
+        "the refusal must name the target custody was proven against: {err}"
+    );
+    assert!(f.path.exists(), "and the file is still there");
+}
+
+/// A gate that cannot name its target is refused, not waved through.
+///
+/// This is the arm that decides whether the check above is a check: `None` is
+/// "I do not know which target answered", which is not a weaker proof than a
+/// mismatch — it is the same one. A bare adapter genuinely cannot know, since
+/// the target is a catalog fact rather than a property of the connection.
+#[tokio::test]
+async fn a_gate_that_cannot_name_its_target_does_not_authorize_this_destroy() {
+    let f = fixture("no-target", AttestationMode::Content);
+    let c = custodian(AttestationMode::Content, f.hash);
+    let req = f.request(&c);
+
+    let err = execute_local_destruction(
+        &req,
+        &f.provider,
+        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("a gate with no target must not authorize a destroy");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains("TargetGate")),
+        "the refusal must say how to fix it: {err}"
+    );
+    assert!(f.path.exists(), "and the file is still there");
+}
+
+/// The remote path validates its intent too.
+///
+/// `authorizes` was wired to the local path alone, so an intent prepared for
+/// remote object A could accompany a DELETE of object B — the audit record then
+/// cites A's intent id while the durable recovery row describes A rather than
+/// the object that was irreversibly removed. A forensic record pointing at the
+/// wrong object is worse than none, because recovery trusts it.
+#[tokio::test]
+async fn a_remote_intent_prepared_for_another_object_does_not_authorize_this_delete() {
+    let f = fixture("wrong-remote-intent", AttestationMode::Version);
+    let guard =
+        shepherd_storage::adapter::VersionGuard::Version(shepherd_core::ObjectVersion::new("v9"));
+    let elsewhere =
+        shepherd_catalog::identity::content_key("t", Blake3Hash::from_bytes([0x5A; 32]));
+
+    let err = execute_remote_discard(
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+            IntentId::new(31),
+            shepherd_catalog::intent::IntentKind::Remote,
+            elsewhere.as_str(),
+            0,
+            None,
+        ),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
+        &f.key,
+        &guard,
+        &f.audit,
+        "version",
+        Timestamp::from_nanos(5),
+    )
+    .await
+    .expect_err("an intent prepared for another object must not authorize this delete");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains(elsewhere.as_str())),
+        "the refusal must name what the intent was prepared for: {err}"
+    );
+    assert!(
+        f.adapter.deleted_keys().is_empty(),
+        "and nothing was deleted"
+    );
+    assert!(
+        f.audit.read_all().is_empty(),
+        "refused before `admit`, so the audit gate is not even charged"
+    );
 }
 
 /// A file old enough and big enough to clear the floors.
@@ -309,7 +415,7 @@ impl Fixture {
         execute_local_destruction(
             &self.request(custodian),
             &self.provider,
-            &(&self.adapter as &dyn shepherd_storage::StorageAdapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &self.adapter),
             &self.audit,
             &self.locks,
             Timestamp::from_nanos(1_000_000),
@@ -428,7 +534,7 @@ async fn content_changed_since_verification_aborts_and_restores() {
         execute_local_destruction(
             &req,
             &f.provider,
-            &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -466,7 +572,7 @@ async fn identity_mismatch_aborts_and_restores() {
         execute_local_destruction(
             &req,
             &f.provider,
-            &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -767,7 +873,7 @@ async fn the_destroy_path_stages_a_nested_file_into_the_registered_root() {
         execute_local_destruction(
             &req,
             &f.provider,
-            &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -880,7 +986,7 @@ async fn remote_discard_deletes_and_audits_through_the_same_apparatus() {
             payload().len() as i64,
             Some(f.hash),
         ),
-        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
         &f.key,
         &guard,
         &f.audit,
@@ -913,7 +1019,7 @@ async fn remote_discard_refuses_while_the_audit_log_is_halted() {
             payload().len() as i64,
             Some(f.hash),
         ),
-        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
         &f.key,
         &guard,
         &f.audit,
@@ -952,7 +1058,7 @@ async fn a_failing_unlink_restores_rather_than_orphaning_the_file() {
         execute_local_destruction(
             &f.request(&c),
             &provider,
-            &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &f.adapter),
             &f.audit,
             &f.locks,
             Timestamp::from_nanos(1),
@@ -1021,6 +1127,12 @@ impl AmbiguousDelete {
 
 #[async_trait::async_trait]
 impl RemoteGate for AmbiguousDelete {
+    // The target `custodian()` names, so these doubles exercise the path
+    // rather than the refusal. The refusal has its own test.
+    fn target(&self) -> Option<shepherd_core::TargetId> {
+        Some(shepherd_core::TargetId::new(1))
+    }
+
     async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
         self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !self.head_answers {
@@ -1275,6 +1387,12 @@ struct ParkedRemote<'a> {
 
 #[async_trait::async_trait]
 impl RemoteGate for ParkedRemote<'_> {
+    // The target `custodian()` names, so these doubles exercise the path
+    // rather than the refusal. The refusal has its own test.
+    fn target(&self) -> Option<shepherd_core::TargetId> {
+        Some(shepherd_core::TargetId::new(1))
+    }
+
     async fn head_meta(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>> {
         self.entered.notify_one();
         self.release.notified().await;

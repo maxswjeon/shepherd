@@ -364,6 +364,75 @@ fn a_manifest_with_no_captured_optionals_still_passes() {
             AttrCapture::Unsupported {
                 reason: "not macOS".into(),
             },
+        )
+        // The one that regressed: a capture that RAN and found nothing is a
+        // legal manifest, `is_gap` already treats it as no loss, and reporting
+        // it as a breach failed the restore and cleaned up its output.
+        .with(
+            AttrClass::PosixAcl,
+            AttrCapture::Captured {
+                values: BTreeMap::new(),
+            },
         );
     assert_eq!(verify_restore(&m, &restored()), Ok(()));
+}
+
+/// A destination that quantises mtime is not a destination that lost it.
+///
+/// The resolution used to be chosen from the host OS — 1 ns on unix, 100 ns
+/// otherwise — and the host OS does not know what is mounted under the restore
+/// path. FAT and exFAT mount fine on Linux and macOS and keep 2-second and
+/// 10-millisecond timestamps; ext3 and HFS+ keep whole seconds. On any of them
+/// `set_modified` legitimately quantised the value, verification called it a
+/// breach, and cleanup then removed a restore that was correct.
+///
+/// The read-back is already the probe. What this pins is the rule that tells
+/// quantisation from error: landing exactly on a tick boundary AND within one
+/// tick.
+#[test]
+fn an_mtime_quantised_by_the_destination_is_faithful_and_a_wrong_one_is_not() {
+    let ns = 1_700_000_000_123_456_789i64;
+    let m = FidelityManifest::new(CoreAttrs {
+        mtime: Timestamp::from_nanos(ns),
+        ..core()
+    });
+    let at = |t: i64| RestoredAttrs {
+        mtime: Timestamp::from_nanos(t),
+        ..restored()
+    };
+
+    for (label, g) in [
+        ("nanosecond", 1i64),
+        ("NTFS FILETIME", 100),
+        ("exFAT", 10_000_000),
+        ("ext3 / HFS+", 1_000_000_000),
+        ("FAT32", 2_000_000_000),
+    ] {
+        let quantised = ns - ns.rem_euclid(g);
+        assert_eq!(
+            verify_restore(&m, &at(quantised)),
+            Ok(()),
+            "a {label} destination stored what it could hold and this called it a breach"
+        );
+    }
+
+    // AND THE OTHER DIRECTION, which is what keeps the rule tight.
+    //
+    // Off by a tick and a bit: on a boundary, but further than one tick from
+    // the manifest. That is data the destination could have kept.
+    let two_ticks = ns - ns.rem_euclid(2_000_000_000) - 2_000_000_000;
+    assert!(
+        verify_restore(&m, &at(two_ticks)).is_err(),
+        "a value two whole ticks away is not quantisation"
+    );
+    // Close, but not on any boundary — the shape a wrong write has.
+    assert!(
+        verify_restore(&m, &at(ns - 3)).is_err(),
+        "a nanosecond destination could have held this exactly"
+    );
+    // And the case §4.10.6 put mtime in the floor for.
+    assert!(
+        verify_restore(&m, &at(1_900_000_000_000_000_000)).is_err(),
+        "an mtime of `now` re-matches an age rule and must still be a breach"
+    );
 }

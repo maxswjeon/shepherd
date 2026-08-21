@@ -303,10 +303,17 @@ pub struct NewIntent<'a> {
 /// forensic record; a record that describes a different file than the one that
 /// was destroyed is worse than none, because recovery trusts it.
 ///
-/// So the token carries what `prepare` wrote, and [`Self::authorizes`] is how
-/// the destroy path turns that into a refusal. The fields are private and there
-/// is no setter: a binding the holder can edit binds nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// So the token carries what `prepare` wrote, and [`Self::authorizes`] (local)
+/// and [`Self::authorizes_object`] (remote) are how the destroy path turns that
+/// into a refusal. The fields are private and there is no setter: a binding the
+/// holder can edit binds nothing.
+///
+/// **Neither `Copy` nor `Clone`, deliberately.** Both are ways for one prepared
+/// row to back several irreversible operations while describing only the first,
+/// and the row is the entire forensic record. Dropping `Copy` immediately
+/// caught a reuse in `ac6_recovery`; `Clone` was the escape hatch left behind,
+/// and a token that can be duplicated is a token that can be spent twice.
+#[derive(Debug, PartialEq, Eq)]
 pub struct PreparedIntent {
     id: IntentId,
     kind: IntentKind,
@@ -336,21 +343,7 @@ impl PreparedIntent {
         size: u64,
         blake3: Blake3Hash,
     ) -> std::result::Result<(), String> {
-        if self.kind != kind {
-            return Err(format!(
-                "intent {} was prepared as `{}` and this is a `{}` destruction",
-                self.id.get(),
-                self.kind.as_str(),
-                kind.as_str()
-            ));
-        }
-        if self.path != path {
-            return Err(format!(
-                "intent {} was prepared for `{}` and this destruction names `{path}`",
-                self.id.get(),
-                self.path
-            ));
-        }
+        self.names(kind, path)?;
         if self.size != size as i64 {
             return Err(format!(
                 "intent {} was prepared for {} bytes and this destruction names {size}",
@@ -372,6 +365,37 @@ impl PreparedIntent {
                 self.id.get()
             )),
         }
+    }
+
+    /// Whether this token authorizes destroying one REMOTE object.
+    ///
+    /// The key is the whole binding here, and that is not a weaker check than
+    /// the local one: §4.9 keys name the hash, so a key is a statement about
+    /// the bytes in a way a local pathname is not. Size and digest are what the
+    /// remote row does not carry — `execute_remote_discard`'s own audit record
+    /// writes `size: 0, blake3: None` — so requiring them would be requiring a
+    /// caller to invent them.
+    pub fn authorizes_object(&self, key: &str) -> std::result::Result<(), String> {
+        self.names(IntentKind::Remote, key)
+    }
+
+    fn names(&self, kind: IntentKind, path: &str) -> std::result::Result<(), String> {
+        if self.kind != kind {
+            return Err(format!(
+                "intent {} was prepared as `{}` and this is a `{}` destruction",
+                self.id.get(),
+                self.kind.as_str(),
+                kind.as_str()
+            ));
+        }
+        if self.path != path {
+            return Err(format!(
+                "intent {} was prepared for `{}` and this destruction names `{path}`",
+                self.id.get(),
+                self.path
+            ));
+        }
+        Ok(())
     }
 
     /// Mint one WITHOUT a journal. **Behind the `test-util` feature**, which is

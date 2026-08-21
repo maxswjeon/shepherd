@@ -544,14 +544,24 @@ impl Remote {
     ) -> std::result::Result<(), DestroyError> {
         execute_discard(
             charge,
+            // Bound to the DERIVED KEY, which is what `execute_discard`
+            // deletes — the round-30 fixture bound to the bare prefix, and a
+            // fixture's guess becomes the contract the moment something checks
+            // it. `derive_object_key` is the single place §4.9 keys are built,
+            // so it is also the single place a caller should be deriving the
+            // binding from.
             shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
                 shepherd_core::IntentId::new(intent as i64 + 1),
                 shepherd_catalog::intent::IntentKind::Remote,
-                prefix,
+                candidate
+                    .blake3
+                    .map(|h| crate::plan::derive_object_key(prefix, h))
+                    .as_ref()
+                    .map_or("", |k| k.as_str()),
                 0,
                 None,
             ),
-            &(&self.adapter as &dyn shepherd_storage::StorageAdapter),
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &self.adapter),
             candidate,
             target,
             root,
