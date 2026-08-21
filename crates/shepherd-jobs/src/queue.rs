@@ -173,6 +173,27 @@ impl Queue {
         Ok(Disposition::Done)
     }
 
+    /// Give a claimed job back without charging it an attempt.
+    ///
+    /// For an attempt that declined to START — no permit, no slot, a resource
+    /// another job holds — as distinct from one that tried and failed. The
+    /// claim already incremented `attempts`, so this returns it: an attempt
+    /// that discovered nothing and changed nothing is not one of the five a job
+    /// gets before it is terminally `failed`.
+    ///
+    /// Deliberately NOT reachable from `fail`: the difference between "this
+    /// work is failing" and "this work has not started" is the difference
+    /// between a budget that means something and one that expires on
+    /// contention.
+    pub fn defer(
+        cat: &mut Catalog,
+        id: JobId,
+        until: Timestamp,
+        now: Timestamp,
+    ) -> Result<(), CatalogError> {
+        JobRepo::new(cat).defer(id, until, now)
+    }
+
     /// Record a failed attempt and decide whether it gets another.
     ///
     /// The decision is made here, in one place, so "why did this job stop

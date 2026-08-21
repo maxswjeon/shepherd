@@ -288,6 +288,43 @@ pub async fn upload_item(
     // Resume if a session survived; plan a fresh one otherwise. The driver
     // handles every crash window from whichever state it finds.
     let mut session = match store.load(job).await? {
+        // BOUND TO THIS ITEM before any provider call.
+        //
+        // A persisted session was accepted on the strength of its job id alone,
+        // and the driver then lists, aborts, uploads and verifies
+        // `session.remote_key` through the adapter it was handed. The lock
+        // above is on `item.remote_key`, so a session naming a DIFFERENT key
+        // operates on that key without holding its lock — an `Initiating`
+        // session can abort another upload's multipart, and a `Committed` one
+        // simply reports success for an item nobody uploaded. A replanned job,
+        // an imported checkpoint or a miswired caller all produce that.
+        //
+        // Refused rather than repaired: a checkpoint that does not describe the
+        // work in hand is not a resume, and picking one of the two descriptions
+        // to believe is how the wrong object gets touched.
+        Some(s)
+            if s.target != item.target
+                || s.remote_key != item.remote_key
+                || s.source.file_id != item.file
+                || s.source.blake3 != item.blake3 =>
+        {
+            return Err(StorageError::Provider {
+                provider: "catalog",
+                op: "resume".into(),
+                detail: format!(
+                    "job {} has a checkpoint for target {} key {} file {} and this item is \
+                     target {} key {} file {}; a session that does not describe this work is \
+                     not a resume",
+                    job.get(),
+                    s.target.get(),
+                    s.remote_key.as_str(),
+                    s.source.file_id.get(),
+                    item.target.get(),
+                    item.remote_key.as_str(),
+                    item.file.get()
+                ),
+            });
+        }
         Some(s) => s,
         None => {
             // From the source, so it cannot disagree with what the driver will

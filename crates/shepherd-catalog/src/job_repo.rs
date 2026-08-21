@@ -272,6 +272,26 @@ impl<'a> JobRepo<'a> {
         Ok(())
     }
 
+    /// Requeue a claimed job and GIVE BACK the attempt the claim took.
+    ///
+    /// `requeue` leaves `attempts` alone, which is right for a job that ran and
+    /// is being retried. This is for one that never started — see
+    /// `Queue::defer` — so the increment `claim` applied is undone. Saturating,
+    /// because a row edited to `attempts = 0` must not wrap.
+    pub fn defer(&mut self, id: JobId, run_after: Timestamp, now: Timestamp) -> Result<()> {
+        self.0.conn_mut().execute(
+            "UPDATE job
+             SET state = 'queued',
+                 run_after = ?2,
+                 attempts = MAX(attempts - 1, 0),
+                 last_error = NULL,
+                 updated_at = ?3
+             WHERE id = ?1",
+            params![id.get(), run_after.as_nanos(), now.as_nanos()],
+        )?;
+        Ok(())
+    }
+
     /// Persist a resume point. T6's worker calls this; the row shape is what
     /// makes "kill the daemon mid-upload, restart, resume without re-sending
     /// verified parts" (AC-2) expressible at all.

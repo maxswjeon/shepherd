@@ -335,15 +335,45 @@ fn write_and_verify(
     // early would otherwise produce a short file whose only complaint is a
     // content breach, and "the download stopped" is a different problem from
     // "the bytes were wrong".
+    // BOUNDED BY THE MANIFEST, so an over-long source cannot spend disk it was
+    // never entitled to.
+    //
+    // The length check used to happen after the loop, which is too late: a
+    // corrupt or replaced remote object, or a reader that simply does not stop,
+    // wrote its whole stream first — so a restore expected to cost a few
+    // megabytes could fill the destination filesystem before the check ran and
+    // cleanup fired. `take` caps what is read at exactly the expected size, and
+    // one extra byte afterwards distinguishes "ended early" from "has more",
+    // without either answer costing another write.
     let mut written = 0u64;
     let mut buf = vec![0u8; RESTORE_CHUNK];
-    loop {
-        let n = src.read(&mut buf).map_err(io)?;
+    // Capped by shrinking the read window rather than with `Read::take`, which
+    // needs `Sized` and cannot be called on a trait object.
+    while written < manifest.core.size {
+        let room = usize::try_from(manifest.core.size - written).unwrap_or(usize::MAX);
+        let window = room.min(buf.len());
+        let n = src.read(&mut buf[..window]).map_err(io)?;
         if n == 0 {
             break;
         }
         f.write_all(&buf[..n]).map_err(io)?;
         written += n as u64;
+    }
+    if written == manifest.core.size {
+        let mut extra = [0u8; 1];
+        // `read` rather than `read_exact`: zero is the answer that means the
+        // source ended where the manifest says it does, which is the healthy
+        // case and not an error.
+        if src.read(&mut extra).map_err(io)? > 0 {
+            return Err(RestoreError::Io {
+                path: chosen.display().to_string(),
+                detail: format!(
+                    "the source has more than the {} bytes the manifest records; it is not \
+                     this object, and the surplus was refused rather than written",
+                    manifest.core.size
+                ),
+            });
+        }
     }
     if written != manifest.core.size {
         return Err(RestoreError::Io {

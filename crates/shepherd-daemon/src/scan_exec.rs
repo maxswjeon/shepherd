@@ -313,12 +313,22 @@ impl Executor for ScanExecutor {
         // `MAX_CONCURRENT_WALKS`. Held past the batching loop below, since the
         // `Vec<FileStat>` it bounds is alive until that loop has drained it.
         let Some(_walk_permit) = WalkPermit::acquire() else {
-            return Err(format!(
-                "{MAX_CONCURRENT_WALKS} full-tree walks are already in flight and a slot did \
-                 not free within {}s; each holds an entire tree in memory, so this scan is \
-                 returned to the queue rather than joining them",
-                WALK_PERMIT_WAIT.as_secs()
+            // DEFERRED, not failed. This attempt discovered nothing and changed
+            // nothing — two large walks are simply already in flight — and
+            // reporting it as a failure spent one of the queue's five attempts.
+            // Two 10-million-file scans hold their permits for far longer than
+            // five 30-second waits, so a third scan became terminally `failed`
+            // without anything ever having gone wrong. `JobContext::defer`
+            // gives back the attempt the claim took.
+            ctx.defer(shepherd_core::Timestamp::from_nanos(
+                now().as_nanos() + WALK_PERMIT_WAIT.as_nanos() as i64,
             ));
+            tracing::info!(
+                root = root_id,
+                "deferring: {MAX_CONCURRENT_WALKS} full-tree walks are already in flight, and \
+                 each holds an entire tree in memory"
+            );
+            return Ok(());
         };
         let output = walk(rid, &path, &deny, &ignores, now())
             .map_err(|e| format!("walking {}: {e}", root.path))?;

@@ -177,7 +177,7 @@ async fn an_intent_prepared_for_another_file_does_not_authorize_this_one() {
     };
 
     let err = execute_local_destruction(
-        &req,
+        req,
         &f.provider,
         &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.audit,
@@ -213,7 +213,7 @@ async fn custody_verified_against_other_bytes_does_not_authorize_this_destroy() 
     let req = f.request(&c);
 
     let err = execute_local_destruction(
-        &req,
+        req,
         &f.provider,
         &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.audit,
@@ -241,7 +241,7 @@ async fn a_remote_key_naming_other_bytes_does_not_authorize_this_destroy() {
     };
 
     let err = execute_local_destruction(
-        &req,
+        req,
         &f.provider,
         &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.audit,
@@ -272,7 +272,7 @@ async fn a_closing_head_sent_to_another_target_does_not_authorize_this_destroy()
     let req = f.request(&c);
 
     let err = execute_local_destruction(
-        &req,
+        req,
         &f.provider,
         &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.audit,
@@ -301,7 +301,7 @@ async fn a_gate_that_cannot_name_its_target_does_not_authorize_this_destroy() {
     let req = f.request(&c);
 
     let err = execute_local_destruction(
-        &req,
+        req,
         &f.provider,
         &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
         &f.audit,
@@ -393,7 +393,7 @@ async fn a_root_gate_that_closes_during_a_destroy_stops_it_before_the_unlink() {
 
     let Some(r) = past_the_open_handle_floor(
         execute_local_destruction(
-            &req,
+            req,
             &f.provider,
             &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
@@ -432,14 +432,19 @@ async fn a_gate_for_another_root_does_not_authorize_this_destroy() {
     let c = custodian(AttestationMode::Version, f.hash);
     let mut root = f.root.clone();
     root.id = shepherd_core::RootId::new(2);
+    // The request AGREES WITH ITSELF — the catalog records the file under the
+    // root the request supplies — so only the gate disagrees. Without this the
+    // (earlier, cheaper) owning-root check fires first and this test would pass
+    // without ever reaching the gate.
     let req = LocalDestroyRequest {
         root: &root,
+        file_root: shepherd_core::RootId::new(2),
         ..f.request(&c)
     };
 
     let Some(r) = past_the_open_handle_floor(
         execute_local_destruction(
-            &req,
+            req,
             &f.provider,
             &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
@@ -515,7 +520,7 @@ async fn a_replica_that_disappears_while_the_destroy_waits_stops_the_unlink() {
 
     let Some(r) = past_the_open_handle_floor(
         execute_local_destruction(
-            &req,
+            req,
             &f.provider,
             &remote,
             &f.audit,
@@ -564,7 +569,7 @@ async fn a_remote_key_outside_the_gates_prefix_does_not_authorize_this_destroy()
     };
 
     let err = execute_local_destruction(
-        &req,
+        req,
         &f.provider,
         &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
         &f.audit,
@@ -588,7 +593,7 @@ async fn a_remote_key_outside_the_gates_prefix_does_not_authorize_this_destroy()
         ..f.request(&c)
     };
     let err = execute_local_destruction(
-        &req,
+        req,
         &f.provider,
         &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "tenant/a", &f.adapter),
         &f.audit,
@@ -613,7 +618,7 @@ async fn a_remote_key_outside_the_gates_prefix_does_not_authorize_this_destroy()
         };
         let Some(r) = past_the_open_handle_floor(
             execute_local_destruction(
-                &req,
+                req,
                 &f.provider,
                 &crate::destroy::TargetGate::new(
                     shepherd_core::TargetId::new(1),
@@ -635,6 +640,41 @@ async fn a_remote_key_outside_the_gates_prefix_does_not_authorize_this_destroy()
             "a key under the gate's own prefix (`{configured}`) was refused: {r:?}"
         );
     }
+}
+
+/// The root that governs a destruction is the one the CATALOG says owns the
+/// file.
+///
+/// `root` and `path` arrive independently, and §4.9 allows roots to overlap —
+/// so pathname containment cannot decide which root owns a file, and nothing
+/// checked. A caller could hand root A's file to root B's open snapshot and
+/// gate: the floors, the refusal check and the held gate would all run against
+/// B's authority while A required resync or was unavailable, and the unlink
+/// would proceed on the strength of the wrong root's answer.
+#[tokio::test]
+async fn a_root_that_does_not_own_the_file_does_not_authorize_this_destroy() {
+    let f = fixture("wrong-owner", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let req = LocalDestroyRequest {
+        file_root: shepherd_core::RootId::new(9),
+        ..f.request(&c)
+    };
+
+    let err = execute_local_destruction(
+        req,
+        &f.provider,
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("a root that does not own the file must not authorize its destruction");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains("under root 9")),
+        "the refusal must name the root the catalog records: {err}"
+    );
+    assert!(f.path.exists(), "and the file is still there");
 }
 
 /// A file old enough and big enough to clear the floors.
@@ -725,12 +765,15 @@ impl Fixture {
             custodian,
             remote_key: &self.key,
             root_gate: &self.gate,
+            // The catalog's answer for this fixture's file, which is the
+            // fixture's own root.
+            file_root: self.root.id,
         }
     }
 
     async fn run(&self, custodian: &Location) -> Result<()> {
         execute_local_destruction(
-            &self.request(custodian),
+            self.request(custodian),
             &self.provider,
             &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &self.adapter),
             &self.audit,
@@ -849,7 +892,7 @@ async fn content_changed_since_verification_aborts_and_restores() {
 
     let Some(r) = past_the_open_handle_floor(
         execute_local_destruction(
-            &req,
+            req,
             &f.provider,
             &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
@@ -887,7 +930,7 @@ async fn identity_mismatch_aborts_and_restores() {
 
     let Some(r) = past_the_open_handle_floor(
         execute_local_destruction(
-            &req,
+            req,
             &f.provider,
             &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
@@ -1188,7 +1231,7 @@ async fn the_destroy_path_stages_a_nested_file_into_the_registered_root() {
 
     let Some(r) = past_the_open_handle_floor(
         execute_local_destruction(
-            &req,
+            req,
             &f.provider,
             &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
@@ -1373,7 +1416,7 @@ async fn a_failing_unlink_restores_rather_than_orphaning_the_file() {
 
     let Some(r) = past_the_open_handle_floor(
         execute_local_destruction(
-            &f.request(&c),
+            f.request(&c),
             &provider,
             &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
             &f.audit,
@@ -1810,7 +1853,7 @@ async fn a_destroy_already_admitted_does_not_unlink_after_another_one_halts_the_
         parked: std::sync::atomic::AtomicBool::new(false),
     };
     let second_destroy = execute_local_destruction(
-        &req2,
+        req2,
         &f.provider,
         &parked,
         &f.audit,
@@ -1927,7 +1970,7 @@ async fn two_concurrent_destroys_with_a_healthy_audit_log_both_complete() {
         parked: std::sync::atomic::AtomicBool::new(false),
     };
     let second_destroy = execute_local_destruction(
-        &req2,
+        req2,
         &f.provider,
         &parked,
         &f.audit,

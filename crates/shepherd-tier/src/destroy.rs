@@ -121,6 +121,15 @@ pub struct LocalDestroyRequest<'a> {
     pub intent: PreparedIntent,
     pub path: &'a Path,
     pub root: &'a ScanRoot,
+    /// The catalog `root_id` that OWNS [`Self::path`], as the file row records
+    /// it.
+    ///
+    /// Not derived from [`Self::root`], because that is the snapshot the caller
+    /// chose and this is the fact the catalog holds. §4.9 allows roots to
+    /// overlap, so pathname containment cannot settle which root owns a file —
+    /// a caller could hand A's file to B's open snapshot and gate, and every
+    /// PM-3 check would then run against B's authority while A required resync.
+    pub file_root: RootId,
     /// The hash proven against the remote copy.
     pub expected_hash: Blake3Hash,
     pub expected_size: u64,
@@ -173,7 +182,7 @@ pub struct LocalDestroyRequest<'a> {
 /// primitive; this is the protocol around it.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_local_destruction(
-    req: &LocalDestroyRequest<'_>,
+    req: LocalDestroyRequest<'_>,
     provider: &dyn PlaceholderProvider,
     remote: &impl RemoteGate,
     audit: &AuditLog,
@@ -189,6 +198,25 @@ pub async fn execute_local_destruction(
     // forgotten here.
     if let Some(reason) = req.root.destroy_refusal() {
         return Err(DestroyError::Root(reason));
+    }
+
+    // The ROOT must be the one that owns this file.
+    //
+    // `root` and `path` arrived independently, and §4.9 allows roots to
+    // overlap — so pathname containment cannot decide it, and the catalog's own
+    // answer is the only one that can. Without this, A's file could be
+    // destroyed under B's snapshot and B's gate: the floors, the refusal check
+    // and the held gate would all be about a root that does not own it.
+    if req.file_root != req.root.id {
+        return Err(DestroyError::Unbound {
+            detail: format!(
+                "the catalog records this file under root {} and the request supplies root \
+                 {}; overlapping roots are allowed, so containment does not decide which \
+                 one's PM-3 gates govern it",
+                req.file_root.get(),
+                req.root.id.get()
+            ),
+        });
     }
 
     // The intent must be THIS destruction's, and the custody proof must be
@@ -213,7 +241,7 @@ pub async fn execute_local_destruction(
             req.expected_hash,
         )
         .map_err(|detail| DestroyError::Unbound { detail })?;
-    check_custody_binds(req, remote.target(), remote.prefix())?;
+    check_custody_binds(&req, remote.target(), remote.prefix())?;
 
     // Per-file serialization, keyed on identity. Held across every await below.
     //
@@ -257,7 +285,7 @@ pub async fn execute_local_destruction(
 
     // From here on, every failure path must restore rather than proceed.
     // §4.10.4 is abort-forward-never.
-    let outcome = destroy_staged(req, &staged, remote, now).await;
+    let outcome = destroy_staged(&req, &staged, remote, now).await;
     match outcome {
         Ok(()) => {}
         Err(e) => {
@@ -337,7 +365,7 @@ pub async fn execute_local_destruction(
     //
     // Both waits are behind it now, and the hold is still alive, so what
     // remains between this answer and the syscall is straight-line code.
-    if let Err(e) = closing_head(req, remote).await {
+    if let Err(e) = closing_head(&req, remote).await {
         drop(permit);
         restore_or_report(
             provider,

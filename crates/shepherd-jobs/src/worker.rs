@@ -91,6 +91,8 @@ pub const IDLE_POLL: Duration = Duration::from_millis(250);
 pub struct JobContext {
     pub job: Job,
     writer: CatalogWriter,
+    /// Set by [`JobContext::defer`]. Read once, after the executor returns.
+    deferred: std::sync::Mutex<Option<Timestamp>>,
 }
 
 impl JobContext {
@@ -101,6 +103,29 @@ impl JobContext {
     /// The resume point this attempt should start from, if any.
     pub fn checkpoint(&self) -> Option<&str> {
         self.job.checkpoint_json.as_deref()
+    }
+
+    /// Give the job back without having done any of it.
+    ///
+    /// For a refusal that is about CONTENTION rather than about the work: no
+    /// permit, no slot, a resource another job is holding. Such an attempt
+    /// discovers nothing and fixes nothing, and reporting it as a failure spends
+    /// one of the queue's `MAX_ATTEMPTS` — so a job that keeps losing a race
+    /// becomes terminally `failed` without anything ever having gone wrong.
+    /// `shepherd-daemon`'s walk permit is the case that made this necessary:
+    /// two large scans can hold both permits for far longer than five 30-second
+    /// waits.
+    ///
+    /// The attempt taken by the claim is given back, because it was not one.
+    /// The executor must return `Ok(())` after calling this — it has not
+    /// failed, it has declined to start.
+    pub fn defer(&self, until: Timestamp) {
+        *self.deferred.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
+    }
+
+    /// When this attempt asked to be retried, if it did.
+    pub fn deferred_until(&self) -> Option<Timestamp> {
+        *self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Persist a resume point mid-run.
@@ -369,6 +394,7 @@ pub fn run_one(
     };
 
     let ctx = JobContext {
+        deferred: std::sync::Mutex::new(None),
         job: job.clone(),
         writer: writer.clone(),
     };
@@ -399,6 +425,28 @@ pub fn run_one(
     // Every arm reports AFTER its catalog write returns. A transition announced
     // and then not committed is worse than one nobody saw.
     let (id, class, attempts) = (job.id, job.class, job.attempts);
+    // A DEFERRAL is not a completion and not a failure.
+    //
+    // Checked before both arms, because the executor signals it by returning
+    // `Ok(())` — it has not failed, it has declined to start — and completing
+    // the job here would mark work done that nobody did.
+    if let Some(until) = ctx.deferred_until()
+        && outcome.is_ok()
+    {
+        persist(stop, || {
+            writer.try_with(move |cat| Queue::defer(cat, id, until, now()))
+        })?;
+        observer.transition(Transition {
+            id,
+            class,
+            from: JobState::Running,
+            to: JobState::Queued,
+            attempts: attempts.saturating_sub(1),
+            last_error: None,
+        });
+        return Ok(true);
+    }
+
     match outcome {
         Ok(()) => {
             // `?` here used to abandon the claimed row: `run_one` returned the
@@ -1063,5 +1111,66 @@ mod tests {
         assert_eq!(r.classes(), vec!["hash", "scan"]);
         assert!(r.get(JobClass::Scan).is_some());
         assert!(r.get(JobClass::Upload).is_none());
+    }
+
+    /// A deferred attempt gives back the attempt the claim took.
+    ///
+    /// Contention is not failure. An attempt that declined to START — no
+    /// permit, no slot, a resource another job holds — discovered nothing and
+    /// changed nothing, and charging it against `MAX_ATTEMPTS` makes a job that
+    /// keeps losing a race terminally `failed` without anything having gone
+    /// wrong. The daemon's walk permit is the case: two large scans can hold
+    /// both permits far longer than five 30-second waits.
+    #[test]
+    fn a_deferred_job_is_requeued_without_spending_an_attempt() {
+        let actor = actor_in_memory();
+        let w = actor.handle();
+        w.try_with(|cat| Queue::enqueue(cat, JobClass::Scan, 0, "{}", now()))
+            .unwrap();
+
+        let deferred_until = Timestamp::from_nanos(now().as_nanos() + 60_000_000_000);
+        let registry = Arc::new(Registry::new().with(JobClass::Scan, {
+            move |ctx: &JobContext| {
+                ctx.defer(deferred_until);
+                Ok(())
+            }
+        }));
+        let stop = AtomicBool::new(false);
+
+        // Three attempts that all decline. Under `fail` this would be three of
+        // five spent; under `defer` the job is exactly where it started.
+        for _ in 0..3 {
+            // The job is not claimable until `run_after`, so each round moves
+            // it back by hand — this test is about `attempts`, not the clock.
+            w.try_with(|cat| {
+                shepherd_catalog::job_repo::JobRepo::new(cat).defer(
+                    JobId::new(1),
+                    Timestamp::from_nanos(0),
+                    now(),
+                )
+            })
+            .unwrap();
+            assert!(run_one(&w, &registry, &(), &stop).unwrap());
+        }
+
+        let job = w
+            .try_with(|cat| shepherd_catalog::job_repo::JobRepo::new(cat).get(JobId::new(1)))
+            .unwrap()
+            .expect("the job is still there");
+        assert_eq!(
+            job.state,
+            JobState::Queued,
+            "a deferred job goes back to the queue, not to done or failed"
+        );
+        assert_eq!(
+            job.attempts, 0,
+            "three declined attempts spent {} of the retry budget",
+            job.attempts
+        );
+        assert!(
+            job.last_error.is_none(),
+            "declining to start is not an error to report: {:?}",
+            job.last_error
+        );
     }
 }

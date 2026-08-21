@@ -227,8 +227,9 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     // exactly the reuse the binding exists to stop.
     let prepared_intent_id = prepared_intent.id();
     let destroyed = execute_local_destruction(
-        &LocalDestroyRequest {
+        LocalDestroyRequest {
             root_gate: &OpenGate,
+            file_root: root.id,
             // Minted by the JOURNAL, not fabricated. `PreparedIntent` exists so
             // that "an intent was durably prepared before anything
             // irreversible" is a precondition rather than a comment, and a

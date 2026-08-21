@@ -546,8 +546,9 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
     .expect("fs_id");
 
     execute_local_destruction(
-        &LocalDestroyRequest {
+        LocalDestroyRequest {
             root_gate: &OpenGate,
+            file_root: root.id,
             intent: shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
                 IntentId::new(1),
                 shepherd_catalog::intent::IntentKind::Local,

@@ -50,6 +50,13 @@ use std::sync::Mutex;
 use rusqlite::OptionalExtension;
 use shepherd_catalog::writer::{CatalogWriter, WriterError};
 use shepherd_catalog::{Catalog, CatalogError};
+/// The most parts any provider this build speaks to accepts.
+///
+/// S3's limit, which `multipart::plan` already works to — it grows the part
+/// size rather than exceeding this. A persisted count above it did not come
+/// from a plan this code made.
+const MAX_PARTS: u32 = 10_000;
+
 use shepherd_core::{
     Blake3Hash, FileId, FsId, JobId, ObjectKey, ObjectVersion, TargetId, Timestamp,
 };
@@ -513,6 +520,29 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
         };
         let part_size = nonneg("part_size", r.10)?;
         let src_size = nonneg("src_size", r.5)?;
+        // `part_count` was only CONVERTED, and conversion is not validation:
+        // `u32::try_from(..).unwrap_or(1)` turned a negative into 1 and let
+        // `4_294_967_295` straight through, after which `reconcile_parts`
+        // allocates an actions vector of that length and the daemon dies. Zero
+        // was accepted too, which is not a plan.
+        //
+        // Bounded by the same invariant `multipart::plan` works to: no provider
+        // this build speaks to takes more than `MAX_PARTS`, so a row above it
+        // did not come from a plan this code made.
+        let part_count = {
+            let raw = r.11.unwrap_or(1);
+            u32::try_from(raw)
+                .ok()
+                .filter(|n| (1..=MAX_PARTS).contains(n))
+                .ok_or_else(|| StorageError::Provider {
+                    provider: "catalog",
+                    op: "transfer_session".into(),
+                    detail: format!(
+                        "row has part_count = {raw}, outside 1..={MAX_PARTS} — refusing to \
+                         resume a plan this build could not have produced"
+                    ),
+                })
+        };
         let rows = stmt
             .query_map([r.0], |row| {
                 Ok((
@@ -587,7 +617,7 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
             plan: PartPlan {
                 total_size: src_size,
                 part_size,
-                part_count: u32::try_from(r.11.unwrap_or(1)).unwrap_or(1),
+                part_count: part_count?,
             },
             attempt_epoch: u32::try_from(r.12).unwrap_or_default(),
             upload_id: r.9.map(OpaqueToken::new),
