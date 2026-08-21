@@ -626,6 +626,78 @@ fn a_page_larger_than_the_daemon_will_hold_is_refused() {
     );
 }
 
+/// A second scan of a root that is already pending is coalesced, not queued.
+///
+/// `shepherd_scan::walk` materialises the whole `Vec<FileStat>` before
+/// batching, so a full tree is resident for the length of the scan — and the
+/// pool runs four executors. Starting the same large root repeatedly retained
+/// four full trees at once and could exhaust the daemon before any
+/// index-rebuild gate applied; a second scan would also produce nothing the
+/// first one will not.
+///
+/// Reported through `skipped`, so the caller is told which roots did not start
+/// and why rather than being handed a job id that does the same work twice.
+#[test]
+fn a_scan_of_a_root_already_pending_is_coalesced() {
+    let d = Daemon::start("coalesce");
+    let mut c = d.connect();
+    let dir = d.dir.join("tree");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..64 {
+        std::fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+    }
+    let root_id = c.call(
+        "root.add",
+        serde_json::json!({ "path": dir.to_string_lossy(), "stub_mode": "delete" }),
+    )["root"]["root_id"]
+        .as_i64()
+        .expect("root_id");
+
+    // Two starts, back to back. Whichever wins, exactly one job exists.
+    let first = c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    let second = c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+
+    let started: usize = [&first, &second]
+        .iter()
+        .map(|r| r["roots_started"].as_array().map_or(0, Vec::len))
+        .sum();
+    let skipped: Vec<&serde_json::Value> = [&first, &second]
+        .iter()
+        .filter_map(|r| r["skipped"].as_array())
+        .flatten()
+        .collect();
+
+    // The first may already have finished, in which case the second starts
+    // legitimately — a completed scan is not pending. What must never happen is
+    // BOTH being queued at once, and the skip must say why when it happens.
+    assert!(
+        started >= 1,
+        "at least one start must have taken: {first} / {second}"
+    );
+    if started == 1 {
+        assert_eq!(skipped.len(), 1, "{first} / {second}");
+        assert!(
+            skipped[0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already queued or running"),
+            "the skip must name the reason: {}",
+            skipped[0]
+        );
+    }
+
+    // AND THE ACCEPTING DIRECTION: once the scan has finished, the root can be
+    // scanned again — coalescing must not be a one-scan-per-root rule.
+    let scan = wait_for_scan(&mut c, root_id);
+    assert!(scan["last_error"].is_null(), "{scan}");
+    let again = c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    assert_eq!(
+        again["roots_started"].as_array().map_or(0, Vec::len),
+        1,
+        "a finished scan must not block the next one: {again}"
+    );
+}
+
 /// The skew case §4.3 calls the most common one, end to end.
 #[test]
 fn a_major_version_mismatch_is_rejected_with_both_versions_named() {

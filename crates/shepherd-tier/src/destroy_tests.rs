@@ -1491,6 +1491,12 @@ fn v9() -> VersionGuard {
 /// the **audit log** rather than on the return value is the point: propagating
 /// the provider error was already what this did, and it left no evidence that
 /// the object had been destroyed at all.
+///
+/// Under a CONTENT-ADDRESSED guard, deliberately. The key is the identity
+/// there, so an absent key is an absent object and the outcome really is
+/// resolved. This used to run under a version guard, where a plain HEAD cannot
+/// establish that at all — see
+/// `an_absent_key_under_a_version_guard_is_not_a_resolved_delete`.
 #[tokio::test]
 async fn a_lost_delete_acknowledgement_is_still_audited() {
     let f = fixture("discard-lost-ack", AttestationMode::Version);
@@ -1506,9 +1512,9 @@ async fn a_lost_delete_acknowledgement_is_still_audited() {
         ),
         &remote,
         &f.key,
-        &v9(),
+        &VersionGuard::ContentAddressed { expect: f.hash },
         &f.audit,
-        "version",
+        "content",
         Timestamp::from_nanos(5),
     )
     .await
@@ -1970,5 +1976,54 @@ async fn two_concurrent_destroys_with_a_healthy_audit_log_both_complete() {
     assert!(
         f.provider.list_staged(&f.tmp.0).unwrap().is_empty(),
         "nothing is left in staging"
+    );
+}
+
+/// An absent key under a VERSION guard is not a resolved delete.
+///
+/// `head_meta` answers about the CURRENT version, and a delete marker — one
+/// that was already there, or one another writer added — makes it answer
+/// "absent" while the guarded version is still present as a noncurrent one. So
+/// `Ok(None)` is equally consistent with the ambiguous DELETE never having
+/// reached the provider, and appending a destruction record for it would
+/// describe an object that still exists. That is the record §4.10.4's recovery
+/// trusts.
+///
+/// The version-mismatch arm already reasoned this way; this is the same
+/// argument reached from the other direction, and the arm that had it backwards.
+#[tokio::test]
+async fn an_absent_key_under_a_version_guard_is_not_a_resolved_delete() {
+    let f = fixture("discard-version-absent", AttestationMode::Version);
+    let remote = AmbiguousDelete::new(true, true);
+
+    let err = execute_remote_discard(
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+            IntentId::new(12),
+            shepherd_catalog::intent::IntentKind::Remote,
+            f.key.as_str(),
+            payload().len() as i64,
+            Some(f.hash),
+        ),
+        &remote,
+        &f.key,
+        &v9(),
+        &f.audit,
+        "version",
+        Timestamp::from_nanos(5),
+    )
+    .await
+    .expect_err("an unresolvable outcome must not be reported as a destruction");
+    assert!(
+        matches!(&err, DestroyError::Storage(d) if d.contains("delete marker")),
+        "the failure must say why the answer settles nothing: {err}"
+    );
+    assert!(
+        f.audit.is_halted(),
+        "an irreversible step may have happened and its record cannot be completed; that is \
+         what the global halt is for"
+    );
+    assert!(
+        f.audit.read_all().is_empty(),
+        "and no destruction record is written for something that may still exist"
     );
 }

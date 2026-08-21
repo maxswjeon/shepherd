@@ -277,12 +277,32 @@ impl StorageAdapter for S3Adapter {
             Ok(v) if v.status() == Some(&BucketVersioningStatus::Enabled) => {
                 Ok(AttestationMode::Version)
             }
-            // Not versioned, or we are not allowed to ask. Either way the
-            // honest answer is mechanism B: §4.9 commits the BLAKE3 into the
-            // key, so Shepherd can still attest content itself. Never `None`
-            // here — that would claim the target is destruction-ineligible when
-            // content self-attestation demonstrably works.
-            Ok(_) | Err(_) => Ok(AttestationMode::Content),
+            // A definite "not enabled" is mechanism B, and that is an honest
+            // answer: §4.9 commits the BLAKE3 into the key, so Shepherd can
+            // still attest content itself. Never `None` here — that would claim
+            // the target is destruction-ineligible when content
+            // self-attestation demonstrably works.
+            Ok(_) => Ok(AttestationMode::Content),
+            // A FAILED probe is not an answer, and treating it as one is the
+            // decay this function's own comment warns about. Lacking
+            // `s3:GetBucketVersioning` on a bucket that IS versioned used to
+            // land on `Content` — after which `verify_upload` omits the version
+            // it could have pinned and the closing check falls back to
+            // existence and size, so a same-sized replacement written after
+            // verification authorises unlinking the local copy. The weaker
+            // mechanism was chosen by an unanswered question rather than by the
+            // bucket.
+            Err(e) => Err(StorageError::Provider {
+                provider: self.capabilities().provider,
+                op: "probe_attestation_mode".into(),
+                detail: format!(
+                    "could not read the bucket's versioning state, so this build cannot tell \
+                     whether the target attests by version or by content — and guessing \
+                     content would silently take the weaker one. Grant \
+                     `s3:GetBucketVersioning` on `{}`: {e}",
+                    self.bucket
+                ),
+            }),
         }
     }
 

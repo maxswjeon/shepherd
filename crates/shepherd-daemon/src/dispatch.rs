@@ -80,6 +80,24 @@ pub struct Session {
     pub negotiated: Negotiated,
 }
 
+/// Whether a scan of this root is already queued or running.
+///
+/// `json_extract` rather than a `LIKE` over the payload: `"root_id":1` is a
+/// prefix of `"root_id":10`, and a substring match would coalesce a scan of
+/// root 10 into a scan of root 1 — silently, and in the direction that skips
+/// work the caller asked for.
+fn scan_already_pending(cat: &mut Catalog, root_id: i64) -> Result<bool, CatalogError> {
+    let n: i64 = cat.conn().query_row(
+        "SELECT COUNT(*) FROM job
+         WHERE class = 'scan'
+           AND state IN ('queued','running')
+           AND json_extract(payload_json, '$.root_id') = ?1",
+        [root_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 impl Session {
     fn writer(&self) -> &CatalogWriter {
         &self.daemon.writer
@@ -827,11 +845,41 @@ impl ShepherdApi for Session {
         for root_id in roots {
             let payload = serde_json::json!({ "root_id": root_id, "full": req.full }).to_string();
             let now = self.now();
-            match self.cat(move |cat| Queue::enqueue(cat, JobClass::Scan, 10, &payload, now)) {
-                Ok(id) => {
+            // COALESCED, not queued twice.
+            //
+            // `shepherd_scan::walk` materialises the whole `Vec<FileStat>`
+            // before batching, so a full tree is resident for the length of the
+            // scan — and the pool runs four executors. Starting the same large
+            // root repeatedly, or several large roots together, retained four
+            // full trees at once and could exhaust the daemon before any
+            // index-rebuild gate applied. A second scan of a root that is
+            // already queued or running would also produce nothing the first
+            // one will not.
+            //
+            // The check and the insert are ONE actor closure, so they cannot be
+            // separated: two `scan.start` calls arriving together would
+            // otherwise both find nothing queued and both enqueue.
+            //
+            // Reported through `skipped`, which exists for exactly this — the
+            // caller is told which roots did not start and why, rather than
+            // being handed a job id that does the same work twice.
+            let queued = self.cat(move |cat| {
+                if scan_already_pending(cat, root_id)? {
+                    return Ok(None);
+                }
+                Queue::enqueue(cat, JobClass::Scan, 10, &payload, now).map(Some)
+            });
+            match queued {
+                Ok(Some(id)) => {
                     job_ids.push(id.get());
                     started.push(root_id);
                 }
+                Ok(None) => skipped.push(SkippedRoot {
+                    root_id,
+                    reason: "a scan of this root is already queued or running; \
+                             it will pick up everything a second one would"
+                        .to_owned(),
+                }),
                 Err(e) => skipped.push(SkippedRoot {
                     root_id,
                     reason: e.message,

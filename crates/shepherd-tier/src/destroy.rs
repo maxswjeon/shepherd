@@ -960,8 +960,35 @@ async fn resolve_ambiguous_delete(
     };
 
     match remote.head_meta(key).await {
-        // Gone. Fall through to the record below.
-        Ok(None) => {}
+        // The KEY is gone, which is a different claim depending on the guard.
+        //
+        // Under `ContentAddressed` the key IS the identity, so an absent key
+        // is an absent object and the DELETE landed. Fall through to the
+        // record.
+        Ok(None) if matches!(guard, VersionGuard::ContentAddressed { .. }) => {}
+
+        // Under `Version` it settles nothing, and reading it as success was
+        // the defect. `head` answers about the CURRENT version, and a delete
+        // marker — pre-existing, or written by another writer — makes it
+        // answer "absent" while the guarded version is still there as a
+        // noncurrent one. So this is equally consistent with "the ambiguous
+        // DELETE never reached the provider", and appending a destruction
+        // record would describe an object that still exists.
+        //
+        // The same reasoning the version-mismatch arm below already applies,
+        // reached from the other direction: `head_meta` cannot ask about a
+        // specific version, so the honest answer is that this is unresolved.
+        Ok(None) => {
+            return Err(unresolved(
+                audit,
+                permit,
+                "the key is absent, but the guard names a VERSION and a plain HEAD answers \
+                 only about the current one — a delete marker hides a version that is still \
+                 there, so this is equally consistent with the DELETE never having been \
+                 applied"
+                    .to_owned(),
+            ));
+        }
 
         Ok(Some(meta)) => match guard {
             // The key is the guard, and the key still answers: nothing was

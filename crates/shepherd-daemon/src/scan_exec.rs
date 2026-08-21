@@ -635,7 +635,26 @@ fn upsert_batch(
             return Err(e);
         }
     }
-    cat.conn().execute_batch("COMMIT")?;
+    // A FAILED COMMIT may leave the transaction open.
+    //
+    // Every other failure path here rolls back, and this one returned through
+    // `?` — on the assumption that a failed COMMIT has ended the transaction.
+    // `SQLITE_BUSY` is the counterexample: it can leave the transaction ACTIVE
+    // for the caller to retry. This is the daemon's long-lived writer
+    // connection, so the next actor operation then either fails with "cannot
+    // start a transaction within a transaction" or, worse, runs inside the
+    // abandoned scan transaction — one transient failure stalling catalog
+    // writes for everything after it.
+    //
+    // `is_autocommit` rather than an unconditional ROLLBACK: rolling back when
+    // the commit DID end the transaction is an error of its own, and swallowing
+    // that would hide the case this exists to handle.
+    if let Err(e) = cat.conn().execute_batch("COMMIT") {
+        if !cat.conn().is_autocommit() {
+            let _ = cat.conn().execute_batch("ROLLBACK");
+        }
+        return Err(e.into());
+    }
     Ok(())
 }
 
