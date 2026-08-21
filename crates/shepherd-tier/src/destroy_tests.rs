@@ -943,6 +943,10 @@ impl Fixture {
             .expect("the fixture's custodian must satisfy §4.10.2"),
             remote_key: &self.key,
             root_gate: &self.gate,
+            // No rule in these fixtures asks for a specific target, so the
+            // policy requires none — and the token is issued against the same
+            // empty set, which is what makes them agree.
+            policy_required: &[],
             intent_gate: &self.journal,
             // The catalog's answer for this fixture's file, which is the
             // fixture's own root.

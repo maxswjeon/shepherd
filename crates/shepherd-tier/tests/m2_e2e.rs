@@ -549,6 +549,10 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
     execute_local_destruction(
         LocalDestroyRequest {
             root_gate: &OpenGate,
+            // No rule in these fixtures asks for a specific target, so the
+            // policy requires none — and the token is issued against the same
+            // empty set, which is what makes them agree.
+            policy_required: &[],
             intent_gate: &SilentJournal,
             file_root: root.id,
             intent: shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(

@@ -721,6 +721,7 @@ async fn an_executed_episode_charges_the_window_exactly_once_per_object() {
         &lim,
         now,
         &ledger,
+        &MemEpisodes,
     )
     .await
     .expect("both gates permit and the budget is free");
@@ -779,6 +780,7 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
         &lim,
         now,
         &ledger,
+        &MemEpisodes,
     )
     .await
     .expect("every candidate is proved");
@@ -802,6 +804,7 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
         &lim,
         now,
         &MemLedger::new(),
+        &MemEpisodes,
     )
     .await
     .expect_err("file 1's deferral does not authorize files 2 and 3");
@@ -849,6 +852,7 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
         &lim,
         now,
         &MemLedger::new(),
+        &MemEpisodes,
     )
     .await
     .expect_err("a proof for a file outside the episode is refused");
@@ -912,6 +916,7 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
         &lim,
         now,
         &ledger,
+        &MemEpisodes,
     )
     .await
     .expect_err("target B's proof does not authorize a deletion from target A");
@@ -943,9 +948,17 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
         .remove(0)
     }];
     let ledger = MemLedger::new();
-    reserve_discard(&wrong_root, &mut e, &ledger.snapshot(), &lim, now, &ledger)
-        .await
-        .expect_err("gates describing another root do not vouch for this one");
+    reserve_discard(
+        &wrong_root,
+        &mut e,
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+        &MemEpisodes,
+    )
+    .await
+    .expect_err("gates describing another root do not vouch for this one");
 
     // THE ACCEPTING DIRECTION: the right file, target and root still reserve.
     let ledger = MemLedger::new();
@@ -964,6 +977,7 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
         &lim,
         now,
         &ledger,
+        &MemEpisodes,
     )
     .await
     .expect("a proof bound to this episode authorizes it");
@@ -1000,6 +1014,7 @@ async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
         &lim,
         now,
         &ledger,
+        &MemEpisodes,
     )
     .await
     .expect("the first episode is within budget");
@@ -1020,6 +1035,7 @@ async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
         &lim,
         now,
         &ledger,
+        &MemEpisodes,
     )
     .await
     .expect_err("2 + 2 exceeds a budget of 3");
@@ -1091,6 +1107,7 @@ async fn two_episodes_evaluating_against_one_snapshot_cannot_both_reserve() {
             &lim,
             now,
             &ledger,
+            &MemEpisodes,
         )
         .await;
 
@@ -1143,6 +1160,7 @@ async fn an_object_outside_the_confirmed_set_refuses_before_anything_is_deleted(
         &lim,
         now,
         &ledger,
+        &MemEpisodes,
     )
     .await
     .expect("reserve");
@@ -1199,6 +1217,7 @@ async fn charge_for(ledger: &MemLedger, count: usize, now: Timestamp) -> Discard
         &limits(10),
         now,
         ledger,
+        &MemEpisodes,
     )
     .await
     .expect("both gates permit and the budget is free")
@@ -1451,6 +1470,7 @@ async fn an_unhashed_candidate_is_refused_rather_than_naming_a_key_from_nothing(
         &limits(10),
         now,
         &ledger,
+        &MemEpisodes,
     )
     .await
     .expect("reserve");
@@ -1586,4 +1606,96 @@ impl crate::destroy::IntentGate for NoJournal {
     ) -> std::result::Result<(), DestroyError> {
         Ok(())
     }
+}
+
+/// A durable episode store that always wins the compare-and-set.
+///
+/// These tests own the episode outright — nothing else can be reserving it —
+/// so the CAS always succeeds. `a_confirmed_episode_mints_one_charge` is where
+/// the losing side is exercised.
+struct MemEpisodes;
+
+#[async_trait::async_trait]
+impl crate::discard::EpisodeStore for MemEpisodes {
+    async fn begin_executing(&self, episode: &Episode) -> Result<bool, BreakerRefusal> {
+        Ok(episode.state == crate::breaker::EpisodeState::Confirmed)
+    }
+}
+
+/// A confirmed episode mints exactly one charge, and the catalog arbitrates.
+///
+/// `may_execute` admits only `Confirmed` so a confirmed set runs once, and
+/// holding that in memory is not enough: `Episode` is `Clone`, and a process
+/// that restarts reloads a row still saying `confirmed`. Under content
+/// attestation, an upload that recreates one of the content-addressed objects
+/// between passes is deleted by a confirmation that never saw it.
+///
+/// The double here refuses the second `confirmed → executing`, which is what a
+/// real compare-and-set does to the loser.
+#[tokio::test]
+async fn a_confirmed_episode_mints_one_charge_even_from_a_clone() {
+    /// Succeeds once, like `UPDATE ... WHERE state = 'confirmed'`.
+    struct OnceOnly(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl crate::discard::EpisodeStore for OnceOnly {
+        async fn begin_executing(&self, _e: &Episode) -> Result<bool, BreakerRefusal> {
+            Ok(!self.0.swap(true, std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    let now = t(20);
+    let ledger = MemLedger::new();
+    let mut e = episode_with(2, now);
+    let ds = deferrals_for(&e);
+    let lim = limits(100);
+    let store = OnceOnly(std::sync::atomic::AtomicBool::new(false));
+
+    let at = clock(20);
+    let proofs = |e: &Episode| {
+        proofs_for(
+            e,
+            &at,
+            &ds,
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
+        )
+    };
+
+    // A CLONE taken while it is still confirmed — the value an in-memory
+    // transition cannot reach.
+    let mut clone = e.clone();
+
+    let _first = reserve_discard(
+        &proofs(&e),
+        &mut e,
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+        &store,
+    )
+    .await
+    .expect("the first reservation takes");
+
+    let refusals = reserve_discard(
+        &proofs(&clone),
+        &mut clone,
+        &ledger.snapshot(),
+        &lim,
+        now,
+        &ledger,
+        &store,
+    )
+    .await
+    .expect_err("a clone of a spent episode must not mint a second charge");
+    assert!(
+        refusals
+            .breaker
+            .iter()
+            .any(|r| matches!(r, BreakerRefusal::NotConfirmed { .. })),
+        "the refusal must be about the episode's state: {refusals:?}"
+    );
 }

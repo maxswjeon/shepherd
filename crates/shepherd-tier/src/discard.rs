@@ -438,6 +438,7 @@ pub async fn reserve_discard(
     limits: &BreakerLimits,
     now: Timestamp,
     ledger: &impl RateLedger,
+    episodes: &impl EpisodeStore,
 ) -> Result<DiscardCharge, DiscardRefusals> {
     evaluate_discard_batch(proofs, episode, window, limits, now)?;
 
@@ -465,9 +466,34 @@ pub async fn reserve_discard(
     // matters here is that it is no longer `Confirmed`, which is the only state
     // `may_execute` admits.
     //
+    // DURABLY, and as a compare-and-set. Mutating the in-memory `Episode` was
+    // not enough: `Episode` is `Clone`, and a caller holding a clone — or a
+    // process that restarts and reloads the still-`confirmed` row — reserves
+    // again from a value this function already consumed. Only the catalog can
+    // arbitrate that, and only if the read and the write are one operation:
+    // `confirmed → executing` succeeding is what proves this reservation is the
+    // first, and `Ok(false)` means another one already won.
+    //
     // After the charge, so a refused budget leaves the episode confirmed and
     // retryable; before the `DiscardCharge` exists, so no charge is ever handed
     // out over an episode still in the state that mints them.
+    match episodes.begin_executing(episode).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(DiscardRefusals {
+                policy: Vec::new(),
+                breaker: vec![BreakerRefusal::NotConfirmed {
+                    state: crate::breaker::EpisodeState::Executing,
+                }],
+            });
+        }
+        Err(r) => {
+            return Err(DiscardRefusals {
+                policy: Vec::new(),
+                breaker: vec![r],
+            });
+        }
+    }
     episode.state = crate::breaker::EpisodeState::Executing;
 
     Ok(DiscardCharge {
@@ -479,6 +505,27 @@ pub async fn reserve_discard(
         confirmed: episode.candidates.clone(),
         spent: Vec::new(),
     })
+}
+
+/// The durable half of an episode's lifecycle, as a narrow port.
+///
+/// `may_execute` admits only a `Confirmed` episode so a confirmed set runs
+/// once, and `reserve_discard` held that rule in memory — where a `Clone` or a
+/// restart walks straight past it. This is the compare-and-set that makes it a
+/// fact: only the catalog can arbitrate which reservation is first, and only if
+/// the read and the write are one operation.
+///
+/// The same shape as `RootGate` and `IntentGate` on the destroy path, and for
+/// the same reason: this crate does not open catalogs, and the caller that does
+/// is where the transaction belongs.
+#[async_trait::async_trait]
+pub trait EpisodeStore: Send + Sync {
+    /// `confirmed → executing` for this episode, atomically.
+    ///
+    /// `Ok(true)` means this call made the transition. `Ok(false)` means the
+    /// row was not `confirmed` — someone else already reserved it, or it was
+    /// cancelled — and no charge may be minted.
+    async fn begin_executing(&self, episode: &Episode) -> Result<bool, BreakerRefusal>;
 }
 
 /// Whether a discard hold blocks a job class, ignoring target scope.

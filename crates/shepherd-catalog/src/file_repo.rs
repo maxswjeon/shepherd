@@ -666,7 +666,27 @@ impl<'a> FileRepo<'a> {
                  -- DIFFERENT inode than the row describes, so this is not the
                  -- tiered file at all and none of the tiered file's state is
                  -- about it. See the identity comparison above the statement.
-                 state = CASE WHEN ?15 = 1 THEN 'local' ELSE file.state END,
+                 -- ?15 is the one case where writing it is the correct answer
+                 -- rather than the destructive one: the path is occupied by a
+                 -- DIFFERENT inode than the row describes, so this is not the
+                 -- tiered file at all and none of the tiered file's state is
+                 -- about it. See the identity comparison above the statement.
+                 --
+                 -- A `missing` row is the OTHER case, and it is a sighting
+                 -- rather than a replacement: this upsert only runs because the
+                 -- walk stat'd something at this path, which is exactly the
+                 -- evidence `sweep_absent` lacked when it marked the row. A file
+                 -- moved out for one scan and back for the next, or one under a
+                 -- root with no stable volume id and therefore no `fs_id` to
+                 -- compare, would otherwise stay `missing` forever — and since
+                 -- an ordinary search now excludes that state, permanently
+                 -- unfindable. Revival must not depend on replacement
+                 -- detection, because replacement detection is exactly what is
+                 -- unavailable there.
+                 state = CASE
+                     WHEN ?15 = 1 THEN 'local'
+                     WHEN file.state = 'missing' THEN 'local'
+                     ELSE file.state END,
                  --
                  -- blake3 survives a hashless re-scan ONLY where the metadata
                  -- that identified the hashed bytes held still. A bare COALESCE
@@ -765,20 +785,31 @@ impl<'a> FileRepo<'a> {
     /// `search` and counted by `status`. The column's own comment says this is
     /// what it is for.
     ///
+    /// # Only states that expect a local directory entry
+    ///
+    /// `local` and `stub`, and nothing else. A `remote` row in delete mode is
+    /// INTENTIONALLY absent from the filesystem — that is what delete mode
+    /// means — so sweeping it marks the one catalog entry naming the remote
+    /// object as missing, and the user can no longer find the file to restore
+    /// it while its `object_location` is still perfectly valid. A stub does
+    /// stat, so a stub that has vanished is a real absence.
+    ///
     /// # Why the skipped paths are an argument
     ///
     /// A walk that could not read a subtree observed nothing beneath it, and a
     /// sweep cannot tell "absent" from "not looked at" — so every row under a
     /// skipped path is left exactly as it was. That includes deliberate skips:
     /// an ignored directory, a denied one, a symlinked directory the walker
-    /// does not descend, a cycle it has already visited. In every case the
-    /// walk has no evidence about what is under there, and evidence is what
-    /// this function turns into a state change.
+    /// does not descend, a cycle it has already visited.
     ///
-    /// Filtered in Rust rather than in SQL: the candidate set is the rows this
-    /// scan did NOT see, which on a healthy corpus is small, and prefix-matching
-    /// arbitrary pathnames in `LIKE` needs escaping that is easy to get subtly
-    /// wrong.
+    /// # Batched
+    ///
+    /// A root that has been emptied or moved makes EVERY row a candidate, which
+    /// is the legitimate path this has to survive: collecting ten million
+    /// `(id, rel_path)` pairs and then a second vector of ids is hundreds of
+    /// megabytes at precisely the moment most rows are absent. Candidates are
+    /// read in bounded pages keyed on `id`, filtered, and written before the
+    /// next page is read.
     ///
     /// Returns how many rows were marked.
     pub fn sweep_absent(
@@ -788,44 +819,89 @@ impl<'a> FileRepo<'a> {
         unobserved: &[String],
         now: Timestamp,
     ) -> Result<usize> {
-        let candidates: Vec<(i64, String)> = {
-            let mut stmt = self.0.conn().prepare(
-                "SELECT id, rel_path FROM file
-                 WHERE root_id = ?1 AND last_seen_gen < ?2 AND state <> 'missing'",
-            )?;
-            stmt.query_map(params![root.id.get(), generation], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+        /// Rows held in memory at once. Large enough that the sweep is not
+        /// statement-bound, small enough that an emptied 10M-file root costs a
+        /// page rather than a corpus.
+        const PAGE: usize = 4_096;
+
+        let beneath_unobserved = |rel: &str| {
+            unobserved.iter().any(|skip| {
+                // The skipped path itself, and anything beneath it. The
+                // separator matters: `docs` must not swallow `docs-old`.
+                rel == skip
+                    || rel
+                        .strip_prefix(skip.as_str())
+                        .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+            })
         };
 
-        let doomed: Vec<i64> = candidates
-            .into_iter()
-            .filter(|(_, rel)| {
-                !unobserved.iter().any(|skip| {
-                    // The skipped path itself, and anything beneath it. The
-                    // separator matters: `docs` must not swallow `docs-old`.
-                    rel == skip
-                        || rel
-                            .strip_prefix(skip.as_str())
-                            .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
-                })
-            })
-            .map(|(id, _)| id)
-            .collect();
+        let mut marked = 0usize;
+        let mut after = 0i64;
+        loop {
+            let page: Vec<(i64, String)> = {
+                let mut stmt = self.0.conn().prepare(
+                    "SELECT id, rel_path FROM file
+                     WHERE root_id = ?1
+                       AND last_seen_gen < ?2
+                       AND state IN ('local','stub')
+                       AND id > ?3
+                     ORDER BY id
+                     LIMIT ?4",
+                )?;
+                stmt.query_map(
+                    params![root.id.get(), generation, after, PAGE as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            if page.is_empty() {
+                break;
+            }
+            // Keyed on `id` rather than an offset: the rows are being UPDATED
+            // out of the predicate as this goes, so an offset would skip a page
+            // for every page it wrote.
+            after = page.last().map_or(after, |(id, _)| *id);
 
-        let tx = self.0.conn_mut().savepoint()?;
-        for id in &doomed {
-            tx.execute(
-                "UPDATE file SET state = 'missing', updated_at = ?2 WHERE id = ?1",
-                params![id, now.as_nanos()],
-            )?;
+            let doomed: Vec<i64> = page
+                .into_iter()
+                .filter(|(_, rel)| !beneath_unobserved(rel))
+                .map(|(id, _)| id)
+                .collect();
+
+            let tx = self.0.conn_mut().savepoint()?;
+            for id in &doomed {
+                tx.execute(
+                    "UPDATE file SET state = 'missing', updated_at = ?2 WHERE id = ?1",
+                    params![id, now.as_nanos()],
+                )?;
+            }
+            tx.commit()?;
+            marked += doomed.len();
         }
-        tx.commit()?;
-        Ok(doomed.len())
+        Ok(marked)
     }
 
-    /// Look up by the **matching** key. This is what watcher events use.
+    /// The generation the next scan attempt of `root` should stamp.
+    ///
+    /// One greater than anything this root carries, so every ATTEMPT gets its
+    /// own — the job id does not, because a retry re-runs under the same id.
+    /// With the same generation, a file the failed attempt stamped and that
+    /// then disappeared is neither seen by the retry nor swept by it (the
+    /// predicate is strict `<`), so the index goes on serving a file the
+    /// completed retry proved absent.
+    ///
+    /// `MAX + 1` rather than a counter column: monotonic per root by
+    /// construction, no schema change, and `scan.start` coalesces scans per
+    /// root so nothing else is allocating one concurrently.
+    pub fn next_generation(&self, root: &ScanRoot) -> Result<i64> {
+        Ok(self.0.conn().query_row(
+            "SELECT COALESCE(MAX(last_seen_gen), 0) + 1 FROM file WHERE root_id = ?1",
+            params![root.id.get()],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Look up by the **matching** key. This is what watcher events use.    /// Look up by the **matching** key. This is what watcher events use.
     ///
     /// Returns every row whose `norm_key` matches, which on a case-sensitive
     /// root can legitimately be more than one (`Report.txt` and `report.txt`
@@ -1726,6 +1802,93 @@ mod tests {
                 "sighting {ino:?} dropped a tiered row's custody binding"
             );
         }
+    }
+
+    /// The sweep marks what vanished, spares what was never local, and a
+    /// later sighting brings a row back.
+    ///
+    /// Three properties the first version got wrong. `remote` is a delete-mode
+    /// file whose path is INTENTIONALLY absent, so sweeping it removes the one
+    /// catalog entry naming the remote object and the user can no longer find
+    /// the file to restore it. And a row marked `missing` had no way back:
+    /// `upsert_file` preserves `state` unless it can prove the inode was
+    /// replaced, which is exactly what is unavailable on a root with no stable
+    /// volume id — so a file moved out for one scan and back for the next
+    /// stayed missing, and since searches now exclude that state, permanently
+    /// unfindable.
+    #[test]
+    fn a_sweep_marks_what_vanished_spares_what_is_remote_and_a_sighting_revives() {
+        let (mut cat, root) = fixture();
+        for rel in ["gone.txt", "stays.txt", "tiered.txt", "under/skipped.txt"] {
+            FileRepo::new(&mut cat)
+                .upsert_file(&root, &stat(root.id, rel), GEN, Timestamp::from_nanos(1))
+                .unwrap();
+        }
+        cat.conn_mut()
+            .execute(
+                "UPDATE file SET state = 'remote' WHERE rel_path = 'tiered.txt'",
+                [],
+            )
+            .unwrap();
+
+        // A later scan sees only `stays.txt`, and could not read `under/`.
+        FileRepo::new(&mut cat)
+            .upsert_file(
+                &root,
+                &stat(root.id, "stays.txt"),
+                GEN + 1,
+                Timestamp::from_nanos(2),
+            )
+            .unwrap();
+        let swept = FileRepo::new(&mut cat)
+            .sweep_absent(
+                &root,
+                GEN + 1,
+                &["under".to_owned()],
+                Timestamp::from_nanos(2),
+            )
+            .unwrap();
+        assert_eq!(swept, 1, "only `gone.txt` is an unexplained absence");
+
+        let state_of = |cat: &Catalog, rel: &str| -> String {
+            cat.conn()
+                .query_row("SELECT state FROM file WHERE rel_path = ?1", [rel], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(state_of(&cat, "gone.txt"), "missing");
+        assert_eq!(state_of(&cat, "stays.txt"), "local");
+        assert_eq!(
+            state_of(&cat, "tiered.txt"),
+            "remote",
+            "a delete-mode file is absent on purpose; sweeping it hides the only \
+             catalog entry naming its remote object"
+        );
+        assert_eq!(
+            state_of(&cat, "under/skipped.txt"),
+            "local",
+            "the walk could not read `under/`, so it has no evidence about what is \
+             beneath it"
+        );
+
+        // AND IT COMES BACK. A sighting is the evidence the sweep lacked, and
+        // this fixture has no `fs_id` at all — which is the case where
+        // replacement detection cannot help.
+        FileRepo::new(&mut cat)
+            .upsert_file(
+                &root,
+                &stat(root.id, "gone.txt"),
+                GEN + 2,
+                Timestamp::from_nanos(3),
+            )
+            .unwrap();
+        assert_eq!(
+            state_of(&cat, "gone.txt"),
+            "local",
+            "a row that is seen again must not stay missing — nothing else can \
+             ever bring it back"
+        );
     }
 
     #[test]

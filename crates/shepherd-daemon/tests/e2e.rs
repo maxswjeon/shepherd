@@ -766,6 +766,33 @@ fn a_scan_reconciles_deleted_files_but_not_unobserved_ones() {
          marked missing — the sweep cannot tell absent from not-looked-at"
     );
 
+    // The reconciled row is still FINDABLE by asking for it. `filters.state` is
+    // a documented query whose whole purpose is locating exactly these, and an
+    // index that dropped missing rows made it return nothing at all — so the
+    // sweep would have hidden the evidence of its own work.
+    let found = c.call(
+        "search",
+        serde_json::json!({"query": "gone", "mode": "metadata", "filters": {"state": "missing"}}),
+    );
+    assert_eq!(
+        found["hits"].as_array().map_or(0, Vec::len),
+        1,
+        "a missing-state search must find the row the sweep just marked: {found}"
+    );
+
+    // AND IT COMES BACK. Recreating the file and rescanning must return it to
+    // an ordinary search: a row that can never leave `missing` is permanently
+    // unfindable now that unfiltered searches exclude that state.
+    std::fs::write(dir.join("gone.txt"), b"x").unwrap();
+    c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    let scan = wait_for_scan(&mut c, root_id);
+    assert!(scan["last_error"].is_null(), "{scan}");
+    assert_eq!(
+        hits("gone", &mut c),
+        1,
+        "a file that came back must be findable again"
+    );
+
     std::fs::set_permissions(dir.join("deep"), readable).unwrap();
 }
 

@@ -177,6 +177,15 @@ pub struct LocalDestroyRequest<'a> {
     ///
     /// A comment is not a check. This is.
     pub custodian: PermittedCustodian<'a>,
+    /// The targets THIS FILE's delete policy requires, from the rule that
+    /// selected it.
+    ///
+    /// Compared against the set [`Self::custodian`] was issued against. The
+    /// token proves the ∃ clause and records which ∀ clause it was checked
+    /// with; only the caller knows which one the policy actually names, so this
+    /// is where the two meet. Without it a token issued against an empty
+    /// `required` list authorises a destruction the policy would refuse.
+    pub policy_required: &'a [TargetId],
     pub remote_key: &'a ObjectKey,
     /// [`Self::root`]'s gates, HELD across the unlink rather than re-read.
     ///
@@ -214,6 +223,33 @@ pub async fn execute_local_destruction(
     // forgotten here.
     if let Some(reason) = req.root.destroy_refusal() {
         return Err(DestroyError::Root(reason));
+    }
+
+    // The CUSTODY PROOF must have been checked against this file's own policy.
+    //
+    // `destroy_permitted` answers two clauses, and the token can only carry the
+    // ∃ one as a fact — the ∀ clause is about a required-target list the caller
+    // supplied, so a caller that supplied an empty or short one gets a token
+    // that looks identical. Comparing the set it was issued against with the
+    // set the policy names is what closes that, and it has to happen here
+    // because this is where both are in scope.
+    if !req.custodian.covers(req.policy_required) {
+        return Err(DestroyError::Unbound {
+            detail: format!(
+                "the custody proof was checked against required targets {:?} and this file's \
+                 policy requires {:?}; §4.10.2's ∀ clause was answered about a different \
+                 question",
+                req.custodian
+                    .required()
+                    .iter()
+                    .map(|t| t.get())
+                    .collect::<Vec<_>>(),
+                req.policy_required
+                    .iter()
+                    .map(|t| t.get())
+                    .collect::<Vec<_>>()
+            ),
+        });
     }
 
     // The ROOT must be the one that owns this file.

@@ -1779,9 +1779,18 @@ fn filter_clause(filters: &SearchFilters) -> (String, Vec<Box<dyn rusqlite::ToSq
         sql.push_str(" AND mtime < ?");
         params.push(Box::new(before));
     }
-    if let Some(state) = filters.state {
-        sql.push_str(" AND state = ?");
-        params.push(Box::new(file_state_str(state).to_string()));
+    match filters.state {
+        Some(state) => {
+            sql.push_str(" AND state = ?");
+            params.push(Box::new(file_state_str(state).to_string()));
+        }
+        // A row the scan reconciliation marked `missing` is a file that is no
+        // longer on disk, and an ordinary search must not keep returning it.
+        // Filtered HERE rather than by leaving it out of the index: the index
+        // is the candidate generator, so a row it never emits cannot be brought
+        // back by a filter — and `filters.state = "missing"` is a documented
+        // query whose whole purpose is finding exactly these.
+        None => sql.push_str(" AND state <> 'missing'"),
     }
     if let Some(root) = filters.root_id {
         sql.push_str(" AND root_id = ?");

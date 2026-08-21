@@ -572,13 +572,26 @@ impl Executor for ScanExecutor {
             })
             .filter(|r| !r.is_empty())
             .collect();
+        // Under `with_catalog_mutation`, like every other write in this
+        // function, and `mutated_at` takes ITS watermark.
+        //
+        // The sweep changes `file.state`, so an index pinned before it is stale
+        // in exactly the way the invalidation exists for — and leaving
+        // `mutated_at` pointing at the last upsert batch means a concurrent
+        // rebuild between that batch and this sweep survives with the deleted
+        // rows still in it. A scan whose only effect was deletions had
+        // `mutated_at: None` and never invalidated at all.
         let root_for_sweep = Arc::clone(&root);
-        let swept = self
-            .writer()
-            .try_with(move |cat| {
+        let (swept, swept_at) = self.daemon.with_catalog_mutation(|| {
+            self.writer().try_with(move |cat| {
                 FileRepo::new(cat).sweep_absent(&root_for_sweep, generation, &unobserved, now())
             })
-            .map_err(|e| self.abandon(mutated_at, format!("reconciling absent rows: {e}")))?;
+        });
+        let swept =
+            swept.map_err(|e| self.abandon(mutated_at, format!("reconciling absent rows: {e}")))?;
+        if swept > 0 {
+            mutated_at = Some(swept_at);
+        }
         if swept > 0 {
             tracing::info!(root = root_id, swept, "marked rows absent from this scan");
         }

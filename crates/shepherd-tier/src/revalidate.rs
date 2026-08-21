@@ -159,13 +159,50 @@ pub enum DestroyRefusal {
 /// caller must OBTAIN rather than something it can assert. Same move as
 /// `PreparedIntent`, for the same reason: a claim in a comment is not a claim
 /// the compiler checks.
-#[derive(Debug, Clone, Copy)]
-pub struct PermittedCustodian<'a>(&'a Location);
+/// # And bound to the REQUIRED SET it was issued against
+///
+/// The token recorded only the selected location, so a caller could call the
+/// predicate with an empty or short `required` list — satisfying the ∀ clause
+/// trivially — and hand the result to a destroy path that has no rule and no
+/// required-set input with which to notice. The sole local copy is then
+/// unlinked before every location the file's policy asks for has been reached,
+/// which is the other half of §4.10.2 and the half a token that carries only
+/// the ∃ result cannot speak for.
+///
+/// So the required set travels with it, and the destroy path compares it
+/// against the one the FILE's policy names. That comparison is the caller's,
+/// because this crate does not read policies; what the token guarantees is that
+/// the set it was checked against is knowable rather than lost.
+#[derive(Debug, Clone)]
+pub struct PermittedCustodian<'a> {
+    location: &'a Location,
+    required: Vec<TargetId>,
+}
 
 impl<'a> PermittedCustodian<'a> {
     /// The location the predicate accepted.
     pub fn location(&self) -> &'a Location {
-        self.0
+        self.location
+    }
+
+    /// The required-target set this token was issued against.
+    ///
+    /// Sorted, so a comparison against a policy's list is about membership
+    /// rather than about the order someone happened to build it in.
+    pub fn required(&self) -> &[TargetId] {
+        &self.required
+    }
+
+    /// Whether this token was issued against exactly `policy_required`.
+    ///
+    /// The check the destroy path makes. A token issued against a SUBSET is the
+    /// defect this exists for; a superset is refused too, because a predicate
+    /// answered about a different question is not a weaker answer to this one.
+    pub fn covers(&self, policy_required: &[TargetId]) -> bool {
+        let mut wanted: Vec<TargetId> = policy_required.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        self.required == wanted
     }
 }
 
@@ -173,7 +210,7 @@ impl std::ops::Deref for PermittedCustodian<'_> {
     type Target = Location;
 
     fn deref(&self) -> &Location {
-        self.0
+        self.location
     }
 }
 
@@ -235,7 +272,12 @@ pub fn destroy_permitted<'a>(
     locations
         .iter()
         .find(|l| l.satisfies_custody(now, window))
-        .map(PermittedCustodian)
+        .map(|location| {
+            let mut required = required.to_vec();
+            required.sort_unstable();
+            required.dedup();
+            PermittedCustodian { location, required }
+        })
         .ok_or(DestroyRefusal::NoAttestedCustodian {
             examined: locations.len(),
         })

@@ -229,6 +229,10 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     let destroyed = execute_local_destruction(
         LocalDestroyRequest {
             root_gate: &OpenGate,
+            // No rule in these fixtures asks for a specific target, so the
+            // policy requires none — and the token is issued against the same
+            // empty set, which is what makes them agree.
+            policy_required: &[],
             intent_gate: &SilentJournal,
             file_root: root.id,
             // Minted by the JOURNAL, not fabricated. `PreparedIntent` exists so
