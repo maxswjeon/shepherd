@@ -395,7 +395,32 @@ pub async fn execute_local_destruction(
     // one before either — which is the whole reason the state exists. Recorded
     // under the permit, alongside everything else that has to survive.
     let intent_id = req.intent.id();
-    record_transition(req.intent_gate, intent_id, IntentState::SyscallIssued).await;
+    // THIS ONE IS A PRECONDITION, not a trail entry.
+    //
+    // Everything after the unlink is recorded best-effort, because there is
+    // nothing left to abort to. This is before it, and it is the whole reason
+    // the state exists: if `syscall-issued` is not durable, a crash leaves
+    // deleted bytes behind an intent that still says `prepared`, and recovery
+    // cannot tell an unissued operation from a completed one. A write that
+    // failed for `SQLITE_BUSY` or ENOSPC has to stop the destruction, not be
+    // logged past.
+    //
+    // Refused BEFORE the syscall, so abort-forward-never applies exactly as it
+    // does to every other pre-syscall refusal: the staged file is restored.
+    if let Err(e) = req
+        .intent_gate
+        .advance(intent_id, IntentState::SyscallIssued)
+        .await
+    {
+        drop(permit);
+        restore_or_report(
+            provider,
+            staged,
+            "the intent could not be advanced to `syscall-issued`",
+            &e,
+        );
+        return Err(e);
+    }
 
     if let Err(e) = provider.destroy_local(&staged, req.expected_hash) {
         // `DestroyedNotDurable` is the one failure here that is NOT a failure to
@@ -458,16 +483,21 @@ pub async fn execute_local_destruction(
         reconstructed: false,
     })?;
 
-    // §4.4's tail, in the order §4.10.4 requires it: the outcome is known, the
-    // record is written, and the catalog change this destruction implies is the
-    // caller's — so `catalog-committed` is the last one and it is recorded here
-    // because this function is where the sequence is known to have completed.
+    // §4.4's tail, and it STOPS AT `audited`.
     //
     // After the audit append, never before: `audited` claiming a record that
     // does not exist is exactly the lie the state is supposed to rule out.
+    //
+    // `catalog-committed` is NOT recorded here, and adding it was wrong: this
+    // function unlinks a file and appends a record, and changes no catalog row
+    // at all — the caller cannot make that change until this returns. Claiming
+    // it settles the intent, which takes it out of `unresolved()`, so a crash
+    // between this return and the caller's write leaves the catalog saying the
+    // file is still local with nothing left to reconcile it. The transaction
+    // that records the destruction is the one that may advance the final state,
+    // because it is the only place the two can be made atomic.
     record_transition(req.intent_gate, intent_id, IntentState::OutcomeKnown).await;
     record_transition(req.intent_gate, intent_id, IntentState::Audited).await;
-    record_transition(req.intent_gate, intent_id, IntentState::CatalogCommitted).await;
 
     Ok(())
 }
@@ -978,7 +1008,15 @@ pub async fn execute_remote_discard(
     // entry points, and a lifecycle only one half of the destroy apparatus
     // advances is a lifecycle recovery cannot read.
     let intent_id = intent.id();
-    record_transition(intent_gate, intent_id, IntentState::SyscallIssued).await;
+    // A precondition here too — see the local path. Nothing irreversible has
+    // happened yet, so this refuses rather than being logged past.
+    if let Err(e) = intent_gate
+        .advance(intent_id, IntentState::SyscallIssued)
+        .await
+    {
+        drop(permit);
+        return Err(e);
+    }
 
     if let Err(e) = remote.remove_object(key, guard).await {
         // A refused precondition is not ambiguous: the provider says it did not
@@ -1018,9 +1056,11 @@ pub async fn execute_remote_discard(
         reconstructed: false,
     })?;
 
+    // Stops at `audited`, for the reason the local tail does: the catalog
+    // change is the caller's, and settling the intent here would take it out of
+    // `unresolved()` before anything had reconciled it.
     record_transition(intent_gate, intent_id, IntentState::OutcomeKnown).await;
     record_transition(intent_gate, intent_id, IntentState::Audited).await;
-    record_transition(intent_gate, intent_id, IntentState::CatalogCommitted).await;
     Ok(())
 }
 
@@ -1172,9 +1212,11 @@ async fn resolve_ambiguous_delete(
         reconstructed: false,
     })?;
 
+    // Stops at `audited`, for the reason the local tail does: the catalog
+    // change is the caller's, and settling the intent here would take it out of
+    // `unresolved()` before anything had reconciled it.
     record_transition(intent_gate, intent_id, IntentState::OutcomeKnown).await;
     record_transition(intent_gate, intent_id, IntentState::Audited).await;
-    record_transition(intent_gate, intent_id, IntentState::CatalogCommitted).await;
     Ok(())
 }
 

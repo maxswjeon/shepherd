@@ -563,16 +563,21 @@ impl Remote {
     /// from this now, so a fixture cannot hand `execute_discard` a guard that
     /// disagrees with the location it is supposed to be protecting — which is
     /// what the old `&Self::guard()` argument allowed.
-    fn custodian() -> crate::revalidate::Location {
+    fn custodian(candidate: &Candidate, target: TargetId) -> crate::revalidate::Location {
         crate::revalidate::Location {
-            target: TARGET,
+            target,
             state: crate::revalidate::LocationState::Verified,
             attestation: shepherd_storage::adapter::AttestationMode::Version,
             custody_eligible: true,
             last_full_hash_verified_at: Some(t(0)),
             publication_receipt_ok: true,
             object_version: Some(shepherd_core::ObjectVersion::new("v9")),
-            expected_hash: shepherd_core::Blake3Hash::from_bytes([0u8; 32]),
+            // The candidate's own hash and the charged target: the custody
+            // proof is checked against both now, so a fixture that supplies a
+            // constant is describing another file's location.
+            expected_hash: candidate
+                .blake3
+                .unwrap_or_else(|| shepherd_core::Blake3Hash::from_bytes([0u8; 32])),
         }
     }
 
@@ -645,7 +650,7 @@ impl Remote {
             candidate,
             target,
             root,
-            &Self::custodian(),
+            &Self::custodian(candidate, target),
             &self.locks,
             &self.audit,
             // The transitions themselves are asserted in `destroy_tests`; here

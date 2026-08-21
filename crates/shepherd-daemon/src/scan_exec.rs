@@ -411,8 +411,10 @@ impl Executor for ScanExecutor {
         let mut files_seen: u64 = 0;
         let mut bytes_seen: u64 = 0;
         let mut since_progress = 0usize;
-        // Whether any batch has reached the catalog. See `abandon`.
-        let mut committed = false;
+        // Whether any batch has reached the catalog, and the watermark of the
+        // last one that did. See `abandon`.
+
+        let mut mutated_at: Option<u64> = None;
 
         // The generation this scan stamps on every row it sees.
         //
@@ -489,13 +491,29 @@ impl Executor for ScanExecutor {
             //
             // `committed` is what separates "this scan changed the catalog"
             // from "it failed before touching it"; the second owes nothing.
-            match self
-                .writer()
-                .try_with(move |cat| upsert_batch(cat, &root_for_batch, &batch, generation))
-            {
-                Ok(()) => committed = true,
+            // The watermark is taken WITH the mutation, not after the failure.
+            //
+            // `abandon` used to call `with_catalog_mutation(|| ())` at the
+            // moment it gave up, and a rebuild that pinned a snapshot between
+            // the last batch and that call gets the SAME generation — so
+            // `invalidate_index` raises the floor above a snapshot that is
+            // genuinely current, and `search` is refused until some later
+            // rebuild happens to run. `with_catalog_mutation` holds the ticket
+            // across the closure, which is what makes the generation order the
+            // two; taking it afterwards orders nothing.
+            let (wrote, at) = self.daemon.with_catalog_mutation(|| {
+                self.writer()
+                    .try_with(move |cat| upsert_batch(cat, &root_for_batch, &batch, generation))
+            });
+            match wrote {
+                Ok(()) => {
+                    // The watermark of the last batch that LANDED is the
+                    // tightest correct floor for the failure path, and it is
+                    // only obtainable here.
+                    mutated_at = Some(at);
+                }
                 Err(e) => {
-                    return Err(self.abandon(committed, format!("upserting a batch of {n}: {e}")));
+                    return Err(self.abandon(mutated_at, format!("upserting a batch of {n}: {e}")));
                 }
             }
 
@@ -513,7 +531,7 @@ impl Executor for ScanExecutor {
                 .to_string(),
             ) {
                 return Err(self.abandon(
-                    committed,
+                    mutated_at,
                     format!("checkpointing after {files_seen} files: {e}"),
                 ));
             }
@@ -550,7 +568,7 @@ impl Executor for ScanExecutor {
             Ok(n) => n,
             Err(e) => {
                 return Err(self.abandon(
-                    committed,
+                    mutated_at,
                     format!("refreshing the metadata index after scanning root {root_id}: {e}"),
                 ));
             }
@@ -575,18 +593,21 @@ impl ScanExecutor {
     /// the installed index was built from. Failing the job alone leaves that
     /// arena serving rows from before the scan — a `search` that confidently
     /// finds nothing, which is the one thing an ABSENT index is honest about
-    /// and a stale one is not. The watermark is taken here rather than up
-    /// front, and that is what makes it tight: taken now it is necessarily
-    /// after the last batch that landed, so no snapshot pinned before that
-    /// batch can install afterwards.
+    /// and a stale one is not.
     ///
-    /// A scan that failed before its first batch owes nothing — it changed
-    /// nothing — and invalidating there would refuse `search` for a scan that
-    /// never touched the catalog.
-    fn abandon(&self, committed: bool, detail: String) -> String {
-        if committed {
-            let (_, mutated_at) = self.daemon.with_catalog_mutation(|| ());
-            self.daemon.invalidate_index(mutated_at);
+    /// `mutated_at` is the watermark of the LAST BATCH THAT LANDED, taken
+    /// while the ticket was held across that write. Taking it here instead —
+    /// which is what this did — orders nothing: a rebuild that pinned a
+    /// snapshot after the last batch gets the same generation, and the floor
+    /// then rises above an index that is genuinely current, refusing `search`
+    /// until some later rebuild happens to run.
+    ///
+    /// `None` means no batch reached the catalog, so nothing is owed: the scan
+    /// changed nothing, and invalidating would refuse `search` on account of a
+    /// scan that never touched it.
+    fn abandon(&self, mutated_at: Option<u64>, detail: String) -> String {
+        if let Some(at) = mutated_at {
+            self.daemon.invalidate_index(at);
         }
         detail
     }

@@ -589,27 +589,51 @@ pub async fn execute_discard(
         }
     };
 
-    // Before the deletion, never after. The budget was already persisted by
-    // `reserve_discard`; this is the per-object draw against it, and it both
-    // authorises the deletion and names what may be deleted.
-    let key = charge
-        .spend(candidate, target, root, prefix)
-        .map_err(DestroyError::Breaker)?;
-
-    // The SAME process-wide remote-key lock `upload::upload_item` takes through
-    // `acquire_both`. Without it the two operations interleave on one key:
-    // a delete landing between an upload's completion and its verification
-    // makes that upload fail after it has already published, and a completion
-    // landing after the delete recreates an object this discard has already
-    // audited as gone — a live object with a forensic record saying it was
-    // destroyed.
+    // THE CUSTODIAN must be about THIS target and THESE bytes, and the guard is
+    // derived from it — never accepted beside it.
     //
-    // Held across the audit resolution, not just the DELETE: it is
-    // `execute_remote_discard`'s closing HEAD that decides whether an ambiguous
-    // failure gets a record or a halt, and a republish underneath that HEAD is
-    // exactly what would make it decide wrongly.
-    let _key_lock = locks.acquire_key(&key).await;
-
+    // The guard used to arrive as its own argument, unchecked against the
+    // candidate, the charge or the location that authorised any of this: a
+    // miswired caller could pass `ContentAddressed` and issue an UNVERSIONED
+    // delete against a versioned bucket, or pass another location's version and
+    // permanently remove that version while the candidate's verified one
+    // survived. Deriving it fixed that and left the LOCATION itself unchecked,
+    // which is the same hole one level up — another file's content-attested
+    // location produces a content guard over this candidate's hash while the
+    // custody proof concerns different bytes, and a content-mode location from
+    // another target issues an unversioned delete against a bucket that
+    // requires versions.
+    //
+    // BEFORE `spend`, with the gate check, for the reason that one moved there:
+    // every refusal here is deterministic and touches no remote, so spending
+    // first strands the candidate's unit in a reserved episode and a corrected
+    // retry meets `AlreadySpent`.
+    if custodian.target != target {
+        return Err(DestroyError::Unbound {
+            detail: format!(
+                "the custody proof is for target {} and this discard is charged against \
+                 target {}",
+                custodian.target.get(),
+                target.get()
+            ),
+        });
+    }
+    // Only when the candidate HAS a hash. An unhashed candidate is a fact about
+    // the candidate rather than a custody mismatch, and `spend` reports it as
+    // `BreakerRefusal::Unhashed` — which names the actual problem instead of
+    // blaming the location.
+    if let Some(h) = candidate.blake3
+        && custodian.expected_hash != h
+    {
+        return Err(DestroyError::Unbound {
+            detail: format!(
+                "the custody proof is for blake3 {} and this candidate is {}; a location \
+                 verified against other bytes cannot authorise deleting these",
+                custodian.expected_hash.to_hex(),
+                h.to_hex()
+            ),
+        });
+    }
     // THE GUARD IS DERIVED, not accepted.
     //
     // It arrived as its own argument, unchecked against the candidate, the
@@ -631,9 +655,9 @@ pub async fn execute_discard(
                 None => {
                     return Err(DestroyError::Unbound {
                         detail: format!(
-                            "the custodian for {} attests by version and records none, so there \
-                         is nothing to guard the DELETE with",
-                            key.as_str()
+                            "the custodian for file {} attests by version and records none, \
+                             so there is nothing to guard the DELETE with",
+                            candidate.file.get()
                         ),
                     });
                 }
@@ -643,9 +667,9 @@ pub async fn execute_discard(
         shepherd_storage::adapter::AttestationMode::Content => VersionGuard::ContentAddressed {
             expect: candidate.blake3.ok_or_else(|| DestroyError::Unbound {
                 detail: format!(
-                    "the candidate for {} has no hash, and a content-addressed guard is a \
-                     statement about the bytes",
-                    key.as_str()
+                    "candidate {} has no hash, and a content-addressed guard is a statement \
+                     about the bytes",
+                    candidate.file.get()
                 ),
             })?,
         },
@@ -654,13 +678,34 @@ pub async fn execute_discard(
         shepherd_storage::adapter::AttestationMode::None => {
             return Err(DestroyError::Unbound {
                 detail: format!(
-                    "the custodian for {} has no attestation mechanism and cannot authorise \
-                     destroying anything",
-                    key.as_str()
+                    "the custodian for file {} has no attestation mechanism and cannot \
+                     authorise destroying anything",
+                    candidate.file.get()
                 ),
             });
         }
     };
+
+    // Before the deletion, never after. The budget was already persisted by
+    // `reserve_discard`; this is the per-object draw against it, and it both
+    // authorises the deletion and names what may be deleted.
+    let key = charge
+        .spend(candidate, target, root, prefix)
+        .map_err(DestroyError::Breaker)?;
+
+    // The SAME process-wide remote-key lock `upload::upload_item` takes through
+    // `acquire_both`. Without it the two operations interleave on one key:
+    // a delete landing between an upload's completion and its verification
+    // makes that upload fail after it has already published, and a completion
+    // landing after the delete recreates an object this discard has already
+    // audited as gone — a live object with a forensic record saying it was
+    // destroyed.
+    //
+    // Held across the audit resolution, not just the DELETE: it is
+    // `execute_remote_discard`'s closing HEAD that decides whether an ambiguous
+    // failure gets a record or a halt, and a republish underneath that HEAD is
+    // exactly what would make it decide wrongly.
+    let _key_lock = locks.acquire_key(&key).await;
 
     // One call site. PM-2's requirement is that the discard branch runs through
     // the same intent + audit apparatus as local destruction; a second path

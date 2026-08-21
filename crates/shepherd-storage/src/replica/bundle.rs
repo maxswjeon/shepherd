@@ -524,22 +524,88 @@ pub fn encode_segment(entries: &[BundleEntry]) -> Result<Vec<u8>, super::chain::
     })
 }
 
+/// The most a recovery segment may expand to.
+///
+/// The compressed body comes from the TARGET, and zstd's expansion ratio is
+/// unbounded — a small planted or corrupted object can decompress to many
+/// gigabytes. `decode_all` builds the whole frame in one `Vec` before anything
+/// parses it, and recovery is exactly when the daemon has least to spare.
+///
+/// A catalog-scale bundle is JSONL of custody and config rows: 256 MiB is far
+/// above what `encode_segment` produces for any real one and far below what an
+/// expansion attack needs to be interesting.
+const MAX_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Decode a segment produced by [`encode_segment`].
+///
+/// # Bounded, and version-checked
+///
+/// Two things a decoder that trusts its input does not do. The body is a
+/// provider object under a key this build decided is a segment; being able to
+/// parse it is what establishes that it is one, and the allocation happens
+/// first.
 pub fn decode_segment(body: &[u8]) -> Result<Vec<BundleEntry>, super::chain::ChainError> {
-    let jsonl = zstd::decode_all(body).map_err(|err| super::chain::ChainError::Malformed {
+    // Streamed through a limited reader rather than `decode_all`, so the
+    // ceiling is enforced DURING expansion rather than discovered after it.
+    let mut jsonl = Vec::new();
+    let decoder = zstd::Decoder::new(body).map_err(|err| super::chain::ChainError::Malformed {
         key: "bundle segment".into(),
         detail: format!("zstd: {err}"),
     })?;
+    // `+ 1` so hitting the ceiling exactly is distinguishable from stopping at
+    // it: a segment that reads `MAX_SEGMENT_BYTES + 1` is over, and one that
+    // reads exactly the maximum is not.
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(decoder, MAX_SEGMENT_BYTES + 1),
+        &mut jsonl,
+    )
+    .map_err(|err| super::chain::ChainError::Malformed {
+        key: "bundle segment".into(),
+        detail: format!("zstd: {err}"),
+    })?;
+    if jsonl.len() as u64 > MAX_SEGMENT_BYTES {
+        return Err(super::chain::ChainError::Malformed {
+            key: "bundle segment".into(),
+            detail: format!(
+                "expands past the {MAX_SEGMENT_BYTES}-byte ceiling for a recovery segment; \
+                 it is not one, and expanding it to find that out is the allocation this \
+                 refuses"
+            ),
+        });
+    }
+
     let mut out = Vec::new();
     for (i, line) in jsonl.split(|b| *b == b'\n').enumerate() {
         if line.is_empty() {
             continue;
         }
-        let e =
+        let e: BundleEntry =
             serde_json::from_slice(line).map_err(|err| super::chain::ChainError::Malformed {
                 key: format!("bundle segment line {}", i + 1),
                 detail: err.to_string(),
             })?;
+        // THE SCHEMA VERSION, which nothing read.
+        //
+        // `BootstrapRecord` carries it and no reader checked it, and serde
+        // ignores unknown fields by default — so a segment from a future
+        // version deserialises cleanly, silently dropping whatever it added and
+        // applying version-1 semantics to anything it changed. Disaster
+        // recovery that is quietly incomplete is worse than one that refuses:
+        // the refusal is recoverable by upgrading, and the silent version is
+        // discovered by finding files missing.
+        if let BundleEntry::Bootstrap(b) = &e
+            && b.bundle_schema_version != BUNDLE_SCHEMA_VERSION
+        {
+            return Err(super::chain::ChainError::Malformed {
+                key: format!("bundle segment line {}", i + 1),
+                detail: format!(
+                    "bundle schema version {} and this build reads {BUNDLE_SCHEMA_VERSION}; \
+                     recovering from it would apply this version's meaning to another \
+                     version's records",
+                    b.bundle_schema_version
+                ),
+            });
+        }
         out.push(e);
     }
     Ok(out)

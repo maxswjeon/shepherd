@@ -211,7 +211,15 @@ impl IntentState {
             Prepared => &[SyscallIssued, Aborted],
             SyscallIssued => &[OutcomeKnown, OutcomeAmbiguous],
             OutcomeAmbiguous => &[OutcomeKnown, Aborted],
-            OutcomeKnown => &[Audited, ReconstructedAfterCrash],
+            // `Aborted` is the PROVEN-NEGATIVE edge: the syscall was issued
+            // and demonstrably did nothing — a failed `unlink(2)` whose errno
+            // says the entry is still there, a DELETE the provider refused on a
+            // precondition. That outcome is known, nothing irreversible
+            // happened, and there is no audit record owed, so `Audited` is the
+            // wrong way out and was the only one available. Without this edge
+            // every ordinary failed unlink settles nowhere and stays in
+            // `unresolved()` forever, which is the state recovery reads.
+            OutcomeKnown => &[Audited, ReconstructedAfterCrash, Aborted],
             Audited => &[CatalogCommitted],
             ReconstructedAfterCrash => &[CatalogCommitted],
             CatalogCommitted | Aborted => &[],

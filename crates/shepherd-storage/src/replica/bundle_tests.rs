@@ -614,3 +614,65 @@ fn the_bootstrap_record_lands_on_a_well_known_control_key() {
 fn corrupt_segment_bytes_are_reported_rather_than_partially_accepted() {
     assert!(decode_segment(b"not a zstd frame").is_err());
 }
+
+/// A segment that expands past the ceiling is refused before it is held.
+///
+/// The compressed body comes from the TARGET and zstd's expansion ratio is
+/// unbounded, so a small planted or corrupted object can decompress to many
+/// gigabytes — and `decode_all` built the whole frame in one `Vec` before
+/// anything parsed it. Recovery is exactly when the daemon has least to spare.
+#[test]
+fn a_segment_that_expands_past_the_ceiling_is_refused() {
+    // Highly compressible, and larger than the ceiling. Zeroes cost almost
+    // nothing to encode, which is the shape of the attack.
+    let huge = vec![0u8; (MAX_SEGMENT_BYTES + 1024) as usize];
+    let bomb = zstd::encode_all(huge.as_slice(), 3).expect("encode");
+    assert!(
+        (bomb.len() as u64) < MAX_SEGMENT_BYTES / 100,
+        "the fixture must be small compressed, or it is not testing expansion: {} bytes",
+        bomb.len()
+    );
+
+    let err = decode_segment(&bomb).expect_err("an expansion past the ceiling must be refused");
+    assert!(
+        format!("{err:?}").contains("ceiling"),
+        "the refusal must say what it refused: {err:?}"
+    );
+
+    // AND THE ACCEPTING DIRECTION: an ordinary segment still round-trips, so
+    // the ceiling cannot be satisfied by refusing everything.
+    let entries = vec![BundleEntry::Bootstrap(BootstrapRecord::new(
+        vec!["https://s3.example".into()],
+        "shepherd".into(),
+        AttestationMode::Version,
+    ))];
+    let ok = encode_segment(&entries).expect("encode");
+    assert_eq!(decode_segment(&ok).expect("decode"), entries);
+}
+
+/// A segment from another schema version is refused, not half-read.
+///
+/// `BootstrapRecord` carries `bundle_schema_version` and nothing read it — and
+/// serde ignores unknown fields by default, so a future segment deserialises
+/// cleanly while this build drops whatever it added and applies version-1
+/// meaning to whatever it changed. Disaster recovery that is quietly incomplete
+/// is worse than one that refuses: the refusal is fixed by upgrading, and the
+/// silent version is discovered by finding files missing.
+#[test]
+fn a_segment_from_another_schema_version_is_refused() {
+    let mut record = BootstrapRecord::new(
+        vec!["https://s3.example".into()],
+        "shepherd".into(),
+        AttestationMode::Version,
+    );
+    record.bundle_schema_version = BUNDLE_SCHEMA_VERSION + 1;
+    let body = encode_segment(&[BundleEntry::Bootstrap(record)]).expect("encode");
+
+    let err = decode_segment(&body).expect_err("another schema version must be refused");
+    let text = format!("{err:?}");
+    assert!(
+        text.contains(&(BUNDLE_SCHEMA_VERSION + 1).to_string())
+            && text.contains(&BUNDLE_SCHEMA_VERSION.to_string()),
+        "the refusal must name both versions: {text}"
+    );
+}

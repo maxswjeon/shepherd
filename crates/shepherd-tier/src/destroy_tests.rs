@@ -718,7 +718,7 @@ async fn a_root_that_does_not_own_the_file_does_not_authorize_this_destroy() {
 /// record — claiming a record that does not exist is the lie that state is
 /// supposed to rule out.
 #[tokio::test]
-async fn a_successful_destroy_walks_its_intent_to_catalog_committed() {
+async fn a_successful_destroy_walks_its_intent_to_audited() {
     use shepherd_catalog::intent::IntentState;
 
     let f = fixture("lifecycle", AttestationMode::Version);
@@ -745,9 +745,11 @@ async fn a_successful_destroy_walks_its_intent_to_catalog_committed() {
             IntentState::SyscallIssued,
             IntentState::OutcomeKnown,
             IntentState::Audited,
-            IntentState::CatalogCommitted,
         ],
-        "the journal must trace §4.4's sequence, in order"
+        "the journal must trace §4.4's sequence, in order — and STOP at \
+         `audited`, because this function changes no catalog row and the \
+         transaction that records the destruction is the only place the final \
+         state can be made atomic with it"
     );
     assert!(!f.path.exists(), "and the file really was destroyed");
 }
@@ -781,6 +783,61 @@ async fn a_destroy_refused_before_the_syscall_advances_nothing() {
         f.journal.seen().is_empty(),
         "a refusal before the syscall recorded {:?}",
         f.journal.seen()
+    );
+}
+
+/// A journal that cannot record `syscall-issued` stops the destruction.
+///
+/// Everything after the unlink is recorded best-effort, because there is
+/// nothing left to abort to. THIS one is different and treating it the same way
+/// was the defect: if `syscall-issued` is not durable, a crash leaves deleted
+/// bytes behind an intent that still says `prepared`, and recovery cannot tell
+/// an unissued operation from a completed one — which is the distinction the
+/// state exists to make.
+#[tokio::test]
+async fn a_destroy_whose_intent_cannot_be_advanced_does_not_unlink() {
+    struct Refuses;
+
+    #[async_trait::async_trait]
+    impl crate::destroy::IntentGate for Refuses {
+        async fn advance(
+            &self,
+            _id: shepherd_core::IntentId,
+            _to: shepherd_catalog::intent::IntentState,
+        ) -> Result<()> {
+            Err(DestroyError::Storage("the writer is unavailable".into()))
+        }
+    }
+
+    let f = fixture("journal-down", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let req = LocalDestroyRequest {
+        intent_gate: &Refuses,
+        ..f.request(&c)
+    };
+
+    let Some(r) = past_the_open_handle_floor(
+        execute_local_destruction(
+            req,
+            &f.provider,
+            &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
+            &f.audit,
+            &f.locks,
+            Timestamp::from_nanos(1),
+        )
+        .await,
+    ) else {
+        return;
+    };
+    r.expect_err("an unrecordable `syscall-issued` must stop the destruction");
+    assert!(
+        f.path.exists(),
+        "the file is restored from staging: this refusal is BEFORE the syscall, \
+         so abort-forward-never applies exactly as it does to every other one"
+    );
+    assert!(
+        f.audit.read_all().is_empty(),
+        "nothing irreversible happened, so nothing is owed a record"
     );
 }
 

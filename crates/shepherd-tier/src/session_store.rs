@@ -590,15 +590,24 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
         for row in rows {
             let (part_no, etag, bytes, local, checksum) = row.map_err(sqlite)?;
             let bytes = nonneg("a part's `bytes`", bytes)?;
-            // `try_from` rather than the old `unwrap_or_default`: a part number
-            // that does not fit silently became 0, which is not a part number
-            // at all — multipart parts are 1-based — so the offset below came
-            // out as if it were part 1.
-            let part_no = u32::try_from(part_no).map_err(|_| StorageError::Provider {
-                provider: "catalog",
-                op: "transfer_session".into(),
-                detail: format!("row has part_no = {part_no}, which is not a part number"),
-            })?;
+            // Against the PLAN, not merely against `u32`. The comment that
+            // replaced `unwrap_or_default` said multipart parts are 1-based and
+            // then only checked the conversion — so 0 and every value above
+            // `part_count` still loaded. Reconciliation ignores such a
+            // checkpoint, but the stale row survives in `session.parts` and
+            // `acknowledged_receipts` hands it to `complete_multipart`, which
+            // fails the completion even after every valid part is uploaded.
+            let part_no = u32::try_from(part_no)
+                .ok()
+                .filter(|n| (1..=part_count).contains(n))
+                .ok_or_else(|| StorageError::Provider {
+                    provider: "catalog",
+                    op: "transfer_session".into(),
+                    detail: format!(
+                        "row has part_no = {part_no}, outside 1..={part_count} — it belongs to \
+                         no part of this plan"
+                    ),
+                })?;
             parts.push(PartCheckpoint {
                 part_no,
                 // Derived, not stored: `part_size` is immutable for a session's
