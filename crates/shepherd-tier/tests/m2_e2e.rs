@@ -543,9 +543,13 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
 
     execute_local_destruction(
         &LocalDestroyRequest {
-            intent: shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(
-                1,
-            )),
+            intent: shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+                IntentId::new(1),
+                shepherd_catalog::intent::IntentKind::Local,
+                &corpus.target.to_string_lossy(),
+                corpus.payload.len() as i64,
+                Some(hash),
+            ),
             path: &corpus.target,
             root: &root,
             expected_hash: hash,

@@ -45,7 +45,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use shepherd_catalog::file_repo::ScanRoot;
-use shepherd_catalog::intent::PreparedIntent;
+use shepherd_catalog::intent::{IntentKind, PreparedIntent};
 use shepherd_core::ObjectKey;
 use shepherd_core::{Blake3Hash, FsId, Timestamp};
 use shepherd_placeholder::provider::{PlaceholderProvider, Staged};
@@ -75,6 +75,15 @@ pub enum DestroyError {
     Audit(#[from] crate::audit::AuditError),
     #[error("identity changed between verification and staging: {detail}")]
     IdentityMismatch { detail: String },
+    /// The request is not bound to the proofs it arrived with.
+    ///
+    /// Distinct from [`Self::Refused`], which carries §4.10.2's predicate
+    /// verdict about the world. This one is about the REQUEST: a prepared
+    /// intent, a custody proof and a remote key that do not all describe the
+    /// same bytes at the same path. Nothing here needs I/O to decide, which is
+    /// why it is decided before the lock.
+    #[error("request is not bound to its proof: {detail}")]
+    Unbound { detail: String },
     #[error("local content changed after verification: expected {expected}, staged holds {actual}")]
     ContentChanged { expected: String, actual: String },
     #[error("storage: {0}")]
@@ -175,6 +184,30 @@ pub async fn execute_local_destruction(
     if let Some(reason) = req.root.destroy_refusal() {
         return Err(DestroyError::Root(reason));
     }
+
+    // The intent must be THIS destruction's, and the custody proof must be
+    // about THESE bytes. Both are cheap refusals on the request alone, so both
+    // are made before the lock, before staging, and long before the syscall.
+    //
+    // Neither was checked. `PreparedIntent` proved only that some row reached
+    // `prepared`, so an intent prepared for one path authorized an unlink of
+    // another and the sole forensic record described a file that still exists.
+    // `custodian` proved only that SOME location was recently verified: under
+    // `AttestationMode::Content`, `destroy_permitted` could hand back a
+    // custodian holding different same-sized content, the local re-hash would
+    // pass against this request's hash, and the closing HEAD would prove only
+    // that an object of the right size exists — while the last local copy of
+    // different bytes went away. A predicate that authorizes destroying bytes
+    // has to name the bytes.
+    req.intent
+        .authorizes(
+            IntentKind::Local,
+            &req.path.to_string_lossy(),
+            req.expected_size,
+            req.expected_hash,
+        )
+        .map_err(|detail| DestroyError::Unbound { detail })?;
+    check_custody_binds(req)?;
 
     // Per-file serialization, keyed on identity. Held across every await below.
     //
@@ -335,6 +368,43 @@ fn restore_or_report(
             "{why} AND restore failed — the file is in staging and needs recovery"
         ),
     }
+}
+
+/// The custody proof must be about the bytes being destroyed.
+///
+/// Two clauses, because the hash alone leaves the key free to name something
+/// else: the closing HEAD in step 5 asks about the KEY, so a key that does not
+/// name these bytes turns that HEAD into a statement about a different object.
+///
+/// The LEAF, not the whole key and not a fan-out suffix. §4.9 has two key
+/// layouts — `content_key`'s `objects/aa/bb/<hex>` and `id_key`'s
+/// `objects/<file-id>/<hex>` for providers that need a human-navigable tree —
+/// and both end in the hash. Pinning `derive_object_key`'s shape would refuse
+/// the id-addressed layout outright the day it is wired up, which is a
+/// coupling to today's only caller rather than to §4.9. The leaf is the part
+/// that is about the bytes, and it is the part both layouts agree on.
+fn check_custody_binds(req: &LocalDestroyRequest<'_>) -> Result<()> {
+    if req.custodian.expected_hash != req.expected_hash {
+        return Err(DestroyError::Unbound {
+            detail: format!(
+                "the custody proof is for blake3 {} and this destruction is of {}; a location \
+             verified against other bytes cannot authorize destroying these",
+                req.custodian.expected_hash.to_hex(),
+                req.expected_hash.to_hex()
+            ),
+        });
+    }
+    let hex = req.expected_hash.to_hex();
+    if req.remote_key.as_str().rsplit('/').next() != Some(hex.as_str()) {
+        return Err(DestroyError::Unbound {
+            detail: format!(
+                "the remote key `{}` does not name blake3 {hex}, so the closing HEAD would ask \
+             about a different object than the one being destroyed",
+                req.remote_key.as_str()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Steps 3–5. Split out so every error path above restores the staged file.

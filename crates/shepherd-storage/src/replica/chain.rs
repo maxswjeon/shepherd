@@ -709,9 +709,13 @@ pub async fn verify_segments(
             continue;
         };
 
-        match crate::adapter::verify_full_content(
+        // Pinned to the HEAD's version, for the reason `verify_upload` is:
+        // unversioned ranges describe whatever is current as they run, not the
+        // object this loop decided to check.
+        match crate::adapter::verify_full_content_of(
             adapter,
             &key,
+            meta.version.as_ref(),
             expected,
             meta.size,
             SEGMENT_VERIFY_CHUNK,

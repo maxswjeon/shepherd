@@ -307,3 +307,63 @@ fn a_dot_in_a_parent_directory_is_not_treated_as_an_extension() {
         other => panic!("expected a conflict name: {other:?}"),
     }
 }
+
+/// A restore that drops captured attributes must not report success.
+///
+/// `restore_file` writes bytes, mode and mtime and nothing else, so every
+/// `Captured` xattr, ACL, resource fork, Finder tag and alternate data stream
+/// in a manifest is lost — and `verify_restore` never looked at
+/// `manifest.optional`, so it said `Ok(())` while it happened. §4.10.6's rule
+/// is that anything not preserved is DOCUMENTED, and silence is the one
+/// outcome it forbids.
+///
+/// One breach per class, because the remedies differ: xattrs can be re-set
+/// from the manifest, a resource fork cannot.
+#[test]
+fn captured_optional_attributes_that_are_not_restored_are_reported() {
+    let m = FidelityManifest::new(core())
+        .with(
+            AttrClass::Xattrs,
+            AttrCapture::Captured {
+                values: BTreeMap::from([
+                    ("user.tag".into(), "blue".into()),
+                    ("user.origin".into(), "camera".into()),
+                ]),
+            },
+        )
+        .with(AttrClass::PosixAcl, AttrCapture::Absent)
+        .with(
+            AttrClass::ResourceFork,
+            AttrCapture::Unsupported {
+                reason: "the target cannot carry a resource fork".into(),
+            },
+        );
+
+    let breaches = verify_restore(&m, &restored())
+        .expect_err("a restore that silently dropped two xattrs reported full fidelity");
+    assert_eq!(
+        breaches,
+        vec![FidelityBreach::OptionalNotRestored {
+            class: AttrClass::Xattrs,
+            values: 2,
+        }],
+        "only the CAPTURED class is a breach: `Absent` lost nothing, and \
+         `Unsupported` is already disclosed through `gaps()`"
+    );
+}
+
+/// The other direction: a manifest with no captured optional attributes is
+/// still a clean restore, so the check above cannot be satisfied by refusing
+/// everything.
+#[test]
+fn a_manifest_with_no_captured_optionals_still_passes() {
+    let m = FidelityManifest::new(core())
+        .with(AttrClass::Xattrs, AttrCapture::Absent)
+        .with(
+            AttrClass::FinderTags,
+            AttrCapture::Unsupported {
+                reason: "not macOS".into(),
+            },
+        );
+    assert_eq!(verify_restore(&m, &restored()), Ok(()));
+}

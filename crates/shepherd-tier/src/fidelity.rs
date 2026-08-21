@@ -175,6 +175,26 @@ pub enum FidelityBreach {
         expected: u32,
         actual: u32,
     },
+    /// The manifest captured an optional attribute class that the restore did
+    /// not put back.
+    ///
+    /// `restore_file` applies bytes, mode and mtime; nothing applies xattrs,
+    /// POSIX ACLs, resource forks, Finder tags or alternate data streams, and
+    /// `verify_restore` used to ignore `manifest.optional` entirely. A restore
+    /// of a file whose manifest recorded `Captured` xattrs therefore returned
+    /// success with every one of them gone — the silent direction, and the one
+    /// §4.10.6 exists to prevent. `Unsupported` already reaches the user as a
+    /// gap; `Captured`-but-not-applied was the arm with no reader.
+    ///
+    /// This fails the restore rather than warning, which is the same stance
+    /// the mode and mtime breaches take: a restore that reports success is a
+    /// claim of fidelity. Nothing produces `Captured` yet — the capture side
+    /// is unwired, as `AttrCapture`'s own tests are its only source — so this
+    /// costs nothing today and refuses on the first day it would have lied.
+    OptionalNotRestored {
+        class: AttrClass,
+        values: usize,
+    },
 }
 
 /// The finest mtime this platform's filesystems can actually store, in
@@ -261,6 +281,23 @@ pub fn verify_restore(
             expected: c.mode,
             actual: actual.mode,
         });
+    }
+
+    // Every captured optional class, because none of them are applied.
+    //
+    // Stated as a breach per CLASS rather than one summary breach: the caller's
+    // remedy differs — xattrs are re-settable from the manifest, a resource
+    // fork is not — and a single "optional attributes lost" line cannot say
+    // which. `Absent` and `Unsupported` are deliberately not here: nothing was
+    // lost in the first, and the second is already a declared gap carried
+    // through `AttrCapture::is_gap`.
+    for (class, capture) in &manifest.optional {
+        if let AttrCapture::Captured { values } = capture {
+            breaches.push(FidelityBreach::OptionalNotRestored {
+                class: *class,
+                values: values.len(),
+            });
+        }
     }
 
     if breaches.is_empty() {

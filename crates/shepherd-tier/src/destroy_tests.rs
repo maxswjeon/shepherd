@@ -103,6 +103,120 @@ fn custodian(mode: AttestationMode, hash: Blake3Hash) -> Location {
     }
 }
 
+/// An intent bound to exactly what a request destroys.
+///
+/// Every request that overrides `path` or `expected_hash` must rebind, because
+/// the destroy path now refuses a token prepared for something else. That is
+/// the point of the check, so the fixtures state the binding rather than
+/// working around it.
+fn bound_intent(id: i64, path: &Path, size: i64, hash: Blake3Hash) -> PreparedIntent {
+    PreparedIntent::fabricated_for_tests(
+        IntentId::new(id),
+        shepherd_catalog::intent::IntentKind::Local,
+        &path.to_string_lossy(),
+        size,
+        Some(hash),
+    )
+}
+
+/// A prepared intent authorizes ONE destruction, not any destruction.
+///
+/// `PreparedIntent` proved a row reached `prepared` and nothing about which
+/// row, so an intent prepared for one file authorized unlinking another and
+/// the sole forensic record — which is what §4.10.4's recovery reads — named a
+/// file that still exists. Being `Copy`, one row could back any number of
+/// them; that half is now a compile error rather than a test.
+#[tokio::test]
+async fn an_intent_prepared_for_another_file_does_not_authorize_this_one() {
+    let f = fixture("wrong-intent", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let elsewhere = f.tmp.0.join("someone-else.bin");
+    let req = LocalDestroyRequest {
+        intent: bound_intent(1, &elsewhere, payload().len() as i64, f.hash),
+        ..f.request(&c)
+    };
+
+    let err = execute_local_destruction(
+        &req,
+        &f.provider,
+        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("an intent prepared for another path must not authorize this unlink");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains("someone-else.bin")),
+        "the refusal must name the disagreement: {err}"
+    );
+    assert!(f.path.exists(), "and the file is still there");
+    assert!(
+        f.audit.read_all().is_empty(),
+        "refused before the syscall, so there is nothing to record"
+    );
+}
+
+/// Custody must be about the bytes being destroyed.
+///
+/// The closing check imported the custodian's attestation mode and version but
+/// never required its hash to be this file's. Under `AttestationMode::Content`
+/// that let a recently-verified location holding different same-sized content
+/// stand as custody: the local re-hash passes against the request's own hash,
+/// the closing HEAD proves only that an object of the right size exists, and
+/// the last local copy of unrelated bytes is unlinked.
+#[tokio::test]
+async fn custody_verified_against_other_bytes_does_not_authorize_this_destroy() {
+    let f = fixture("wrong-custody", AttestationMode::Content);
+    let other = Blake3Hash::from_bytes([0xAB; 32]);
+    let c = custodian(AttestationMode::Content, other);
+    let req = f.request(&c);
+
+    let err = execute_local_destruction(
+        &req,
+        &f.provider,
+        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("a custodian verified against other bytes must not authorize this destroy");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains(&other.to_hex())),
+        "the refusal must name the hash custody was verified against: {err}"
+    );
+    assert!(f.path.exists(), "and the file is still there");
+}
+
+/// The remote key must name the bytes, whatever §4.9 layout built it.
+#[tokio::test]
+async fn a_remote_key_naming_other_bytes_does_not_authorize_this_destroy() {
+    let f = fixture("wrong-key", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+    let other = shepherd_catalog::identity::content_key("t", Blake3Hash::from_bytes([0xCD; 32]));
+    let req = LocalDestroyRequest {
+        remote_key: &other,
+        ..f.request(&c)
+    };
+
+    let err = execute_local_destruction(
+        &req,
+        &f.provider,
+        &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("a key naming other bytes must not authorize this destroy");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains("does not name")),
+        "the refusal must say the key is about something else: {err}"
+    );
+    assert!(f.path.exists(), "and the file is still there");
+}
+
 /// A file old enough and big enough to clear the floors.
 fn payload() -> Vec<u8> {
     vec![7u8; 128 * 1024]
@@ -168,9 +282,16 @@ fn fixture(tag: &str, mode: AttestationMode) -> Fixture {
 impl Fixture {
     fn request<'a>(&'a self, custodian: &'a Location) -> LocalDestroyRequest<'a> {
         LocalDestroyRequest {
-            intent: shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(
-                1,
-            )),
+            // Bound to what this request destroys — the token is checked
+            // against the request now, so a fixture that fabricates a
+            // mismatched one is testing the refusal, not the happy path.
+            intent: shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+                IntentId::new(1),
+                shepherd_catalog::intent::IntentKind::Local,
+                &self.path.to_string_lossy(),
+                payload().len() as i64,
+                Some(self.hash),
+            ),
             path: &self.path,
             root: &self.root,
             expected_hash: self.hash,
@@ -286,12 +407,20 @@ async fn the_happy_path_destroys_and_audits() {
 #[tokio::test]
 async fn content_changed_since_verification_aborts_and_restores() {
     let f = fixture("changed", AttestationMode::Version);
-    // The catalog believes a different hash than the disk holds.
-    let mut c = custodian(AttestationMode::Version, f.hash);
-    c.object_version = Some(shepherd_core::ObjectVersion::new("v9"));
+    // The catalog believes a different hash than the disk holds. Every PROOF in
+    // the request agrees on that belief — the intent, the custody record and
+    // the remote key are all for `wrong` — because a request whose own proofs
+    // disagree is refused at the door now, and this test is about the other
+    // failure: the disk not matching what everything else agrees on. Step 4's
+    // re-hash through the staged handle is what has to catch it.
     let wrong = Blake3Hash::from_bytes([0xEE; 32]);
+    let mut c = custodian(AttestationMode::Version, wrong);
+    c.object_version = Some(shepherd_core::ObjectVersion::new("v9"));
+    let wrong_key = shepherd_catalog::identity::content_key("t", wrong);
     let req = LocalDestroyRequest {
         expected_hash: wrong,
+        intent: bound_intent(1, &f.path, payload().len() as i64, wrong),
+        remote_key: &wrong_key,
         ..f.request(&c)
     };
 
@@ -630,6 +759,7 @@ async fn the_destroy_path_stages_a_nested_file_into_the_registered_root() {
         path: &nested,
         verified_identity: identity_of(&nested),
         fs_id: &nested_fs_id,
+        intent: bound_intent(1, &nested, payload().len() as i64, f.hash),
         ..f.request(&c)
     };
 
@@ -743,7 +873,13 @@ async fn remote_discard_deletes_and_audits_through_the_same_apparatus() {
         shepherd_storage::adapter::VersionGuard::Version(shepherd_core::ObjectVersion::new("v9"));
 
     execute_remote_discard(
-        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(7)),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+            IntentId::new(7),
+            shepherd_catalog::intent::IntentKind::Remote,
+            f.key.as_str(),
+            payload().len() as i64,
+            Some(f.hash),
+        ),
         &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
         &f.key,
         &guard,
@@ -770,7 +906,13 @@ async fn remote_discard_refuses_while_the_audit_log_is_halted() {
         shepherd_storage::adapter::VersionGuard::Version(shepherd_core::ObjectVersion::new("v9"));
 
     let err = execute_remote_discard(
-        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(8)),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+            IntentId::new(8),
+            shepherd_catalog::intent::IntentKind::Remote,
+            f.key.as_str(),
+            payload().len() as i64,
+            Some(f.hash),
+        ),
         &(&f.adapter as &dyn shepherd_storage::StorageAdapter),
         &f.key,
         &guard,
@@ -922,7 +1064,13 @@ async fn a_lost_delete_acknowledgement_is_still_audited() {
     let remote = AmbiguousDelete::new(true, true);
 
     execute_remote_discard(
-        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(11)),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+            IntentId::new(11),
+            shepherd_catalog::intent::IntentKind::Remote,
+            f.key.as_str(),
+            payload().len() as i64,
+            Some(f.hash),
+        ),
         &remote,
         &f.key,
         &v9(),
@@ -958,7 +1106,13 @@ async fn a_delete_that_never_landed_is_neither_audited_nor_halting() {
     let remote = AmbiguousDelete::new(false, true);
 
     let err = execute_remote_discard(
-        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(12)),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+            IntentId::new(12),
+            shepherd_catalog::intent::IntentKind::Remote,
+            f.key.as_str(),
+            payload().len() as i64,
+            Some(f.hash),
+        ),
         &remote,
         &f.key,
         &v9(),
@@ -988,7 +1142,13 @@ async fn an_unresolvable_delete_halts_subsequent_destruction() {
     let remote = AmbiguousDelete::new(true, false);
 
     let err = execute_remote_discard(
-        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(13)),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+            IntentId::new(13),
+            shepherd_catalog::intent::IntentKind::Remote,
+            f.key.as_str(),
+            payload().len() as i64,
+            Some(f.hash),
+        ),
         &remote,
         &f.key,
         &v9(),
@@ -1025,7 +1185,13 @@ async fn a_head_that_answers_with_another_version_is_not_a_resolution() {
     let remote = AmbiguousDelete::replaced("v10");
 
     let err = execute_remote_discard(
-        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(14)),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+            IntentId::new(14),
+            shepherd_catalog::intent::IntentKind::Remote,
+            f.key.as_str(),
+            payload().len() as i64,
+            Some(f.hash),
+        ),
         &remote,
         &f.key,
         &v9(),
@@ -1060,7 +1226,13 @@ async fn a_refused_precondition_neither_records_nor_halts() {
     let remote = AmbiguousDelete::refused();
 
     let err = execute_remote_discard(
-        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(IntentId::new(15)),
+        shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
+            IntentId::new(15),
+            shepherd_catalog::intent::IntentKind::Remote,
+            f.key.as_str(),
+            payload().len() as i64,
+            Some(f.hash),
+        ),
         &remote,
         &f.key,
         &v9(),
@@ -1167,6 +1339,7 @@ async fn a_destroy_already_admitted_does_not_unlink_after_another_one_halts_the_
         path: &second,
         verified_identity: second_id,
         fs_id: &second_fs_id,
+        intent: bound_intent(2, &second, payload().len() as i64, f.hash),
         ..f.request(&c)
     };
     let entered = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -1282,6 +1455,7 @@ async fn two_concurrent_destroys_with_a_healthy_audit_log_both_complete() {
         path: &second,
         verified_identity: second_id,
         fs_id: &second_fs_id,
+        intent: bound_intent(2, &second, payload().len() as i64, f.hash),
         ..f.request(&c)
     };
     let entered = std::sync::Arc::new(tokio::sync::Notify::new());

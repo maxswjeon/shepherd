@@ -551,7 +551,43 @@ impl<'a> FileRepo<'a> {
             InodeSighting::ForeignVolume => (None, true),
             InodeSighting::Unknown => (None, false),
         };
-        self.0.conn_mut().execute(
+        // WHOSE inode is at this path now.
+        //
+        // The conflict branch below preserves `state` so a re-scan cannot
+        // revoke a tiered file's custody — but "the path still stats" and "it
+        // is the same file" are different claims, and only the second one
+        // justifies preserving anything. Recreate a delete-mode file at a
+        // tiered path and the row kept `state = 'remote'`, kept the old bytes'
+        // digest, and kept its `object_location` rows: a brand-new local file
+        // wearing another file's custody, which the destroy predicate reads as
+        // permission to unlink it because a replica of the OLD bytes exists.
+        //
+        // Both sides must be KNOWN to differ. An unknown identity on either
+        // side is not evidence of replacement, and guessing in that direction
+        // revokes custody on a genuinely tiered file — the failure the
+        // preserved `state` exists to prevent. Neither unknown case is silently
+        // safe; they are simply not decidable here, and `fs_id`'s own comment
+        // is where the volume-id gaps are tracked.
+        // A SAVEPOINT, not a transaction. The batch writer already wraps a
+        // whole batch of upserts in one, and `transaction()` inside that is
+        // "cannot start a transaction within a transaction" — the scan then
+        // fails with zero files catalogued. A savepoint nests, and outside a
+        // transaction it behaves as one, so this reads the prior identity and
+        // revokes custody atomically either way.
+        let tx = self.0.conn_mut().savepoint()?;
+        let prior: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT id, fs_id FROM file WHERE root_id = ?1 AND rel_path = ?2",
+                params![root.id.get(), stat.rel_path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let replaced = match (&prior, &fs_id) {
+            (Some((_, Some(was))), Some(now_id)) => was != now_id,
+            _ => false,
+        };
+
+        let changed = tx.execute(
             "INSERT INTO file
                  (root_id, rel_path, name, ext, size, mtime, ctime, atime,
                   norm_key, first_seen_at, blake3, state, last_seen_gen, updated_at,
@@ -587,10 +623,17 @@ impl<'a> FileRepo<'a> {
                  -- min-age floor source where mtime is untrusted or in the
                  -- future, and a re-scan must not reset a file's apparent age.
                  --
-                 -- state is NOT in this list either, and for the same shape of
-                 -- reason: a stub or a tiered placeholder still stats, so a
-                 -- re-scan that wrote excluded.state ('local') would silently
+                 -- state is preserved for the same shape of reason: a stub or
+                 -- a tiered placeholder still stats, so a re-scan that wrote
+                 -- excluded.state ('local') unconditionally would silently
                  -- revoke custody on every file the tierer had moved.
+                 --
+                 -- ?15 is the one case where writing it is the correct answer
+                 -- rather than the destructive one: the path is occupied by a
+                 -- DIFFERENT inode than the row describes, so this is not the
+                 -- tiered file at all and none of the tiered file's state is
+                 -- about it. See the identity comparison above the statement.
+                 state = CASE WHEN ?15 = 1 THEN 'local' ELSE file.state END,
                  --
                  -- blake3 survives a hashless re-scan ONLY where the metadata
                  -- that identified the hashed bytes held still. A bare COALESCE
@@ -624,12 +667,18 @@ impl<'a> FileRepo<'a> {
                  -- file becomes permanently `PlanRefusal::Unhashed`, silently
                  -- excluded from every tier plan, which is a file that never
                  -- gets backed up and never reports why.
-                 blake3 = COALESCE(
+                 --
+                 -- ?15 short-circuits the whole guard: on a replaced inode the
+                 -- metadata comparison is meaningless (a new file can land with
+                 -- the same size and a copied mtime) and the recorded digest is
+                 -- the OLD bytes'. Keeping it would name the new file's row
+                 -- with the old content-addressed key.
+                 blake3 = CASE WHEN ?15 = 1 THEN excluded.blake3 ELSE COALESCE(
                      excluded.blake3,
                      CASE WHEN excluded.size  = file.size
                            AND excluded.mtime = file.mtime
                            AND excluded.ctime = file.ctime
-                          THEN file.blake3 END)
+                          THEN file.blake3 END) END
              WHERE excluded.last_seen_gen >= file.last_seen_gen",
             params![
                 root.id.get(),
@@ -646,8 +695,29 @@ impl<'a> FileRepo<'a> {
                 generation,
                 fs_id,
                 clear_fs_id as i64,
+                replaced as i64,
             ],
         )?;
+
+        // Only when the write actually applied. The statement's trailing
+        // `WHERE` drops a stale scan's batch entirely, and a stale batch must
+        // not be able to revoke custody either — it is describing an older view
+        // of the path than the row already holds.
+        if replaced
+            && changed == 1
+            && let Some((id, _)) = prior
+        {
+            // The bindings, not only the state word. `destroy_permitted` reads
+            // `object_location` by `file_id`, so a verified location left
+            // attached to a replaced row is a live custody claim over bytes
+            // that are no longer at this path — the state reset above would not
+            // stop it.
+            tx.execute(
+                "DELETE FROM object_location WHERE file_id = ?1",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1337,6 +1407,127 @@ mod tests {
             .query_row("SELECT updated_at FROM file", [], |r| r.get(0))
             .unwrap();
         assert_eq!(updated, 2, "the re-scan must still have written the row");
+    }
+
+    /// A NEW inode at a tiered path is a new file, and inherits nothing.
+    ///
+    /// The conflict branch preserves `state` so a re-scan cannot revoke a
+    /// tiered file's custody, and that is right for the file it was written
+    /// for — but "the path still stats" is not "it is the same file". Recreate
+    /// a delete-mode file at a tiered path and the row kept `state='remote'`,
+    /// kept the old bytes' digest, and kept its `object_location` rows: a
+    /// brand-new local file wearing another file's custody, which
+    /// `destroy_permitted` reads as permission to unlink it because a replica
+    /// of the OLD bytes exists somewhere.
+    ///
+    /// All three are asserted, because the state word alone is not the claim.
+    /// The location row is what the destroy predicate actually reads.
+    #[test]
+    fn a_new_inode_at_a_tiered_path_does_not_inherit_its_custody() {
+        let (mut cat, root) = fixture();
+        let mut first = stat(root.id, "a.txt");
+        first.ino = InodeSighting::Known(11);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &first, GEN, Timestamp::from_nanos(1))
+            .unwrap();
+
+        // Stand in for the tierer (Phase 2/3): a tiered row with a digest and
+        // a verified location.
+        cat.conn_mut()
+            .execute_batch(
+                "UPDATE file SET state = 'remote', blake3 = X'0102';
+                 INSERT INTO target (id, name, adapter) VALUES (1, 't', 's3');
+                 INSERT INTO remote_object (id, target_id, key, size)
+                     VALUES (1, 1, 'objects/aa/bb/aabb', 10);
+                 INSERT INTO object_location (file_id, target_id, remote_object_id, state)
+                     SELECT id, 1, 1, 'verified' FROM file;",
+            )
+            .unwrap();
+
+        // The user recreates a file at the same path: same name, new inode.
+        let mut replaced = stat(root.id, "a.txt");
+        replaced.ino = InodeSighting::Known(22);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &replaced, GEN, Timestamp::from_nanos(2))
+            .unwrap();
+
+        let (st, hash): (String, Option<Vec<u8>>) = cat
+            .conn()
+            .query_row("SELECT state, blake3 FROM file", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            st, "local",
+            "a new inode at the path is a local file, whatever the row used to describe"
+        );
+        assert_eq!(
+            hash, None,
+            "and the old bytes' digest does not name the new file — it is the \
+             content-addressed key an upload would put the NEW bytes under"
+        );
+        let locations: i64 = cat
+            .conn()
+            .query_row("SELECT COUNT(*) FROM object_location", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            locations, 0,
+            "the custody binding is what `destroy_permitted` reads; leaving it \
+             attached is a live claim over bytes that are no longer at this path"
+        );
+    }
+
+    /// The same inode keeps everything — the other half, and the one that has
+    /// to keep holding.
+    ///
+    /// Revoking on a re-scan of a genuinely tiered file is the failure the
+    /// preserved `state` exists to prevent, and a replacement check that is
+    /// too eager reintroduces it. An UNKNOWN identity on either side counts as
+    /// "not decidable", never as "replaced": most of this test's sightings
+    /// carry no inode at all, which is exactly the shape a scan of a root with
+    /// no volume id produces.
+    #[test]
+    fn a_rescan_of_the_same_inode_keeps_custody() {
+        let (mut cat, root) = fixture();
+        let mut seen = stat(root.id, "a.txt");
+        seen.ino = InodeSighting::Known(11);
+        FileRepo::new(&mut cat)
+            .upsert_file(&root, &seen, GEN, Timestamp::from_nanos(1))
+            .unwrap();
+        cat.conn_mut()
+            .execute_batch(
+                "UPDATE file SET state = 'remote', blake3 = X'0102';
+                 INSERT INTO target (id, name, adapter) VALUES (1, 't', 's3');
+                 INSERT INTO remote_object (id, target_id, key, size)
+                     VALUES (1, 1, 'objects/aa/bb/aabb', 10);
+                 INSERT INTO object_location (file_id, target_id, remote_object_id, state)
+                     SELECT id, 1, 1, 'verified' FROM file;",
+            )
+            .unwrap();
+
+        for (ino, at) in [(InodeSighting::Known(11), 2), (InodeSighting::Unknown, 3)] {
+            let mut again = stat(root.id, "a.txt");
+            again.ino = ino;
+            FileRepo::new(&mut cat)
+                .upsert_file(&root, &again, GEN, Timestamp::from_nanos(at))
+                .unwrap();
+            let (st, locations): (String, i64) = cat
+                .conn()
+                .query_row(
+                    "SELECT f.state, (SELECT COUNT(*) FROM object_location) FROM file f",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                st, "remote",
+                "sighting {ino:?} revoked a tiered row's state"
+            );
+            assert_eq!(
+                locations, 1,
+                "sighting {ino:?} dropped a tiered row's custody binding"
+            );
+        }
     }
 
     #[test]

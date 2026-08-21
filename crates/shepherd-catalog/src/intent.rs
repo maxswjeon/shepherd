@@ -292,12 +292,86 @@ pub struct NewIntent<'a> {
 /// transaction commits — an fsync under `synchronous = FULL`. Passing it by
 /// value into the destroy path makes "an intent was durably prepared for this"
 /// a precondition the caller cannot skip rather than a comment it can ignore.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PreparedIntent(IntentId);
+/// # Bound to ONE destruction, not merely to the fact that one was prepared
+///
+/// The token used to be `PreparedIntent(IntentId)` and `Copy`. That proved a
+/// row existed and nothing about WHICH row: the destroy path never compared it
+/// against the request it arrived with, so one prepared intent could authorize
+/// an unlink of a different path, of different bytes, or of a different kind
+/// entirely — and being `Copy`, could authorize any number of them, leaving a
+/// single journal row that describes only the first. The row is §4.10.4's whole
+/// forensic record; a record that describes a different file than the one that
+/// was destroyed is worse than none, because recovery trusts it.
+///
+/// So the token carries what `prepare` wrote, and [`Self::authorizes`] is how
+/// the destroy path turns that into a refusal. The fields are private and there
+/// is no setter: a binding the holder can edit binds nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedIntent {
+    id: IntentId,
+    kind: IntentKind,
+    path: String,
+    size: i64,
+    blake3: Option<Blake3Hash>,
+}
 
 impl PreparedIntent {
     pub fn id(&self) -> IntentId {
-        self.0
+        self.id
+    }
+
+    /// Whether this token authorizes destroying exactly what is described.
+    ///
+    /// `Err` names the field that disagreed, because the alternative — a bare
+    /// "intent does not match" on an irreversible path — tells an operator
+    /// nothing about whether they hit a bug or an attack.
+    ///
+    /// A `None` hash in the row does NOT match a request that names one: the
+    /// row was prepared without recording which bytes it covers, so it cannot
+    /// be evidence about them. Fail closed.
+    pub fn authorizes(
+        &self,
+        kind: IntentKind,
+        path: &str,
+        size: u64,
+        blake3: Blake3Hash,
+    ) -> std::result::Result<(), String> {
+        if self.kind != kind {
+            return Err(format!(
+                "intent {} was prepared as `{}` and this is a `{}` destruction",
+                self.id.get(),
+                self.kind.as_str(),
+                kind.as_str()
+            ));
+        }
+        if self.path != path {
+            return Err(format!(
+                "intent {} was prepared for `{}` and this destruction names `{path}`",
+                self.id.get(),
+                self.path
+            ));
+        }
+        if self.size != size as i64 {
+            return Err(format!(
+                "intent {} was prepared for {} bytes and this destruction names {size}",
+                self.id.get(),
+                self.size
+            ));
+        }
+        match self.blake3 {
+            Some(h) if h == blake3 => Ok(()),
+            Some(h) => Err(format!(
+                "intent {} was prepared for blake3 {} and this destruction names {}",
+                self.id.get(),
+                h.to_hex(),
+                blake3.to_hex()
+            )),
+            None => Err(format!(
+                "intent {} recorded no blake3, so it is not evidence about the bytes this \
+                 destruction names",
+                self.id.get()
+            )),
+        }
     }
 
     /// Mint one WITHOUT a journal. **Behind the `test-util` feature**, which is
@@ -313,8 +387,20 @@ impl PreparedIntent {
     /// [`IntentJournal::prepare`] wherever a `Catalog` is at hand — `ac6_recovery`
     /// does, and the destroy path is the better tested for it.
     #[cfg(feature = "test-util")]
-    pub fn fabricated_for_tests(id: IntentId) -> Self {
-        Self(id)
+    pub fn fabricated_for_tests(
+        id: IntentId,
+        kind: IntentKind,
+        path: &str,
+        size: i64,
+        blake3: Option<Blake3Hash>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            path: path.to_owned(),
+            size,
+            blake3,
+        }
     }
 }
 
@@ -356,7 +442,15 @@ impl<'a> IntentJournal<'a> {
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
-        Ok(PreparedIntent(IntentId::new(id)))
+        // The token repeats what the row says, so the destroy path can refuse a
+        // request that does not match it without another read.
+        Ok(PreparedIntent {
+            id: IntentId::new(id),
+            kind: new.kind,
+            path: new.path.to_owned(),
+            size: new.size,
+            blake3: new.blake3,
+        })
     }
 
     /// Advance an intent's state along §4.4's lifecycle.

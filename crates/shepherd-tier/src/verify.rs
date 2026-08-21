@@ -18,7 +18,7 @@
 use shepherd_core::{Blake3Hash, ObjectKey, ObjectVersion, TargetId, Timestamp};
 use shepherd_storage::adapter::{
     AttestationMode, ObjectChecksum, StorageAdapter, StorageError, StorageResult,
-    verify_full_content,
+    verify_full_content_of,
 };
 
 /// The chunk size for the streaming full-content read.
@@ -78,7 +78,26 @@ pub async fn verify_upload(
 
     // AC-1. Streamed by range: a 50 GB object read into one buffer would need
     // 50 GB of RAM, and these are exactly the objects the tier path exists for.
-    verify_full_content(adapter, key, expected, expected_size, VERIFY_CHUNK).await?;
+    //
+    // BY VERSION, pinned to the one the HEAD above returned. Unversioned ranges
+    // hash whatever is current while they are being read, which is a different
+    // claim from the one `VerifiedLocation` records: a writer that replaces the
+    // object between the HEAD and the reads, with bytes that happen to match,
+    // leaves this returning `object_version: meta.version` for bytes nobody
+    // hashed. Deleting the replacement then exposes that earlier version again,
+    // and its closing HEAD authorizes a destruction on the strength of a
+    // verification that never looked at it. Same fix the transfer-session path
+    // took, and it is the same mistake — the pin has to reach the reads, not
+    // only the record.
+    verify_full_content_of(
+        adapter,
+        key,
+        meta.version.as_ref(),
+        expected,
+        expected_size,
+        VERIFY_CHUNK,
+    )
+    .await?;
 
     let mode = adapter.probe_attestation_mode().await?;
     if mode == AttestationMode::None {

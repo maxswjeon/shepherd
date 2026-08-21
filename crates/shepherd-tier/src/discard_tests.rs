@@ -546,6 +546,10 @@ impl Remote {
             charge,
             shepherd_catalog::intent::PreparedIntent::fabricated_for_tests(
                 shepherd_core::IntentId::new(intent as i64 + 1),
+                shepherd_catalog::intent::IntentKind::Remote,
+                prefix,
+                0,
+                None,
             ),
             &(&self.adapter as &dyn shepherd_storage::StorageAdapter),
             candidate,

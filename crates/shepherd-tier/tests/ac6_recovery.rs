@@ -222,6 +222,10 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
             .expect("the journal must accept a prepared intent")
     };
 
+    // Read the id BEFORE the token moves into the request: `PreparedIntent` is
+    // no longer `Copy`, because one prepared row authorizing several unlinks is
+    // exactly the reuse the binding exists to stop.
+    let prepared_intent_id = prepared_intent.id();
     let destroyed = execute_local_destruction(
         &LocalDestroyRequest {
             // Minted by the JOURNAL, not fabricated. `PreparedIntent` exists so
@@ -342,7 +346,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     };
     assert_eq!(
         audited["intent"].as_i64(),
-        Some(prepared_intent.id().get()),
+        Some(prepared_intent_id.get()),
         "the record must belong to the intent the journal prepared, or deriving from it \
          proves nothing about this destruction"
     );
