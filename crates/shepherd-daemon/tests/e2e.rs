@@ -922,6 +922,25 @@ fn a_root_retargeted_to_another_directory_refuses_to_scan() {
     )["root"]["root_id"]
         .as_i64()
         .expect("root_id");
+    // The check under test is skipped when no identity was recorded, and the
+    // first version of this test could not tell that apart from a scan that
+    // was allowed — it passed here and failed on CI, where the workspace
+    // filesystem has no UUID. Asserting the identity exists is what makes a
+    // silently-absent check a failure with a name.
+    let enrolled: Option<String> =
+        rusqlite::Connection::open(d.dir.join("state").join("catalog.db"))
+            .unwrap()
+            .query_row(
+                "SELECT root_fs_id FROM scan_root WHERE id = ?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(
+        enrolled.is_some(),
+        "the enrolled directory's identity must be recorded, or this test proves nothing"
+    );
+
     c.call("scan.start", serde_json::json!({ "root_id": root_id }));
     assert!(wait_for_scan(&mut c, root_id)["last_error"].is_null());
 

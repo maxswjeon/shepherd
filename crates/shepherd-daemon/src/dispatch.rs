@@ -467,18 +467,31 @@ impl ShepherdApi for Session {
         // where nothing is wrong beyond the identity being weak. The operator
         // is told what they lose instead.
         let volume = shepherd_catalog::volume::current_volume_id(&path);
-        // The directory's own identity, built the way a file's is: the volume
-        // it is on plus its inode. `None` where either is unavailable, which is
-        // the same "unknown, not wrong" every other identity here uses.
-        let root_identity = volume.as_deref().and_then(|vol| {
-            std::fs::metadata(&path).ok().map(|md| {
-                shepherd_catalog::volume::fs_id_from_ino(
-                    vol,
-                    std::os::unix::fs::MetadataExt::ino(&md),
-                )
-                .as_str()
-                .to_owned()
-            })
+        // The directory's own identity: the volume it is on where that is
+        // knowable, plus its inode.
+        //
+        // The INODE is the part that answers this question, and it is available
+        // even where a volume id is not — a filesystem with no UUID still gives
+        // every directory a distinct one, and an inode does not change across a
+        // remount, which is the reason `volume_id` exists in the first place.
+        // Requiring a volume id here would have made the check silently absent
+        // on exactly the hosts that have no other identity to fall back on;
+        // that is where its CI first ran, and where it did nothing.
+        //
+        // The unqualified form is prefixed so it can never be mistaken for a
+        // volume-qualified one, and so a root enrolled before a UUID appeared
+        // does not silently compare equal to one enrolled after.
+        //
+        // `None` only when the directory cannot be stat'd at all, which is the
+        // same "unknown, not wrong" every other identity here uses.
+        let root_identity = std::fs::metadata(&path).ok().map(|md| {
+            let ino = std::os::unix::fs::MetadataExt::ino(&md);
+            match volume.as_deref() {
+                Some(vol) => shepherd_catalog::volume::fs_id_from_ino(vol, ino)
+                    .as_str()
+                    .to_owned(),
+                None => format!("ino-only:{ino}"),
+            }
         });
 
         let mut warnings = Vec::new();

@@ -864,18 +864,25 @@ fn upsert_batch(
 
 /// The enrolled directory's identity as it stands now.
 ///
-/// Built the way a file's `fs_id` is — the volume plus the inode — so the two
-/// are comparable and neither depends on `st_dev`, which does not survive a
-/// remount.
+/// The volume plus the inode where a volume id is known, and the inode alone
+/// where it is not — the inode is the part that answers "which directory", and
+/// it survives a remount, which is why neither form uses `st_dev`.
+///
+/// The unqualified form carries a prefix so it cannot compare equal to a
+/// volume-qualified one: a root enrolled before a UUID appeared must not look
+/// like the same root afterwards.
 fn current_root_identity(path: &std::path::Path, volume_id: Option<&str>) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let vol = volume_id?;
-    let md = std::fs::metadata(path).ok()?;
-    Some(
-        shepherd_catalog::volume::fs_id_from_ino(vol, md.ino())
+    let ino = std::fs::metadata(path).ok()?.ino();
+    Some(match volume_id {
+        Some(vol) => shepherd_catalog::volume::fs_id_from_ino(vol, ino)
             .as_str()
             .to_owned(),
-    )
+        // Unqualified, and prefixed so it can never compare equal to a
+        // volume-qualified id. See the enrollment side for why the inode alone
+        // is still worth recording.
+        None => format!("ino-only:{ino}"),
+    })
 }
 
 /// The path a skip is about, if it has one.
