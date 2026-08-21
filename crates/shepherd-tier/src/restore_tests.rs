@@ -206,9 +206,16 @@ fn a_content_mismatch_is_caught_by_the_read_back() {
     // success.
     let dir = TempDir::new("mismatch");
     let target = dir.path("bad.raw");
+    // The SAME LENGTH as the manifest describes, deliberately. A shorter
+    // source is a truncated download and now says so — a different failure
+    // from "the bytes were wrong", and this test is about the second one.
     let m = manifest_for(b"what the manifest says", 0o644);
+    assert_eq!(
+        b"what actually arrivedX".len(),
+        b"what the manifest says".len()
+    );
 
-    match restore_file(&target, b"what actually arrived", &m) {
+    match restore_file(&target, b"what actually arrivedX", &m) {
         Err(RestoreError::FidelityBreached { breaches, .. }) => {
             assert!(
                 breaches
@@ -481,7 +488,7 @@ fn a_destination_swapped_after_the_create_is_named_rather_than_verified() {
     );
     std::fs::rename(&staging, &chosen).expect("take the name over");
 
-    let err = write_and_verify(f, &chosen, BYTES, &m, created).expect_err(
+    let err = write_and_verify(f, &chosen, &mut &BYTES[..], &m, created).expect_err(
         "the destination no longer names the inode this attempt created, so the \
          restore did not publish anything and must not report success",
     );
@@ -520,5 +527,62 @@ fn a_destination_swapped_after_the_create_is_named_rather_than_verified() {
     assert_eq!(
         ours.blake3, m.core.blake3,
         "our inode holds the restored bytes"
+    );
+}
+
+/// A restore streams its input rather than requiring the whole object.
+///
+/// The read-back was changed to stream precisely so a 50 GB restore does not
+/// need a 50 GB buffer to VERIFY, and the input side still demanded one to
+/// WRITE — half a fix, with the allocation moved out of the second half of the
+/// function and left in every caller.
+///
+/// A reader that refuses to hand over more than a chunk at a time is the
+/// property itself: it cannot be satisfied by an implementation that collects
+/// first, because collecting is what it makes impossible to do in one call.
+#[test]
+fn a_restore_never_holds_more_than_a_chunk_of_its_input() {
+    struct Dribble<'a> {
+        rest: &'a [u8],
+        largest_read: std::cell::Cell<usize>,
+    }
+
+    impl std::io::Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // Seven bytes at a time, so `write_and_verify` must loop.
+            let n = self.rest.len().min(buf.len()).min(7);
+            buf[..n].copy_from_slice(&self.rest[..n]);
+            self.rest = &self.rest[n..];
+            self.largest_read.set(self.largest_read.get().max(n));
+            Ok(n)
+        }
+    }
+
+    let dir = TempDir::new("stream");
+    let target = dir.path("streamed.raw");
+    let m = manifest_for(BYTES, 0o644);
+    let mut src = Dribble {
+        rest: BYTES,
+        largest_read: std::cell::Cell::new(0),
+    };
+
+    let outcome = restore_stream(&target, &mut src, &m).expect("a streamed restore lands");
+    assert_eq!(std::fs::read(outcome.path()).unwrap(), BYTES);
+    assert!(
+        src.largest_read.get() <= 7,
+        "the restore pulled {} bytes in one read from a source that offers seven",
+        src.largest_read.get()
+    );
+
+    // AND A SOURCE THAT ENDS EARLY is a truncated download, which is a
+    // different failure from wrong bytes and says so. Without the count it
+    // reads as a content breach, and "the download stopped" and "the object is
+    // corrupt" send an operator to different places.
+    let short = dir.path("short.raw");
+    let err = restore_stream(&short, &mut &BYTES[..10], &m)
+        .expect_err("a source that ends early must not report success");
+    assert!(
+        matches!(&err, RestoreError::Io { detail, .. } if detail.contains("truncated")),
+        "{err:?}"
     );
 }

@@ -497,7 +497,22 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
                  FROM transfer_part WHERE session_id = ?1 ORDER BY part_no",
             )
             .map_err(sqlite)?;
-        let part_size = r.10 as u64;
+        // VALIDATED, not cast. The schema has no CHECK on these columns, so an
+        // imported, hand-edited or damaged row can hold a negative — and `as
+        // u64` turns that into a value near `u64::MAX`, after which resume
+        // derives ranges that make `FileSource::read_range` attempt a
+        // near-address-space allocation instead of rejecting the checkpoint.
+        // The loader already refuses an unknown state and a missing source
+        // hash; a corrupt size is the same kind of row.
+        let nonneg = |what: &str, v: i64| -> StorageResult<u64> {
+            u64::try_from(v).map_err(|_| StorageError::Provider {
+                provider: "catalog",
+                op: "transfer_session".into(),
+                detail: format!("row has {what} = {v}, which is not a size — refusing to resume"),
+            })
+        };
+        let part_size = nonneg("part_size", r.10)?;
+        let src_size = nonneg("src_size", r.5)?;
         let rows = stmt
             .query_map([r.0], |row| {
                 Ok((
@@ -511,13 +526,22 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
             .map_err(sqlite)?;
         for row in rows {
             let (part_no, etag, bytes, local, checksum) = row.map_err(sqlite)?;
-            let part_no = u32::try_from(part_no).unwrap_or_default();
+            let bytes = nonneg("a part's `bytes`", bytes)?;
+            // `try_from` rather than the old `unwrap_or_default`: a part number
+            // that does not fit silently became 0, which is not a part number
+            // at all — multipart parts are 1-based — so the offset below came
+            // out as if it were part 1.
+            let part_no = u32::try_from(part_no).map_err(|_| StorageError::Provider {
+                provider: "catalog",
+                op: "transfer_session".into(),
+                detail: format!("row has part_no = {part_no}, which is not a part number"),
+            })?;
             parts.push(PartCheckpoint {
                 part_no,
                 // Derived, not stored: `part_size` is immutable for a session's
                 // life, which is what makes this safe and the column redundant.
                 offset: u64::from(part_no.saturating_sub(1)) * part_size,
-                len: bytes as u64,
+                len: bytes,
                 local_blake3: hash_from(local).unwrap_or(Blake3Hash::from_bytes([0u8; 32])),
                 etag: etag.map(OpaqueToken::new),
                 // PERSISTED now, and the old comment here was wrong about the
@@ -554,14 +578,14 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
                 // `file_id`, because a plausible-looking path recovered by a
                 // join is worse than an obviously absent one.
                 rel_path: String::new(),
-                size: r.5 as u64,
+                size: src_size,
                 mtime: Timestamp::from_nanos(r.8.unwrap_or_default()),
                 fs_id: FsId::new(r.7.unwrap_or_default()),
                 blake3,
             },
             state,
             plan: PartPlan {
-                total_size: r.5 as u64,
+                total_size: src_size,
                 part_size,
                 part_count: u32::try_from(r.11.unwrap_or(1)).unwrap_or(1),
             },

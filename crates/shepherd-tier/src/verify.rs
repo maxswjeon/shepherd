@@ -102,6 +102,22 @@ pub async fn verify_upload(
         });
     }
 
+    // Mechanism A without a version identifier is a contradiction — see the
+    // same refusal in `transfer_session`. The bucket says it versions and the
+    // HEAD returned nothing to pin, so there is no version to attest with and
+    // recording one anyway produces a location every closing check refuses.
+    if mode == AttestationMode::Version && meta.version.is_none() {
+        return Err(StorageError::Provider {
+            provider: adapter.capabilities().provider,
+            op: "verify_upload".into(),
+            detail: format!(
+                "the target reports versioning enabled but returned no version id for {}, so \
+                 mechanism A cannot be honoured for this object",
+                key.as_str()
+            ),
+        });
+    }
+
     // AC-1. Streamed by range: a 50 GB object read into one buffer would need
     // 50 GB of RAM, and these are exactly the objects the tier path exists for.
     //
@@ -132,6 +148,12 @@ pub async fn verify_upload(
         // Pinned only where the provider actually attests it. Recording a
         // version under mechanism B would invite a later closing HEAD to
         // "re-attest" against a value the provider never guaranteed.
+        //
+        // Under mechanism A the version is REQUIRED, and the refusal above is
+        // what makes this unwrap-free: a bucket that reports versioning and
+        // returns no version id would otherwise record `Version` with no
+        // version — a location that satisfies custody and is refused by every
+        // closing check, permanently and silently.
         object_version: (mode == AttestationMode::Version)
             .then_some(meta.version)
             .flatten(),

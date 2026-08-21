@@ -751,6 +751,15 @@ pub async fn verify_segments(
     Ok(())
 }
 
+/// The most a pointer record may weigh.
+///
+/// A pointer is a small JSON object — an epoch, a sequence, a uuid, a schema
+/// version and two hashes — so this is orders of magnitude above anything this
+/// format produces and still small enough that reading one costs nothing. It
+/// exists because `meta.size` is the PROVIDER's number for an object at a key
+/// that merely parses as a pointer name.
+const MAX_POINTER_BYTES: u64 = 64 * 1024;
+
 /// Reconstruct the chain from a set of fetched pointer bodies.
 ///
 /// The caller is responsible for **exhausting pagination** before calling this
@@ -931,6 +940,28 @@ pub async fn read_chain(adapter: &dyn StorageAdapter) -> StorageResult<ChainReso
                 ),
             });
         };
+        // CAPPED before the read, on the size the HEAD reported.
+        //
+        // `meta.size` is the provider's number for an object under a key this
+        // loop decided is a pointer, and `get_range` collects the whole
+        // response into one `Bytes`. A corrupted or planted multi-gigabyte
+        // object at `_shepherd/…/ptr-….json` would therefore be read entirely
+        // into memory during chain recovery — the moment the daemon is already
+        // trying to recover from something. A real pointer record is a few
+        // hundred bytes; nothing legitimate is near this bound.
+        if meta.size > MAX_POINTER_BYTES {
+            return Err(StorageError::Provider {
+                provider: adapter.capabilities().provider,
+                op: "read_chain".into(),
+                detail: format!(
+                    "pointer {} is {} bytes, above the {MAX_POINTER_BYTES}-byte maximum for a \
+                     pointer record; it is not one, and reading it to find that out is the \
+                     allocation this refuses",
+                    k.as_str(),
+                    meta.size
+                ),
+            });
+        }
         let raw = adapter
             .get_range(
                 &k,

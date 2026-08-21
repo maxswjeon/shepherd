@@ -182,12 +182,41 @@ impl RestoreOutcome {
 
 /// Write `bytes` back, honouring the fidelity contract.
 ///
-/// Exclusive-create at the syscall, then `mtime` and `mode`, then a read-back
-/// verified against `manifest`. Returns the breaches rather than a bare failure
-/// so a restore report can name what did not survive.
+/// A convenience over [`restore_stream`] for callers that already hold the
+/// whole object — the tests, and nothing else. **A caller restoring a large
+/// object must use `restore_stream`**: `&[u8]` requires the entire object in
+/// memory before the first byte reaches disk, which for the 50 GB objects the
+/// tier path exists for is more than the daemon has.
 pub fn restore_file(
     original: &Path,
     bytes: &[u8],
+    manifest: &FidelityManifest,
+) -> Result<RestoreOutcome> {
+    restore_stream(original, &mut &bytes[..], manifest)
+}
+
+/// Stream `src` back, honouring the fidelity contract.
+///
+/// Exclusive-create at the syscall, then `mtime` and `mode`, then a read-back
+/// verified against `manifest`. Returns the breaches rather than a bare failure
+/// so a restore report can name what did not survive.
+///
+/// # Why a reader
+///
+/// The read-back streams — it was changed to, precisely so a 50 GB restore
+/// does not need a 50 GB buffer to VERIFY — and the input side still demanded
+/// one to WRITE. Half a fix: the allocation was moved out of the second half
+/// of the function and left in every caller.
+///
+/// `std::io::Read` rather than a ranged-fetch trait: the copy below is
+/// synchronous file I/O, and an async caller supplies a reader over its own
+/// ranged fetches, which is the shape `verify_full_content_of` already uses on
+/// the other side. Choosing the async abstraction now would be designing for a
+/// caller that does not exist — `restore_stream` has no production caller yet,
+/// and §4.10.5's hydration path is where it lands.
+pub fn restore_stream(
+    original: &Path,
+    src: &mut dyn std::io::Read,
     manifest: &FidelityManifest,
 ) -> Result<RestoreOutcome> {
     let original_s = original.to_string_lossy().to_string();
@@ -248,7 +277,7 @@ pub fn restore_file(
     // Every failure from here on goes through the cleanup. Nothing is returned
     // early: an error path that skipped it is exactly the defect this shape
     // exists to make unreachable.
-    match write_and_verify(f, &chosen, bytes, manifest, created) {
+    match write_and_verify(f, &chosen, src, manifest, created) {
         Ok(attrs) => Ok(RestoreOutcome { target, attrs }),
         Err(e) => {
             discard_failed_attempt(&chosen, created);
@@ -292,7 +321,7 @@ fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
 fn write_and_verify(
     mut f: std::fs::File,
     chosen: &Path,
-    bytes: &[u8],
+    src: &mut dyn std::io::Read,
     manifest: &FidelityManifest,
     created: Option<CreatedInode>,
 ) -> Result<RestoredAttrs> {
@@ -301,7 +330,31 @@ fn write_and_verify(
         detail: e.to_string(),
     };
 
-    f.write_all(bytes).map_err(io)?;
+    // Copied through a fixed buffer, so the peak is the buffer rather than the
+    // object. The length is COUNTED rather than trusted: a source that ends
+    // early would otherwise produce a short file whose only complaint is a
+    // content breach, and "the download stopped" is a different problem from
+    // "the bytes were wrong".
+    let mut written = 0u64;
+    let mut buf = vec![0u8; RESTORE_CHUNK];
+    loop {
+        let n = src.read(&mut buf).map_err(io)?;
+        if n == 0 {
+            break;
+        }
+        f.write_all(&buf[..n]).map_err(io)?;
+        written += n as u64;
+    }
+    if written != manifest.core.size {
+        return Err(RestoreError::Io {
+            path: chosen.display().to_string(),
+            detail: format!(
+                "the source supplied {written} bytes and the manifest records {}; the restore \
+                 was truncated rather than corrupt",
+                manifest.core.size
+            ),
+        });
+    }
     f.sync_all().map_err(io)?;
 
     #[cfg(unix)]
@@ -381,6 +434,13 @@ fn write_and_verify(
     drop(f);
     Ok(attrs)
 }
+
+/// How much of a restore is held in memory at once.
+///
+/// The same order as the verification chunk on the other side of this function:
+/// large enough that the copy is not syscall-bound, small enough that it is a
+/// buffer rather than a fraction of the object.
+const RESTORE_CHUNK: usize = 8 * 1024 * 1024;
 
 /// fsync a directory, so an entry created in it survives a crash.
 ///

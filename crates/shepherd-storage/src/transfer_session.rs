@@ -903,6 +903,36 @@ impl<'a> TransferDriver<'a> {
         let pinned = (mode == AttestationMode::Version)
             .then(|| meta.version.clone())
             .flatten();
+        // MECHANISM A NEEDS A VERSION, and the provider must actually have
+        // given one.
+        //
+        // An S3-compatible endpoint can report versioning enabled and still
+        // omit `version_id` from HEAD. `pinned` was then `None`, so the read
+        // below fell back to the mutable current key and the session committed
+        // with `attestation_mode = Version` and no `object_version` — a
+        // location that satisfies `Location::satisfies_custody`, which does not
+        // require the version field, and that every closing check afterwards
+        // refuses, because mechanism A requires a version on BOTH sides. A
+        // verified upload that can never be used for tiering, and nothing says
+        // why.
+        //
+        // Refused here rather than downgraded to `Content`: the bucket said it
+        // versions, so silently attesting by content would be choosing the
+        // weaker mechanism from a contradiction — the same move
+        // `probe_attestation_mode` stopped making one commit ago.
+        if mode == AttestationMode::Version && pinned.is_none() {
+            return Err(StorageError::Provider {
+                provider: self.adapter.capabilities().provider,
+                op: "verify".into(),
+                detail: format!(
+                    "the bucket reports versioning enabled but returned no version id for {}, \
+                     so there is nothing to pin and mechanism A cannot be honoured. A \
+                     location recorded this way passes custody and is refused by every \
+                     closing check",
+                    session.remote_key.as_str()
+                ),
+            });
+        }
         verify_full_content_of(
             self.adapter,
             &session.remote_key,

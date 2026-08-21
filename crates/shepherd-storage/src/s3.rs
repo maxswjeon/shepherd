@@ -292,17 +292,38 @@ impl StorageAdapter for S3Adapter {
             // verification authorises unlinking the local copy. The weaker
             // mechanism was chosen by an unanswered question rather than by the
             // bucket.
-            Err(e) => Err(StorageError::Provider {
-                provider: self.capabilities().provider,
-                op: "probe_attestation_mode".into(),
-                detail: format!(
-                    "could not read the bucket's versioning state, so this build cannot tell \
-                     whether the target attests by version or by content — and guessing \
-                     content would silently take the weaker one. Grant \
-                     `s3:GetBucketVersioning` on `{}`: {e}",
-                    self.bucket
-                ),
-            }),
+            //
+            // Through `map_err`, which is the second half and was missing: a
+            // timeout, a throttle or a 5xx is `Transient` there, and flattening
+            // every failure into `Provider` made a temporary outage terminally
+            // fail an upload the queue would otherwise have retried. Failing
+            // closed is about not GUESSING the mechanism; it is not a reason to
+            // discard what the SDK already said about retrying.
+            Err(e) => Err(
+                match Self::map_err("probe_attestation_mode", &self.bucket, e) {
+                    // A definite non-retryable failure — denied, or a bucket that
+                    // is not there — says the registration cannot work as
+                    // configured, and the message says which permission answers it.
+                    StorageError::Provider {
+                        provider,
+                        op,
+                        detail,
+                    } => StorageError::Provider {
+                        provider,
+                        op,
+                        detail: format!(
+                            "could not read the bucket's versioning state, so this build cannot \
+                         tell whether the target attests by version or by content — and \
+                         guessing content would silently take the weaker one. Grant \
+                         `s3:GetBucketVersioning` on `{}`: {detail}",
+                            self.bucket
+                        ),
+                    },
+                    // Everything else keeps the classification `map_err` gave it,
+                    // `Transient` above all.
+                    other => other,
+                },
+            ),
         }
     }
 

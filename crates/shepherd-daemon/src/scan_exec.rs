@@ -78,6 +78,69 @@ pub struct ScanExecutor {
     daemon: Arc<Daemon>,
 }
 
+/// Full-tree walks that may be resident at once.
+///
+/// `shepherd_scan::walk` materialises the complete `Vec<FileStat>` before
+/// batching, so a scan holds an entire tree for its duration — and the pool
+/// runs `POOL_SIZE` workers. Per-root coalescing stops the same root being
+/// walked twice; it says nothing about four DIFFERENT large roots, which is
+/// the memory case unchanged.
+///
+/// Two, against a pool of four, so at most half the workers can be waiting here
+/// and the other classes keep making progress. That asymmetry is the whole
+/// reason this is a bound rather than a lock.
+///
+/// **This is a mitigation, not the fix.** The fix is a streaming walk that
+/// never holds the tree, which is `shepherd-scan`'s to make; this bounds the
+/// blast radius of the shape that exists today.
+const MAX_CONCURRENT_WALKS: usize = 2;
+
+/// How long a scan waits for a walk permit before giving the worker back.
+///
+/// A parked worker is a worker not running anything else, and `Pool::shutdown`
+/// joins its threads — so an unbounded wait is a hung shutdown as well as a
+/// starved queue. Giving up requeues the job with the queue's own backoff,
+/// which costs one attempt in a case that only arises when two large scans are
+/// already running.
+const WALK_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+static WALKS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static WALK_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// One in-flight full-tree walk, released on drop.
+struct WalkPermit;
+
+impl WalkPermit {
+    /// Wait up to [`WALK_PERMIT_WAIT`] for a slot.
+    fn acquire() -> Option<Self> {
+        let deadline = std::time::Instant::now() + WALK_PERMIT_WAIT;
+        let mut n = WALKS.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if *n < MAX_CONCURRENT_WALKS {
+                *n += 1;
+                return Some(Self);
+            }
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            // `wait_timeout` rather than `wait`: a worker parked forever is a
+            // hung `Pool::shutdown`, and the queue's backoff is a better place
+            // to wait than a condvar nobody will signal if the running scans
+            // are slow.
+            let (guard, _) = WALK_FREED
+                .wait_timeout(n, left)
+                .unwrap_or_else(|e| e.into_inner());
+            n = guard;
+        }
+    }
+}
+
+impl Drop for WalkPermit {
+    fn drop(&mut self) {
+        let mut n = WALKS.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        WALK_FREED.notify_one();
+    }
+}
+
 impl ScanExecutor {
     pub fn new(daemon: Arc<Daemon>) -> Self {
         Self { daemon }
@@ -245,6 +308,18 @@ impl Executor for ScanExecutor {
         // --- walk ---------------------------------------------------------
         // On the worker thread, deliberately: this is the I/O-heavy half and
         // must not run inside the single-writer actor.
+        //
+        // Under a permit, because the walk MATERIALISES the tree — see
+        // `MAX_CONCURRENT_WALKS`. Held past the batching loop below, since the
+        // `Vec<FileStat>` it bounds is alive until that loop has drained it.
+        let Some(_walk_permit) = WalkPermit::acquire() else {
+            return Err(format!(
+                "{MAX_CONCURRENT_WALKS} full-tree walks are already in flight and a slot did \
+                 not free within {}s; each holds an entire tree in memory, so this scan is \
+                 returned to the queue rather than joining them",
+                WALK_PERMIT_WAIT.as_secs()
+            ));
+        };
         let output = walk(rid, &path, &deny, &ignores, now())
             .map_err(|e| format!("walking {}: {e}", root.path))?;
 
