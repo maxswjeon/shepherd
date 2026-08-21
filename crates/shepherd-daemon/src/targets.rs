@@ -340,14 +340,66 @@ pub fn probe_multipart_checksum_blocking(cfg: &S3Config) -> Result<ChecksumProbe
                 format!("could not build the runtime the registration probe needs: {e}"),
             )
         })?;
-    rt.block_on(probe_multipart_checksum(cfg)).map_err(|e| {
-        RpcError::new(
-            ErrorCode::TargetUnreachable,
-            format!(
-                "the registration probe could not reach the target, so this build cannot tell \
-                 whether it supports whole-object multipart checksums: {e}"
-            ),
-        )
+    // BOUNDED, by Shepherd rather than by the provider's retry policy.
+    //
+    // An endpoint that accepts connections and then stalls requests keeps this
+    // `block_on` inside the SDK's whole retry sequence, and there is nothing on
+    // the other side to stop it: the client's own 30-second timeout disconnects
+    // the CALLER and cancels nothing here. Every `target.add` runs its own
+    // probe before replying and the server admits 64 connections, so 64
+    // registrations against such an endpoint hold every slot long after their
+    // clients are gone — and ordinary `status` and `search` calls are refused
+    // by a daemon that is otherwise healthy. A provider's per-request retry
+    // policy must not be able to decide this daemon's availability.
+    //
+    // The whole probe, not per request: a per-request deadline multiplies by
+    // the retry count, which is the quantity that is not ours to choose.
+    rt.block_on(async {
+        tokio::time::timeout(probe_timeout(), probe_multipart_checksum(cfg))
+            .await
+            .map_err(|_| {
+                RpcError::new(
+                    ErrorCode::TargetUnreachable,
+                    format!(
+                        "the registration probe did not finish within {}ms, so this build \
+                         cannot tell whether the target supports whole-object multipart \
+                         checksums. The endpoint accepted a connection and did not answer",
+                        probe_timeout().as_millis()
+                    ),
+                )
+            })?
+            .map_err(|e| {
+                RpcError::new(
+                    ErrorCode::TargetUnreachable,
+                    format!(
+                        "the registration probe could not reach the target, so this build \
+                         cannot tell whether it supports whole-object multipart checksums: {e}"
+                    ),
+                )
+            })
+    })
+}
+
+/// How long the whole registration probe may take.
+///
+/// Generous against a real round trip — the probe does a complete multipart
+/// cycle against the bucket — and finite, which is the property that matters:
+/// what it bounds is a connection slot, and the alternative to a number here is
+/// the provider's retry policy choosing one.
+///
+/// Overridable so the bound is testable at all, the same seam and the same
+/// reasoning as the daemon's idle deadline: waiting a minute to observe a
+/// one-minute timeout is how a bound ends up with no test.
+fn probe_timeout() -> std::time::Duration {
+    static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("SHEPHERD_PROBE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map_or(std::time::Duration::from_secs(60), |ms| {
+                std::time::Duration::from_millis(ms)
+            })
     })
 }
 
@@ -485,5 +537,63 @@ mod tests {
             !format!("{creds:?}").contains("s3cr3t-material"),
             "credentials rendered their secret half in Debug"
         );
+    }
+
+    /// An endpoint that accepts and never answers does not hold a connection
+    /// slot for as long as the provider's retry policy feels like.
+    ///
+    /// The probe ran the SDK's whole retry sequence with no Shepherd-level
+    /// deadline, and nothing on the other side could stop it: the client's own
+    /// 30-second timeout disconnects the CALLER and cancels nothing here. Every
+    /// `target.add` probes before replying and the server admits 64
+    /// connections, so 64 registrations against such an endpoint hold every
+    /// slot long after their clients are gone — and `status` and `search` are
+    /// refused by a daemon that is otherwise perfectly healthy.
+    ///
+    /// A listener that accepts and never writes is the stall itself rather than
+    /// a stand-in for it. The deadline is overridden to milliseconds, for the
+    /// reason the override exists.
+    #[test]
+    fn a_stalling_endpoint_does_not_hold_the_probe_open() {
+        // SAFETY: single-threaded by construction — this test owns the variable
+        // and `probe_timeout` caches on first read, so it is set before any
+        // probe in this binary runs.
+        unsafe { std::env::set_var("SHEPHERD_PROBE_TIMEOUT_MS", "300") };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stall = std::thread::spawn(move || {
+            // Accept and hold. Never read, never write, never close.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept() {
+                held.push(sock);
+                if held.len() > 8 {
+                    break;
+                }
+            }
+            held
+        });
+
+        let cfg = S3Config {
+            bucket: "archive".into(),
+            endpoint_url: Some(format!("http://{addr}")),
+            region: Some("us-east-1".into()),
+            force_path_style: true,
+            credentials: None,
+            multipart_checksum: None,
+        };
+
+        let started = std::time::Instant::now();
+        let err = probe_multipart_checksum_blocking(&cfg)
+            .expect_err("a stalling endpoint cannot be probed");
+        let took = started.elapsed();
+
+        assert_eq!(err.kind(), Some(ErrorCode::TargetUnreachable));
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "the probe ran for {took:?} against a 300ms deadline, so the provider's retry \
+             policy is still deciding how long a connection slot is held"
+        );
+        drop(stall);
     }
 }

@@ -213,7 +213,7 @@ pub async fn execute_local_destruction(
             req.expected_hash,
         )
         .map_err(|detail| DestroyError::Unbound { detail })?;
-    check_custody_binds(req, remote.target())?;
+    check_custody_binds(req, remote.target(), remote.prefix())?;
 
     // Per-file serialization, keyed on identity. Held across every await below.
     //
@@ -451,7 +451,44 @@ fn restore_or_report(
 /// the id-addressed layout outright the day it is wired up, which is a
 /// coupling to today's only caller rather than to §4.9. The leaf is the part
 /// that is about the bytes, and it is the part both layouts agree on.
-fn check_custody_binds(req: &LocalDestroyRequest<'_>, gate: Option<TargetId>) -> Result<()> {
+fn check_custody_binds(
+    req: &LocalDestroyRequest<'_>,
+    gate: Option<TargetId>,
+    prefix: Option<&str>,
+) -> Result<()> {
+    // The key must live in the GATE's namespace.
+    //
+    // The leaf check below says the key names these bytes and the target check
+    // says the HEAD reaches the custodian's target; neither says the key is
+    // under that target's prefix. Two logical targets can share one adapter and
+    // one bucket, so a request with a custodian and gate for A can name a
+    // hash-suffixed key under B's namespace — and under content attestation a
+    // same-sized object there satisfies both closing HEADs while A's
+    // catalogued replica is gone. The local original is then unlinked with no
+    // reachable location recorded for the surviving bytes.
+    //
+    // Same finding as the discard path's, one file over: binding the target
+    // without binding the prefix leaves the hole open one level down.
+    match prefix {
+        Some(p) if req.remote_key.as_str().starts_with(p) => {}
+        Some(p) => {
+            return Err(DestroyError::Unbound {
+                detail: format!(
+                    "the remote key `{}` is not under this target's prefix `{p}`, so the \
+                     closing HEAD would ask about an object in another target's namespace",
+                    req.remote_key.as_str()
+                ),
+            });
+        }
+        None => {
+            return Err(DestroyError::Unbound {
+                detail: "this remote gate cannot say where its target's objects live, so the \
+                         remote key cannot be bound to it. Wrap the adapter in `TargetGate`"
+                    .to_owned(),
+            });
+        }
+    }
+
     match gate {
         Some(t) if t == req.custodian.target => {}
         Some(t) => {

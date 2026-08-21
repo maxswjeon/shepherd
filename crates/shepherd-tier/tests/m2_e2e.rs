@@ -373,7 +373,11 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
     let a = adapter(bucket).await;
 
     // --- scan + dry-run selection + plan -------------------------------------
-    let plan = tier_plan_for(&corpus, now, &format!("m2-{}-{tag}", std::process::id()));
+    // Captured, because the destroy path's gate now carries the target's prefix
+    // and it has to be the one the key was derived from — the whole point of
+    // moving it onto the gate is that there is one source for it.
+    let prefix = format!("m2-{}-{tag}", std::process::id());
+    let plan = tier_plan_for(&corpus, now, &prefix);
 
     // ASSERT THE QUANTITY. Exactly one item, and exactly the right one — not
     // "at least one", which would pass if the rule matched the whole corpus.
@@ -566,7 +570,7 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
             remote_key: &key,
         },
         &DeleteModeProvider::new(),
-        &shepherd_tier::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &a),
+        &shepherd_tier::destroy::TargetGate::new(shepherd_core::TargetId::new(1), &prefix, &a),
         &audit,
         &locks,
         now,

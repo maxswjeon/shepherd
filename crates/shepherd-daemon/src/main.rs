@@ -160,6 +160,14 @@ fn secure_state_dir(dir: &std::path::Path) -> Result<(), String> {
 
     let created =
         create_dir_all_tracked(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+
+    // AND AGAIN, after creating. The walk above described the path as it was
+    // found; `create_dir_all_tracked` can lose a race for a missing component
+    // to another account under a sticky ancestor such as `/tmp`, and that
+    // account's directory would then sit above the leaf every check below
+    // looks at. Re-walking is what turns "it was safe a moment ago" into "it
+    // is safe now", and it costs one `lstat` per component.
+    shepherd_daemon::server::check_path_ancestry(dir, me, "the state directory")?;
     let we_made_it = created.iter().any(|p| p == dir);
 
     let owner = std::fs::metadata(dir)
@@ -248,10 +256,29 @@ fn create_dir_all_tracked(dir: &std::path::Path) -> std::io::Result<Vec<std::pat
         cursor = p.parent().filter(|q| !q.as_os_str().is_empty());
     }
 
+    // OWNER-ONLY at creation, every level, not only the leaf.
+    //
+    // `create_dir` obeys the ambient umask, and `secure_state_dir` chmods the
+    // final directory alone — so with a permissive umask an intermediate this
+    // daemon made was left world-writable, and an account that can write it can
+    // rename or replace the checked `0700` leaf before `daemon.lock`,
+    // `catalog.db` and `secrets.json` are opened through the pathname. The mode
+    // has to be applied by the call that creates the entry rather than after
+    // it, or the window is simply narrower.
+    //
+    // `DirBuilder::mode` is `mkdir(2)`'s mode argument, so the directory is
+    // never briefly anything else — the same reason `secure_socket_dir` builds
+    // with it rather than creating and tightening.
+    use std::os::unix::fs::DirBuilderExt;
     let mut created = Vec::with_capacity(missing.len());
     for p in missing.iter().rev() {
-        match std::fs::create_dir(p) {
+        match std::fs::DirBuilder::new().mode(0o700).create(p) {
             Ok(()) => created.push(p.clone()),
+            // Somebody else made it between the probe and the call. NOT ours,
+            // so it is not chmodded — and not trusted either: the caller
+            // re-walks the whole ancestry after this returns, which is what
+            // catches an account that won the race and installed a writable
+            // intermediate under a sticky ancestor like `/tmp`.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
@@ -646,6 +673,12 @@ mod tests {
         let base = tmp("anc");
         let open = base.join("open");
         std::fs::create_dir_all(&open).unwrap();
+        // Explicit, not umask-derived. `create_dir_all` takes whatever umask
+        // the process has, and this binary now has a test that sets it to 0 —
+        // so a fixture that leaned on the ambient value picked up `0777` on
+        // `base` and was refused by the ancestry walk for a reason that had
+        // nothing to do with what it was testing.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
 
         let under = open.join("state");
@@ -667,6 +700,7 @@ mod tests {
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
         let real = base.join("real");
         std::fs::create_dir_all(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
         secure_state_dir(&base.join("link").join("state"))
             .expect("a link this daemon owns must not block startup");
@@ -689,6 +723,8 @@ mod tests {
         let base = tmp("rel");
         let open = base.join("open");
         std::fs::create_dir_all(&open).unwrap();
+        // Explicit for the same reason as the ancestry fixture above.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
 
         // The refusal must come from the ancestor, reached only by resolving
@@ -724,10 +760,19 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
+    /// The one lock both process-global guards take.
+    ///
+    /// Two locks would not serialise them against each other, and a test that
+    /// moved the working directory while another changed the umask would make a
+    /// third fail for a reason nobody could find.
+    fn process_state_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     impl WorkingDir {
         fn set(to: &std::path::Path) -> Self {
-            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = process_state_lock();
             let previous = std::env::current_dir().unwrap();
             std::env::set_current_dir(to).unwrap();
             Self {
@@ -740,6 +785,70 @@ mod tests {
     impl Drop for WorkingDir {
         fn drop(&mut self) {
             let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    /// EVERY level this daemon creates is owner-only, not only the leaf.
+    ///
+    /// `create_dir` obeys the ambient umask and `secure_state_dir` chmodded the
+    /// final directory alone, so with a permissive umask an intermediate this
+    /// daemon made was left group- or world-writable. An account that can write
+    /// it can rename or replace the checked `0700` leaf before `daemon.lock`,
+    /// `catalog.db` and `secrets.json` are opened through the pathname — the
+    /// leaf's own mode says nothing about who can swap the leaf.
+    ///
+    /// The umask is set for the duration, because the defect is invisible under
+    /// the ordinary `022`: the old code produced `0755` intermediates there and
+    /// nobody would have called that world-writable.
+    #[test]
+    fn every_level_of_a_created_state_path_is_owner_only() {
+        let base = tmp("levels");
+        let deep = base.join("a").join("b").join("state");
+
+        let _umask = Umask::set(0o000);
+        secure_state_dir(&deep).unwrap();
+        drop(_umask);
+
+        for level in [base.join("a"), base.join("a").join("b"), deep.clone()] {
+            assert_eq!(
+                mode_of(&level),
+                0o700,
+                "{} was created {:04o} under a permissive umask",
+                level.display(),
+                mode_of(&level)
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Sets the process umask for a scope, and puts it back.
+    ///
+    /// Process-global like the working directory, and the harness is threaded,
+    /// so it takes the same lock the working-directory guard does — a test that
+    /// changed the umask underneath another would make an unrelated one fail
+    /// for a reason nobody could find.
+    struct Umask {
+        previous: libc::mode_t,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Umask {
+        fn set(to: libc::mode_t) -> Self {
+            let lock = process_state_lock();
+            // SAFETY: `umask` is infallible per POSIX — it returns the previous
+            // value and cannot fail. It is process-global, which is what the
+            // lock above is for.
+            let previous = unsafe { libc::umask(to) };
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for Umask {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.previous) };
         }
     }
 

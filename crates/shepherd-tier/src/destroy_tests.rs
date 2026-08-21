@@ -541,6 +541,45 @@ async fn a_replica_that_disappears_while_the_destroy_waits_stops_the_unlink() {
     );
 }
 
+/// A key in another target's namespace does not authorize this destroy.
+///
+/// The leaf check says the key names these bytes and the target check says the
+/// HEAD reaches the custodian's target; neither says the key is under that
+/// target's PREFIX. Two logical targets can share one adapter and one bucket,
+/// so a request with a custodian and gate for A can name a hash-suffixed key
+/// under B's namespace — and under content attestation a same-sized object
+/// there satisfies both closing HEADs while A's catalogued replica is gone.
+/// The local original is then unlinked with no reachable location recorded for
+/// the surviving bytes.
+#[tokio::test]
+async fn a_remote_key_outside_the_gates_prefix_does_not_authorize_this_destroy() {
+    let f = fixture("wrong-prefix", AttestationMode::Content);
+    let c = custodian(AttestationMode::Content, f.hash);
+    // The same content hash — so the leaf check passes — under another
+    // target's prefix, which is exactly the shape a shared bucket produces.
+    let elsewhere = shepherd_catalog::identity::content_key("other-target", f.hash);
+    let req = LocalDestroyRequest {
+        remote_key: &elsewhere,
+        ..f.request(&c)
+    };
+
+    let err = execute_local_destruction(
+        &req,
+        &f.provider,
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("a key in another namespace must not authorize this destroy");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains("prefix")),
+        "the refusal must name what is wrong with the key: {err}"
+    );
+    assert!(f.path.exists(), "and the file is still there");
+}
+
 /// A file old enough and big enough to clear the floors.
 fn payload() -> Vec<u8> {
     vec![7u8; 128 * 1024]
