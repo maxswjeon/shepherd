@@ -842,21 +842,22 @@ impl<'a> FileRepo<'a> {
 
         let beneath_unobserved = |rel: &str| {
             unobserved.iter().any(|skip| {
-                // The skipped path itself, and anything beneath it.
+                // COMPONENTS, not a string prefix.
                 //
-                // The HOST separator only. A backslash is a legal filename
-                // character on unix, so treating it as a boundary means a
-                // root-level file literally named `docs\gone` counts as
-                // beneath a skipped `docs` directory — and stays `local`
-                // forever after it is deleted, with every catalog consumer
-                // still reporting a file that is not there.
+                // Two failures, one on each platform, and neither is fixable by
+                // picking a separator: on unix a backslash is a legal filename
+                // character, so `docs\gone` is one component and must not count
+                // as beneath a skipped `docs`; on Windows the catalog stores
+                // `/` in `rel_path` regardless, so keying on `MAIN_SEPARATOR`
+                // stopped recognising `under/skipped.txt` as beneath `under`
+                // and swept a row the walk never observed.
                 //
-                // The separator itself matters too: `docs` must not swallow
-                // `docs-old`.
-                rel == skip
-                    || rel
-                        .strip_prefix(skip.as_str())
-                        .is_some_and(|rest| rest.starts_with(std::path::MAIN_SEPARATOR))
+                // `Path::starts_with` is component-wise and treats `/` as a
+                // separator on both platforms, which is what makes it the
+                // answer to both at once. It also gives the `docs` /
+                // `docs-old` distinction for free.
+                let rel = std::path::Path::new(rel);
+                rel.starts_with(std::path::Path::new(skip))
             })
         };
 
@@ -1926,6 +1927,13 @@ mod tests {
     /// file literally named `docs\gone` counted as beneath a skipped `docs`
     /// directory — and stayed `local` forever after it was deleted, with
     /// searches and every other catalog consumer still reporting it.
+    ///
+    /// Unix only, and that is the finding rather than a portability dodge: on
+    /// Windows `\` really is a separator, so the same name is a different
+    /// question there. What both platforms share is the fix —
+    /// `Path::starts_with` compares COMPONENTS — and
+    /// `a_sweep_marks_what_vanished_spares_what_is_remote_and_a_sighting_revives`
+    /// exercises that on every platform.
     #[cfg(unix)]
     #[test]
     fn a_backslash_in_a_name_does_not_make_a_row_look_skipped() {
