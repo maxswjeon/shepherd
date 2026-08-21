@@ -217,6 +217,7 @@ impl Corpus {
             norm_policy: PathNormPolicy::Preserve,
             atime_mode: AtimeMode::Relatime,
             volume_id: Some("uuid:m2-test".into()),
+            root_fs_id: None,
             resync_required: false,
             availability: Availability::Available,
             destruction_ineligible: false,

@@ -685,6 +685,7 @@ mod tests {
                         shepherd_catalog::PathNormPolicy::Nfc,
                         shepherd_catalog::AtimeMode::Relatime,
                         None,
+                        None,
                         false,
                         &[],
                         shepherd_core::Timestamp::from_nanos(1),

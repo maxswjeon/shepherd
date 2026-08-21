@@ -56,6 +56,7 @@ fn root(path: &std::path::Path) -> ScanRoot {
         norm_policy: shepherd_catalog::identity::PathNormPolicy::Preserve,
         atime_mode: shepherd_catalog::AtimeMode::Relatime,
         volume_id: Some("uuid:test".into()),
+        root_fs_id: None,
         resync_required: false,
         availability: Availability::Available,
         destruction_ineligible: false,

@@ -24,6 +24,10 @@ pub struct ScanRoot {
     pub norm_policy: PathNormPolicy,
     pub atime_mode: AtimeMode,
     pub volume_id: Option<String>,
+    /// The ENROLLED DIRECTORY's own identity — see the column's comment.
+    ///
+    /// `volume_id` says which filesystem; this says which directory on it.
+    pub root_fs_id: Option<String>,
     /// PM-3: while set, ALL tiering, destruction and discard for this root are
     /// refused.
     pub resync_required: bool,
@@ -147,6 +151,9 @@ impl<'a> FileRepo<'a> {
         norm_policy: PathNormPolicy,
         atime_mode: AtimeMode,
         volume_id: Option<&str>,
+        // The enrolled DIRECTORY's own identity. `volume_id` says which
+        // filesystem; this says which directory on it.
+        root_fs_id: Option<&str>,
         hosted_optin: bool,
         ignore_patterns: &[String],
         now: Timestamp,
@@ -161,8 +168,8 @@ impl<'a> FileRepo<'a> {
         self.0.conn_mut().execute(
             "INSERT INTO scan_root
                  (path, stub_mode, path_case_policy, path_norm_policy, atime_mode,
-                  volume_id, hosted_optin, ignore_patterns_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  volume_id, root_fs_id, hosted_optin, ignore_patterns_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 path,
                 stub,
@@ -170,6 +177,7 @@ impl<'a> FileRepo<'a> {
                 norm_policy.as_str(),
                 atime_mode.as_str(),
                 volume_id,
+                root_fs_id,
                 hosted_optin as i64,
                 patterns_json,
                 now.as_nanos()
@@ -235,6 +243,9 @@ impl<'a> FileRepo<'a> {
         norm_policy: PathNormPolicy,
         atime_mode: AtimeMode,
         volume_id: Option<&str>,
+        // The enrolled DIRECTORY's own identity. `volume_id` says which
+        // filesystem; this says which directory on it.
+        root_fs_id: Option<&str>,
         hosted_optin: bool,
         ignore_patterns: &[String],
         now: Timestamp,
@@ -271,6 +282,7 @@ impl<'a> FileRepo<'a> {
                 norm_policy,
                 atime_mode,
                 volume_id,
+                root_fs_id,
                 hosted_optin,
                 ignore_patterns,
                 now,
@@ -371,7 +383,7 @@ impl<'a> FileRepo<'a> {
             .conn()
             .query_row(
                 "SELECT id, path, stub_mode, path_case_policy, path_norm_policy,
-                        atime_mode, volume_id, resync_required, availability,
+                        atime_mode, volume_id, root_fs_id, resync_required, availability,
                         destruction_ineligible, destruction_ineligible_reason
                  FROM scan_root WHERE id = ?1",
                 params![id.get()],
@@ -575,6 +587,25 @@ impl<'a> FileRepo<'a> {
         // transaction it behaves as one, so this reads the prior identity and
         // revokes custody atomically either way.
         let tx = self.0.conn_mut().savepoint()?;
+        // By the EXACT spelling first, then by the root's own equivalence.
+        //
+        // `rel_path` is what the walk saw; `norm_key` is that path folded by
+        // this root's case and normalization policies, and §4.9 exists because
+        // those differ. A case-only rename on an insensitive root, or an NFC
+        // path that was catalogued as NFD, presents the same inode under a
+        // different `rel_path` — so an exact-match lookup finds nothing, this
+        // upsert INSERTS a second row, and the sweep marks the original
+        // `missing`. If that original was tiered, its custody and
+        // `object_location` rows stay attached to the obsolete row while the
+        // live placeholder is catalogued as a new local file.
+        //
+        // The exact spelling is still tried first: it is the common case and it
+        // is unambiguous. `norm_key` can legitimately match more than one row
+        // on a case-SENSITIVE root under an insensitive policy — `Report.txt`
+        // and `report.txt` both fold to one key — so the fallback takes the row
+        // whose `fs_id` matches this sighting, and only that row. Without a
+        // known identity on both sides there is nothing to disambiguate with,
+        // and inserting is the safer answer than adopting an arbitrary one.
         let prior: Option<(i64, Option<String>)> = tx
             .query_row(
                 "SELECT id, fs_id FROM file WHERE root_id = ?1 AND rel_path = ?2",
@@ -582,6 +613,34 @@ impl<'a> FileRepo<'a> {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let prior = match (&prior, &fs_id) {
+            (None, Some(seen)) => {
+                let equivalent: Option<(i64, Option<String>)> = tx
+                    .query_row(
+                        "SELECT id, fs_id FROM file
+                         WHERE root_id = ?1 AND norm_key = ?2 AND fs_id = ?3",
+                        params![root.id.get(), nk, seen],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                // RE-SPELLED, not re-inserted. The upsert below keys on
+                // `(root_id, rel_path)`, so finding the row and leaving its old
+                // spelling in place would insert the second row anyway. Moving
+                // the name onto the existing row is what keeps its identity,
+                // its state and its custody attached to the file it describes.
+                //
+                // Safe against the unique index: the exact-spelling lookup
+                // above returned `None`, so no row holds this `rel_path`.
+                if let Some((id, _)) = equivalent {
+                    tx.execute(
+                        "UPDATE file SET rel_path = ?2, norm_key = ?3 WHERE id = ?1",
+                        params![id, stat.rel_path, nk],
+                    )?;
+                }
+                equivalent.or(prior)
+            }
+            _ => prior,
+        };
         let replaced = match (&prior, &fs_id) {
             (Some((_, Some(was))), Some(now_id)) => was != now_id,
             // A NESTED MOUNT is a replacement too, through a different door.
@@ -864,6 +923,34 @@ impl<'a> FileRepo<'a> {
         let mut marked = 0usize;
         let mut after = 0i64;
         loop {
+            // STILL REGISTERED, re-read on every page.
+            //
+            // `upsert_batch` checks this inside the transaction that writes,
+            // and the sweep is a later phase that write never covers — an empty
+            // scan does no upserts at all. A default `root.remove` retains the
+            // row and clears `enabled`, so without this a deregistration that
+            // has already reported success is followed by this sweep marking
+            // its retained `local` and `stub` rows `missing`.
+            //
+            // Per page rather than once, because the sweep commits page by page
+            // and each page is its own opportunity to stop.
+            let enabled: bool = self
+                .0
+                .conn()
+                .query_row(
+                    "SELECT enabled FROM scan_root WHERE id = ?1",
+                    [root.id.get()],
+                    |r| r.get::<_, i64>(0).map(|v| v != 0),
+                )
+                .unwrap_or(false);
+            if !enabled {
+                return Err(CatalogError::Invalid(format!(
+                    "root {} was deregistered while this scan was reconciling it; {marked} \
+                     rows were already marked and the rest are not ours to touch",
+                    root.id.get()
+                )));
+            }
+
             let page: Vec<(i64, String)> = {
                 let mut stmt = self.0.conn().prepare(
                     "SELECT id, rel_path FROM file
@@ -1026,7 +1113,7 @@ fn row_to_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ScanRoot>> {
     let case: String = row.get(3)?;
     let norm: String = row.get(4)?;
     let at: String = row.get(5)?;
-    let avail: String = row.get(8)?;
+    let avail: String = row.get(9)?;
     Ok((|| {
         Ok(ScanRoot {
             id: RootId::new(row.get(0)?),
@@ -1050,11 +1137,12 @@ fn row_to_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ScanRoot>> {
             atime_mode: AtimeMode::parse(&at)
                 .ok_or_else(|| CatalogError::Invalid(format!("atime_mode `{at}`")))?,
             volume_id: row.get(6)?,
-            resync_required: row.get::<_, i64>(7)? != 0,
+            root_fs_id: row.get(7)?,
+            resync_required: row.get::<_, i64>(8)? != 0,
             availability: Availability::parse(&avail)
                 .ok_or_else(|| CatalogError::Invalid(format!("availability `{avail}`")))?,
-            destruction_ineligible: row.get::<_, i64>(9)? != 0,
-            destruction_ineligible_reason: row.get(10)?,
+            destruction_ineligible: row.get::<_, i64>(10)? != 0,
+            destruction_ineligible_reason: row.get(11)?,
         })
     })())
 }
@@ -1187,6 +1275,7 @@ mod tests {
                 PathNormPolicy::Nfc,
                 AtimeMode::Relatime,
                 Some("uuid:abc"),
+                None,
                 false,
                 &[],
                 Timestamp::from_nanos(9),
@@ -1249,6 +1338,7 @@ mod tests {
                 PathNormPolicy::Nfd,
                 AtimeMode::Relatime,
                 Some("uuid:abc"),
+                None,
                 false,
                 &[],
                 Timestamp::from_nanos(9),
@@ -1307,6 +1397,7 @@ mod tests {
                 PathNormPolicy::Nfc,
                 AtimeMode::Reliable,
                 Some("uuid:abc"),
+                None,
                 true,
                 &["*.tmp".to_string()],
                 Timestamp::from_nanos(9),
@@ -1365,6 +1456,7 @@ mod tests {
                 PathNormPolicy::Nfc,
                 AtimeMode::Relatime,
                 volume,
+                None,
                 false,
                 &[],
                 Timestamp::from_nanos(9),
@@ -1405,6 +1497,7 @@ mod tests {
                 PathNormPolicy::Nfc,
                 AtimeMode::Relatime,
                 None,
+                None,
                 false,
                 &[],
                 Timestamp::from_nanos(9),
@@ -1434,6 +1527,7 @@ mod tests {
                 PathCasePolicy::Sensitive,
                 PathNormPolicy::Nfc,
                 AtimeMode::Relatime,
+                None,
                 None,
                 false,
                 &[],
@@ -1473,6 +1567,7 @@ mod tests {
                 PathNormPolicy::Nfc,
                 AtimeMode::Relatime,
                 Some("uuid:abc"),
+                None,
                 false,
                 &[],
                 Timestamp::from_nanos(1),
@@ -2237,6 +2332,7 @@ mod tests {
                 PathCasePolicy::Sensitive,
                 PathNormPolicy::Nfc,
                 AtimeMode::Relatime,
+                None,
                 None,
                 false,
                 &[],

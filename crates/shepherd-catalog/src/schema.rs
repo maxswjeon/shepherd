@@ -50,6 +50,20 @@ CREATE TABLE scan_root (
     -- re-key every row under this root and manufacture false absence.
     volume_id              TEXT,
 
+    -- §4.4: the ENROLLED DIRECTORY's own identity, as `volume::fs_id` builds
+    -- one for a file.
+    --
+    -- `volume_id` says which filesystem the root is on and nothing about WHICH
+    -- DIRECTORY on it. A registered root reached through a symlinked ancestor,
+    -- or one that is itself a symlink, can be retargeted at another directory
+    -- on the same filesystem — and every volume check still passes, so the scan
+    -- commits the replacement tree under this root and sweeps the enrolled
+    -- tree's rows as absent, stub custody included.
+    --
+    -- NULL where the identity could not be established at enrollment, which is
+    -- the same "unknown, not wrong" the file rows use.
+    root_fs_id             TEXT,
+
     -- §4.12: reliable | relatime | disabled | unknown. On a volume where
     -- last-access updates are off, atime never advances, so "not accessed in
     -- 1 year" eventually matches EVERYTHING, including files in daily use.

@@ -292,6 +292,32 @@ impl Executor for ScanExecutor {
         {
             return Err(reason);
         }
+        // THE DIRECTORY, not just the filesystem.
+        //
+        // `volume_refusal` establishes that the root is on the volume it was
+        // enrolled from, and says nothing about WHICH DIRECTORY on it — so a
+        // root reached through a symlinked ancestor, or one that is itself a
+        // symlink, can be retargeted at another directory on the same
+        // filesystem and every check above still passes. The scan then commits
+        // the replacement tree under this root and sweeps the enrolled tree's
+        // rows as absent, retained stub custody included.
+        //
+        // `None` on either side is unknown rather than wrong, and is the same
+        // decision `fs_id` makes for files: a root enrolled before this column
+        // existed, or on a volume with no stable id, is not refused for it.
+        if present
+            && let Some(enrolled) = root.root_fs_id.as_deref()
+            && let Some(seen) = current_root_identity(&path, root.volume_id.as_deref())
+            && enrolled != seen
+        {
+            return Err(format!(
+                "root {root_id} ({}) was enrolled as {enrolled} and now resolves to {seen}: \
+                 the path names a different directory than the one registered. Nothing has \
+                 been committed — re-register the root if the move was intended",
+                root.path
+            ));
+        }
+
         let dev_after = present.then(|| device_of(&path)).flatten();
         if present && dev_before != dev_after {
             return Err(format!(
@@ -836,6 +862,22 @@ fn upsert_batch(
     Ok(())
 }
 
+/// The enrolled directory's identity as it stands now.
+///
+/// Built the way a file's `fs_id` is — the volume plus the inode — so the two
+/// are comparable and neither depends on `st_dev`, which does not survive a
+/// remount.
+fn current_root_identity(path: &std::path::Path, volume_id: Option<&str>) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let vol = volume_id?;
+    let md = std::fs::metadata(path).ok()?;
+    Some(
+        shepherd_catalog::volume::fs_id_from_ino(vol, md.ino())
+            .as_str()
+            .to_owned(),
+    )
+}
+
 /// The path a skip is about, if it has one.
 ///
 /// Every variant carries one — the walker reports WHERE it did not look, which
@@ -968,6 +1010,7 @@ mod tests {
                 shepherd_catalog::PathCasePolicy::Sensitive,
                 shepherd_catalog::PathNormPolicy::Nfc,
                 shepherd_catalog::AtimeMode::Relatime,
+                None,
                 None,
                 false,
                 patterns,

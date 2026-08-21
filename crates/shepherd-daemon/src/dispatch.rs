@@ -467,6 +467,19 @@ impl ShepherdApi for Session {
         // where nothing is wrong beyond the identity being weak. The operator
         // is told what they lose instead.
         let volume = shepherd_catalog::volume::current_volume_id(&path);
+        // The directory's own identity, built the way a file's is: the volume
+        // it is on plus its inode. `None` where either is unavailable, which is
+        // the same "unknown, not wrong" every other identity here uses.
+        let root_identity = volume.as_deref().and_then(|vol| {
+            std::fs::metadata(&path).ok().map(|md| {
+                shepherd_catalog::volume::fs_id_from_ino(
+                    vol,
+                    std::os::unix::fs::MetadataExt::ino(&md),
+                )
+                .as_str()
+                .to_owned()
+            })
+        });
 
         let mut warnings = Vec::new();
 
@@ -712,6 +725,11 @@ impl ShepherdApi for Session {
                 policies.norm,
                 atime_mode,
                 volume.as_deref(),
+                // The enrolled DIRECTORY's identity, not just its filesystem's.
+                // A root reached through a symlinked ancestor, or one that is
+                // itself a symlink, can be retargeted at another directory on
+                // the same volume — and every volume check still passes.
+                root_identity.as_deref(),
                 hosted_optin,
                 &ignore_patterns,
                 now,
@@ -1142,9 +1160,22 @@ impl ShepherdApi for Session {
         // the same mistake in reverse: state is exactly what the index cannot
         // narrow on, so `state = "missing"` with fifty `local` name-matches in
         // front of it returns an empty page.
+        // Expanded, ceilinged — and never below what the page itself needs.
+        //
+        // `MAX_CANDIDATES` bounds the EXPANSION, and applying it to the total
+        // made every offset past 10,000 return an empty page: the ids are
+        // truncated before `.skip(offset)` ever runs, so a request the
+        // validation explicitly accepts (offsets up to `MAX_OFFSET`) silently
+        // answers "no matches" over a corpus full of them.
+        //
+        // The floor is `want`, which is exactly what the old unfiltered branch
+        // asked for and is bounded by `MAX_OFFSET + MAX_PAGE` — a deep page
+        // costs a vector of ids rather than an unbounded scan, and a shallow
+        // one still gets the expansion filtering needs.
         let cap = want
             .saturating_mul(FILTERED_CANDIDATE_FACTOR)
-            .min(MAX_CANDIDATES);
+            .min(MAX_CANDIDATES)
+            .max(want);
 
         let matched = index.search(&req.query, cap.max(1));
 
@@ -2188,6 +2219,7 @@ mod tests {
                 PathCasePolicy::Sensitive,
                 PathNormPolicy::Nfc,
                 AtimeMode::Relatime,
+                None,
                 None,
                 false,
                 &[],

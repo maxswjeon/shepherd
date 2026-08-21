@@ -896,6 +896,83 @@ fn a_state_filtered_search_looks_past_the_first_page_of_name_matches() {
     );
 }
 
+/// A root retargeted at another directory on the same filesystem is refused.
+///
+/// The volume check establishes which FILESYSTEM the root is on and says
+/// nothing about which directory — so a root that is itself a symlink can be
+/// repointed at a sibling and every check passes. The scan would then commit
+/// the replacement tree under this root and sweep the enrolled tree's rows as
+/// absent, retained stub custody included.
+#[test]
+fn a_root_retargeted_to_another_directory_refuses_to_scan() {
+    let d = Daemon::start("retarget");
+    let mut c = d.connect();
+    let real = d.dir.join("real");
+    let other = d.dir.join("other");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(real.join("mine.txt"), b"x").unwrap();
+    std::fs::write(other.join("theirs.txt"), b"x").unwrap();
+
+    let link = d.dir.join("root");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let root_id = c.call(
+        "root.add",
+        serde_json::json!({ "path": link.to_string_lossy(), "stub_mode": "delete" }),
+    )["root"]["root_id"]
+        .as_i64()
+        .expect("root_id");
+    c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    assert!(wait_for_scan(&mut c, root_id)["last_error"].is_null());
+
+    // Repoint at a sibling on the SAME filesystem: every volume check still
+    // agrees, because the volume did not change.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+
+    c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    // Polled for the ERROR rather than for `finished_at`: a refused scan is
+    // retried by the queue, so it never reports finished — which is correct,
+    // and means `wait_for_scan` would wait for something that will not happen.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let scan = loop {
+        // `scan.status` answers with a `scans` array, one entry per root.
+        let s = c.call("scan.status", serde_json::json!({ "root_id": root_id }));
+        let entry = s["scans"][0].clone();
+        if entry["last_error"].as_str().is_some_and(|e| !e.is_empty()) {
+            break entry;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the retargeted root never reported a refusal: {s}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        scan["last_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("different directory"),
+        "a retargeted root must refuse rather than adopt the replacement tree: {scan}"
+    );
+
+    // And the enrolled tree's row is untouched — not swept, not replaced.
+    let hits = |q: &str, c: &mut Client| {
+        c.call(
+            "search",
+            serde_json::json!({"query": q, "mode": "metadata"}),
+        )["hits"]
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    assert_eq!(hits("mine", &mut c), 1, "the enrolled tree's row survives");
+    assert_eq!(
+        hits("theirs", &mut c),
+        0,
+        "and the replacement was never catalogued"
+    );
+}
+
 /// The skew case §4.3 calls the most common one, end to end.
 #[test]
 fn a_major_version_mismatch_is_rejected_with_both_versions_named() {
