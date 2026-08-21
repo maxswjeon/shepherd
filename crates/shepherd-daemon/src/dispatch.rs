@@ -1128,7 +1128,24 @@ impl ShepherdApi for Session {
         // more candidates than the caller asked for or a filtered page comes
         // back short. The multiplier is a bounded guess, and `degraded` reports
         // when it was not enough rather than pretending it was.
-        let cap = if req.filters == SearchFilters::default() {
+        // EVERY search is filtered now, and that is not a wording change.
+        //
+        // Hydration excludes `missing` rows when no state filter is given, so
+        // the unfiltered branch — which asks the index for exactly `offset +
+        // limit` candidates because nothing will be dropped — is describing a
+        // world that no longer exists. If the first fifty matching ids are
+        // reconciled-away rows, a default `limit = 50` hydrates all fifty away
+        // and returns an empty page while live matches sit further down the
+        // index.
+        //
+        // The one genuinely unfiltered case is an explicit `state` filter: the
+        // implicit exclusion does not apply on top of it, so `want` candidates
+        // is again exactly what is needed.
+        let only_state_filter = SearchFilters {
+            state: None,
+            ..req.filters.clone()
+        } == SearchFilters::default();
+        let cap = if only_state_filter && req.filters.state.is_some() {
             want
         } else {
             want.saturating_mul(FILTERED_CANDIDATE_FACTOR)

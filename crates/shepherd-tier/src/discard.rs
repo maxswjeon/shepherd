@@ -477,21 +477,39 @@ pub async fn reserve_discard(
     // After the charge, so a refused budget leaves the episode confirmed and
     // retryable; before the `DiscardCharge` exists, so no charge is ever handed
     // out over an episode still in the state that mints them.
+    // REFUNDED when the transition loses, because nothing has been deleted.
+    //
+    // The charge commits first and the transition is a separate operation, so
+    // two clones that both fit the rate limit both consume budget before one of
+    // them loses the compare-and-set — and the loser's units are gone for the
+    // window's whole length, with no deletion to show for them. A crash in the
+    // same gap leaves a charged but still-`confirmed` episode that charges
+    // again on retry.
+    //
+    // Safe precisely because it is here: no DELETE has been issued, so
+    // returning the budget cannot mask work that happened. The refund is
+    // best-effort — a ledger that cannot be reached leaves the budget spent,
+    // which is the conservative direction for a blast-radius control and is
+    // what the window rolling forward eventually resolves.
+    let refund = |r: BreakerRefusal| DiscardRefusals {
+        policy: Vec::new(),
+        breaker: vec![r],
+    };
     match episodes.begin_executing(episode).await {
         Ok(true) => {}
         Ok(false) => {
-            return Err(DiscardRefusals {
-                policy: Vec::new(),
-                breaker: vec![BreakerRefusal::NotConfirmed {
-                    state: crate::breaker::EpisodeState::Executing,
-                }],
-            });
+            ledger
+                .refund(episode.target, episode.root, now, count)
+                .await;
+            return Err(refund(BreakerRefusal::NotConfirmed {
+                state: crate::breaker::EpisodeState::Executing,
+            }));
         }
         Err(r) => {
-            return Err(DiscardRefusals {
-                policy: Vec::new(),
-                breaker: vec![r],
-            });
+            ledger
+                .refund(episode.target, episode.root, now, count)
+                .await;
+            return Err(refund(r));
         }
     }
     episode.state = crate::breaker::EpisodeState::Executing;

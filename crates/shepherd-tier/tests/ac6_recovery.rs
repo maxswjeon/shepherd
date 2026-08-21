@@ -229,10 +229,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
     let destroyed = execute_local_destruction(
         LocalDestroyRequest {
             root_gate: &OpenGate,
-            // No rule in these fixtures asks for a specific target, so the
-            // policy requires none — and the token is issued against the same
-            // empty set, which is what makes them agree.
-            policy_required: &[],
+            policy_gate: &NoRequiredTargets,
             intent_gate: &SilentJournal,
             file_root: root.id,
             // Minted by the JOURNAL, not fabricated. `PreparedIntent` exists so
@@ -562,5 +559,20 @@ impl shepherd_tier::destroy::IntentGate for SilentJournal {
         _to: shepherd_catalog::intent::IntentState,
     ) -> shepherd_tier::destroy::Result<()> {
         Ok(())
+    }
+}
+
+/// The delete policy's required targets. Empty in these tests: no rule names
+/// one, so the token's empty set is the right answer rather than a shortcut.
+struct NoRequiredTargets;
+
+#[async_trait::async_trait]
+impl shepherd_tier::destroy::PolicyGate for NoRequiredTargets {
+    async fn required_targets(
+        &self,
+        _root: shepherd_core::RootId,
+        _path: &std::path::Path,
+    ) -> shepherd_tier::destroy::Result<Vec<shepherd_core::TargetId>> {
+        Ok(Vec::new())
     }
 }

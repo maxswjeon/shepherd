@@ -177,15 +177,13 @@ pub struct LocalDestroyRequest<'a> {
     ///
     /// A comment is not a check. This is.
     pub custodian: PermittedCustodian<'a>,
-    /// The targets THIS FILE's delete policy requires, from the rule that
-    /// selected it.
+    /// Where the targets THIS FILE's delete policy requires are read from.
     ///
-    /// Compared against the set [`Self::custodian`] was issued against. The
-    /// token proves the ∃ clause and records which ∀ clause it was checked
-    /// with; only the caller knows which one the policy actually names, so this
-    /// is where the two meet. Without it a token issued against an empty
-    /// `required` list authorises a destruction the policy would refuse.
-    pub policy_required: &'a [TargetId],
+    /// A port rather than a value, and that distinction is the whole point: a
+    /// required-target LIST supplied by the caller can be the same empty list
+    /// it passed to `destroy_permitted`, and the two agreeing proves only that
+    /// the caller is consistent with itself. See [`PolicyGate`].
+    pub policy_gate: &'a dyn PolicyGate,
     pub remote_key: &'a ObjectKey,
     /// [`Self::root`]'s gates, HELD across the unlink rather than re-read.
     ///
@@ -225,15 +223,24 @@ pub async fn execute_local_destruction(
         return Err(DestroyError::Root(reason));
     }
 
-    // The CUSTODY PROOF must have been checked against this file's own policy.
+    // The CUSTODY PROOF must have been checked against the policy the CATALOG
+    // holds for this file — not against a second list the same caller supplied.
     //
-    // `destroy_permitted` answers two clauses, and the token can only carry the
-    // ∃ one as a fact — the ∀ clause is about a required-target list the caller
-    // supplied, so a caller that supplied an empty or short one gets a token
-    // that looks identical. Comparing the set it was issued against with the
-    // set the policy names is what closes that, and it has to happen here
-    // because this is where both are in scope.
-    if !req.custodian.covers(req.policy_required) {
+    // Carrying the required set on the token made it knowable and left the
+    // comparison vacuous: a caller passing the same empty list to
+    // `destroy_permitted` and to the request satisfies it while the file's
+    // actual policy asks for targets nobody reached. Two values from one source
+    // agreeing proves only that the source is consistent with itself.
+    //
+    // So the authoritative set is READ HERE, through a port, at the destruction
+    // boundary — the same shape as `RootGate`, and for the same reason: the
+    // question is "what does the catalog say", and only the catalog can answer
+    // it. A caller cannot supply this one at all.
+    let policy_required = req
+        .policy_gate
+        .required_targets(req.file_root, req.path)
+        .await?;
+    if !req.custodian.covers(&policy_required) {
         return Err(DestroyError::Unbound {
             detail: format!(
                 "the custody proof was checked against required targets {:?} and this file's \
@@ -244,10 +251,7 @@ pub async fn execute_local_destruction(
                     .iter()
                     .map(|t| t.get())
                     .collect::<Vec<_>>(),
-                req.policy_required
-                    .iter()
-                    .map(|t| t.get())
-                    .collect::<Vec<_>>()
+                policy_required.iter().map(|t| t.get()).collect::<Vec<_>>()
             ),
         });
     }
@@ -773,6 +777,32 @@ async fn closing_head(req: &LocalDestroyRequest<'_>, remote: &impl RemoteGate) -
     check
         .evaluate(req.custodian.object_version.as_ref(), req.expected_size)
         .map_err(DestroyError::Refused)
+}
+
+/// Read the delete policy's required targets for one file, as a narrow port.
+///
+/// # Why this cannot be an argument
+///
+/// §4.10.2's predicate has two clauses. `PermittedCustodian` proves the ∃ one
+/// as a fact and records which ∀ one it was checked against — but the ∀ clause
+/// is about a required-target list the CALLER supplied to `destroy_permitted`,
+/// so comparing it with a second list from that same caller is a comparison
+/// between two copies of one belief. A caller that passed an empty list to both
+/// satisfies it while the file's policy asks for targets nobody reached, and
+/// the sole local copy is unlinked.
+///
+/// The authoritative answer is in the catalog, and the destruction boundary is
+/// where it has to be read — after which the token's recorded set can be
+/// compared against something that did not come from the caller. Same shape as
+/// `RootGate` and `IntentGate`, for the same reason: this crate does not open
+/// catalogs, and a fact the caller could forge is not a precondition.
+#[async_trait::async_trait]
+pub trait PolicyGate: Send + Sync {
+    /// The targets this file's delete policy requires to have been reached.
+    ///
+    /// Empty means the policy names none, which is a real answer and not the
+    /// absence of one.
+    async fn required_targets(&self, root: RootId, path: &Path) -> Result<Vec<TargetId>>;
 }
 
 /// Advance an intent along §4.4's lifecycle, as a narrow port.

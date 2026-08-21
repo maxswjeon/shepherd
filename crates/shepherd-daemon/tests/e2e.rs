@@ -796,6 +796,58 @@ fn a_scan_reconciles_deleted_files_but_not_unobserved_ones() {
     std::fs::set_permissions(dir.join("deep"), readable).unwrap();
 }
 
+/// A scan that hit the candidate cap says its total is a lower bound.
+///
+/// `total` counts what survived filtering, and that is exact only when the
+/// index handed over every match. Reporting a truncated count as authoritative
+/// is the dishonest direction — AC-40's UI shows this number to a human.
+///
+/// Its own fixture because the cap is `limit * FILTERED_CANDIDATE_FACTOR`:
+/// reaching it takes more matches than a handful of files, which is exactly why
+/// the ordinary search test no longer exercises it.
+#[test]
+fn a_capped_candidate_scan_reports_its_total_as_a_floor() {
+    let d = Daemon::start("capped");
+    let mut c = d.connect();
+    let dir = d.dir.join("many");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..64 {
+        std::fs::write(dir.join(format!("report-{i:03}.txt")), b"x").unwrap();
+    }
+    let root_id = c.call(
+        "root.add",
+        serde_json::json!({ "path": dir.to_string_lossy(), "stub_mode": "delete" }),
+    )["root"]["root_id"]
+        .as_i64()
+        .expect("root_id");
+    c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    let scan = wait_for_scan(&mut c, root_id);
+    assert!(scan["last_error"].is_null(), "{scan}");
+
+    // limit 1 -> 16 candidates, against 64 matches.
+    let page = c.call(
+        "search",
+        serde_json::json!({"query": "report-", "limit": 1}),
+    );
+    assert_eq!(page["hits"].as_array().map_or(0, Vec::len), 1);
+    assert!(
+        page["degraded"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("lower bound"),
+        "a capped scan must say its total is a floor: {page}"
+    );
+
+    // AND THE UNCAPPED DIRECTION: a page wide enough to take every match
+    // reports an exact total and says nothing about degradation.
+    let all = c.call(
+        "search",
+        serde_json::json!({"query": "report-", "limit": 200}),
+    );
+    assert_eq!(all["total"], serde_json::json!(64), "{all}");
+    assert_eq!(all["degraded"], serde_json::Value::Null);
+}
+
 /// The skew case §4.3 calls the most common one, end to end.
 #[test]
 fn a_major_version_mismatch_is_rejected_with_both_versions_named() {
@@ -2850,12 +2902,21 @@ fn search_finds_scanned_files_and_misses_absent_ones() {
     assert_eq!(page["hits"].as_array().unwrap().len(), 2);
     assert_eq!(
         page["total"],
-        serde_json::json!(2),
-        "`limit` caps the page; three .txt files exist but only two were requested"
+        serde_json::json!(3),
+        "`limit` caps the PAGE and not the count: `total` is what survived \
+         filtering, and all three .txt files did. It read 2 before only because \
+         the unfiltered branch asked the index for exactly `offset + limit` \
+         candidates — and every search is filtered now, since hydration \
+         excludes reconciled-away rows unless a state filter says otherwise"
     );
-    assert!(
-        page["degraded"].as_str().unwrap().contains("lower bound"),
-        "a capped scan must say its total is a floor: {page}"
+    assert_eq!(
+        page["degraded"],
+        serde_json::Value::Null,
+        "nothing was truncated — the candidate scan is `limit * FILTERED_CANDIDATE_FACTOR` \
+         now, which is far past three matches — so the total is exact and saying it is a \
+         floor would be the dishonest direction. \
+         `a_capped_candidate_scan_reports_its_total_as_a_floor` covers the case where it \
+         genuinely is one: {page}"
     );
     let all_txt = c.call("search", serde_json::json!({"query": ".txt", "limit": 50}));
     assert_eq!(all_txt["total"], serde_json::json!(3), "{all_txt}");

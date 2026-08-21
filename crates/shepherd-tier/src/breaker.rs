@@ -405,6 +405,17 @@ pub trait RateLedger: Send + Sync {
         n: u32,
         limits: &BreakerLimits,
     ) -> Result<(), BreakerRefusal>;
+
+    /// Return `n` discards to the window, for a reservation that will not
+    /// happen.
+    ///
+    /// Only ever called BEFORE any deletion — a refusal between the charge and
+    /// the episode's durable transition — so it cannot mask work that occurred.
+    /// Infallible by signature and best-effort by contract: a ledger that
+    /// cannot be reached leaves the budget spent, which is the conservative
+    /// direction for a blast-radius control and is what the window rolling
+    /// forward eventually resolves anyway.
+    async fn refund(&self, target: TargetId, root: RootId, at: Timestamp, n: u32);
 }
 
 impl Episode {

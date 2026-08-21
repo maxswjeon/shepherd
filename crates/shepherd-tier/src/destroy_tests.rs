@@ -169,6 +169,25 @@ impl crate::destroy::IntentGate for Journal {
     }
 }
 
+/// The delete policy's required targets, as the catalog would answer.
+///
+/// Default is empty — no rule in these fixtures names a target — and a test
+/// that wants the mismatch sets it, which is the only way to produce one now
+/// that the destroy path reads this rather than taking it from the caller.
+#[derive(Default)]
+struct Policy(std::sync::Mutex<Vec<shepherd_core::TargetId>>);
+
+#[async_trait::async_trait]
+impl crate::destroy::PolicyGate for Policy {
+    async fn required_targets(
+        &self,
+        _root: shepherd_core::RootId,
+        _path: &std::path::Path,
+    ) -> Result<Vec<shepherd_core::TargetId>> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+}
+
 /// An intent bound to exactly what a request destroys.
 ///
 /// Every request that overrides `path` or `expected_hash` must rebind, because
@@ -841,6 +860,41 @@ async fn a_destroy_whose_intent_cannot_be_advanced_does_not_unlink() {
     );
 }
 
+/// A custody proof checked against a shorter required set does not authorize.
+///
+/// `destroy_permitted` answers two clauses, and only the ∃ one is a fact the
+/// token can carry — the ∀ clause is about a list the CALLER supplied. Carrying
+/// that list made it knowable and left the comparison vacuous: passing the same
+/// empty list to the predicate and to the request satisfied it while the file's
+/// policy asked for targets nobody had reached. The required set is read at the
+/// boundary now, so a caller cannot supply both halves of the comparison.
+#[tokio::test]
+async fn a_custody_proof_checked_against_the_wrong_required_set_does_not_authorize() {
+    let f = fixture("wrong-required", AttestationMode::Version);
+    let c = custodian(AttestationMode::Version, f.hash);
+
+    // The catalog says the policy requires a second target. The token was
+    // issued against none — which is exactly what a caller cutting the corner
+    // produces.
+    *f.policy.0.lock().unwrap() = vec![shepherd_core::TargetId::new(2)];
+
+    let err = execute_local_destruction(
+        f.request(&c),
+        &f.provider,
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "t", &f.adapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("a proof checked against a shorter required set must not authorize");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains("different question")),
+        "the refusal must say the predicate answered about something else: {err}"
+    );
+    assert!(f.path.exists(), "and the file is still there");
+}
+
 /// A file old enough and big enough to clear the floors.
 fn payload() -> Vec<u8> {
     vec![7u8; 128 * 1024]
@@ -868,6 +922,7 @@ struct Fixture {
     locks: FileLocks,
     gate: Gate,
     journal: Journal,
+    policy: Policy,
     provider: DeleteModeProvider,
 }
 
@@ -904,6 +959,7 @@ fn fixture(tag: &str, mode: AttestationMode) -> Fixture {
         locks: FileLocks::new(),
         gate: Gate::open(),
         journal: Journal::default(),
+        policy: Policy::default(),
         provider: DeleteModeProvider::new(),
         tmp,
     }
@@ -943,10 +999,7 @@ impl Fixture {
             .expect("the fixture's custodian must satisfy §4.10.2"),
             remote_key: &self.key,
             root_gate: &self.gate,
-            // No rule in these fixtures asks for a specific target, so the
-            // policy requires none — and the token is issued against the same
-            // empty set, which is what makes them agree.
-            policy_required: &[],
+            policy_gate: &self.policy,
             intent_gate: &self.journal,
             // The catalog's answer for this fixture's file, which is the
             // fixture's own root.

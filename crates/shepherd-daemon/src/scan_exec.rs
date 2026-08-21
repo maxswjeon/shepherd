@@ -418,12 +418,17 @@ impl Executor for ScanExecutor {
 
         // The generation this scan stamps on every row it sees.
         //
-        // The job id, deliberately. `last_seen_gen` only has to be **monotonic
-        // per root** for the absence sweep it exists to feed
-        // (`last_seen_gen < :this_scan`), and a job id already is: it is a
-        // SQLite `INTEGER PRIMARY KEY` allocated when the job is enqueued, so a
-        // later scan of a root always carries a larger one than any earlier
-        // scan of that root.
+        // `MAX(last_seen_gen) + 1` for this root, and NOT the job id.
+        //
+        // `last_seen_gen` only has to be monotonic per root for the absence
+        // sweep it feeds (`last_seen_gen < :this_scan`), and a job id is — but
+        // it is monotonic per JOB, not per ATTEMPT, and a retry re-runs under
+        // the same id. An attempt that commits a batch and then fails leaves
+        // rows stamped with that generation; if one of those files disappears
+        // before the retry, the retry neither sees it nor sweeps it, because
+        // the predicate is strict `<` and the row's generation equals the
+        // retry's. The index then goes on serving a file the completed retry
+        // proved absent.
         //
         // Rejected alternatives, because both fail in the direction that marks
         // present files missing:
@@ -432,12 +437,17 @@ impl Executor for ScanExecutor {
         //   carry an *earlier* generation, and the next sweep then deletes the
         //   world. `last_seen_gen` exists precisely so absence does not depend
         //   on a clock;
-        // * a per-root counter column — the same value, plus a schema change
-        //   and a read-modify-write to keep it monotonic.
+        // * the job id, as above.
         //
-        // NOTE: nothing sweeps on this yet. Stamping it is correct and inert on
-        // its own; the reconciliation that reads it is a separate decision.
-        let generation = ctx.id().get();
+        // `MAX + 1` needs no schema change and is monotonic per root by
+        // construction, and `scan.start` coalesces scans per root so nothing
+        // else is allocating one concurrently.
+        let generation = {
+            let r = root.clone();
+            self.writer()
+                .try_with(move |cat| FileRepo::new(cat).next_generation(&r))
+                .map_err(|e| format!("allocating a scan generation: {e}"))?
+        };
 
         // `into_iter`, not `chunks`: every `FileStat` the walk produced is
         // moved into exactly one batch and from there into the writer actor.
@@ -587,11 +597,19 @@ impl Executor for ScanExecutor {
                 FileRepo::new(cat).sweep_absent(&root_for_sweep, generation, &unobserved, now())
             })
         });
+        // The watermark moves BEFORE the error is examined, because the sweep
+        // commits page by page: an error on a later page returns `Err` with
+        // earlier pages already written, so `abandon` must invalidate against
+        // the sweep rather than against the last upsert — and for a scan whose
+        // only effect was deletions the old watermark was `None`, which
+        // invalidates nothing at all.
+        //
+        // Unconditional rather than `if swept > 0`: a failed sweep does not
+        // report how many rows it wrote before failing, so "wrote nothing" is
+        // not a thing this can know.
+        mutated_at = Some(swept_at);
         let swept =
             swept.map_err(|e| self.abandon(mutated_at, format!("reconciling absent rows: {e}")))?;
-        if swept > 0 {
-            mutated_at = Some(swept_at);
-        }
         if swept > 0 {
             tracing::info!(root = root_id, swept, "marked rows absent from this scan");
         }

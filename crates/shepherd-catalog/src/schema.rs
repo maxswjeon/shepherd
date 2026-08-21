@@ -129,6 +129,18 @@ CREATE TABLE file (
     blake3             BLOB,
 
     state              TEXT    NOT NULL DEFAULT 'local',  -- local | stub | remote | missing
+
+    -- What `state` was when the reconciliation sweep marked this row `missing`.
+    --
+    -- A `stat` cannot tell a dehydrate-mode placeholder from a file with bytes
+    -- in it, which is why `upsert_file` preserves `state` at all — so a stub
+    -- that vanished for one scan and reappeared would come back as `local`,
+    -- claiming the bytes are here while its `object_location` still says they
+    -- are remote. Recording what the row was is what lets revival put it back
+    -- instead of guessing.
+    --
+    -- NULL for every row that is not currently `missing`.
+    state_before_missing TEXT,
     flags              INTEGER NOT NULL DEFAULT 0,        -- hardlink|sparse|symlink|open (AC-8)
     dirty              INTEGER NOT NULL DEFAULT 0,
     model_version      TEXT,

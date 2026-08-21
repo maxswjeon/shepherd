@@ -488,6 +488,16 @@ impl RateLedger for MemLedger {
     ) -> Result<(), BreakerRefusal> {
         self.window.lock().unwrap().try_charge(at, n, limits)
     }
+
+    async fn refund(&self, _target: TargetId, _root: RootId, at: Timestamp, n: u32) {
+        // The real ledger subtracts from the persisted bucket; this one edits
+        // the in-memory window the same way, so a refunded reservation is
+        // observable through `used`.
+        let mut w = self.window.lock().unwrap();
+        if let Some(b) = w.buckets.iter_mut().find(|b| b.bucket_start == at) {
+            b.count = b.count.saturating_sub(n);
+        }
+    }
 }
 
 /// The target's key prefix. Load-bearing: the key `spend` mints is derived

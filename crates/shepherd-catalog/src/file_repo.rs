@@ -683,10 +683,26 @@ impl<'a> FileRepo<'a> {
                  -- unfindable. Revival must not depend on replacement
                  -- detection, because replacement detection is exactly what is
                  -- unavailable there.
+                 -- Revival goes to `local` only when the row was NEVER a
+                 -- placeholder. A dehydrate-mode stub that was absent for one
+                 -- scan and reappears is still a stub: a `stat` cannot tell a
+                 -- placeholder from a file with bytes in it, which is the
+                 -- reason `state` is preserved in the first place. Calling it
+                 -- `local` would say the bytes are here while the location
+                 -- metadata still says they are remote — a misclassification
+                 -- the tier path would then act on.
+                 --
+                 -- `state_before_missing` is what makes that answerable:
+                 -- `sweep_absent` records what the row WAS, so revival can put
+                 -- it back rather than guess.
                  state = CASE
                      WHEN ?15 = 1 THEN 'local'
-                     WHEN file.state = 'missing' THEN 'local'
+                     WHEN file.state = 'missing'
+                         THEN COALESCE(file.state_before_missing, 'local')
                      ELSE file.state END,
+                 -- Cleared on revival and on replacement: it describes a row
+                 -- that is currently missing, and this row is neither.
+                 state_before_missing = NULL,
                  --
                  -- blake3 survives a hashless re-scan ONLY where the metadata
                  -- that identified the hashed bytes held still. A bare COALESCE
@@ -871,7 +887,11 @@ impl<'a> FileRepo<'a> {
             let tx = self.0.conn_mut().savepoint()?;
             for id in &doomed {
                 tx.execute(
-                    "UPDATE file SET state = 'missing', updated_at = ?2 WHERE id = ?1",
+                    "UPDATE file
+                     SET state_before_missing = state,
+                         state = 'missing',
+                         updated_at = ?2
+                     WHERE id = ?1",
                     params![id, now.as_nanos()],
                 )?;
             }
