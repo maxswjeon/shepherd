@@ -442,3 +442,62 @@ fn a_terminal_episode_is_not_revived() {
     );
     assert_eq!(e.state, EpisodeState::Held, "and drops back to Held");
 }
+
+/// A nonpositive rolling window disables the budget, so it is refused.
+///
+/// `BreakerLimits` is `Deserialize` and nothing rejected `window_nanos <= 0`.
+/// With a zero window the floor is `now` and `count_within`'s strict `>`
+/// excludes even the bucket just recorded at `now` — so every call observes
+/// `used == 0` and an unbounded sequence of individually sub-limit episodes is
+/// permitted. The rolling budget switched off silently, in the direction that
+/// destroys data; a negative window moves the floor into the future and does
+/// the same.
+#[test]
+fn a_nonpositive_window_is_refused_rather_than_silently_unlimited() {
+    let now = t(0);
+    for window_nanos in [0i64, -1, i64::MIN] {
+        let limits = BreakerLimits {
+            max_in_window: 2,
+            window_nanos,
+            max_per_episode: 500,
+        };
+        let mut w = RateWindow::default();
+
+        // Spending is refused outright — this is the call that consumes.
+        assert_eq!(
+            w.try_charge(now, 1, &limits),
+            Err(BreakerRefusal::InvalidWindow { window_nanos }),
+            "window {window_nanos} was spent against"
+        );
+
+        // And nothing was recorded on the way to refusing, so a corrected
+        // configuration starts from a truthful counter.
+        assert_eq!(w.count_within(now, DEFAULT_WINDOW_NANOS), 0);
+
+        // The evaluating side reports it alongside its other conjuncts.
+        let mut e = Episode::open(RootId::new(1), TargetId::new(1), now);
+        e.enumerate(candidates(1));
+        e.confirm("operator", now, 3_600_000_000_000);
+        let refusals = e
+            .may_execute(&w, &limits, now)
+            .expect_err("an episode must not execute against a disabled budget");
+        assert!(
+            refusals.contains(&BreakerRefusal::InvalidWindow { window_nanos }),
+            "window {window_nanos} was evaluated against: {refusals:?}"
+        );
+    }
+
+    // AND THE ACCEPTING DIRECTION: a positive window still charges and still
+    // exhausts, so the refusal cannot be satisfied by refusing everything.
+    let limits = BreakerLimits {
+        max_in_window: 2,
+        window_nanos: DEFAULT_WINDOW_NANOS,
+        max_per_episode: 500,
+    };
+    let mut w = RateWindow::default();
+    w.try_charge(now, 2, &limits).expect("within the budget");
+    assert!(
+        w.try_charge(t(1), 1, &limits).is_err(),
+        "and the third exhausts it"
+    );
+}

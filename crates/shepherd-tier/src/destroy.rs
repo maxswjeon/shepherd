@@ -469,8 +469,27 @@ fn check_custody_binds(
     //
     // Same finding as the discard path's, one file over: binding the target
     // without binding the prefix leaves the hole open one level down.
-    match prefix {
-        Some(p) if req.remote_key.as_str().starts_with(p) => {}
+    // On a COMPONENT boundary, not on leading bytes.
+    //
+    // `starts_with` accepted `tenant/archive/objects/...` for a gate configured
+    // `tenant/a`: a different namespace that happens to share a prefix string,
+    // which in a shared bucket is a neighbouring tenant rather than a
+    // hypothetical. The target and hash-leaf checks pass there too, so content
+    // attestation could authorise the unlink from an object the custodian's
+    // target never held.
+    //
+    // The trailing slash is trimmed first because `derive_object_key` trims it
+    // when building the key, so a prefix configured `tenant/a/` and one
+    // configured `tenant/a` name the same objects and must be accepted the same
+    // way. An empty prefix means the bucket root, and every key is under it.
+    match prefix.map(|p| p.trim_end_matches('/')) {
+        Some(p)
+            if p.is_empty()
+                || req
+                    .remote_key
+                    .as_str()
+                    .strip_prefix(p)
+                    .is_some_and(|rest| rest.starts_with('/')) => {}
         Some(p) => {
             return Err(DestroyError::Unbound {
                 detail: format!(

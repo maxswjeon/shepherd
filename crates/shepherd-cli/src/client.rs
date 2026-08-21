@@ -42,6 +42,28 @@ use shepherd_proto::{
 /// How long to wait for the daemon to answer one call.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default deadline for `target.add`, which probes before it replies.
+///
+/// The daemon allows the registration probe 60 seconds — a complete multipart
+/// round trip against the bucket — so a client deadline below that abandons a
+/// call the daemon is still going to finish and commit. This is longer rather
+/// than equal, so the answer the operator gets is the daemon's own
+/// `TargetUnreachable`, which names the endpoint, instead of a transport error
+/// that names nothing.
+pub const TARGET_ADD_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The default deadline for one method.
+///
+/// A function rather than a constant because it is a property of the METHOD:
+/// most calls answer from memory or a catalog read, and the one that does a
+/// network round trip before replying cannot share their deadline.
+pub fn default_timeout_for(kind: shepherd_proto::MethodKind) -> Duration {
+    match kind {
+        shepherd_proto::MethodKind::TargetAdd => TARGET_ADD_TIMEOUT,
+        _ => DEFAULT_TIMEOUT,
+    }
+}
+
 /// The handshake's method name.
 ///
 /// Not a table method — see `shepherd_proto::version` for why the connection

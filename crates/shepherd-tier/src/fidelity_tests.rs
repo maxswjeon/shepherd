@@ -436,3 +436,36 @@ fn an_mtime_quantised_by_the_destination_is_faithful_and_a_wrong_one_is_not() {
         "an mtime of `now` re-matches an age rule and must still be a breach"
     );
 }
+
+/// Timestamps far enough apart to overflow an `i64` difference are not
+/// "faithful".
+///
+/// Two valid `Timestamp`s can be more than `i64::MAX` nanoseconds apart — about
+/// 292 years — and `(e - a).abs()` overflowed there: a debug build panics, and
+/// a release build wraps to a negative value smaller than every granularity, so
+/// the granularity-1 arm passes and a wildly wrong mtime is called faithful.
+/// Release is the build that ships, and the wrong direction for a predicate
+/// whose job is to catch a restored file that would immediately re-match an age
+/// rule.
+#[test]
+fn an_mtime_difference_too_large_for_i64_is_still_a_breach() {
+    for (e, a) in [
+        (i64::MIN, 0),
+        (0, i64::MIN),
+        (i64::MAX, i64::MIN),
+        (i64::MIN, i64::MAX),
+    ] {
+        let m = FidelityManifest::new(CoreAttrs {
+            mtime: Timestamp::from_nanos(e),
+            ..core()
+        });
+        let restored = RestoredAttrs {
+            mtime: Timestamp::from_nanos(a),
+            ..restored()
+        };
+        assert!(
+            verify_restore(&m, &restored).is_err(),
+            "expected {e} and actual {a} are ~292 years apart and were called faithful"
+        );
+    }
+}

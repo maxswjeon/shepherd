@@ -286,12 +286,22 @@ const MODE_IS_REPRESENTABLE: bool = cfg!(unix);
 /// and that still fails every arm.
 fn mtime_is_faithful(expected: Timestamp, actual: Timestamp) -> bool {
     let (e, a) = (expected.as_nanos(), actual.as_nanos());
+    // In `i128`, because `i64` cannot hold the difference.
+    //
+    // Two valid `Timestamp`s can be more than `i64::MAX` nanoseconds apart —
+    // `i64::MIN` and `0` are about 292 years — and `(e - a).abs()` overflows
+    // there: a debug build panics, and a release build WRAPS to a negative
+    // value that is less than every granularity, so the check passes and a
+    // wildly wrong mtime is called faithful. That is the wrong direction for a
+    // predicate whose job is to catch a restored file that would immediately
+    // re-match an age rule.
+    let delta = (i128::from(e) - i128::from(a)).abs();
     MTIME_GRANULARITIES
         .iter()
         // `rem_euclid`, not `%`: timestamps before 1970 are negative, and `%`
         // takes the sign of the dividend, so a value exactly on a tick would
         // fail the boundary test for being negative.
-        .any(|&g| a.rem_euclid(g) == 0 && (e - a).abs() < g)
+        .any(|&g| a.rem_euclid(g) == 0 && delta < i128::from(g))
 }
 
 /// Check a restore against its manifest's floor.

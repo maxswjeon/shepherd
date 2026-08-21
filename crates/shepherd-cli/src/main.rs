@@ -124,9 +124,25 @@ fn run(matches: &ArgMatches) -> Result<serde_json::Value, Failure> {
     })?;
 
     let socket = matches.get_one::<String>("socket").map(String::as_str);
-    let timeout = matches
-        .get_one::<u64>("timeout")
-        .map_or(client::DEFAULT_TIMEOUT, |s| Duration::from_secs(*s));
+    // An EXPLICIT `--timeout` is the operator's, whatever the method. Otherwise
+    // the default depends on what the method has to do before it can answer.
+    //
+    // `target.add` runs a complete multipart probe against the bucket before
+    // replying, and the daemon allows that up to 60 seconds. A 30-second client
+    // deadline against a 60-second server one is the worst pairing available: a
+    // reachable but slow target finishes its probe between them, so `shepctl`
+    // reports a transport failure and disconnects while the daemon goes on to
+    // commit the registration — and the retry the operator was told to make
+    // fails with a duplicate name for a command that appeared not to have run.
+    //
+    // Longer than the server's, not equal to it: a deadline that matches
+    // exactly races the probe's own refusal, and the useful answer is the
+    // daemon's `TargetUnreachable` naming the endpoint rather than a transport
+    // error naming nothing.
+    let timeout = matches.get_one::<u64>("timeout").map_or_else(
+        || client::default_timeout_for(kind),
+        |s| Duration::from_secs(*s),
+    );
 
     // `events.subscribe` is the one method whose answer is not the point. The
     // daemon replies, then pumps notifications down the same socket; a client

@@ -578,6 +578,63 @@ async fn a_remote_key_outside_the_gates_prefix_does_not_authorize_this_destroy()
         "the refusal must name what is wrong with the key: {err}"
     );
     assert!(f.path.exists(), "and the file is still there");
+
+    // A NEIGHBOUR SHARING LEADING BYTES is the same hazard, and `starts_with`
+    // accepted it: a gate for `tenant/a` took `tenant/archive/...`, which in a
+    // shared bucket is another tenant rather than a hypothetical.
+    let neighbour = shepherd_catalog::identity::content_key("tenant/archive", f.hash);
+    let req = LocalDestroyRequest {
+        remote_key: &neighbour,
+        ..f.request(&c)
+    };
+    let err = execute_local_destruction(
+        &req,
+        &f.provider,
+        &crate::destroy::TargetGate::new(shepherd_core::TargetId::new(1), "tenant/a", &f.adapter),
+        &f.audit,
+        &f.locks,
+        Timestamp::from_nanos(1),
+    )
+    .await
+    .expect_err("a neighbouring namespace must not authorize this destroy");
+    assert!(
+        matches!(&err, DestroyError::Unbound { detail } if detail.contains("prefix")),
+        "the refusal must name what is wrong with the key: {err}"
+    );
+
+    // AND THE ACCEPTING DIRECTION, including the trailing slash a config may
+    // carry: `derive_object_key` trims it, so both spellings name the same
+    // objects and both must be accepted.
+    let own = shepherd_catalog::identity::content_key("tenant/a", f.hash);
+    for configured in ["tenant/a", "tenant/a/"] {
+        let req = LocalDestroyRequest {
+            remote_key: &own,
+            ..f.request(&c)
+        };
+        let Some(r) = past_the_open_handle_floor(
+            execute_local_destruction(
+                &req,
+                &f.provider,
+                &crate::destroy::TargetGate::new(
+                    shepherd_core::TargetId::new(1),
+                    configured,
+                    &f.adapter,
+                ),
+                &f.audit,
+                &f.locks,
+                Timestamp::from_nanos(1),
+            )
+            .await,
+        ) else {
+            return;
+        };
+        // It gets past the binding checks; whether it completes depends on the
+        // fixture's remote holding that key, which is not what this asserts.
+        assert!(
+            !matches!(&r, Err(DestroyError::Unbound { detail }) if detail.contains("prefix")),
+            "a key under the gate's own prefix (`{configured}`) was refused: {r:?}"
+        );
+    }
 }
 
 /// A file old enough and big enough to clear the floors.

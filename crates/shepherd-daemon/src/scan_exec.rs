@@ -326,6 +326,8 @@ impl Executor for ScanExecutor {
         let mut files_seen: u64 = 0;
         let mut bytes_seen: u64 = 0;
         let mut since_progress = 0usize;
+        // Whether any batch has reached the catalog. See `abandon`.
+        let mut committed = false;
 
         // The generation this scan stamps on every row it sees.
         //
@@ -388,9 +390,29 @@ impl Executor for ScanExecutor {
             let bytes: u64 = batch.iter().map(|f| f.size).sum();
             let last_path = batch.last().map(|f| f.rel_path.clone());
 
-            self.writer()
+            // ONCE A BATCH HAS LANDED, every way out of this loop owes the
+            // index an invalidation.
+            //
+            // The rebuild below invalidates when the rebuild itself fails, and
+            // that covered one exit of several. A checkpoint that fails after
+            // batches have committed — running out of space is the obvious
+            // one, and SQLite stays readable through it — returned straight
+            // out of the executor, leaving the pre-scan arena installed and
+            // `search` unable to find rows that are already in the catalog.
+            // Once the retries are exhausted that answer is permanent, and it
+            // is indistinguishable from a correct search that found nothing.
+            //
+            // `committed` is what separates "this scan changed the catalog"
+            // from "it failed before touching it"; the second owes nothing.
+            match self
+                .writer()
                 .try_with(move |cat| upsert_batch(cat, &root_for_batch, &batch, generation))
-                .map_err(|e| format!("upserting a batch of {n}: {e}"))?;
+            {
+                Ok(()) => committed = true,
+                Err(e) => {
+                    return Err(self.abandon(committed, format!("upserting a batch of {n}: {e}")));
+                }
+            }
 
             files_seen += n as u64;
             bytes_seen += bytes;
@@ -398,14 +420,18 @@ impl Executor for ScanExecutor {
 
             // Checkpoint every batch: it is one more field on a write the
             // actor is already doing, and it is what `scan.status` reads.
-            ctx.save_checkpoint(
+            if let Err(e) = ctx.save_checkpoint(
                 &serde_json::json!({
                     "files_seen": files_seen,
                     "bytes_seen": bytes_seen,
                 })
                 .to_string(),
-            )
-            .map_err(|e| format!("checkpointing after {files_seen} files: {e}"))?;
+            ) {
+                return Err(self.abandon(
+                    committed,
+                    format!("checkpointing after {files_seen} files: {e}"),
+                ));
+            }
 
             if since_progress >= PROGRESS_EVERY {
                 since_progress = 0;
@@ -435,11 +461,15 @@ impl Executor for ScanExecutor {
         // The watermark is taken the same way `root_remove` takes it, under the
         // ticket lock, so a rebuild that pinned AFTER this scan's batches
         // committed already reflects them and survives.
-        let (_, scanned_at) = self.daemon.with_catalog_mutation(|| ());
-        let entries = self.daemon.rebuild_index().map_err(|e| {
-            self.daemon.invalidate_index(scanned_at);
-            format!("refreshing the metadata index after scanning root {root_id}: {e}")
-        })?;
+        let entries = match self.daemon.rebuild_index() {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(self.abandon(
+                    committed,
+                    format!("refreshing the metadata index after scanning root {root_id}: {e}"),
+                ));
+            }
+        };
 
         self.publish(root_id, files_seen, bytes_seen, None, true);
         tracing::info!(
@@ -450,6 +480,30 @@ impl Executor for ScanExecutor {
             "scan complete"
         );
         Ok(())
+    }
+}
+
+impl ScanExecutor {
+    /// End a scan that failed, leaving the index honest about it.
+    ///
+    /// A scan that committed batches and then failed has changed the catalog
+    /// the installed index was built from. Failing the job alone leaves that
+    /// arena serving rows from before the scan — a `search` that confidently
+    /// finds nothing, which is the one thing an ABSENT index is honest about
+    /// and a stale one is not. The watermark is taken here rather than up
+    /// front, and that is what makes it tight: taken now it is necessarily
+    /// after the last batch that landed, so no snapshot pinned before that
+    /// batch can install afterwards.
+    ///
+    /// A scan that failed before its first batch owes nothing — it changed
+    /// nothing — and invalidating there would refuse `search` for a scan that
+    /// never touched the catalog.
+    fn abandon(&self, committed: bool, detail: String) -> String {
+        if committed {
+            let (_, mutated_at) = self.daemon.with_catalog_mutation(|| ());
+            self.daemon.invalidate_index(mutated_at);
+        }
+        detail
     }
 }
 

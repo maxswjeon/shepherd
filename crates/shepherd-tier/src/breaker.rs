@@ -49,9 +49,35 @@ pub const DEFAULT_CONFIRMATION_TTL_NANOS: i64 = 3_600 * 1_000_000_000;
 pub struct BreakerLimits {
     /// Most discards permitted inside one rolling window.
     pub max_in_window: u32,
+    /// The rolling window's length. **Must be positive** — see
+    /// [`BreakerLimits::validate`].
     pub window_nanos: i64,
     /// Per-episode cap, retained alongside the rolling window.
     pub max_per_episode: u32,
+}
+
+impl BreakerLimits {
+    /// Refuse limits that would disable the breaker instead of enforcing it.
+    ///
+    /// `BreakerLimits` is `Deserialize`, so these arrive from a config file and
+    /// nothing rejected a nonpositive window. With `window_nanos == 0` the
+    /// floor is `now` and `count_within`'s strict `>` excludes even the bucket
+    /// just recorded at `now`, so every call sees `used == 0` and an unbounded
+    /// sequence of individually sub-limit episodes is permitted — the rolling
+    /// budget silently switched off, in the direction that destroys data. A
+    /// negative window moves the floor into the future and does the same.
+    ///
+    /// Checked where the budget is EVALUATED and where it is CONSUMED, not once
+    /// at load: a value that can be deserialized anywhere has no single door to
+    /// guard, and the two call sites that matter are the two that spend.
+    pub fn validate(&self) -> Result<(), BreakerRefusal> {
+        if self.window_nanos <= 0 {
+            return Err(BreakerRefusal::InvalidWindow {
+                window_nanos: self.window_nanos,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for BreakerLimits {
@@ -86,6 +112,18 @@ pub struct RateWindow {
 impl RateWindow {
     /// Discards counted inside the window ending at `now`.
     pub fn count_within(&self, now: Timestamp, window_nanos: i64) -> u32 {
+        // A nonpositive window is not a small window, it is no window — see
+        // `BreakerLimits::validate`. Counting EVERYTHING is the only safe
+        // reading here: this function has no way to refuse, and the callers
+        // that can (`try_charge`, `may_execute`) do. Returning 0 would be the
+        // answer that disables the budget.
+        if window_nanos <= 0 {
+            return self
+                .buckets
+                .iter()
+                .map(|b| b.count)
+                .fold(0u32, |a, b| a.saturating_add(b));
+        }
         let floor = now.as_nanos().saturating_sub(window_nanos);
         self.buckets
             .iter()
@@ -114,6 +152,7 @@ impl RateWindow {
         n: u32,
         limits: &BreakerLimits,
     ) -> Result<(), BreakerRefusal> {
+        limits.validate()?;
         let used = self.count_within(now, limits.window_nanos);
         if used.saturating_add(n) > limits.max_in_window {
             return Err(BreakerRefusal::RateWindowExhausted {
@@ -249,6 +288,11 @@ pub fn candidate_set_hash(candidates: &[Candidate]) -> Blake3Hash {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BreakerRefusal {
+    /// The configured rolling window is nonpositive, which disables the budget
+    /// rather than narrowing it.
+    InvalidWindow {
+        window_nanos: i64,
+    },
     /// Enumeration never completed, so the "complete set held before the first
     /// delete" precondition does not hold.
     SetNotEnumerated,
@@ -454,6 +498,14 @@ impl Episode {
         now: Timestamp,
     ) -> Result<(), Vec<BreakerRefusal>> {
         let mut refusals = Vec::new();
+
+        // Limits that would disable the budget rather than narrow it. Reported
+        // alongside everything else because this predicate reports every
+        // failing conjunct; `try_charge` refuses outright, since it is the one
+        // that spends.
+        if let Err(e) = limits.validate() {
+            refusals.push(e);
+        }
 
         // The STATE must be `Confirmed`, not merely "not cancelled".
         //
