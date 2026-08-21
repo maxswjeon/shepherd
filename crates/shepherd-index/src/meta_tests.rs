@@ -662,3 +662,69 @@ fn the_arena_ceiling_is_an_error_and_names_its_size() {
     // condition — an index quietly missing rows. Production must be an error.
     assert!(matches!(e, BuildError::ArenaTooLarge { .. }));
 }
+
+/// Concurrent searches share one thread ceiling, and every one still answers.
+///
+/// The fan-out was per request: one thread per segment, normally one per CPU,
+/// with 64 admitted connections and no pool between them — so as-you-type
+/// searches on a 32-core host could ask for roughly 2048 scan threads at once.
+/// What that exhausts is thread resources and memory bandwidth against the same
+/// arena, and the symptom is ordinary searches stalling rather than anything
+/// reporting an error.
+///
+/// The bound degrades rather than queues, so the property is that answers stay
+/// IDENTICAL however many slots a request happens to win. That is the risk in
+/// splitting segments between the caller's thread and the spawned ones: a
+/// request that reserved nothing takes a different code path through the same
+/// scan, and it must produce the same hits in the same order.
+#[test]
+fn concurrent_searches_return_identical_results_under_the_thread_ceiling() {
+    // Over `PARALLEL_SCAN_THRESHOLD_BYTES`, so the bounded path is really
+    // taken; the same shape `the_parallel_scan_agrees_with_the_single_threaded_one`
+    // uses, for the same reason.
+    let mut b = MetaIndexBuilder::new();
+    let filler = "x".repeat(80);
+    for id in 1..=110_000i64 {
+        let path = if id % 1_000 == 0 {
+            format!("dir{id}/{filler}-report-{id}.txt")
+        } else {
+            format!("dir{id}/{filler}-{id}.txt")
+        };
+        b.push(id, &path).unwrap();
+    }
+    let index = b.build().unwrap();
+    let expected = index.search("report", 64);
+    assert!(!expected.ids.is_empty(), "the fixture must actually match");
+
+    let hammered: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let index = &index;
+                s.spawn(move || {
+                    (0..8)
+                        .map(|_| index.search("report", 64))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    for batch in &hammered {
+        for got in batch {
+            assert_eq!(
+                got.ids, expected.ids,
+                "a search that won a different number of scan threads returned different hits"
+            );
+            assert_eq!(got.truncated, expected.truncated);
+        }
+    }
+
+    // And every slot is handed back: a leak would silently degrade every later
+    // search on this process to serial, which no test would otherwise notice.
+    assert_eq!(
+        SCAN_THREADS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "scan thread slots were not released"
+    );
+}

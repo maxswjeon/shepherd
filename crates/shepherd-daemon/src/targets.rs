@@ -368,16 +368,47 @@ pub fn probe_multipart_checksum_blocking(cfg: &S3Config) -> Result<ChecksumProbe
                     ),
                 )
             })?
-            .map_err(|e| {
-                RpcError::new(
-                    ErrorCode::TargetUnreachable,
-                    format!(
-                        "the registration probe could not reach the target, so this build \
-                         cannot tell whether it supports whole-object multipart checksums: {e}"
-                    ),
-                )
-            })
+            .map_err(probe_failure)
     })
+}
+
+/// Turn a probe failure into the RPC error a client can act on.
+///
+/// `TargetUnreachable` is RETRYABLE — `RpcError::is_retryable` says so — and
+/// mapping everything onto it told a client to repeat a registration that
+/// cannot ever succeed. `AccessDenied`, `NoSuchBucket` and
+/// `SignatureDoesNotMatch` all arrive as `StorageError::Provider`, which that
+/// type documents as "not retryable by default — failing closed is the
+/// direction that cannot lose data", and this function was undoing exactly that
+/// decision one layer up.
+///
+/// So the classification is the storage layer's, not a second one invented
+/// here: `is_retryable()` decides, and the message says which kind of failure
+/// it is so an operator reads "fix the bucket policy" rather than "the network
+/// was bad".
+fn probe_failure(e: shepherd_storage::StorageError) -> RpcError {
+    if e.is_retryable() {
+        return RpcError::new(
+            ErrorCode::TargetUnreachable,
+            format!(
+                "the registration probe could not reach the target, so this build cannot \
+                 tell whether it supports whole-object multipart checksums: {e}"
+            ),
+        );
+    }
+    // `Invalid`, because that is what it is: the registration as CONFIGURED
+    // cannot work, and repeating it unchanged will fail the same way. Denied
+    // access, a bucket that does not exist and a signature that does not
+    // verify are all answers about the configuration rather than about the
+    // network.
+    RpcError::new(
+        ErrorCode::Invalid,
+        format!(
+            "the target refused the registration probe, so this registration cannot \
+             succeed as configured — check the bucket name, the region, the endpoint and \
+             the credentials' permissions: {e}"
+        ),
+    )
 }
 
 /// How long the whole registration probe may take.

@@ -595,6 +595,39 @@ fn upsert_batch(
     generation: i64,
 ) -> Result<(), CatalogError> {
     cat.conn().execute_batch("BEGIN")?;
+
+    // STILL REGISTERED, re-read inside the transaction that writes.
+    //
+    // `load_scan_input` checked this once, before the walk. A default
+    // `root.remove` keeps the row and its catalog and clears `enabled` — it
+    // does not delete the row, because `file.root_id` cascades and deleting it
+    // would take every custody record with it — so the foreign key these
+    // upserts satisfy is still there and a scan walking a large tree went on
+    // adding and updating files after removal had reported success, then
+    // rebuilt the index from them.
+    //
+    // In the SAME transaction as the writes, not before the call: the writer
+    // actor is single-threaded, so a check inside its transaction and the
+    // upserts that follow cannot be separated by another writer. A check in
+    // the executor would be a read the removal could land behind.
+    let enabled: bool = cat
+        .conn()
+        .query_row(
+            "SELECT enabled FROM scan_root WHERE id = ?1",
+            [root.id.get()],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )
+        .unwrap_or(false);
+    if !enabled {
+        let _ = cat.conn().execute_batch("ROLLBACK");
+        return Err(CatalogError::Invalid(format!(
+            "root {} was deregistered while this scan was walking it, so these {} rows are \
+             not ours to write",
+            root.id.get(),
+            batch.len()
+        )));
+    }
+
     let stamp = now();
     for stat in batch {
         if let Err(e) = FileRepo::new(cat).upsert_file(root, stat, generation, stamp) {

@@ -388,6 +388,59 @@ pub struct MetaIndex {
     segments: Vec<(usize, usize)>,
 }
 
+/// Scan threads in flight across every concurrent search.
+///
+/// A per-request fan-out is a bound on ONE search and no bound at all on the
+/// daemon: 64 connections times one thread per segment is a number nobody
+/// chose. This is the process-wide ceiling those requests share.
+static SCAN_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The ceiling, measured once.
+///
+/// Available parallelism, because the work is a linear scan of an in-memory
+/// arena: past one thread per core the threads contend for the same memory
+/// bandwidth and add nothing. `1` on a machine that will not say, which
+/// degrades every search to serial rather than guessing high.
+fn max_scan_threads() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get))
+}
+
+/// Scan threads this search may spawn, released when it is done.
+struct ScanSlots(usize);
+
+impl ScanSlots {
+    /// Reserve up to `want` extra threads, taking whatever is left.
+    ///
+    /// `fetch_update` rather than a load followed by a store: two searches
+    /// arriving together would otherwise both read the same headroom and both
+    /// take it, which is the arithmetic the ceiling exists to prevent.
+    fn reserve(want: usize) -> Self {
+        let mut taken = 0;
+        let _ = SCAN_THREADS.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |in_flight| {
+                taken = want.min(max_scan_threads().saturating_sub(in_flight));
+                (taken > 0).then_some(in_flight + taken)
+            },
+        );
+        Self(taken)
+    }
+
+    fn granted(&self) -> usize {
+        self.0
+    }
+}
+
+impl Drop for ScanSlots {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            SCAN_THREADS.fetch_sub(self.0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 impl MetaIndex {
     /// An index over nothing. Searches it correctly — returning nothing.
     pub fn empty() -> MetaIndex {
@@ -447,23 +500,53 @@ impl MetaIndex {
             // and a lifetime, and the spawn cost is tens of microseconds against
             // a scan measured in milliseconds. Guarded by
             // `PARALLEL_SCAN_THRESHOLD_BYTES` so a small index never pays it.
+            //
+            // BOUNDED ACROSS REQUESTS, which the per-call fan-out was not. Every
+            // search on a production-sized index reached this branch and spawned
+            // one thread per segment — normally one per CPU — and the daemon
+            // admits 64 connections with no shared pool between them, so
+            // as-you-type searches on a 32-core host could ask for ~2048 scan
+            // threads at once. What that exhausts first is not CPU but thread
+            // resources and memory bandwidth against the same arena, and the
+            // failure is ordinary searches stalling rather than anything
+            // reporting an error.
+            //
+            // Degrades rather than queues: a request that cannot reserve extra
+            // threads scans its segments on the calling thread, which is slower
+            // and still correct. Blocking would turn a bandwidth problem into a
+            // latency one and hold a connection slot while it did.
+            let slots = ScanSlots::reserve(self.segments.len().saturating_sub(1));
+            let groups = slots.granted() + 1;
+            let per_group = self.segments.len().div_ceil(groups);
             std::thread::scope(|s| {
-                let handles: Vec<_> = self
-                    .segments
-                    .iter()
-                    .map(|&(lo, hi)| {
+                let mut chunks = self.segments.chunks(per_group);
+                // The caller's own chunk, so a reservation of zero still works
+                // and the calling thread is never idle while others scan.
+                let mine = chunks.next().unwrap_or(&[]);
+                let handles: Vec<_> = chunks
+                    .map(|group| {
                         let finder = &finder;
                         let len = needle.len();
-                        s.spawn(move || self.scan_segment(lo, hi, finder, len, scope, cap))
+                        s.spawn(move || {
+                            group
+                                .iter()
+                                .map(|&(lo, hi)| self.scan_segment(lo, hi, finder, len, scope, cap))
+                                .collect::<Vec<_>>()
+                        })
                     })
                     .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .expect("a scan segment panicked; the arena is immutable during a scan")
-                    })
-                    .collect()
+                let mut parts: Vec<(Vec<i64>, bool)> = mine
+                    .iter()
+                    .map(|&(lo, hi)| self.scan_segment(lo, hi, &finder, needle.len(), scope, cap))
+                    .collect();
+                for h in handles {
+                    parts.extend(
+                        h.join().expect(
+                            "a scan segment panicked; the arena is immutable during a scan",
+                        ),
+                    );
+                }
+                parts
             })
         };
 
