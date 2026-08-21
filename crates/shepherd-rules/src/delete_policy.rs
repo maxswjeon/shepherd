@@ -98,9 +98,29 @@ pub enum DeferralKind {
 /// The distinction this type exists to preserve is trashed-vs-permanent.
 /// A trash reparent is **not** a permanent delete, and treating it as one is
 /// the misclassification the whole deferral window insures against.
+/// A confirmation, and **which file it is about**.
+///
+/// The source alone was the whole value, and the predicate only asked whether
+/// one was present — so in a batch a confirmation produced for file A could be
+/// carried into file B's inputs and B's remote copies discarded with no
+/// permanent-delete event for B anywhere. Every other authority in this module
+/// is checked against the candidate before its status is read (see
+/// `governs_this_discard`); this one had no identity to check.
+///
+/// A struct rather than a `file` field on each variant: the identity is not
+/// part of what the platform reported, it is what the report is ABOUT, and
+/// keeping them apart is what stops a future variant from forgetting it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentDeleteConfirmation {
+    /// The file the platform reported permanently deleted.
+    pub file: FileId,
+    pub source: ConfirmationSource,
+}
+
+/// Where a [`PermanentDeleteConfirmation`] came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "source")]
-pub enum PermanentDeleteConfirmation {
+pub enum ConfirmationSource {
     /// CFAPI `NOTIFY_DELETE` **without** `CF_CALLBACK_DELETE_FLAG_IS_UNDELETE`.
     WindowsCfApi,
     /// File Provider `deleteItem`, documented as "delete an item forever" —
@@ -340,6 +360,20 @@ pub enum DiscardRefusal {
     NotADiscard,
     /// No platform or operator confirmation of a **permanent** delete.
     NoPermanentDeleteConfirmation,
+    /// The deferral was opened under a different window than the one in force.
+    DeferralWindowStale {
+        deferral_days: u32,
+        policy_days: u32,
+    },
+    /// A confirmation was supplied and it is about a different file.
+    ///
+    /// Distinct from [`Self::NoPermanentDeleteConfirmation`] on purpose: one
+    /// says the platform never reported a permanent delete, the other says it
+    /// reported one for something else and the proof was carried across. The
+    /// second is a bug in the caller and reads as one.
+    ConfirmationForAnotherFile {
+        confirmed_file: FileId,
+    },
     /// A nonzero window is configured but no deferral record exists. Fails
     /// closed: a missing record is not an elapsed one.
     WindowConfiguredButNoDeferral {
@@ -449,8 +483,17 @@ pub fn discard_permitted(inputs: &DiscardInputs<'_>) -> DiscardDecision {
         refusals.push(DiscardRefusal::NotADiscard);
     }
 
-    if inputs.confirmation.is_none() {
-        refusals.push(DiscardRefusal::NoPermanentDeleteConfirmation);
+    match &inputs.confirmation {
+        None => refusals.push(DiscardRefusal::NoPermanentDeleteConfirmation),
+        // Identity before authority, the same order `governs_this_discard`
+        // applies to the deferral. A confirmation about another file is not a
+        // weaker permanent-delete event for this one, it is none.
+        Some(c) if c.file != inputs.file => {
+            refusals.push(DiscardRefusal::ConfirmationForAnotherFile {
+                confirmed_file: c.file,
+            });
+        }
+        Some(_) => {}
     }
 
     // The window conjunct. `window == 0` satisfies it outright; otherwise a
@@ -468,6 +511,27 @@ pub fn discard_permitted(inputs: &DiscardInputs<'_>) -> DiscardDecision {
                     deferral_file: d.file,
                     deferral_target: d.target,
                     deferral_kind: d.kind,
+                });
+            }
+            // The deferral must represent the window in force NOW.
+            //
+            // Its deadline was computed from `window_days` when it was opened,
+            // and a policy edited afterwards does not move it. Lengthening the
+            // window from 1 day to 14 therefore left a one-day deferral
+            // satisfying a fourteen-day policy, and the sole-copy discard ran
+            // thirteen days before the active policy permits — the window is
+            // the whole insurance against a misclassified delete, so serving it
+            // from a stale row is serving it from a policy nobody chose.
+            //
+            // Equality, not `>=`. A SHORTENED window leaves a deferral longer
+            // than the policy asks for, and refusing that costs a new deferral
+            // and some waiting, while accepting it means honouring a window the
+            // operator has replaced. Between two ways to be wrong about an
+            // irreversible operation, this takes the one that waits.
+            Some(d) if d.window_days != window => {
+                refusals.push(DiscardRefusal::DeferralWindowStale {
+                    deferral_days: d.window_days,
+                    policy_days: window,
                 });
             }
             Some(d) => match d.status(inputs.now) {

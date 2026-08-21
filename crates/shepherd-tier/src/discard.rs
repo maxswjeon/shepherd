@@ -33,11 +33,11 @@
 
 use shepherd_catalog::intent::PreparedIntent;
 use shepherd_catalog::job_repo::JobClass;
-use shepherd_core::{ObjectKey, RootId, TargetId, Timestamp};
+use shepherd_core::{FileId, ObjectKey, RootId, TargetId, Timestamp};
 use shepherd_placeholder::mock::StubState;
 use shepherd_rules::delete_policy::{
-    BreakerState, DiscardDecision, DiscardInputs, DiscardRefusal, PermanentDeleteConfirmation,
-    discard_permitted,
+    BreakerState, ConfirmationSource, DiscardDecision, DiscardInputs, DiscardRefusal,
+    PermanentDeleteConfirmation, discard_permitted,
 };
 use shepherd_storage::adapter::VersionGuard;
 
@@ -60,13 +60,21 @@ use crate::serialize::FileLocks;
 /// confirmation comes from an operator, via
 /// [`confirmation_from_operator`], never from an observed state.
 pub fn confirmation_from_stub(
+    file: FileId,
     state: StubState,
     platform: StubPlatform,
 ) -> Option<PermanentDeleteConfirmation> {
     match state {
-        StubState::PermanentlyDeleted => Some(match platform {
-            StubPlatform::WindowsCfApi => PermanentDeleteConfirmation::WindowsCfApi,
-            StubPlatform::MacosFileProvider => PermanentDeleteConfirmation::MacosFileProvider,
+        // `file` is threaded in because a confirmation is about a FILE, and
+        // this function used to produce one that named nothing — so a value
+        // built for A could be carried into B's inputs and the predicate had
+        // no way to notice.
+        StubState::PermanentlyDeleted => Some(PermanentDeleteConfirmation {
+            file,
+            source: match platform {
+                StubPlatform::WindowsCfApi => ConfirmationSource::WindowsCfApi,
+                StubPlatform::MacosFileProvider => ConfirmationSource::MacosFileProvider,
+            },
         }),
         // Reversible, or reversed. Not a confirmation.
         StubState::TrashedPending | StubState::Restored | StubState::Present => None,
@@ -87,8 +95,11 @@ pub enum StubPlatform {
 /// §4.10.3's table gives Linux **no automatic trigger**, so the operator *is*
 /// the confirmation and the deferral window is the interval in which they may
 /// change their mind.
-pub fn confirmation_from_operator(at: Timestamp) -> PermanentDeleteConfirmation {
-    PermanentDeleteConfirmation::OperatorExplicit { at }
+pub fn confirmation_from_operator(file: FileId, at: Timestamp) -> PermanentDeleteConfirmation {
+    PermanentDeleteConfirmation {
+        file,
+        source: ConfirmationSource::OperatorExplicit { at },
+    }
 }
 
 /// Why a discard was refused, across both gates.

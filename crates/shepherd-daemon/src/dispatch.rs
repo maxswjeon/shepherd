@@ -973,6 +973,36 @@ impl ShepherdApi for Session {
             )),
         };
 
+        // Pagination, bounded before anything is allocated against it.
+        //
+        // The unfiltered branch below deliberately does NOT clamp `cap` — see
+        // `MAX_CANDIDATES` — so `want` was whatever the caller asked for, and
+        // `limit: 4294967295` on a common query over the supported ten-million
+        // file corpus collected every matching id, built a rank map and a
+        // hydrated hit list the same size, and serialised the result. One
+        // malformed local client could exhaust the daemon that way.
+        //
+        // REFUSED, not clamped, and for the reason `MAX_CANDIDATES` gives about
+        // the unfiltered branch: silently serving a smaller page than was asked
+        // for is a refusal wearing the costume of an answer. A caller that
+        // wants everything pages through it.
+        for (name, value, max) in [
+            ("limit", u64::from(req.limit), MAX_PAGE),
+            ("offset", u64::from(req.offset), MAX_OFFSET),
+        ] {
+            if value > max as u64 {
+                return Err(RpcError::new(
+                    ErrorCode::Invalid,
+                    format!(
+                        "`{name}` is {value}, above the maximum of {max}. The daemon holds \
+                         every candidate of a page in memory before filtering it, so an \
+                         unbounded page is an unbounded allocation; page through the results \
+                         instead."
+                    ),
+                ));
+            }
+        }
+
         let index = self.daemon.index()?;
         let offset = req.offset as usize;
         let limit = req.limit as usize;
@@ -1449,6 +1479,22 @@ const FILTERED_CANDIDATE_FACTOR: usize = 16;
 /// costume of an answer. The bind ceiling that made that clamp look necessary
 /// is handled where it actually lives, in [`hydrate`].
 const MAX_CANDIDATES: usize = 10_000;
+
+/// The largest page `search` will serve, and the deepest it will page.
+///
+/// The unfiltered branch is uncapped by design — a legitimately deep page must
+/// come back rather than be clamped into an empty result with a `degraded` note
+/// — and "uncapped" was taken literally: `want` was `offset + limit` with
+/// neither bounded, so one request could ask the daemon to hold every matching
+/// id, a rank map and a hydrated hit list for the whole corpus.
+///
+/// So the bound moves to where it belongs, on the REQUEST rather than on the
+/// answer. A thousand hits is far past what any UI renders at once, and a
+/// millionth row is far past what anyone scrolls to; both leave the deep-paging
+/// case this file argued for intact, and both refuse rather than truncate, so a
+/// caller is never told a short page is the whole answer.
+const MAX_PAGE: usize = 1_000;
+const MAX_OFFSET: usize = 1_000_000;
 
 /// The most bound values one SQLite statement accepts.
 ///

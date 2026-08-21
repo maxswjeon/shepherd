@@ -297,13 +297,29 @@ fn describe_file_type(ft: std::fs::FileType) -> &'static str {
     }
 }
 
-/// Subscriptions one connection may hold at once.
+/// Subscriptions one connection may hold at once: **one**.
 ///
-/// Each costs an OS thread and a bounded channel for the connection's life, so
-/// this is a resource bound rather than a policy. Generous against real use:
-/// `events.subscribe` takes a LIST of streams, so a client wanting everything
-/// needs one subscription, not six — and there are only six streams to ask for.
-const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 8;
+/// This was eight, bounding the pump threads a client could start. That bound
+/// was real and this is a strictly tighter one, but the reason changed: two
+/// pumps on a connection are not merely expensive, they are UNORDERED. Each
+/// runs its own thread and takes the shared writer lock independently, so
+/// frames reach the socket in whatever order the two threads win it — and
+/// `EventFrame` carries no subscription id, so a client cannot demultiplex
+/// them or tell which cursor a frame belongs to. Overlapping streams are worse
+/// still: an empty `streams` list means ALL of them, so a connection that
+/// subscribes to everything and then to one stream sees every event twice, with
+/// nothing in the frame to say so.
+///
+/// One pump per connection makes the global sequence the client observes the
+/// order this daemon actually published in, which is what the cursor contract
+/// says it is.
+///
+/// This costs a client nothing it had: `events.subscribe` takes a LIST, so
+/// wanting six streams is one request, not six. What it does cost is holding
+/// two cursors on one socket — a client that needs `job` from one position and
+/// `index` from another opens a second connection, which is also what the
+/// per-connection limits above already tell it to do.
+const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 1;
 
 /// Take the state directory's singleton lock.
 ///
@@ -1049,9 +1065,12 @@ fn subscribe_on_connection(
                 ErrorCode::Busy,
                 format!(
                     "this connection already holds {MAX_SUBSCRIPTIONS_PER_CONNECTION} \
-                     subscriptions, which is the per-connection limit. Each one owns a thread \
-                     for the life of the connection; open a second connection, or subscribe \
-                     to several streams in one request rather than one request per stream"
+                     subscription, which is the per-connection limit. A second pump would \
+                     write to the same socket from its own thread, and `EventFrame` carries \
+                     no subscription id — so the frames could not be told apart or ordered. \
+                     Subscribe to several streams in ONE request (`streams` is a list, and an \
+                     empty list means all of them), or open a second connection if the two \
+                     really need separate cursors"
                 ),
             ),
         ));
@@ -1270,6 +1289,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn one_connection_cannot_hold_unbounded_subscriptions() {
+        // The cap is 1 now, and for a different reason than when it was 8: two
+        // pumps on a connection are UNORDERED, not merely expensive. Each takes
+        // the shared writer lock from its own thread and `EventFrame` carries
+        // no subscription id, so the client cannot demultiplex them — and an
+        // empty `streams` list means ALL streams, so an overlapping pair
+        // delivers the same event twice with nothing to say so.
+
         let dir = std::env::temp_dir().join(format!(
             "shepherd-subcap-{}-{:?}",
             std::process::id(),
@@ -1357,13 +1383,60 @@ mod tests {
             "a refused subscribe must not have registered anything"
         );
 
+        // AND THE ACCEPTING DIRECTION, which is what makes one subscription a
+        // limit rather than a loss: several streams in ONE request. A client
+        // that wants everything asks once; it never needed a pump per stream.
+        // (This connection is at its cap, so a second one asks.)
+        let (c2, s2) = UnixStream::pair().unwrap();
+        let conn2 = std::thread::spawn({
+            let daemon = Arc::clone(&daemon);
+            move || {
+                let _ = handle(s2, daemon);
+            }
+        });
+        let mut reader2 = BufReader::new(c2.try_clone().unwrap());
+        let mut c2w = c2;
+        let mut call2 = |line: String| -> String {
+            use std::io::Write;
+            c2w.write_all(line.as_bytes()).unwrap();
+            c2w.write_all(b"\n").unwrap();
+            let mut buf = String::new();
+            std::io::BufRead::read_line(&mut reader2, &mut buf).unwrap();
+            buf
+        };
+        call2(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "hello",
+                "params": {
+                    "proto_version": shepherd_proto::PROTO_VERSION,
+                    "client": {"name": "cap-test-2", "build": "0"},
+                    "capabilities": [],
+                }
+            })
+            .to_string(),
+        );
+        let many = call2(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "events.subscribe",
+                "params": {"streams": ["target", "job", "index"]}
+            })
+            .to_string(),
+        );
+        assert!(
+            many.contains("subscription_id") && many.contains("\"index\""),
+            "three streams in one subscription must be accepted: {many}"
+        );
+
+        drop(c2w);
+        drop(reader2);
+        conn2.join().expect("the second connection ends at EOF");
         drop(client);
         drop(reader);
         conn.join().expect("the connection thread ends at EOF");
         assert_eq!(
             daemon.events.subscriber_count(),
             0,
-            "and all of them are released when the connection closes"
+            "and all of them are released when the connections close"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

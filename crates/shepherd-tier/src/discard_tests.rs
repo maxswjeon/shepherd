@@ -82,7 +82,17 @@ fn proofs_for<'a>(
             ..inputs(
                 now,
                 deferrals.iter().find(|d| d.file == c.file),
-                confirmation.clone(),
+                // RE-TARGETED per candidate, not cloned across the batch.
+                //
+                // Cloning one confirmation into every candidate's inputs is
+                // exactly the defect the identity check exists to catch — the
+                // fixture was doing it, and before the check landed nothing
+                // could tell. A caller with a real confirmation per file
+                // produces this; a caller with one produces the refusal.
+                confirmation.clone().map(|k| PermanentDeleteConfirmation {
+                    file: c.file,
+                    source: k.source,
+                }),
             )
         })
         .collect()
@@ -120,15 +130,26 @@ fn inputs<'a>(
 fn the_translation_exists_and_trashing_never_confirms() {
     // Permanently deleted -> a confirmation, per platform.
     assert_eq!(
-        confirmation_from_stub(StubState::PermanentlyDeleted, StubPlatform::WindowsCfApi),
-        Some(PermanentDeleteConfirmation::WindowsCfApi)
+        confirmation_from_stub(
+            FileId::new(1),
+            StubState::PermanentlyDeleted,
+            StubPlatform::WindowsCfApi
+        ),
+        Some(PermanentDeleteConfirmation {
+            file: FileId::new(1),
+            source: ConfirmationSource::WindowsCfApi
+        })
     );
     assert_eq!(
         confirmation_from_stub(
+            FileId::new(1),
             StubState::PermanentlyDeleted,
             StubPlatform::MacosFileProvider
         ),
-        Some(PermanentDeleteConfirmation::MacosFileProvider)
+        Some(PermanentDeleteConfirmation {
+            file: FileId::new(1),
+            source: ConfirmationSource::MacosFileProvider
+        })
     );
 
     // Everything reversible yields nothing.
@@ -138,7 +159,7 @@ fn the_translation_exists_and_trashing_never_confirms() {
         StubState::Present,
     ] {
         assert_eq!(
-            confirmation_from_stub(state, StubPlatform::WindowsCfApi),
+            confirmation_from_stub(FileId::new(1), state, StubPlatform::WindowsCfApi),
             None,
             "{state:?} must NOT confirm a permanent delete"
         );
@@ -155,7 +176,7 @@ fn the_translation_runs_against_the_real_mock_lifecycle() {
 
     let state = m.state_of(std::path::Path::new("/root/a.raw")).unwrap();
     assert_eq!(
-        confirmation_from_stub(state, StubPlatform::MacosFileProvider),
+        confirmation_from_stub(FileId::new(1), state, StubPlatform::MacosFileProvider),
         None,
         "a trashed stub must not confirm"
     );
@@ -164,8 +185,11 @@ fn the_translation_runs_against_the_real_mock_lifecycle() {
     m.emit_deleted("/root/a.raw");
     let state = m.state_of(std::path::Path::new("/root/a.raw")).unwrap();
     assert_eq!(
-        confirmation_from_stub(state, StubPlatform::MacosFileProvider),
-        Some(PermanentDeleteConfirmation::MacosFileProvider)
+        confirmation_from_stub(FileId::new(1), state, StubPlatform::MacosFileProvider),
+        Some(PermanentDeleteConfirmation {
+            file: FileId::new(1),
+            source: ConfirmationSource::MacosFileProvider
+        })
     );
 
     // And an undelete before that would have cancelled it instead.
@@ -175,7 +199,7 @@ fn the_translation_runs_against_the_real_mock_lifecycle() {
     m2.emit_undeleted("/root/b.raw").unwrap();
     let state = m2.state_of(std::path::Path::new("/root/b.raw")).unwrap();
     assert_eq!(
-        confirmation_from_stub(state, StubPlatform::WindowsCfApi),
+        confirmation_from_stub(FileId::new(1), state, StubPlatform::WindowsCfApi),
         None
     );
 }
@@ -184,10 +208,13 @@ fn the_translation_runs_against_the_real_mock_lifecycle() {
 fn linux_confirmation_comes_from_an_operator_not_from_absence() {
     // §4.10.3: Linux delete-mode has no automatic trigger, because absence is
     // the steady state of every tiered file.
-    let c = confirmation_from_operator(t(3));
+    let c = confirmation_from_operator(FileId::new(1), t(3));
     assert_eq!(
         c,
-        PermanentDeleteConfirmation::OperatorExplicit { at: t(3) }
+        PermanentDeleteConfirmation {
+            file: FileId::new(1),
+            source: ConfirmationSource::OperatorExplicit { at: t(3) }
+        }
     );
     // There is no stub state that produces this variant.
     for state in [
@@ -197,8 +224,11 @@ fn linux_confirmation_comes_from_an_operator_not_from_absence() {
         StubState::PermanentlyDeleted,
     ] {
         assert_ne!(
-            confirmation_from_stub(state, StubPlatform::WindowsCfApi),
-            Some(PermanentDeleteConfirmation::OperatorExplicit { at: t(3) })
+            confirmation_from_stub(FileId::new(1), state, StubPlatform::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::OperatorExplicit { at: t(3) }
+            })
         );
     }
 }
@@ -223,7 +253,10 @@ fn both_gates_passing_permits_the_discard() {
             inputs(
                 &now,
                 Some(&d),
-                Some(PermanentDeleteConfirmation::WindowsCfApi)
+                Some(PermanentDeleteConfirmation {
+                    file: FileId::new(1),
+                    source: ConfirmationSource::WindowsCfApi
+                })
             ),
             &e,
             &RateWindow::default(),
@@ -254,7 +287,10 @@ fn caller_supplied_breaker_booleans_are_overwritten_not_trusted() {
     let i = inputs(
         &now,
         Some(&d),
-        Some(PermanentDeleteConfirmation::WindowsCfApi),
+        Some(PermanentDeleteConfirmation {
+            file: FileId::new(1),
+            source: ConfirmationSource::WindowsCfApi,
+        }),
     );
     assert!(!i.breaker.charged, "precondition: caller says not charged");
     assert_eq!(
@@ -293,7 +329,10 @@ fn an_unconfirmed_episode_blocks_even_when_the_policy_is_satisfied() {
         inputs(
             &now,
             Some(&d),
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &RateWindow::default(),
@@ -330,7 +369,10 @@ fn a_running_deferral_blocks_even_when_the_breaker_is_happy() {
         inputs(
             &now,
             Some(&d),
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &RateWindow::default(),
@@ -354,7 +396,8 @@ fn a_trashed_file_is_refused_end_to_end() {
     m.emit_created("/root/a.raw");
     m.emit_trashed("/root/a.raw").unwrap();
     let state = m.state_of(std::path::Path::new("/root/a.raw")).unwrap();
-    let confirmation = confirmation_from_stub(state, StubPlatform::MacosFileProvider);
+    let confirmation =
+        confirmation_from_stub(FileId::new(1), state, StubPlatform::MacosFileProvider);
 
     let now = clock(20);
     let opened = clock(0);
@@ -623,7 +666,10 @@ async fn an_executed_episode_charges_the_window_exactly_once_per_object() {
             &e,
             &clock(20),
             &ds,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &ledger.snapshot(),
@@ -678,7 +724,10 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
             &e,
             &clock(20),
             &all,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &ledger.snapshot(),
@@ -698,7 +747,10 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
             &e,
             &clock(20),
             &only_first,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &MemLedger::new().snapshot(),
@@ -729,11 +781,21 @@ async fn a_batch_needs_a_policy_proof_for_every_candidate() {
         &e,
         &at,
         &all,
-        Some(PermanentDeleteConfirmation::WindowsCfApi),
+        Some(PermanentDeleteConfirmation {
+            file: FileId::new(1),
+            source: ConfirmationSource::WindowsCfApi,
+        }),
     );
     extra.push(DiscardInputs {
         file: FileId::new(404),
-        ..inputs(&at, None, Some(PermanentDeleteConfirmation::WindowsCfApi))
+        ..inputs(
+            &at,
+            None,
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
+        )
     });
     let refusals = reserve_discard(
         &extra,
@@ -788,7 +850,14 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
         file: FileId::new(1),
         target: other_target,
         deferral: Some(&elsewhere),
-        ..inputs(&at, None, Some(PermanentDeleteConfirmation::WindowsCfApi))
+        ..inputs(
+            &at,
+            None,
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
+        )
     }];
     let ledger = MemLedger::new();
     let refusals = reserve_discard(&wrong_target, &e, &ledger.snapshot(), &lim, now, &ledger)
@@ -814,7 +883,10 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
             &e,
             &at,
             &ds,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         )
         .remove(0)
     }];
@@ -830,7 +902,10 @@ async fn a_proof_must_be_bound_to_the_episodes_target_and_root() {
             &e,
             &at,
             &ds,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &ledger.snapshot(),
@@ -858,7 +933,10 @@ async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
             &e,
             &clock(20),
             &ds,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &ledger.snapshot(),
@@ -875,7 +953,10 @@ async fn repeated_sub_threshold_episodes_accumulate_against_one_budget() {
             &e,
             &clock(20),
             &ds,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &ledger.snapshot(),
@@ -922,7 +1003,10 @@ async fn two_episodes_evaluating_against_one_snapshot_cannot_both_reserve() {
                 inputs(
                     &clock(20),
                     Some(&d),
-                    Some(PermanentDeleteConfirmation::WindowsCfApi),
+                    Some(PermanentDeleteConfirmation {
+                        file: FileId::new(1),
+                        source: ConfirmationSource::WindowsCfApi
+                    }),
                 ),
                 &episode_with(2, now),
                 &snapshot,
@@ -940,7 +1024,10 @@ async fn two_episodes_evaluating_against_one_snapshot_cannot_both_reserve() {
                 &racer,
                 &clock(20),
                 &ds,
-                Some(PermanentDeleteConfirmation::WindowsCfApi),
+                Some(PermanentDeleteConfirmation {
+                    file: FileId::new(1),
+                    source: ConfirmationSource::WindowsCfApi,
+                }),
             ),
             &racer,
             &snapshot,
@@ -989,7 +1076,10 @@ async fn an_object_outside_the_confirmed_set_refuses_before_anything_is_deleted(
             &one,
             &clock(20),
             &ds,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &one,
         &ledger.snapshot(),
@@ -1042,7 +1132,10 @@ async fn charge_for(ledger: &MemLedger, count: usize, now: Timestamp) -> Discard
             &e,
             &clock(20),
             &ds,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &ledger.snapshot(),
@@ -1284,7 +1377,10 @@ async fn an_unhashed_candidate_is_refused_rather_than_naming_a_key_from_nothing(
             &e,
             &clock(20),
             &ds,
-            Some(PermanentDeleteConfirmation::WindowsCfApi),
+            Some(PermanentDeleteConfirmation {
+                file: FileId::new(1),
+                source: ConfirmationSource::WindowsCfApi,
+            }),
         ),
         &e,
         &ledger.snapshot(),

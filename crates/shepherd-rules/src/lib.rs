@@ -27,9 +27,10 @@ pub mod r#match;
 pub mod preview;
 
 pub use delete_policy::{
-    BreakerState, ClockProvenance, ClockReading, DEFAULT_DEFERRAL_WINDOW_DAYS, Deferral,
-    DeferralKind, DeferralStatus, DeleteAction, DiscardDecision, DiscardInputs, DiscardRefusal,
-    PermanentDeleteConfirmation, RootGates, discard_permitted, effective_window_days,
+    BreakerState, ClockProvenance, ClockReading, ConfirmationSource, DEFAULT_DEFERRAL_WINDOW_DAYS,
+    Deferral, DeferralKind, DeferralStatus, DeleteAction, DiscardDecision, DiscardInputs,
+    DiscardRefusal, PermanentDeleteConfirmation, RootGates, discard_permitted,
+    effective_window_days,
 };
 pub use engine::{
     Candidate, Engine, EngineRefusal, MatchDrifted, MatchSetDrift, PlannedAction, RunMode,

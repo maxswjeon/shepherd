@@ -37,7 +37,10 @@ fn inputs<'a>(
         file: FileId::new(1),
         target: TargetId::new(1),
         action: DeleteAction::Discard,
-        confirmation: Some(PermanentDeleteConfirmation::WindowsCfApi),
+        confirmation: Some(PermanentDeleteConfirmation {
+            file: FileId::new(1),
+            source: ConfirmationSource::WindowsCfApi,
+        }),
         policy_window_override: window,
         deferral,
         now,
@@ -523,5 +526,95 @@ fn a_zero_window_does_not_read_another_files_deferral_either() {
             deferral_kind: DeferralKind::Remote,
         }],
         "another file's cancellation is not this file's cancellation, either way round"
+    );
+}
+
+/// A deferral opened under a different window is not evidence for this one.
+///
+/// The deadline was computed from `window_days` when the deferral was opened,
+/// and editing the policy afterwards does not move it. Lengthening the window
+/// from one day to fourteen therefore left a one-day deferral satisfying a
+/// fourteen-day policy, and the sole-copy discard ran thirteen days before the
+/// active policy permits. The window is the whole insurance against a
+/// misclassified permanent delete, so serving it from a stale row is serving it
+/// from a policy nobody chose.
+#[test]
+fn a_deferral_opened_under_another_window_does_not_satisfy_this_policy() {
+    let opened = boot("b", 0, 0);
+    let d = deferral_at(&opened, 1);
+    // A day later the one-day window has expired on its own terms.
+    let now = boot("b", 2, 2);
+
+    // Under the window it was opened for, it is exactly what it claims.
+    assert_eq!(
+        discard_permitted(&inputs(&now, Some(&d), Some(1))).refusals(),
+        &[] as &[DiscardRefusal],
+        "a deferral matching the live window still permits"
+    );
+
+    // The operator lengthens the policy. The stored row is unchanged, and it is
+    // now the wrong evidence.
+    let refusals = discard_permitted(&inputs(&now, Some(&d), Some(14)))
+        .refusals()
+        .to_vec();
+    assert_eq!(
+        refusals,
+        vec![DiscardRefusal::DeferralWindowStale {
+            deferral_days: 1,
+            policy_days: 14,
+        }],
+        "a one-day deferral satisfied a fourteen-day policy: {refusals:?}"
+    );
+
+    // SHORTENING is refused too, and that is the deliberate direction. A longer
+    // deferral than the policy asks for is still a window the operator has
+    // replaced; refusing costs a new deferral and some waiting, accepting means
+    // honouring a policy nobody chose. Between two ways to be wrong about an
+    // irreversible operation, this one waits.
+    let long = deferral_at(&opened, 30);
+    assert_eq!(
+        discard_permitted(&inputs(&now, Some(&long), Some(14))).refusals(),
+        &[DiscardRefusal::DeferralWindowStale {
+            deferral_days: 30,
+            policy_days: 14,
+        }]
+    );
+}
+
+/// A confirmation is about a FILE, and one for another file proves nothing.
+///
+/// The predicate asked only whether some confirmation was present, and the
+/// value carried no identity — so in a batch a confirmation produced for file A
+/// could be cloned into file B's otherwise correctly keyed proof, and B's
+/// remote copies discarded with no permanent-delete event for B anywhere. Every
+/// other authority in this module is checked against the candidate before its
+/// status is read; this one had nothing to check.
+#[test]
+fn a_confirmation_for_another_file_does_not_authorize_this_discard() {
+    let now = boot("b", 2, 2);
+    let opened = boot("b", 0, 0);
+    let d = deferral_at(&opened, 1);
+
+    let mut i = inputs(&now, Some(&d), Some(1));
+    i.confirmation = Some(PermanentDeleteConfirmation {
+        file: FileId::new(99),
+        source: ConfirmationSource::WindowsCfApi,
+    });
+    assert_eq!(
+        discard_permitted(&i).refusals(),
+        &[DiscardRefusal::ConfirmationForAnotherFile {
+            confirmed_file: FileId::new(99),
+        }],
+        "a confirmation naming another file authorized this one"
+    );
+
+    // Distinct from having none at all, deliberately: one says the platform
+    // never reported a permanent delete, the other says the proof was carried
+    // across from something else, and the second is a bug in the caller.
+    let mut i = inputs(&now, Some(&d), Some(1));
+    i.confirmation = None;
+    assert_eq!(
+        discard_permitted(&i).refusals(),
+        &[DiscardRefusal::NoPermanentDeleteConfirmation]
     );
 }

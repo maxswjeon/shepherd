@@ -584,6 +584,48 @@ fn an_idle_connection_that_never_subscribes_is_closed() {
     );
 }
 
+/// A page bigger than the daemon will hold is refused, not served short.
+///
+/// The unfiltered branch deliberately does not clamp its candidate cap, so a
+/// legitimately deep page comes back rather than being clamped into an empty
+/// result — and "does not clamp" was taken literally: `want` was
+/// `offset + limit` with neither bounded. `limit: 4294967295` on a common query
+/// over the supported ten-million-file corpus collects every matching id,
+/// builds a rank map and a hydrated hit list the same size, and serialises the
+/// result. One malformed local client is enough.
+///
+/// Refused rather than truncated, for the same reason the cap is not clamped: a
+/// short page served as though it were the whole answer is a refusal wearing
+/// the costume of an answer.
+#[test]
+fn a_page_larger_than_the_daemon_will_hold_is_refused() {
+    let d = Daemon::start("bigpage");
+    let mut c = d.connect();
+
+    for (field, value) in [("limit", 4_294_967_295u64), ("offset", 4_294_967_295)] {
+        let err = c.call_err(
+            "search",
+            serde_json::json!({ "query": "a", field: value, "mode": "metadata" }),
+        );
+        assert!(
+            err.message.contains(field) && err.message.contains("page through"),
+            "`{field}: {value}` must be refused with the remedy named: {}",
+            err.message
+        );
+    }
+
+    // AND THE ACCEPTING DIRECTION: an ordinary page still works, and so does a
+    // deep one, which is the case the uncapped branch exists for.
+    let ok = c.call(
+        "search",
+        serde_json::json!({ "query": "a", "limit": 50, "offset": 100_000, "mode": "metadata" }),
+    );
+    assert!(
+        ok["hits"].is_array(),
+        "a deep but bounded page must still be served: {ok}"
+    );
+}
+
 /// The skew case §4.3 calls the most common one, end to end.
 #[test]
 fn a_major_version_mismatch_is_rejected_with_both_versions_named() {
@@ -993,7 +1035,12 @@ fn a_rebuild_publishes_on_the_advertised_index_stream() {
     let scan = wait_for_scan(&mut c, root_id);
     assert!(scan["last_error"].is_null(), "{scan}");
 
-    let epoch = c.call("events.subscribe", serde_json::json!({}))["epoch"]
+    // The epoch comes from a SEPARATE connection, because a connection holds
+    // one subscription: an empty `streams` list means ALL of them, so probing
+    // for the epoch here and then subscribing to one stream would be the
+    // overlapping pair that has no ordering. A real resuming client already
+    // holds an epoch from its previous subscription and needs no probe.
+    let epoch = d.connect().call("events.subscribe", serde_json::json!({}))["epoch"]
         .as_str()
         .expect("epoch")
         .to_owned();
@@ -5085,7 +5132,12 @@ fn registering_a_target_publishes_on_the_advertised_target_stream() {
     );
     let target_id = added["target"]["target_id"].as_i64().expect("target_id");
 
-    let epoch = c.call("events.subscribe", serde_json::json!({}))["epoch"]
+    // The epoch comes from a SEPARATE connection, because a connection holds
+    // one subscription: an empty `streams` list means ALL of them, so probing
+    // for the epoch here and then subscribing to one stream would be the
+    // overlapping pair that has no ordering. A real resuming client already
+    // holds an epoch from its previous subscription and needs no probe.
+    let epoch = d.connect().call("events.subscribe", serde_json::json!({}))["epoch"]
         .as_str()
         .expect("epoch")
         .to_owned();

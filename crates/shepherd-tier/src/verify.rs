@@ -51,9 +51,18 @@ pub struct VerifiedLocation {
 
 /// Verify an uploaded object end to end.
 ///
-/// HEAD for existence and size, then the mandatory full re-read, then the
-/// attestation probe. The order matters: probing attestation first would let a
-/// target that cannot attest at all still pay for a full read.
+/// HEAD for existence and size, then the attestation probe, then the mandatory
+/// full re-read.
+///
+/// The order matters and the probe used to be LAST, under a comment claiming
+/// that probing first would make a target that cannot attest pay for the full
+/// read — which is the argument for the order it did not have. A target
+/// reporting `AttestationMode::None` is refused permanently, and it was refused
+/// only after a 50 GB object had been downloaded and hashed: minutes and paid
+/// egress spent to reach a conclusion the probe alone establishes.
+///
+/// The probe cannot move above the HEAD: a size mismatch is the cheaper
+/// refusal, and it is about this object rather than about the target.
 pub async fn verify_upload(
     adapter: &dyn StorageAdapter,
     key: &ObjectKey,
@@ -73,6 +82,23 @@ pub async fn verify_upload(
             key: key.as_str().to_owned(),
             expected: format!("{expected_size} bytes"),
             actual: format!("{} bytes", meta.size),
+        });
+    }
+
+    let mode = adapter.probe_attestation_mode().await?;
+    if mode == AttestationMode::None {
+        // The bytes may well be correct — but this target can never authorize
+        // destroying the original, so recording the location as custody-bearing
+        // would overstate what was established. Fail closed here rather than
+        // let §4.10.2's predicate discover it later, and fail closed BEFORE the
+        // full read rather than after: the answer does not depend on the bytes.
+        return Err(StorageError::Unsupported {
+            provider: adapter.capabilities().provider,
+            what: format!(
+                "target has no attestation mechanism, so {} can hold a replica but never \
+                 authorize a destruction",
+                key.as_str()
+            ),
         });
     }
 
@@ -98,22 +124,6 @@ pub async fn verify_upload(
         VERIFY_CHUNK,
     )
     .await?;
-
-    let mode = adapter.probe_attestation_mode().await?;
-    if mode == AttestationMode::None {
-        // The bytes are correct and the upload succeeded — but this target can
-        // never authorize destroying the original, so recording the location as
-        // custody-bearing would overstate what was established. Fail closed
-        // here rather than let §4.10.2's predicate discover it later.
-        return Err(StorageError::Unsupported {
-            provider: adapter.capabilities().provider,
-            what: format!(
-                "target has no attestation mechanism, so {} can hold a replica but never \
-                 authorize a destruction",
-                key.as_str()
-            ),
-        });
-    }
 
     Ok(VerifiedLocation {
         target,
