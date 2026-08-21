@@ -848,6 +848,54 @@ fn a_capped_candidate_scan_reports_its_total_as_a_floor() {
     assert_eq!(all["degraded"], serde_json::Value::Null);
 }
 
+/// An explicit `state` filter gets the same candidate expansion as any other.
+///
+/// The metadata index encodes NAMES and nothing else, so state is applied by
+/// SQL after the candidate set is chosen — and a set sized to exactly
+/// `offset + limit` comes back short whenever the leading matches are dropped.
+/// A `state = "missing"` search behind fifty `local` name-matches returned an
+/// empty page.
+#[test]
+fn a_state_filtered_search_looks_past_the_first_page_of_name_matches() {
+    let d = Daemon::start("statefilter");
+    let mut c = d.connect();
+    let dir = d.dir.join("tree");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The one that will be deleted sorts LAST by file id, so every other match
+    // stands in front of it in the index.
+    for i in 0..40 {
+        std::fs::write(dir.join(format!("report-{i:03}.txt")), b"x").unwrap();
+    }
+    std::fs::write(dir.join("report-zzz.txt"), b"x").unwrap();
+
+    let root_id = c.call(
+        "root.add",
+        serde_json::json!({ "path": dir.to_string_lossy(), "stub_mode": "delete" }),
+    )["root"]["root_id"]
+        .as_i64()
+        .expect("root_id");
+    c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    assert!(wait_for_scan(&mut c, root_id)["last_error"].is_null());
+
+    std::fs::remove_file(dir.join("report-zzz.txt")).unwrap();
+    c.call("scan.start", serde_json::json!({ "root_id": root_id }));
+    assert!(wait_for_scan(&mut c, root_id)["last_error"].is_null());
+
+    let found = c.call(
+        "search",
+        serde_json::json!({
+            "query": "report-", "mode": "metadata", "limit": 5,
+            "filters": {"state": "missing"}
+        }),
+    );
+    assert_eq!(
+        found["hits"].as_array().map_or(0, Vec::len),
+        1,
+        "the reconciled row is behind forty live name-matches, and a candidate set \
+         sized to the page would never reach it: {found}"
+    );
+}
+
 /// The skew case §4.3 calls the most common one, end to end.
 #[test]
 fn a_major_version_mismatch_is_rejected_with_both_versions_named() {

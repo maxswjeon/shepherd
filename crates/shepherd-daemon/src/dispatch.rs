@@ -1128,29 +1128,23 @@ impl ShepherdApi for Session {
         // more candidates than the caller asked for or a filtered page comes
         // back short. The multiplier is a bounded guess, and `degraded` reports
         // when it was not enough rather than pretending it was.
-        // EVERY search is filtered now, and that is not a wording change.
+        // EVERY search is filtered, and there is no exception.
         //
-        // Hydration excludes `missing` rows when no state filter is given, so
-        // the unfiltered branch — which asks the index for exactly `offset +
-        // limit` candidates because nothing will be dropped — is describing a
-        // world that no longer exists. If the first fifty matching ids are
-        // reconciled-away rows, a default `limit = 50` hydrates all fifty away
-        // and returns an empty page while live matches sit further down the
-        // index.
+        // The index encodes NAMES and nothing else — not state, not size, not
+        // mtime — so any predicate at all is applied by SQL after the candidate
+        // set is chosen, and a candidate set sized to exactly `offset + limit`
+        // comes back short whenever the first matches are dropped.
         //
-        // The one genuinely unfiltered case is an explicit `state` filter: the
-        // implicit exclusion does not apply on top of it, so `want` candidates
-        // is again exactly what is needed.
-        let only_state_filter = SearchFilters {
-            state: None,
-            ..req.filters.clone()
-        } == SearchFilters::default();
-        let cap = if only_state_filter && req.filters.state.is_some() {
-            want
-        } else {
-            want.saturating_mul(FILTERED_CANDIDATE_FACTOR)
-                .min(MAX_CANDIDATES)
-        };
+        // The unfiltered branch was written when `SearchFilters::default()`
+        // really did drop nothing. Hydration now excludes reconciled-away rows
+        // by default, so that branch had no occupants — and my attempt to carve
+        // out "an explicit state filter is the genuinely unfiltered case" was
+        // the same mistake in reverse: state is exactly what the index cannot
+        // narrow on, so `state = "missing"` with fifty `local` name-matches in
+        // front of it returns an empty page.
+        let cap = want
+            .saturating_mul(FILTERED_CANDIDATE_FACTOR)
+            .min(MAX_CANDIDATES);
 
         let matched = index.search(&req.query, cap.max(1));
 

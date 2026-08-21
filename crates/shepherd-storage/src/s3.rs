@@ -461,6 +461,26 @@ impl StorageAdapter for S3Adapter {
             if let Some(m) = requested.clone() {
                 req = req.part_number_marker(m);
             }
+            // BOUNDED, on top of the repeated-marker guard below.
+            //
+            // That guard catches a provider that CYCLES its markers and
+            // structurally cannot catch one that keeps minting fresh ones —
+            // the loop pages forever and `out` grows with every receipt. This
+            // build's plans hold at most `S3_MAX_PARTS` parts, so any listing
+            // larger than that is not describing an upload we made.
+            if out.len() > S3_MAX_PARTS as usize {
+                return Err(StorageError::Provider {
+                    provider: "s3",
+                    op: "list_parts".into(),
+                    detail: format!(
+                        "the listing for {} is still going after {} receipts, past the \
+                         {S3_MAX_PARTS}-part ceiling every plan this build makes works to",
+                        key.as_str(),
+                        out.len()
+                    ),
+                });
+            }
+
             let page = req
                 .send()
                 .await

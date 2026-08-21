@@ -842,12 +842,21 @@ impl<'a> FileRepo<'a> {
 
         let beneath_unobserved = |rel: &str| {
             unobserved.iter().any(|skip| {
-                // The skipped path itself, and anything beneath it. The
-                // separator matters: `docs` must not swallow `docs-old`.
+                // The skipped path itself, and anything beneath it.
+                //
+                // The HOST separator only. A backslash is a legal filename
+                // character on unix, so treating it as a boundary means a
+                // root-level file literally named `docs\gone` counts as
+                // beneath a skipped `docs` directory — and stays `local`
+                // forever after it is deleted, with every catalog consumer
+                // still reporting a file that is not there.
+                //
+                // The separator itself matters too: `docs` must not swallow
+                // `docs-old`.
                 rel == skip
                     || rel
                         .strip_prefix(skip.as_str())
-                        .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+                        .is_some_and(|rest| rest.starts_with(std::path::MAIN_SEPARATOR))
             })
         };
 
@@ -1908,6 +1917,55 @@ mod tests {
             "local",
             "a row that is seen again must not stay missing — nothing else can \
              ever bring it back"
+        );
+    }
+
+    /// A backslash in a filename is not a subtree boundary on unix.
+    ///
+    /// The skipped-prefix test treated `\\` as a separator, so a root-level
+    /// file literally named `docs\gone` counted as beneath a skipped `docs`
+    /// directory — and stayed `local` forever after it was deleted, with
+    /// searches and every other catalog consumer still reporting it.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_name_does_not_make_a_row_look_skipped() {
+        let (mut cat, root) = fixture();
+        for rel in ["docs\\gone", "docs/real.txt"] {
+            FileRepo::new(&mut cat)
+                .upsert_file(&root, &stat(root.id, rel), GEN, Timestamp::from_nanos(1))
+                .unwrap();
+        }
+
+        // A later scan saw neither, and could not read `docs/`.
+        let swept = FileRepo::new(&mut cat)
+            .sweep_absent(
+                &root,
+                GEN + 1,
+                &["docs".to_owned()],
+                Timestamp::from_nanos(2),
+            )
+            .unwrap();
+        assert_eq!(
+            swept, 1,
+            "only the root-level file is an unexplained absence"
+        );
+
+        let state_of = |cat: &Catalog, rel: &str| -> String {
+            cat.conn()
+                .query_row("SELECT state FROM file WHERE rel_path = ?1", [rel], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            state_of(&cat, "docs\\gone"),
+            "missing",
+            "a backslash is a legal filename character here, not a directory boundary"
+        );
+        assert_eq!(
+            state_of(&cat, "docs/real.txt"),
+            "local",
+            "and something genuinely beneath the skipped directory is still spared"
         );
     }
 
