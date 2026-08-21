@@ -107,7 +107,7 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
     // directories ABOVE a link's target, which the first walk never names.
     // `canonicalize` needs the path to exist, so it runs on the deepest
     // existing ancestor; nothing below that exists to be substituted yet.
-    check_ancestry(dir, me)?;
+    check_ancestry(dir, me, "the socket directory")?;
     let mut deepest = dir;
     while std::fs::symlink_metadata(deepest).is_err() {
         match deepest.parent() {
@@ -118,7 +118,7 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
     if let Ok(real) = deepest.canonicalize()
         && real != deepest
     {
-        check_ancestry(&real, me)?;
+        check_ancestry(&real, me, "the socket directory")?;
     }
 
     // CREATE owner-only, or VERIFY — never seize.
@@ -181,6 +181,13 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
 
 /// Refuse a path any account but this daemon or root could re-point.
 ///
+/// Shared with the state directory (`main::secure_state_dir`), which has the
+/// same hazard through a different environment variable: `metadata` follows a
+/// symlinked ancestor and describes what it resolves to at that instant, and
+/// the lock, the catalog and the secrets file are then opened through the
+/// ORIGINAL pathname afterwards. `what` names the destination in the refusal
+/// so an operator is told which setting to change.
+///
 /// Asked of every component, of both the configured path and the path it
 /// resolves to. Two conditions, and the second is what lets the first stay
 /// narrow:
@@ -208,7 +215,7 @@ fn secure_socket_dir(dir: &Path) -> std::result::Result<(), String> {
 /// The residual is unchanged and is issue #3's `openat` work: a component we
 /// ourselves own can still move between this check and the bind. Nobody else
 /// can move it, which is what this buys.
-fn check_ancestry(path: &Path, me: u32) -> std::result::Result<(), String> {
+pub fn check_ancestry(path: &Path, me: u32, what: &str) -> std::result::Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
     let mut walked = std::path::PathBuf::new();
@@ -221,9 +228,9 @@ fn check_ancestry(path: &Path, me: u32) -> std::result::Result<(), String> {
         };
         if md.uid() != me && md.uid() != 0 {
             return Err(format!(
-                "{} is owned by uid {} on the way to the socket directory, and neither this \
-                 daemon ({me}) nor root. An account that can replace a component of this path \
-                 can move the socket out from under every client that follows it",
+                "{} is owned by uid {} on the way to {what}, and neither this daemon ({me}) \
+                 nor root. An account that can replace a component of this path can move that \
+                 destination out from under everything that follows the pathname",
                 walked.display(),
                 md.uid()
             ));
@@ -231,10 +238,10 @@ fn check_ancestry(path: &Path, me: u32) -> std::result::Result<(), String> {
         let mode = md.mode() & 0o7777;
         if md.is_dir() && mode & 0o002 != 0 && mode & 0o1000 == 0 {
             return Err(format!(
-                "{} is mode {mode:04o} on the way to the socket directory: world-writable and \
-                 not sticky, so any account may rename what is inside it and put their own \
-                 socket at this path. Either set the sticky bit on it, as `/tmp` has, or point \
-                 `SHEPHERD_SOCKET` somewhere only this daemon and root can write",
+                "{} is mode {mode:04o} on the way to {what}: world-writable and not sticky, \
+                 so any account may rename what is inside it and put their own directory at \
+                 this path. Either set the sticky bit on it, as `/tmp` has, or point that \
+                 setting somewhere only this daemon and root can write",
                 walked.display()
             ));
         }
@@ -478,13 +485,62 @@ pub struct Bound {
 /// CLI invocations and a UI. What it bounds is a loop.
 const MAX_CONNECTIONS: usize = 64;
 
-/// How long a connection may take to send its `hello`.
+/// How long a connection may sit idle without a subscription.
 ///
-/// The handshake is the first frame on a socket that has just been accepted, so
-/// this is a bound on doing nothing rather than on being slow. Without it a
-/// connection that never speaks holds its thread for the daemon's life, which
-/// is the cheapest way to spend the budget above.
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// It covers two moments and they are the same hazard: before `hello`, and
+/// after `hello` while the connection has asked for nothing. Both are a
+/// connection doing NOTHING rather than being slow, and both hold a thread and
+/// one of the [`MAX_CONNECTIONS`] slots while they do — which is the cheapest
+/// way to spend that budget. A subscribed connection is exempt, because sitting
+/// silent is what a subscriber is FOR; the deadline is cleared when its first
+/// subscription is installed.
+///
+/// # It is also the WRITE deadline
+///
+/// The same question from the other side: a subscriber that stops reading
+/// while its stream is live fills the socket buffer, and the event pump then
+/// blocks in `write_all` **holding the shared writer lock**. The hub notices
+/// the queue overflow and drops its sender, but the pump cannot reach the
+/// shutdown at the end of `pump_events` — it is still inside the write — so the
+/// connection, its threads and its slot are held by a client that has stopped
+/// participating. Bounding connections and subscription queues does not help,
+/// because nothing in either path can interrupt a blocked write.
+///
+/// One knob for both because it is one question: how long a peer may fail to
+/// participate before the daemon stops paying for it.
+///
+/// Thirty seconds is short for a general RPC connection and that is deliberate:
+/// a client with a reason to hold a socket open quietly has one — subscribe —
+/// and a client without one can reconnect over a local socket for almost
+/// nothing. The alternative is letting one malfunctioning process refuse every
+/// other client on the machine.
+fn idle_timeout() -> std::time::Duration {
+    // Overridable so the bound is testable at all. Waiting thirty seconds in a
+    // test to observe a thirty-second deadline is why the handshake half of
+    // this had no test for its actual timing.
+    static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("SHEPHERD_IDLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map_or(std::time::Duration::from_secs(30), |ms| {
+                std::time::Duration::from_millis(ms)
+            })
+    })
+}
+
+/// Put both deadlines on a freshly accepted connection.
+///
+/// One function because they are one policy and because the write half arrived
+/// a round later than the read half: a connection carried a read deadline and
+/// no write deadline, which is precisely the asymmetry that let a peer who
+/// stopped reading hold a thread forever. Setting them apart invites the same
+/// gap again.
+fn set_deadlines(stream: &UnixStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(idle_timeout()))?;
+    stream.set_write_timeout(Some(idle_timeout()))
+}
 
 /// Accept connections until `stop` is set.
 pub fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Arc<AtomicBool>) {
@@ -571,7 +627,7 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
     // to exhaust the connection budget; a connection that has said hello is a
     // client the daemon is serving, and `events.subscribe` legitimately waits
     // for hours, so the timeout is cleared below rather than kept.
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    set_deadlines(&stream)?;
     // Kept to clear that deadline once the handshake is done. The timeout is a
     // property of the socket, so this handle and the one inside `writer` are
     // the same underlying description either way.
@@ -602,10 +658,19 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
         }
     };
 
-    // Handshake done: this is a client, not a squatter. The deadline is
-    // cleared because a subscribed connection is SUPPOSED to sit quiet — it is
-    // waiting for events — and a read timeout would end it.
-    deadline_handle.set_read_timeout(None)?;
+    // The deadline is NOT cleared here, and clearing it here was the bug.
+    //
+    // "This is a client, not a squatter" is what the handshake establishes, and
+    // it is not what the deadline is about. A client that completes the
+    // handshake and then sends nothing parks its thread in the request loop's
+    // `read_frame` forever and holds a `MAX_CONNECTIONS` slot while it does —
+    // so 64 of them, which one malfunctioning process can open, refuse every
+    // subsequent client with the daemon otherwise perfectly healthy.
+    //
+    // The quiet-connection exception is real but it belongs to SUBSCRIBERS: a
+    // subscribed connection is supposed to sit silent, because it is waiting
+    // for events rather than withholding a request. So the deadline survives
+    // the handshake and is cleared at the moment a subscription is installed.
 
     let mut session = Session {
         daemon: Arc::clone(&daemon),
@@ -622,7 +687,35 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
     let mut guards: Vec<crate::events::SubscriptionGuard> = Vec::new();
 
     loop {
-        let line = match read_frame(&mut reader)? {
+        let line = match read_frame(&mut reader) {
+            Ok(f) => f,
+            // The idle deadline. An unsubscribed connection that has sent
+            // nothing for `idle_timeout()` is holding a slot and a thread
+            // for nothing; ending it is what makes `MAX_CONNECTIONS` a bound on
+            // concurrent WORK rather than on how many sockets a broken client
+            // can open. A subscribed connection never reaches this, because
+            // installing a subscription clears the deadline.
+            //
+            // Both kinds: a socket read timeout surfaces as `WouldBlock` on
+            // unix (`SO_RCVTIMEO` yields `EAGAIN`) and as `TimedOut` on
+            // Windows, and matching only one of them leaves the bound working
+            // on one platform.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                tracing::debug!(
+                    timeout_ms = idle_timeout().as_millis() as u64,
+                    "closing an idle connection that completed the handshake and never \
+                     sent a request"
+                );
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let line = match line {
             Frame::Line(l) => l,
             Frame::Eof => break,
             // Not resynchronised: finding the next newline after an oversized
@@ -640,8 +733,16 @@ fn handle(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
         // `None` means the frame is already on the socket. Only
         // `events.subscribe` answers that way, because only it has to write
         // more than one frame and has to write them in a fixed order.
+        let had = guards.len();
         if let Some(response) = serve_one(&line, &mut session, &writer, &mut guards) {
             write_frame(&writer, &response)?;
+        }
+        // A subscription was installed by that request, so this connection is
+        // now entitled to be quiet. Cleared once and only on the transition:
+        // `set_read_timeout` is a syscall, and doing it per request would put
+        // one on the hot path for every RPC.
+        if had == 0 && !guards.is_empty() {
+            deadline_handle.set_read_timeout(None)?;
         }
     }
     Ok(())
@@ -1027,9 +1128,28 @@ fn pump_events(
     sub: u64,
 ) {
     for frame in rx {
-        if write_frame(sink, &RpcNotification::new(frame)).is_err() {
-            // The socket is already gone; there is nothing to shut down and
-            // nothing to tell anyone.
+        if let Err(e) = write_frame(sink, &RpcNotification::new(frame)) {
+            // Two cases, one answer. Either the socket is already gone, or the
+            // peer stopped reading and the write deadline expired — and the
+            // second one is why this shuts the socket down rather than simply
+            // returning. The connection thread is parked in `read_frame` with
+            // no deadline (installing a subscription cleared it, which is
+            // correct: a subscriber is supposed to be quiet), so a pump that
+            // just returns leaves the connection, its threads and its
+            // `MAX_CONNECTIONS` slot held by a client that has stopped
+            // participating. `shutdown` is what turns that read into an EOF.
+            //
+            // A timed-out `write_all` may have put a partial line on the wire.
+            // That is acceptable precisely because the connection is ending:
+            // the peer gets a truncated frame and then EOF, rather than a
+            // well-formed stream it was never going to read.
+            tracing::debug!(
+                subscription = sub,
+                error = %e,
+                "event pump ending: the subscriber's socket cannot be written"
+            );
+            let guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = guard.shutdown(std::net::Shutdown::Both);
             return;
         }
     }
@@ -2033,5 +2153,118 @@ mod tests {
         UnixStream::connect(&path).expect("and it really is listening");
         drop(restarted);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A subscriber that stops reading does not pin the pump forever.
+    ///
+    /// The pump wrote with `write_all` and no deadline, **while holding the
+    /// shared writer lock**. A client that stopped reading with its stream
+    /// live filled the socket buffer and the pump blocked inside the write —
+    /// so the hub's overflow detection fired, dropped its sender, and the pump
+    /// still could not reach the shutdown at the end of `pump_events`, because
+    /// it was never going to return from the write. The connection, both its
+    /// threads and its `MAX_CONNECTIONS` slot stayed held by a peer that had
+    /// stopped participating, and neither the connection bound nor the
+    /// subscription bound could do anything about it: nothing in either path
+    /// can interrupt a blocked write.
+    ///
+    /// Both ends are owned here, so the buffer is filled honestly — 64 KiB per
+    /// frame against a socket nobody reads — rather than simulated. Without the
+    /// deadline this test does not fail; it HANGS, which is the defect stated
+    /// exactly.
+    #[test]
+    fn a_subscriber_that_stops_reading_does_not_pin_the_event_pump() {
+        let (daemon_side, client_side) = UnixStream::pair().unwrap();
+        daemon_side
+            .set_write_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let sink = Arc::new(std::sync::Mutex::new(daemon_side));
+        let overflowed = Arc::new(AtomicBool::new(true));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for seq in 0..16u64 {
+            tx.send(shepherd_proto::event::EventFrame {
+                seq: shepherd_proto::event::Seq(seq),
+                stream: shepherd_proto::event::EventStream::Job,
+                emitted_at: 0,
+                payload: shepherd_proto::event::EventPayload::Unknown(serde_json::json!({
+                    "kind": "filler",
+                    "blob": "x".repeat(64 * 1024),
+                })),
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let (sink, overflowed, done) = (
+                Arc::clone(&sink),
+                Arc::clone(&overflowed),
+                Arc::clone(&done),
+            );
+            move || {
+                pump_events(rx, &overflowed, &sink, 1);
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+
+        // The client never reads. The pump must give up on its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            done.load(Ordering::SeqCst),
+            "the pump is still inside `write_all` against a peer that stopped reading; \
+             its connection slot and threads are held indefinitely"
+        );
+        handle.join().unwrap();
+
+        // AND the socket is shut down, which is what frees the slot: the
+        // connection thread is parked in `read_frame` with no deadline —
+        // subscribing cleared it, correctly — so only a shutdown turns that
+        // read into an EOF and ends the connection.
+        drop(sink);
+        let mut buf = [0u8; 1];
+        use std::io::Read;
+        let mut client_side = client_side;
+        // Drain whatever did land, then confirm the stream ends rather than
+        // blocking on a peer that is still notionally alive.
+        client_side
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        loop {
+            match client_side.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("the client never saw the connection end: {e}"),
+            }
+        }
+    }
+
+    /// Both deadlines, on every accepted connection.
+    ///
+    /// The read half existed and the write half did not, and the pump test
+    /// above sets its own deadline on a socket pair — so without this nothing
+    /// asserts that a real connection carries one. That is the shape the
+    /// original gap had: a mechanism that works, wired on one side only.
+    #[test]
+    fn an_accepted_connection_carries_a_deadline_in_both_directions() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert!(a.read_timeout().unwrap().is_none(), "none to begin with");
+        assert!(a.write_timeout().unwrap().is_none());
+
+        set_deadlines(&a).unwrap();
+        assert_eq!(
+            a.read_timeout().unwrap(),
+            Some(idle_timeout()),
+            "a peer that never sends can hold a slot"
+        );
+        assert_eq!(
+            a.write_timeout().unwrap(),
+            Some(idle_timeout()),
+            "a peer that never reads can pin the event pump inside `write_all`"
+        );
     }
 }

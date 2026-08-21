@@ -60,6 +60,22 @@ pub struct Daemon {
     /// Held across pinning the read snapshot, and for nothing else — see
     /// [`Daemon::build_snapshot`]. The `u64` inside is the last ticket issued.
     snapshot_ticket: Mutex<u64>,
+    /// Held for the whole of one build-and-install, so at most ONE full index
+    /// arena is ever under construction.
+    ///
+    /// The ticket above orders concurrent rebuilds so the newest wins, which is
+    /// a correctness mechanism and says nothing about cost. Every scan worker
+    /// rebuilds on completion and the pool runs four of them, so four scans
+    /// finishing together built four complete arenas before any generation
+    /// check could discard three of them — about 668 MiB each at the documented
+    /// 10-million-file size, so roughly 3.3 GiB of metadata index alone,
+    /// against a supported corpus. Three of those four were destined to be
+    /// thrown away.
+    ///
+    /// Serialising is not the whole fix and would trade an OOM for a queue.
+    /// What makes it cheap is that a request which waited here is usually
+    /// ANSWERED by the build it waited for: see [`Daemon::rebuild_index_since`].
+    rebuild_gate: Mutex<()>,
     /// Held so the actor and its WAL-checkpoint thread live as long as the
     /// daemon. Never used directly — `writer` is the handle.
     _actor: CatalogActor,
@@ -125,6 +141,7 @@ impl Daemon {
             secrets: SecretStore::with_keyfile(paths_for_secrets),
             index: RwLock::new(Indexed::default()),
             snapshot_ticket: Mutex::new(0),
+            rebuild_gate: Mutex::new(()),
             // Advertised because the event buffer and its resume cursor exist
             // (`shepherd_proto::event`). Placeholders and hosted inference are
             // NOT advertised: Linux is delete-mode only and Phase 7 has not
@@ -172,8 +189,70 @@ impl Daemon {
     /// built would let `scan_exec`'s `indexed=` log describe an index nobody is
     /// searching.
     pub fn rebuild_index(&self) -> Result<usize, String> {
+        // The ticket as it stands NOW is the watermark this request is asking
+        // to beat. Everything this caller committed is already in the catalog
+        // when it calls — `scan_exec` takes its watermark and then calls this —
+        // so any snapshot pinned after this read necessarily includes it.
+        let asked_after = *self
+            .snapshot_ticket
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.rebuild_index_since(asked_after)
+    }
+
+    /// [`Self::rebuild_index`], with the watermark passed in.
+    ///
+    /// Split out because the coalescing decision is the whole point and a test
+    /// cannot otherwise stand where a queued rebuild stands. `asked_after` is
+    /// the snapshot generation this request needs to beat.
+    ///
+    /// # Coalescing, not merely serialising
+    ///
+    /// A request that waited on the gate very often no longer has anything to
+    /// do: if the index installed while it waited was pinned AFTER it asked,
+    /// that index already reflects everything its caller committed, and
+    /// building a second one would spend seconds and hundreds of megabytes
+    /// reaching the same answer. So four scans finishing together now cost one
+    /// arena and one build rather than four of each — faster as well as
+    /// bounded, which is why this is not the tradeoff the unbounded version
+    /// was avoiding.
+    ///
+    /// The skip reads the INSTALLED generation rather than the ticket: a ticket
+    /// is minted when a snapshot is pinned, and a snapshot that lost the
+    /// install race or fell below the floor never became an index anyone can
+    /// search. `index.is_some()` is part of the condition for the same reason —
+    /// `invalidate_index` can drop the arena and leave the generation behind.
+    pub fn rebuild_index_since(&self, asked_after: u64) -> Result<usize, String> {
+        let _gate = self
+            .rebuild_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let guard = self
+                .index
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(index) = guard.index.as_ref()
+                && guard.generation > asked_after
+            {
+                tracing::debug!(
+                    installed = guard.generation,
+                    asked_after,
+                    "a newer index was installed while this rebuild queued; not building another"
+                );
+                return Ok(index.len());
+            }
+        }
         let snapshot = self.build_snapshot()?;
         Ok(self.install_snapshot(snapshot))
+    }
+
+    /// The generation of the index a search would be answered from, or 0.
+    pub fn installed_generation(&self) -> u64 {
+        self.index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
     }
 
     /// Read the catalog into a new index, tagged with a generation that orders
@@ -888,5 +967,55 @@ mod tests {
                 want
             );
         }
+    }
+
+    /// A rebuild that queued behind another does not build a second arena.
+    ///
+    /// The generation ticket orders concurrent rebuilds so the newest wins,
+    /// which is correctness and says nothing about cost. Every scan worker
+    /// rebuilds on completion and the pool runs four, so four scans finishing
+    /// together each built a COMPLETE index before any generation check could
+    /// throw three of them away — roughly 668 MiB apiece at the documented
+    /// 10-million-file size, on a corpus this project says it supports.
+    ///
+    /// `rebuild_index_since` is the request as a queued rebuild sees it: a
+    /// watermark it needs to beat. Asking with a watermark an installed index
+    /// already beats must return that index rather than reproduce it.
+    #[test]
+    fn a_rebuild_that_a_newer_index_already_answers_does_not_build_again() {
+        let (daemon, dir) = daemon_on_disk("coalesce");
+        let root = add_root(&daemon, "/data");
+        add_file(&daemon, root, "a.txt");
+
+        let first = daemon.rebuild_index().unwrap();
+        let installed = daemon.installed_generation();
+        assert_eq!(first, 1, "the first rebuild indexes the one row");
+        assert!(installed > 0, "and installs a generation");
+
+        // A rebuild requested BEFORE that one installed. Its caller's writes
+        // are necessarily included in what is already there.
+        add_file(&daemon, root, "b.txt");
+        let coalesced = daemon.rebuild_index_since(installed - 1).unwrap();
+        assert_eq!(
+            coalesced, 1,
+            "the queued rebuild must return the installed index, not build one"
+        );
+        assert_eq!(
+            daemon.installed_generation(),
+            installed,
+            "and it must not have pinned a new snapshot: b.txt is deliberately \
+             uncounted here, which is what proves nothing was rebuilt"
+        );
+
+        // THE OTHER DIRECTION: a request that the installed index does NOT
+        // already answer still builds, so the skip cannot be satisfied by
+        // never rebuilding at all.
+        let fresh = daemon.rebuild_index().unwrap();
+        assert_eq!(
+            fresh, 2,
+            "a request newer than the installed index rebuilds"
+        );
+        assert!(daemon.installed_generation() > installed);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

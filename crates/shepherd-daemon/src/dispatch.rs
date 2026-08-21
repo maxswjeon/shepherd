@@ -1144,6 +1144,29 @@ impl ShepherdApi for Session {
             })?
         };
 
+        // ANNOUNCED, not only answered.
+        //
+        // `EventStream::Target` is advertised and `EventPayload::TargetHealth`
+        // existed with no production writer, so a dashboard subscribed to the
+        // stream this daemon told it about saw nothing when another client
+        // registered a target — and it cannot repair its own view by polling,
+        // because `target.list` is Phase 2. An advertised stream that never
+        // carries the one event this phase can produce is a promise the daemon
+        // does not keep.
+        //
+        // After the insert commits, so the frame is never a claim about a
+        // registration that failed; `reachable: true` because the probe
+        // completed a real multipart round trip to get here, which is the same
+        // observation the reply carries.
+        self.hub().publish(
+            shepherd_proto::event::EventStream::Target,
+            shepherd_proto::event::EventPayload::TargetHealth {
+                target_id: id.get(),
+                reachable: true,
+                detail: Some(format!("registered `{name}` and probed it reachable")),
+            },
+        );
+
         Ok(TargetAddResult {
             target: TargetSummary {
                 target_id: id.get(),

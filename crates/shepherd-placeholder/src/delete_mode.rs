@@ -702,9 +702,23 @@ fn secure_staging(dir: &Path) -> Result<()> {
         return Err(not_a_directory(dir));
     }
 
-    if let Ok(me) = std::fs::metadata("/proc/self").map(|m| m.uid())
-        && md.uid() != me
-    {
+    // `geteuid`, not `/proc/self`. `/proc` is Linux and this function is
+    // `cfg(unix)`, so on macOS the `if let` never bound and the ownership check
+    // was SKIPPED — after which the `set_permissions` below still ran and could
+    // chmod another account's directory to `0700`, making the mode check pass
+    // on a directory that was never ours. The owner can then replace a staged
+    // entry between the held-handle verification and the pathname unlink, and
+    // the audit record describes a file that was not the one destroyed.
+    //
+    // Unconditional now, so the chmod below only ever lands on a directory this
+    // daemon owns. A check that disables itself where it cannot read a Linux
+    // filesystem is worse than an absent one: the code reads as though it is
+    // present.
+    //
+    // SAFETY: `geteuid` is infallible per POSIX — no error return, no memory
+    // touched. The socket and state paths make the same call.
+    let me = unsafe { libc::geteuid() };
+    if md.uid() != me {
         return Err(io(format!(
             "the staging directory is owned by uid {} and this daemon runs as {me}; another \
              account owning it can replace a staged entry between verification and unlink, so \

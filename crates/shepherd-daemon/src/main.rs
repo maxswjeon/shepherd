@@ -127,13 +127,40 @@ fn secure_state_dir(dir: &std::path::Path) -> Result<(), String> {
     // `create_dir_all_tracked` already reports which levels it made, which is
     // exactly the distinction needed: those are ours by construction and may be
     // tightened; anything that was already there is checked and refused.
+    // The ANCESTRY, before anything is created — the same walk the socket path
+    // takes, and for the same reason one level up. `metadata` below follows a
+    // symlinked ancestor and describes whatever it resolves to at that instant,
+    // while `daemon.lock`, `catalog.db` and `secrets.json` are opened through
+    // the ORIGINAL pathname afterwards. A link another account can repoint in
+    // between therefore passes every check here and still lands the daemon's
+    // state — including its secrets — inside a directory that account controls.
+    //
+    // Shared rather than copied: two spellings of one rule drift, and this one
+    // already arrived a round after the socket's. Both walks run, configured
+    // and resolved, so a writable directory ABOVE a link's target is refused
+    // too. See `server::check_ancestry`.
+    //
+    // Residual unchanged and still #3: a component this daemon itself owns can
+    // move between the check and the open. Nobody else can move it.
+    let me = unsafe { libc::geteuid() };
+    shepherd_daemon::server::check_ancestry(dir, me, "the state directory")?;
+    let mut deepest = dir;
+    while std::fs::symlink_metadata(deepest).is_err() {
+        match deepest.parent() {
+            Some(p) => deepest = p,
+            None => break,
+        }
+    }
+    if let Ok(real) = deepest.canonicalize()
+        && real != deepest
+    {
+        shepherd_daemon::server::check_ancestry(&real, me, "the state directory")?;
+    }
+
     let created =
         create_dir_all_tracked(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let we_made_it = created.iter().any(|p| p == dir);
 
-    // SAFETY: `geteuid` is always successful per POSIX — it cannot fail, has no
-    // error return, and touches no memory we own.
-    let me = unsafe { libc::geteuid() };
     let owner = std::fs::metadata(dir)
         .map_err(|e| format!("cannot inspect {}: {e}", dir.display()))?
         .uid();
@@ -600,6 +627,50 @@ mod tests {
 
     fn mode_of(p: &std::path::Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A replaceable ancestor of the state directory is refused, and refusing
+    /// creates nothing.
+    ///
+    /// The ownership and mode checks below describe what the pathname resolves
+    /// to at the instant they run, and `daemon.lock`, `catalog.db` and
+    /// `secrets.json` are opened through the ORIGINAL pathname afterwards — so
+    /// a component another account can repoint in between passes every one of
+    /// them and still lands the daemon's secrets inside a directory that
+    /// account controls. The socket path grew this walk a round earlier and
+    /// this one is the same hazard through `SHEPHERD_STATE_DIR`; it is the
+    /// SAME walk rather than a second spelling of it.
+    #[test]
+    fn a_replaceable_ancestor_of_the_state_directory_is_refused() {
+        let base = tmp("anc");
+        let open = base.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let under = open.join("state");
+        let err = secure_state_dir(&under)
+            .expect_err("a state directory anyone may rename must be refused");
+        assert!(
+            err.contains("not sticky") && err.contains("the state directory"),
+            "the refusal must name what is wrong and which destination: {err}"
+        );
+        assert!(
+            !under.exists(),
+            "and a refused path must be left exactly as it was found"
+        );
+
+        // THE ACCEPTING DIRECTION, and the one the old rule would have failed:
+        // a symlinked ancestor this account owns is not a hazard, because only
+        // this account or root can repoint it. `$TMPDIR` under macOS is exactly
+        // this shape.
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        secure_state_dir(&base.join("link").join("state"))
+            .expect("a link this daemon owns must not block startup");
+        assert_eq!(mode_of(&real.join("state")), 0o700);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// A first run creates it, and the ambient umask does not get a vote.

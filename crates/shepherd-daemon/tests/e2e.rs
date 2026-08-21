@@ -480,6 +480,110 @@ fn a_connection_that_skips_the_handshake_is_refused() {
     assert!(err.message.contains("hello"), "{}", err.message);
 }
 
+/// A connection that handshakes and then asks for nothing does not hold its
+/// slot forever.
+///
+/// The handshake deadline was cleared the instant `hello` succeeded, on the
+/// reasoning that a subscribed connection is supposed to sit quiet. It is —
+/// but "completed the handshake" is not "subscribed": 64 connections that say
+/// hello and nothing else park 64 threads in `read_frame`, consume every
+/// `MAX_CONNECTIONS` slot, and refuse every subsequent client while the daemon
+/// is otherwise healthy. One malfunctioning script is enough.
+///
+/// The deadline is overridden to milliseconds here. The 30-second default is
+/// why the handshake half of this went untested for its actual timing, and an
+/// untested bound is how it came to be cleared a frame too early.
+#[test]
+fn an_idle_connection_that_never_subscribes_is_closed() {
+    let d = Daemon::start_with_env("idle", &[("SHEPHERD_IDLE_TIMEOUT_MS", "300")]);
+    let stream = UnixStream::connect(&d.socket).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+
+    let hello = Hello {
+        proto_version: PROTO_VERSION,
+        client: PeerInfo {
+            name: "idle".into(),
+            build: "1".into(),
+        },
+        capabilities: vec![],
+    };
+    let req = RpcRequest::new(
+        RequestId::Number(1),
+        "hello",
+        serde_json::to_value(hello).unwrap(),
+    );
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).unwrap();
+    writer.flush().unwrap();
+    let mut buf = String::new();
+    reader.read_line(&mut buf).unwrap();
+    let frame: RpcResponse = serde_json::from_str(&buf).unwrap();
+    assert!(frame.outcome().is_ok(), "the handshake itself must succeed");
+
+    // Now say nothing. The daemon must hang up rather than hold the slot.
+    buf.clear();
+    let n = reader
+        .read_line(&mut buf)
+        .expect("the connection must be closed, not errored");
+    assert_eq!(
+        n, 0,
+        "an idle unsubscribed connection was still open after the deadline: {buf:?}"
+    );
+
+    // AND THE EXEMPTION: a subscriber may sit quiet for as long as it likes,
+    // because waiting is what it is doing. Same daemon, same deadline.
+    let stream = UnixStream::connect(&d.socket).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    let req = RpcRequest::new(
+        RequestId::Number(1),
+        "hello",
+        serde_json::to_value(Hello {
+            proto_version: PROTO_VERSION,
+            client: PeerInfo {
+                name: "watcher".into(),
+                build: "1".into(),
+            },
+            capabilities: vec![],
+        })
+        .unwrap(),
+    );
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).unwrap();
+    let req = RpcRequest::new(
+        RequestId::Number(2),
+        "events.subscribe",
+        serde_json::json!({ "streams": ["job"] }),
+    );
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).unwrap();
+    writer.flush().unwrap();
+    for _ in 0..2 {
+        let mut buf = String::new();
+        reader.read_line(&mut buf).unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    let req = RpcRequest::new(RequestId::Number(3), "status", serde_json::json!({}));
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .expect("a subscribed connection must survive being quiet");
+    writer.flush().unwrap();
+    let mut buf = String::new();
+    reader.read_line(&mut buf).unwrap();
+    let frame: RpcResponse = serde_json::from_str(&buf).unwrap();
+    assert!(
+        frame.outcome().is_ok(),
+        "the subscriber's connection was closed by the idle deadline: {buf}"
+    );
+}
+
 /// The skew case §4.3 calls the most common one, end to end.
 #[test]
 fn a_major_version_mismatch_is_rejected_with_both_versions_named() {
@@ -4947,6 +5051,76 @@ const PROBE_SECRET: &str = r#"{"access_key_id":"probe","secret_access_key":"prob
 /// `Session::target_add` and this test fails: `checksum_probe` is written from
 /// the returned record and from nothing else, so its absence is not something
 /// the handler can fake.
+/// Registering a target reaches every subscriber, not only the caller.
+///
+/// `EventStream::Target` is advertised in the handshake and
+/// `EventPayload::TargetHealth` had no production writer at all — a repo-wide
+/// search found none — so a dashboard subscribed to the stream this daemon told
+/// it about learned nothing when another client registered a target. It cannot
+/// repair its view by polling either: `target.list` is Phase 2 and answers
+/// `MethodNotImplemented`. An advertised stream that never carries the one
+/// event this phase can produce is a promise the daemon does not keep.
+///
+/// Read by REPLAY from cursor 0 rather than by racing a live frame, which is
+/// how the index-stream test avoids the same flake.
+#[test]
+fn registering_a_target_publishes_on_the_advertised_target_stream() {
+    let fake = FakeS3::refusing_every_algorithm();
+    let d = Daemon::start_with_env("target-event", &[(PROBE_SECRET_VAR, PROBE_SECRET)]);
+    let mut c = d.connect();
+
+    let added = c.call(
+        "target.add",
+        serde_json::json!({
+            "name": "announced",
+            "adapter": "s3",
+            "config": {
+                "bucket": "archive",
+                "endpoint_url": fake.endpoint,
+                "region": "us-east-1",
+                "force_path_style": true,
+            },
+            "credentials_ref": "target/probe",
+        }),
+    );
+    let target_id = added["target"]["target_id"].as_i64().expect("target_id");
+
+    let epoch = c.call("events.subscribe", serde_json::json!({}))["epoch"]
+        .as_str()
+        .expect("epoch")
+        .to_owned();
+    let sub = c.call(
+        "events.subscribe",
+        serde_json::json!({"streams": ["target"], "resume_from": 0, "resume_epoch": epoch}),
+    );
+    let replayed = sub["resume"]["replayed"].as_u64().unwrap_or(0);
+    assert!(
+        replayed >= 1,
+        "the target stream carried nothing across a successful registration: {sub}"
+    );
+
+    let mut health = 0;
+    for _ in 0..replayed {
+        let frame = c.read_frame();
+        let p = &frame["params"]["payload"];
+        if p["kind"] == serde_json::json!("target_health")
+            && p["target_id"] == serde_json::json!(target_id)
+        {
+            health += 1;
+            assert_eq!(
+                p["reachable"],
+                serde_json::json!(true),
+                "the probe completed a real round trip to get here: {frame}"
+            );
+        }
+    }
+    assert_eq!(
+        health, 1,
+        "a subscriber saw no `target_health` frame for the target that was just \
+         registered, and `target.list` cannot tell it either"
+    );
+}
+
 #[test]
 fn a_registered_target_carries_what_the_probe_measured() {
     let fake = FakeS3::refusing_every_algorithm();
