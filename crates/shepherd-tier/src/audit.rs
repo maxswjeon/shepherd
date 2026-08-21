@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
+use shepherd_catalog::intent::{DestroyIntent, IntentState};
 use shepherd_core::{Blake3Hash, IntentId, Timestamp};
 
 #[derive(Debug, thiserror::Error)]
@@ -191,7 +192,7 @@ impl AuditLog {
     /// Done at `open` and not at `append`: the cost is one `fsync` per daemon
     /// start rather than a branch on the hot path, and `open` happens before
     /// anything can be destroyed, which is the ordering the guarantee needs.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path, unresolved: &[DestroyIntent]) -> Result<Self> {
         let io = |p: &Path, e: std::io::Error| AuditError::Write {
             path: p.display().to_string(),
             detail: e.to_string(),
@@ -222,11 +223,54 @@ impl AuditLog {
         if let Some(parent) = path.parent() {
             sync_dir(parent).map_err(|e| io(parent, e))?;
         }
-        Ok(Self {
+        // THE HALT IS RECONSTRUCTED, not reset.
+        //
+        // `halted` is in-memory, so reopening the log after a crash cleared it
+        // — and the crash that matters is the one that left an irreversible
+        // step with an incomplete record, which is the exact condition this
+        // flag exists to hold. A restarted process could therefore admit
+        // another destruction while the forensic record of the last one was
+        // still unfinished, which is the opposite of what this type documents.
+        //
+        // Rebuilt from the journal rather than persisted separately: the
+        // journal already knows, and a second durable copy of one fact is a
+        // second thing to keep in step.
+        //
+        // Only POST-SYSCALL states halt. `prepared` means nothing irreversible
+        // happened, so an abandoned preparation must not stop the daemon
+        // forever; `audited` means the record IS written and only the catalog
+        // change is outstanding, which is the caller's to finish and not a
+        // forensic gap.
+        let log = Self {
             path: path.to_path_buf(),
             halted: AtomicBool::new(false),
             gate: AsyncMutex::new(()),
-        })
+        };
+        if let Some(i) = unresolved.iter().find(|i| {
+            matches!(
+                i.state,
+                IntentState::SyscallIssued
+                    | IntentState::OutcomeKnown
+                    | IntentState::OutcomeAmbiguous
+            )
+        }) {
+            log.halt_for_recovery(&format!(
+                "intent {} is `{}`: an irreversible step may have happened and its record is \
+                 not complete. Resolve it before any further destruction",
+                i.id.get(),
+                i.state.as_str()
+            ));
+        }
+        Ok(log)
+    }
+
+    /// [`AuditLog::open`] for a caller with no journal to consult.
+    ///
+    /// Named so that using it is a CLAIM — "nothing could have been left
+    /// unresolved" — rather than the path of least resistance. Every test that
+    /// is not about recovery uses it; the daemon must not.
+    pub fn open_with_no_unresolved_intents(path: &Path) -> Result<Self> {
+        Self::open(path, &[])
     }
 
     /// Whether destruction is currently refused because the forensic record is
@@ -363,11 +407,11 @@ mod tests {
         let t = Tmp::new("append");
         let p = t.0.join("destroy-audit.jsonl");
         {
-            let log = AuditLog::open(&p).unwrap();
+            let log = AuditLog::open_with_no_unresolved_intents(&p).unwrap();
             log.append(&record(1)).unwrap();
             log.append(&record(2)).unwrap();
         }
-        let log = AuditLog::open(&p).unwrap();
+        let log = AuditLog::open_with_no_unresolved_intents(&p).unwrap();
         let lines = log.read_all();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("/data/1.raw"));
@@ -379,7 +423,7 @@ mod tests {
     #[test]
     fn every_record_names_the_attestation_mode() {
         let t = Tmp::new("attest");
-        let log = AuditLog::open(&t.0.join("a.jsonl")).unwrap();
+        let log = AuditLog::open_with_no_unresolved_intents(&t.0.join("a.jsonl")).unwrap();
         let mut r = record(1);
         r.attestation = "content".into();
         log.append(&r).unwrap();
@@ -407,7 +451,7 @@ mod tests {
         let p = t.0.join("nested").join("deeper").join("destroy.jsonl");
         assert!(!p.exists());
 
-        let log = AuditLog::open(&p).unwrap();
+        let log = AuditLog::open_with_no_unresolved_intents(&p).unwrap();
 
         assert!(
             p.exists(),
@@ -432,7 +476,7 @@ mod tests {
         // under test. The log is then replaced by a directory, so the next
         // append fails on a log that had opened cleanly: an audit file that
         // becomes unwritable after the daemon started.
-        let log = AuditLog::open(&p).unwrap();
+        let log = AuditLog::open_with_no_unresolved_intents(&p).unwrap();
         std::fs::remove_file(&p).unwrap();
         std::fs::create_dir(&p).unwrap();
         assert!(!log.is_halted());
@@ -449,7 +493,7 @@ mod tests {
     #[test]
     fn a_halt_can_only_be_cleared_explicitly() {
         let t = Tmp::new("resume");
-        let log = AuditLog::open(&t.0.join("a.jsonl")).unwrap();
+        let log = AuditLog::open_with_no_unresolved_intents(&t.0.join("a.jsonl")).unwrap();
         log.halt_for_recovery("intent reached the syscall with no audit record");
         assert!(log.check_not_halted().is_err());
         log.resume();
@@ -459,10 +503,69 @@ mod tests {
     #[test]
     fn a_reconstructed_record_says_so() {
         let t = Tmp::new("recon");
-        let log = AuditLog::open(&t.0.join("a.jsonl")).unwrap();
+        let log = AuditLog::open_with_no_unresolved_intents(&t.0.join("a.jsonl")).unwrap();
         let mut r = record(1);
         r.reconstructed = true;
         log.append(&r).unwrap();
         assert!(log.read_all()[0].contains("\"reconstructed\":true"));
+    }
+
+    /// The halt survives a restart, rebuilt from the journal.
+    ///
+    /// `halted` is in-memory, so reopening the log cleared it — and the crash
+    /// that matters is the one that left an irreversible step with an
+    /// incomplete record, which is the exact condition the flag exists to hold.
+    /// A restarted process could admit another destruction while the forensic
+    /// record of the last one was unfinished.
+    #[test]
+    fn a_reopened_log_halts_on_an_unresolved_post_syscall_intent() {
+        use shepherd_catalog::intent::{DestroyIntent, IntentKind};
+
+        let t = Tmp::new("halt-rebuild");
+        let p = t.0.join("a.jsonl");
+
+        let intent = |state: IntentState| DestroyIntent {
+            id: IntentId::new(7),
+            kind: IntentKind::Local,
+            file_id: Some(1),
+            path: "/data/a.raw".into(),
+            size: 10,
+            blake3: None,
+            state,
+            batch_id: None,
+            episode_id: None,
+        };
+
+        // POST-SYSCALL and unsettled: an irreversible step may have happened
+        // and its record is not complete.
+        for state in [
+            IntentState::SyscallIssued,
+            IntentState::OutcomeKnown,
+            IntentState::OutcomeAmbiguous,
+        ] {
+            let log = AuditLog::open(&p, &[intent(state)]).unwrap();
+            assert!(
+                log.is_halted(),
+                "reopening with an unresolved `{}` intent must halt",
+                state.as_str()
+            );
+            assert!(log.check_not_halted().is_err());
+        }
+
+        // PRE-SYSCALL, and the record-is-written case. `prepared` means nothing
+        // irreversible happened, so an abandoned preparation must not stop the
+        // daemon forever; `audited` means the record IS complete and only the
+        // catalog change is outstanding, which is the caller's to finish.
+        for state in [IntentState::Prepared, IntentState::Audited] {
+            let log = AuditLog::open(&p, &[intent(state)]).unwrap();
+            assert!(
+                !log.is_halted(),
+                "reopening with a `{}` intent must not halt",
+                state.as_str()
+            );
+        }
+
+        // And nothing unresolved at all is the ordinary start.
+        assert!(!AuditLog::open(&p, &[]).unwrap().is_halted());
     }
 }

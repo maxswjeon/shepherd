@@ -888,7 +888,9 @@ fn fixture(tag: &str, mode: AttestationMode) -> Fixture {
     // accept a derived one.
     adapter.put_versioned(&key, body.clone().into(), "v9");
 
-    let audit = AuditLog::open(&tmp.0.join("audit").join("destroy.jsonl")).unwrap();
+    let audit =
+        AuditLog::open_with_no_unresolved_intents(&tmp.0.join("audit").join("destroy.jsonl"))
+            .unwrap();
     let root = root(&tmp.0);
     Fixture {
         identity: identity_of(&path),

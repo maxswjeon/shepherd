@@ -547,7 +547,9 @@ impl Remote {
                 k
             })
             .collect();
-        let audit = crate::audit::AuditLog::open(&dir.join("audit.jsonl")).unwrap();
+        let audit =
+            crate::audit::AuditLog::open_with_no_unresolved_intents(&dir.join("audit.jsonl"))
+                .unwrap();
         Self {
             dir,
             adapter,

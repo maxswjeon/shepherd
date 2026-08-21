@@ -190,7 +190,7 @@ async fn all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bun
         object_version: Some(shepherd_core::ObjectVersion::new("v1")),
         expected_hash: doomed_hash,
     };
-    let audit = AuditLog::open(&tmp.0.join("audit.jsonl")).unwrap();
+    let audit = AuditLog::open_with_no_unresolved_intents(&tmp.0.join("audit.jsonl")).unwrap();
 
     // The catalog's identity for the doomed file, from the catalog's own
     // function. The destroy path serializes on this, not on `<dev>:<ino>`.

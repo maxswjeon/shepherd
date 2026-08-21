@@ -513,7 +513,8 @@ async fn round_trip(bucket: &str, expect_mode: AttestationMode, tag: &str) {
         expected_hash: hash,
     };
     let root = corpus.root();
-    let audit = AuditLog::open(&corpus.dir.join("audit/destroy.jsonl")).unwrap();
+    let audit =
+        AuditLog::open_with_no_unresolved_intents(&corpus.dir.join("audit/destroy.jsonl")).unwrap();
     let locks = FileLocks::new();
 
     // `& 0o7777`, because `CoreAttrs::mode` is documented as "Unix permission

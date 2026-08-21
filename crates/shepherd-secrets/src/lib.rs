@@ -405,17 +405,60 @@ impl Backend for KeyfileStore {
     }
 }
 
-/// Create-or-truncate `path` with owner-only permissions and write `contents`.
+/// Create `path` EXCLUSIVELY with owner-only permissions and write `contents`.
+///
+/// # `create(true)` was not enough, and `mode` is why
+///
+/// `mode` is `mkdir(2)`-style: it applies to an inode this call CREATES and is
+/// ignored for one that already exists. The temp path is deterministic — the
+/// keyfile's name with `.tmp` — so a file pre-created there by anyone who can
+/// write the directory was opened in place, kept its permissive mode, received
+/// the plaintext credential, and was then renamed over the keyfile. A symlink
+/// at that name was followed to wherever it pointed. `check_permissions`
+/// refuses such a keyfile at READ time, which is after the secret has already
+/// been written into it.
+///
+/// `create_new` closes both: it fails with `EEXIST` on anything already at the
+/// path, symlink included, so the mode is applied to an inode this call made
+/// and there is nothing to follow. A stale temp file from an interrupted write
+/// is removed first — deliberately by name, before the exclusive create, so the
+/// unlink and the create are separate operations and the create is still the
+/// one that establishes exclusivity.
 #[cfg(unix)]
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // A previous run that died between the create and the rename leaves this
+    // behind, and `create_new` would then fail forever. Removing it is safe
+    // BECAUSE the create below is exclusive: if someone re-creates the path in
+    // between, the create fails rather than adopting their file.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
+
+    // ASSERTED, not assumed. `mode` is a request the filesystem may not honour
+    // — a umask cannot loosen it, but a filesystem mounted without permission
+    // support can — and the whole point of this function is that the plaintext
+    // never lands anywhere readable. Checked on the DESCRIPTOR, so it is this
+    // inode rather than whatever the name resolves to a moment later.
+    let mode = f.metadata()?.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return Err(std::io::Error::other(format!(
+            "{} was created mode {mode:04o} rather than 0600; this filesystem cannot hold a \
+             credential file only its owner can read",
+            path.display()
+        )));
+    }
+
     f.write_all(contents.as_bytes())?;
     f.sync_all()
 }
@@ -846,5 +889,71 @@ mod tests {
         );
         assert!(ks.get(&SecretRef::for_target(1)).unwrap().is_some());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pre-created temp file does not receive the plaintext.
+    ///
+    /// The temp path is deterministic — the keyfile's name with `.tmp` — and
+    /// `OpenOptions::mode` applies only to an inode the call CREATES. A file
+    /// left there by anyone who can write the directory was therefore opened in
+    /// place, kept its permissive mode, received the credential, and was
+    /// renamed over the keyfile. `check_permissions` refuses such a keyfile at
+    /// READ time, which is after the secret is already in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_created_temp_file_does_not_receive_the_secret() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "shepherd-secrets-tmp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let keyfile = dir.join("secrets.json");
+        let tmp = keyfile.with_extension("tmp");
+
+        // Somebody else's world-readable file, sitting on the deterministic
+        // temp path.
+        std::fs::write(&tmp, b"").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let mut store = KeyfileStore::new(keyfile.clone());
+        store
+            .put(
+                &SecretRef::new("target/probe").unwrap(),
+                &Secret::new("hunter2"),
+            )
+            .expect("the write must not be blocked by a hostile temp file");
+
+        assert_eq!(
+            std::fs::metadata(&keyfile).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the keyfile must be owner-only whatever was at the temp path"
+        );
+        assert!(
+            !std::fs::read_to_string(&keyfile).unwrap().is_empty(),
+            "and it must actually hold the secret"
+        );
+
+        // A SYMLINK at the temp path is the other half: it was followed, so the
+        // plaintext landed wherever it pointed.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, b"").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
+        store
+            .put(
+                &SecretRef::new("target/second").unwrap(),
+                &Secret::new("hunter3"),
+            )
+            .expect("a symlink at the temp path must not block the write either");
+        assert!(
+            std::fs::read_to_string(&elsewhere).unwrap().is_empty(),
+            "the secret was written through a symlink to {}",
+            elsewhere.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

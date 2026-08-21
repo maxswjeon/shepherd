@@ -686,6 +686,22 @@ pub async fn execute_discard(
         }
     };
 
+    // The INTENT must be this deletion's, and that is checked here rather than
+    // inside `execute_remote_discard` — which is where it lives, and which runs
+    // after the unit has been spent. The authorisation failure happens before
+    // admission and before any DELETE, so a caller that fixed its wiring should
+    // be able to retry; instead the same charge answered `AlreadySpent` and the
+    // reserved rolling-window budget could stop it obtaining another.
+    //
+    // The key is derived twice as a result — once here and once by `spend` —
+    // and that is the cheaper of the two prices: the alternative is spending
+    // before validating.
+    if let Some(h) = candidate.blake3 {
+        intent
+            .authorizes_object(crate::plan::derive_object_key(prefix, h).as_str())
+            .map_err(|detail| DestroyError::Unbound { detail })?;
+    }
+
     // Before the deletion, never after. The budget was already persisted by
     // `reserve_discard`; this is the per-object draw against it, and it both
     // authorises the deletion and names what may be deleted.

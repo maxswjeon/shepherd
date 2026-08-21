@@ -1161,10 +1161,22 @@ async fn resolve_ambiguous_delete(
             // deleted. No record is owed, and holding every other destruction
             // while this one is retried would be wrong.
             VersionGuard::ContentAddressed { .. } => {
+                // The key is the guard and the key still answers: nothing was
+                // deleted, and that is an outcome rather than an unknown.
+                record_transition(intent_gate, intent_id, IntentState::OutcomeKnown).await;
+                record_transition(intent_gate, intent_id, IntentState::Aborted).await;
                 drop(permit);
                 return Err(err);
             }
             VersionGuard::Version(v) if meta.version.as_ref() == Some(v) => {
+                // The guarded version is still the current one, so the
+                // version-specific DELETE demonstrably did not land. Settled,
+                // like the precondition-failure path above it — the outcome is
+                // KNOWN and nothing irreversible happened, so leaving the
+                // intent unresolved would tell recovery this was an operation
+                // whose outcome nobody can determine.
+                record_transition(intent_gate, intent_id, IntentState::OutcomeKnown).await;
+                record_transition(intent_gate, intent_id, IntentState::Aborted).await;
                 drop(permit);
                 return Err(err);
             }
