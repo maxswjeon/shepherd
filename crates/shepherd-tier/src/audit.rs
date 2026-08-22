@@ -123,6 +123,14 @@ pub struct AuditLog {
     /// the ONE source of truth readable at a moment when acting on it is still
     /// possible.
     gate: AsyncMutex<()>,
+    /// `(dev, ino)` of the file whose name `open` durably published.
+    ///
+    /// `append` reopens by path — it does not hold a descriptor — so without
+    /// this it cannot tell the published file from a different one that has
+    /// taken its name. `None` off unix, where the pair is not available; the
+    /// missing-file half of the check works there regardless, because `append`
+    /// no longer creates.
+    identity: Option<(u64, u64)>,
 }
 
 /// Permission to perform one irreversible destruction.
@@ -176,6 +184,23 @@ fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `(dev, ino)` for an OPEN file, or `None` where that pair is unavailable.
+///
+/// `st_dev` is used here for what it is good for — telling two files apart at
+/// one instant — and never stored beyond the life of the process, which is the
+/// distinction §4.4's prohibition draws.
+#[cfg(unix)]
+fn file_identity(f: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let md = f.metadata().ok()?;
+    Some((md.dev(), md.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_f: &std::fs::File) -> Option<(u64, u64)> {
+    None
+}
+
 impl AuditLog {
     /// Open the log, creating the file and **durably publishing its name**
     /// before any destruction can be admitted.
@@ -215,11 +240,15 @@ impl AuditLog {
                 }
             }
         }
-        std::fs::OpenOptions::new()
+        let published = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .map_err(|e| io(path, e))?;
+        // Taken from the DESCRIPTOR, not by stat'ing the path afterwards: the
+        // point is to record the identity of the file this call published, and
+        // a second lookup by name could already be answering about another one.
+        let identity = file_identity(&published);
         if let Some(parent) = path.parent() {
             sync_dir(parent).map_err(|e| io(parent, e))?;
         }
@@ -245,6 +274,7 @@ impl AuditLog {
             path: path.to_path_buf(),
             halted: AtomicBool::new(false),
             gate: AsyncMutex::new(()),
+            identity,
         };
         if let Some(i) = unresolved.iter().find(|i| {
             matches!(
@@ -322,11 +352,29 @@ impl AuditLog {
     /// On failure the log **halts**: the caller cannot un-destroy the file, so
     /// the only remaining protection is to stop destroying more.
     pub fn append(&self, record: &AuditRecord) -> Result<()> {
+        // NOT `create(true)`. Recreating the file here silently undid what
+        // `open` exists to guarantee: the forensic history was already gone,
+        // the fresh directory entry was never fsynced the way `open` fsyncs
+        // one, and the append succeeded with `halted` still false — so the
+        // documented halt did not fire on the one condition it is for.
+        //
+        // A missing file now fails the open and halts through the same arm as
+        // any other write failure.
         let mut f = std::fs::OpenOptions::new()
-            .create(true)
             .append(true)
             .open(&self.path)
             .map_err(|e| self.halt(e.to_string()))?;
+        // And a file that is PRESENT but is not the one `open` published — the
+        // log rotated out from under a running daemon — is the same loss of
+        // history wearing the right name.
+        if let (Some(published), Some(now)) = (self.identity, file_identity(&f))
+            && published != now
+        {
+            return Err(self.halt(
+                "the audit log at this path is not the file this process published: it has                  been replaced or rotated, and the records written before it are no longer                  at the configured path"
+                    .to_string(),
+            ));
+        }
         f.write_all(record.to_line().as_bytes())
             .map_err(|e| self.halt(e.to_string()))?;
         f.sync_all().map_err(|e| self.halt(e.to_string()))?;
@@ -488,6 +536,57 @@ mod tests {
 
         let err = log.check_not_halted().unwrap_err();
         assert!(matches!(err, AuditError::Halted { .. }));
+    }
+
+    /// A vanished audit log halts; it is not quietly recreated.
+    ///
+    /// `append` used `create(true)`, so a log deleted or rotated after `open`
+    /// was replaced by an empty file: the append succeeded, `halted` stayed
+    /// false, the forensic history of every destruction so far was gone, and
+    /// the new directory entry was never fsynced the way `open` fsyncs one.
+    /// The one condition the halt is documented for was the one it missed.
+    #[test]
+    fn a_vanished_audit_log_halts_rather_than_being_recreated() {
+        let t = Tmp::new("vanished");
+        let p = t.0.join("gone.jsonl");
+        let log = AuditLog::open_with_no_unresolved_intents(&p).unwrap();
+        log.append(&record(1)).expect("the first append works");
+
+        std::fs::remove_file(&p).unwrap();
+        assert!(
+            log.append(&record(2)).is_err(),
+            "an audit log that is no longer at its path must not be recreated"
+        );
+        assert!(log.is_halted(), "and destruction must halt");
+        assert!(
+            !p.exists(),
+            "the halted append must not have left a fresh log behind, which \
+             would read as an intact history containing one record"
+        );
+    }
+
+    /// And a log REPLACED between opens is the same loss wearing the right
+    /// name: the path resolves, the file is writable, and everything written
+    /// before it is somewhere else.
+    #[test]
+    fn a_replaced_audit_log_halts() {
+        let t = Tmp::new("replaced");
+        let p = t.0.join("swapped.jsonl");
+        let log = AuditLog::open_with_no_unresolved_intents(&p).unwrap();
+        log.append(&record(1)).expect("the first append works");
+
+        // Rotated: the original moved aside and a new file put in its place.
+        std::fs::rename(&p, t.0.join("swapped.jsonl.1")).unwrap();
+        std::fs::write(&p, b"").unwrap();
+
+        let err = log
+            .append(&record(2))
+            .expect_err("a different file at the audit path must halt");
+        assert!(
+            err.to_string().contains("replaced or rotated"),
+            "the halt must say what happened: {err}"
+        );
+        assert!(log.is_halted());
     }
 
     #[test]

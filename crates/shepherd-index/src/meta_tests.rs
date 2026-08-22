@@ -728,3 +728,32 @@ fn concurrent_searches_return_identical_results_under_the_thread_ceiling() {
         "scan thread slots were not released"
     );
 }
+
+/// The calling thread is a scanner, and the ceiling has to count it.
+///
+/// `reserve` used to be handed `segments - 1` and to count only the workers it
+/// spawned — so the documented process-wide ceiling described half the
+/// scanners. The daemon admits 64 connections and every one of their threads
+/// scans its own chunk of the same arena, which on an N-core host meant up to N
+/// reserved workers plus 64 uncounted callers, against a bound that exists
+/// because of memory bandwidth and does not care which thread is reading.
+#[test]
+fn the_scan_ceiling_counts_the_calling_thread() {
+    // With the whole ceiling free, a search takes one slot per segment —
+    // `segments - 1` workers plus itself.
+    assert_eq!(slots_for(4, 0, 8), 4);
+
+    // Once the ceiling is reached, a search still takes its own slot and gets
+    // no workers. The alternative is refusing a thread that is going to scan
+    // anyway, which is how the count went wrong in the first place.
+    assert_eq!(slots_for(4, 8, 8), 1);
+    assert_eq!(slots_for(4, 100, 8), 1);
+
+    // And the partial case: three slots left, so the caller plus two workers.
+    assert_eq!(slots_for(8, 5, 8), 3);
+
+    // N concurrent single-segment searches on an N-core host is exactly N, not
+    // N plus N — which is the arithmetic the finding is about.
+    assert_eq!(slots_for(1, 0, 4), 1);
+    assert_eq!(slots_for(1, 3, 4), 1);
+}

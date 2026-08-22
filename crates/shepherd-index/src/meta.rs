@@ -406,30 +406,63 @@ fn max_scan_threads() -> usize {
     *MAX.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get))
 }
 
+/// How many slots a search takes, given what is already in flight.
+///
+/// Pure so the ceiling arithmetic is testable without touching the process-wide
+/// counter, which every concurrent search shares — a test that reserved against
+/// the real one would race the test that asserts slots are all handed back.
+///
+/// Never returns zero. The calling thread scans whichever way this comes out,
+/// so its slot is counted rather than gated; refusing it would only make the
+/// count wrong again.
+fn slots_for(segments: usize, in_flight: usize, ceiling: usize) -> usize {
+    segments
+        .max(1)
+        .min(ceiling.saturating_sub(in_flight))
+        .max(1)
+}
+
 /// Scan threads this search may spawn, released when it is done.
 struct ScanSlots(usize);
 
 impl ScanSlots {
-    /// Reserve up to `want` extra threads, taking whatever is left.
+    /// Reserve slots for a search of `segments` segments, the CALLING THREAD
+    /// INCLUDED.
+    ///
+    /// The caller scans too. Counting only the spawned workers made the ceiling
+    /// describe half the scanners: the daemon admits 64 connections and every
+    /// one of their threads scans its own chunk of the same arena, so an N-core
+    /// host ran up to N reserved workers plus 64 uncounted callers — and memory
+    /// bandwidth, which is what the ceiling is really about, does not care which
+    /// thread is reading.
+    ///
+    /// The caller's slot is taken unconditionally and can never be refused: it
+    /// is going to scan whatever this returns, and blocking it would turn a
+    /// bandwidth problem into a latency one while holding a connection slot. It
+    /// is *counted* rather than gated, which is what makes N concurrent searches
+    /// on an N-core host grant no extra workers at all instead of N each.
     ///
     /// `fetch_update` rather than a load followed by a store: two searches
     /// arriving together would otherwise both read the same headroom and both
     /// take it, which is the arithmetic the ceiling exists to prevent.
-    fn reserve(want: usize) -> Self {
-        let mut taken = 0;
+    fn reserve(segments: usize) -> Self {
+        let mut taken = 1;
+        let ceiling = max_scan_threads();
         let _ = SCAN_THREADS.fetch_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
             |in_flight| {
-                taken = want.min(max_scan_threads().saturating_sub(in_flight));
-                (taken > 0).then_some(in_flight + taken)
+                taken = slots_for(segments, in_flight, ceiling);
+                Some(in_flight + taken)
             },
         );
         Self(taken)
     }
 
+    /// Extra threads this search may spawn — the reservation less the caller's
+    /// own slot, which is not a thread to spawn.
     fn granted(&self) -> usize {
-        self.0
+        self.0.saturating_sub(1)
     }
 }
 
@@ -515,7 +548,7 @@ impl MetaIndex {
             // threads scans its segments on the calling thread, which is slower
             // and still correct. Blocking would turn a bandwidth problem into a
             // latency one and hold a connection slot while it did.
-            let slots = ScanSlots::reserve(self.segments.len().saturating_sub(1));
+            let slots = ScanSlots::reserve(self.segments.len());
             let groups = slots.granted() + 1;
             let per_group = self.segments.len().div_ceil(groups);
             std::thread::scope(|s| {

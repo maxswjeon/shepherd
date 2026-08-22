@@ -1193,6 +1193,16 @@ where
 /// sweep is allowed to delete.
 const PROBE_PREFIX: &str = "_shepherd/probe/";
 
+/// Probe objects the cleanup sweep will page through before giving up.
+///
+/// The cycle guard below catches a provider handing back a token it already
+/// issued; it cannot catch one that mints a FRESH token per page forever, and
+/// both the request loop and `seen` grow on every one. This sweep is documented
+/// as best-effort and runs inside `target.add`'s 60-second budget, so paging
+/// without a ceiling turns a cleanup that is allowed to fail into the thing
+/// that fails the registration.
+const MAX_PROBE_OBJECTS: usize = 10_000;
+
 /// How old a probe artifact must be before the sweep may reap it.
 ///
 /// A probe is a handful of round trips; anything still in flight is seconds
@@ -1267,16 +1277,35 @@ async fn sweep_probe_leftovers(adapter: &S3Adapter) {
     // Cycles, not just immediate echoes: `list_page` catches a token handed
     // straight back, and an alternating provider needs the caller's memory.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut examined: usize = 0;
     loop {
         match adapter.list(prefix, page.as_ref()).await {
             Ok(listing) => {
                 for key in &listing.keys {
+                    // BENEATH THE PROBE PREFIX, checked here rather than left to
+                    // `ControlKey::new`, whose guarantee is the broad
+                    // `_shepherd/` namespace and not `_shepherd/probe/`. The
+                    // comment that used to stand here claimed otherwise, and the
+                    // gap is not theoretical: `_shepherd/catalog/ptr-1-2-uuid.json`
+                    // is a control key, so it passed — and `probe_is_stale`
+                    // reads its `2` as a nanosecond timestamp, finds it ancient,
+                    // and the sweep deletes a replica-chain pointer.
+                    //
+                    // A provider that lists outside the prefix it was asked for
+                    // is the case this guards, and nothing outside that prefix
+                    // is this sweep's to delete.
+                    if !key.as_str().starts_with(PROBE_PREFIX) {
+                        tracing::warn!(
+                            prefix,
+                            key = key.as_str(),
+                            "the provider listed a key outside the prefix it was asked                              for; not deleting it"
+                        );
+                        continue;
+                    }
                     // `delete_system_object`, never `delete_object`: §4.1 rule 4
                     // makes `shepherd-tier::destroy` the sole caller of the
                     // latter, and this is a control object rather than a user's
-                    // bytes. `ControlKey::new` returning `None` would mean the
-                    // provider listed something outside the prefix it was
-                    // asked for, which is not ours to delete.
+                    // bytes.
                     let Some(control) = ControlKey::new(key.clone()) else {
                         continue;
                     };
@@ -1293,6 +1322,16 @@ async fn sweep_probe_leftovers(adapter: &S3Adapter) {
                             "could not delete a probe object left by an earlier run"
                         );
                     }
+                }
+                examined = examined.saturating_add(listing.keys.len());
+                if examined >= MAX_PROBE_OBJECTS {
+                    tracing::warn!(
+                        prefix,
+                        examined,
+                        "stopping the probe sweep at the {MAX_PROBE_OBJECTS}-object \
+                         ceiling; earlier runs' objects may remain"
+                    );
+                    break;
                 }
                 match listing.next {
                     Some(token) => {
@@ -1631,6 +1670,47 @@ pub async fn probe_multipart_checksum(cfg: &S3Config) -> StorageResult<ChecksumP
     let bucket = cfg.bucket.clone();
     let prober = S3RoundTrip { cfg: cfg.clone() };
     adopt_first_round_trip(&prober, &FULL_OBJECT_PREFERENCE, &endpoint, &bucket).await
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// The probe sweep's prefix guard is load-bearing, and `ControlKey` is not
+    /// it.
+    ///
+    /// `ControlKey::new` proves membership of the broad `_shepherd/` control
+    /// namespace, not of `_shepherd/probe/`. A provider that lists a key
+    /// outside the prefix it was asked for therefore got as far as
+    /// `probe_is_stale`, which reads a segment of that key as a nanosecond
+    /// timestamp — and a replica-chain pointer's `2` is very old indeed, so the
+    /// sweep deleted it.
+    #[test]
+    fn a_control_key_outside_the_probe_prefix_is_not_the_sweeps_to_delete() {
+        let pointer = "_shepherd/catalog/ptr-1-2-uuid.json";
+
+        // Both halves of the trap, asserted rather than described: it IS a
+        // valid control key, and it IS read as an ancient probe.
+        assert!(
+            ControlKey::new(ObjectKey::new(pointer)).is_some(),
+            "the reviewer's example must really pass the ControlKey check, or \
+             this test is pinning nothing"
+        );
+        let now = std::time::Duration::from_secs(60 * 60 * 24).as_nanos();
+        assert!(
+            probe_is_stale(pointer, now),
+            "and must really be read as stale, which is what made it deletable"
+        );
+
+        // The guard that stops it is the prefix, and only the prefix.
+        assert!(!pointer.starts_with(PROBE_PREFIX));
+
+        // A real probe object passes, so the guard is not simply refusing
+        // everything.
+        let probe = format!("{PROBE_PREFIX}checksum-crc32c-1-2");
+        assert!(probe.starts_with(PROBE_PREFIX));
+        assert!(probe_is_stale(&probe, now));
+    }
 }
 
 #[cfg(test)]
