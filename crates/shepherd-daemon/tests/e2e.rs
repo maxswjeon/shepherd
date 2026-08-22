@@ -992,6 +992,76 @@ fn a_root_retargeted_to_another_directory_refuses_to_scan() {
     );
 }
 
+/// A retargeted root must be refused at `root.add`, not stranded afterwards.
+///
+/// The soft `root.remove` keeps every file row, and re-adding the same path
+/// revives them. If the path was repointed at another directory on the same
+/// volume in between, the volume check has nothing to disagree with — so the
+/// revival succeeds, keeps the OLD `root_fs_id`, and hands back an ENABLED
+/// root whose every future scan is refused by the identity check. The user is
+/// left with a root that cannot be scanned and no command that says why.
+#[test]
+fn a_root_re_enrolled_after_being_retargeted_is_refused() {
+    let d = Daemon::start("retarget-readd");
+    let mut c = d.connect();
+    let real = d.dir.join("real");
+    let other = d.dir.join("other");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(real.join("mine.txt"), b"x").unwrap();
+
+    let link = d.dir.join("root");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let path = link.to_string_lossy().to_string();
+    let root_id = c.call(
+        "root.add",
+        serde_json::json!({ "path": path, "stub_mode": "delete" }),
+    )["root"]["root_id"]
+        .as_i64()
+        .expect("root_id");
+
+    // As in the scan-side test: a check that was never recorded would let this
+    // pass for the wrong reason.
+    let enrolled: Option<String> =
+        rusqlite::Connection::open(d.dir.join("state").join("catalog.db"))
+            .unwrap()
+            .query_row(
+                "SELECT root_fs_id FROM scan_root WHERE id = ?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(
+        enrolled.is_some(),
+        "the enrolled directory's identity must be recorded, or this test proves nothing"
+    );
+
+    // Soft removal: the catalog is deliberately retained.
+    c.call("root.remove", serde_json::json!({ "root_id": root_id }));
+
+    // Repointed while deregistered, at a sibling on the SAME filesystem.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+
+    let err = c.call_err(
+        "root.add",
+        serde_json::json!({ "path": path, "stub_mode": "delete" }),
+    );
+    assert!(
+        err.message.contains("different directory"),
+        "re-enrolling a retargeted path must be refused where the user can act on \
+         it, not on every scan afterwards: {}",
+        err.message
+    );
+
+    // And the refusal left the root deregistered rather than half-revived.
+    let roots = c.call("root.list", serde_json::json!({}))["roots"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(roots, 0, "a refused re-enrollment must not enable the root");
+}
+
 /// The skew case §4.3 calls the most common one, end to end.
 #[test]
 fn a_major_version_mismatch_is_rejected_with_both_versions_named() {
@@ -4900,7 +4970,7 @@ fn the_m1_demo_holds_at_a_million_files() {
     // rows, because the catalog contains exactly one distinct value. That is
     // not a gap in the test — it is a property of the catalog, and it is the
     // second witness to it: `state` having no producer is also why
-    // `count_custody_rows`'s `WHERE state IN ('stub','remote')` returns 0 here,
+    // `count_custody_rows`'s `CUSTODY_PREDICATE` returns 0 here,
     // which is a safety refusal this corpus cannot make fire. That the refusal
     // is *able* to fire is established away from the corpus, in
     // `dispatch::tests::the_custody_count_is_zero_before_tiering_and_non_zero_after`,

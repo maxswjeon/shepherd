@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::OptionalExtension;
-use shepherd_catalog::file_repo::{Enrollment, FileRepo};
+use shepherd_catalog::file_repo::{CUSTODY_PREDICATE, Enrollment, FileRepo};
 use shepherd_catalog::job_repo::JobClass;
 use shepherd_catalog::target_repo::TargetRepo;
 use shepherd_catalog::writer::CatalogWriter;
@@ -1585,7 +1585,7 @@ fn deny_any_component(
 #[cfg(test)]
 fn count_custody_rows(cat: &mut Catalog, root: RootId) -> Result<u64, CatalogError> {
     let n: i64 = cat.conn().query_row(
-        "SELECT COUNT(*) FROM file WHERE root_id = ?1 AND state IN ('stub', 'remote')",
+        &format!("SELECT COUNT(*) FROM file WHERE root_id = ?1 AND {CUSTODY_PREDICATE}"),
         rusqlite::params![root.get()],
         |r| r.get(0),
     )?;
@@ -1675,7 +1675,7 @@ enum RootRemoval {
 /// The refusal's predicate, against an open transaction.
 fn custody_count(tx: &rusqlite::Transaction<'_>, root: RootId) -> Result<u64, CatalogError> {
     let n: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM file WHERE root_id = ?1 AND state IN ('stub', 'remote')",
+        &format!("SELECT COUNT(*) FROM file WHERE root_id = ?1 AND {CUSTODY_PREDICATE}"),
         rusqlite::params![root.get()],
         |r| r.get(0),
     )?;
@@ -2306,6 +2306,44 @@ mod tests {
             2,
             "both custody states must be counted — this is what makes the zero above mean \
              `nothing is tiered` rather than `this query cannot see anything`"
+        );
+    }
+
+    /// A vanished stub is still custody.
+    ///
+    /// `sweep_absent` moves a stub whose file is gone to `missing` and records
+    /// `state_before_missing = 'stub'`, because the row still names the remote
+    /// object that placeholder stood for — that is the whole reason the column
+    /// exists. A predicate that reads only `state` sees a plain absent row and
+    /// lets `--forget-catalog` delete the only address of the remote copy
+    /// without ever demanding `--force`.
+    #[test]
+    fn the_custody_count_includes_a_stub_that_went_missing() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let root = seed(&mut cat, "/data", &["a.txt"]);
+
+        cat.conn_mut()
+            .execute(
+                "UPDATE file SET state = 'missing', state_before_missing = 'stub'
+                 WHERE rel_path = 'a.txt'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            count_custody_rows(&mut cat, root).unwrap(),
+            1,
+            "a missing former stub still holds the remote bytes' only address"
+        );
+        assert_eq!(
+            remove_root(&mut cat, root, true, false).unwrap(),
+            RootRemoval::RefusedCustody { custody: 1 },
+            "`--forget-catalog` must demand `--force` before discarding it"
+        );
+        assert_eq!(
+            file_count(&mut cat, root),
+            1,
+            "and the refusal must leave the row where it was"
         );
     }
 

@@ -14,6 +14,45 @@ use crate::atime::AtimeMode;
 use crate::identity::{PathCasePolicy, PathNormPolicy, norm_key};
 use crate::{Catalog, CatalogError, Result};
 
+/// The `file` rows whose deletion would discard the only address of bytes that
+/// live somewhere else.
+///
+/// One definition because there are three readers — the `root.remove --forget`
+/// refusal, the independent count its tests check it against, and the retained
+/// custody reported at re-enrollment — and three copies of a safety predicate
+/// is three chances for the refusal and the thing it protects to disagree.
+///
+/// `state IN ('stub','remote')` is the obvious half. The other half is a row
+/// that WAS custody and is `missing` now: `sweep_absent` records
+/// `state_before_missing` so a revival can restore the row rather than guess at
+/// it, and a dehydrate-mode stub that has vanished from disk still names the
+/// remote object it stood for. A predicate that reads only `state` sees an
+/// ordinary absent row there and lets `--forget-catalog` delete that address
+/// without ever asking for `--force`.
+///
+/// Written over both custody states rather than the one today's sweep can
+/// produce, because the rule is *was custody, still custody* — an enumeration
+/// tracking `sweep_absent`'s current selection would drift the moment it
+/// widens, and silently.
+///
+/// Fully parenthesized: it is dropped into a `WHERE` and into a `SUM(...)`.
+pub const CUSTODY_PREDICATE: &str = "(state IN ('stub','remote') \
+     OR (state = 'missing' AND state_before_missing IN ('stub','remote')))";
+
+/// The row a soft `root.remove` left behind, as `enroll_root` reads it.
+///
+/// Only the columns a revival has to *decide against*: the two policies whose
+/// stored values win, and the two identities the retained file rows were built
+/// under.
+struct RetainedRoot {
+    id: i64,
+    enabled: bool,
+    case_policy: String,
+    norm_policy: String,
+    volume_id: Option<String>,
+    fs_id: Option<String>,
+}
+
 /// A registered scan root, as far as identity is concerned.
 #[derive(Debug, Clone)]
 pub struct ScanRoot {
@@ -255,26 +294,35 @@ impl<'a> FileRepo<'a> {
         // writer actor (`CatalogWriter`) — this whole function runs inside one
         // of its closures. Splitting the lookup and the write across two
         // `Session::cat` calls would put a real TOCTOU window between them.
-        let existing: Option<(i64, bool, String, String, Option<String>)> = self
+        let existing = self
             .0
             .conn()
             .query_row(
-                "SELECT id, enabled, path_case_policy, path_norm_policy, volume_id
+                "SELECT id, enabled, path_case_policy, path_norm_policy, volume_id, root_fs_id
                  FROM scan_root WHERE path = ?1",
                 params![path],
                 |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get::<_, i64>(1)? != 0,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                    ))
+                    Ok(RetainedRoot {
+                        id: r.get(0)?,
+                        enabled: r.get::<_, i64>(1)? != 0,
+                        case_policy: r.get(2)?,
+                        norm_policy: r.get(3)?,
+                        volume_id: r.get(4)?,
+                        fs_id: r.get(5)?,
+                    })
                 },
             )
             .optional()?;
 
-        let Some((id, enabled, stored_case, stored_norm, stored_volume)) = existing else {
+        let Some(RetainedRoot {
+            id,
+            enabled,
+            case_policy: stored_case,
+            norm_policy: stored_norm,
+            volume_id: stored_volume,
+            fs_id: stored_fs_id,
+        }) = existing
+        else {
             return Ok(Enrollment::Created(self.insert_root(
                 path,
                 stub_mode,
@@ -330,6 +378,43 @@ impl<'a> FileRepo<'a> {
             )));
         }
 
+        // The same question one level down: the volume check establishes which
+        // FILESYSTEM the path is on, and a directory can be repointed at a
+        // sibling on that same filesystem without disturbing it — a root that
+        // is itself a symlink, or one reached through a symlinked ancestor.
+        //
+        // Refused HERE rather than left to the scan, even though `scan_exec`
+        // compares the same two values on every walk. A revival that keeps the
+        // stored identity and enables the root anyway hands back a root that
+        // is enabled and unscannable: every scan afterwards refuses, and the
+        // command that caused it has already returned success. The user can
+        // act on `root.add` refusing; they cannot act on a scan error for a
+        // decision made in a command that reported no problem.
+        //
+        // Compared as written, with no widening. `directory_identity` PREFIXES
+        // the form it emits when the volume has no id precisely so it cannot
+        // compare equal to a volume-qualified one, and inode numbers collide
+        // freely across filesystems — a root directory is inode 2 on most ext4
+        // volumes. A current identity of `None` refuses for the reason the
+        // volume branch above gives: unverifiable is not verified.
+        if let Some(stored) = stored_fs_id.as_deref()
+            && root_fs_id != Some(stored)
+        {
+            return Err(CatalogError::Invalid(format!(
+                "`{path}` was enrolled as {stored} and now resolves to {}: the path names a \
+                 different directory than the one whose catalog was retained. Reviving it \
+                 would revive {stored}'s file rows against another directory's contents. \
+                 Re-point the path at the directory this root was enrolled on, or drop the \
+                 retained rows with `shepctl root remove --forget-catalog` (add `--force` if \
+                 tiered files' custody rows are being discarded deliberately) and add the \
+                 root again",
+                match root_fs_id {
+                    Some(v) => v.to_string(),
+                    None => "no stable identity at all".to_string(),
+                }
+            )));
+        }
+
         let id = RootId::new(id);
         let patterns_json = serde_json::to_string(ignore_patterns).map_err(|e| {
             CatalogError::Invalid(format!("ignore patterns are not serializable as JSON: {e}"))
@@ -339,8 +424,14 @@ impl<'a> FileRepo<'a> {
             StubMode::Delete => "delete",
         };
         self.0.conn_mut().execute(
+            // `root_fs_id` is written, not preserved. Where one was stored the
+            // check above already proved the two agree, so this is a no-op;
+            // where none was, adopting the fresh one records an identity that
+            // nothing retained contradicts — and leaving the column NULL would
+            // mean the scan-time check stayed absent for the life of the root.
             "UPDATE scan_root SET enabled = 1, stub_mode = ?2, hosted_optin = ?3,
-                 ignore_patterns_json = ?4, volume_id = ?5, atime_mode = ?6
+                 ignore_patterns_json = ?4, volume_id = ?5, atime_mode = ?6,
+                 root_fs_id = ?7
              WHERE id = ?1",
             params![
                 id.get(),
@@ -348,13 +439,16 @@ impl<'a> FileRepo<'a> {
                 hosted_optin as i64,
                 patterns_json,
                 volume_id,
-                atime_mode.as_str()
+                atime_mode.as_str(),
+                root_fs_id
             ],
         )?;
 
         let (retained_files, retained_custody): (i64, i64) = self.0.conn().query_row(
-            "SELECT COUNT(*), COALESCE(SUM(state IN ('stub','remote')), 0)
-             FROM file WHERE root_id = ?1",
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM({CUSTODY_PREDICATE}), 0)
+                 FROM file WHERE root_id = ?1"
+            ),
             params![id.get()],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -485,8 +579,8 @@ impl<'a> FileRepo<'a> {
     /// The reason `file.state` nonetheless only ever holds `'local'` is
     /// separate and still open: **nothing in the tree writes `'stub'` or
     /// `'remote'`**, here or anywhere else, because tiering is Phase 2/3 work.
-    /// That is what makes `WHERE state IN ('stub','remote')` a filter over a
-    /// single-valued column, and it is not fixed by this statement.
+    /// That is what makes [`CUSTODY_PREDICATE`] a filter over a single-valued
+    /// column, and it is not fixed by this statement.
     ///
     /// # Concurrent scans of one root
     ///
