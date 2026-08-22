@@ -207,6 +207,23 @@ fn file_identity(_f: &std::fs::File) -> Option<(u64, u64)> {
     None
 }
 
+/// The same pair for a PATH rather than an open file.
+///
+/// The distinction is the whole point of having both: `file_identity` answers
+/// "which file did I open", and this answers "which file does the name resolve
+/// to now". A rotation is exactly the case where those two differ.
+#[cfg(unix)]
+fn path_identity(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(p).ok()?;
+    Some((md.dev(), md.ino()))
+}
+
+#[cfg(not(unix))]
+fn path_identity(_p: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 impl AuditLog {
     /// Open the log, creating the file and **durably publishing its name**
     /// before any destruction can be admitted.
@@ -377,13 +394,43 @@ impl AuditLog {
             && published != now
         {
             return Err(self.halt(
-                "the audit log at this path is not the file this process published: it has                  been replaced or rotated, and the records written before it are no longer                  at the configured path"
+                "the audit log at this path is not the file this process published: it has \
+                 been replaced or rotated, and the records written before it are no longer \
+                 at the configured path"
                     .to_string(),
             ));
         }
         f.write_all(record.to_line().as_bytes())
             .map_err(|e| self.halt(e.to_string()))?;
         f.sync_all().map_err(|e| self.halt(e.to_string()))?;
+
+        // DURABLE, AND STILL AT THE CONFIGURED PATH. The check above compares
+        // the descriptor this call opened; a rotation landing between that open
+        // and this write finds the comparison already passed, and the record is
+        // then fsynced into a file that no longer answers to the audit path.
+        // The append returned success, nothing halted, and the next destruction
+        // was admitted against a path whose history had moved.
+        //
+        // Asked AFTER the fsync, not before, and deliberately: the record is
+        // more useful written than withheld, and it lands in the file holding
+        // all of its predecessors. What must not happen is reporting that as an
+        // ordinary success — so the record is kept, and the log halts.
+        //
+        // This closes the window rather than narrowing it: any rotation, before
+        // or during, leaves the path naming a different file than the one this
+        // process published, and both checks compare against that same
+        // published identity.
+        if let Some(published) = self.identity
+            && path_identity(&self.path) != Some(published)
+        {
+            return Err(self.halt(
+                "the audit log was renamed or replaced while this record was being written. \
+                 The record is durable in the file this process opened, which still holds \
+                 the whole history — but that file is no longer at the configured path, so \
+                 nothing further may be destroyed against it"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -598,8 +645,14 @@ mod tests {
         let err = log
             .append(&record(2))
             .expect_err("a different file at the audit path must halt");
+        // On "replaced" rather than on either guard's exact wording. TWO
+        // guards can produce this — the descriptor comparison before the write
+        // and the path comparison after it — and which one fires depends on
+        // when the rename lands. Asserting one message would pass only for one
+        // interleaving and call the other a regression. Each was checked to
+        // halt on its own by disabling the other.
         assert!(
-            err.to_string().contains("replaced or rotated"),
+            err.to_string().contains("replaced"),
             "the halt must say what happened: {err}"
         );
         assert!(log.is_halted());

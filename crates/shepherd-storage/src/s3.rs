@@ -1230,6 +1230,31 @@ fn probe_is_stale(key: &str, now_nanos: u128) -> bool {
     now_nanos.saturating_sub(started) > PROBE_REAP_AFTER.as_nanos()
 }
 
+/// Whether the probe sweep may reap `key`.
+///
+/// ONE definition for both halves of the sweep. The object listing and the
+/// incomplete-upload listing ask the same two questions, and the first round of
+/// this fix answered them in the object half only — so an out-of-prefix
+/// multipart key whose penultimate `-` component parsed as an old timestamp was
+/// still aborted, interrupting an unrelated uploader.
+///
+/// The prefix is the question nothing else here answers. `ControlKey::new`
+/// proves the broad `_shepherd/` namespace, and `probe_is_stale` parses a key
+/// segment as a nanosecond timestamp without caring what the key is — so a
+/// provider that lists outside the prefix it was asked for otherwise reaches a
+/// delete or an abort on something that was never a probe.
+fn is_reapable_probe(key: &str, now_nanos: u128) -> bool {
+    if !key.starts_with(PROBE_PREFIX) {
+        tracing::warn!(
+            key,
+            prefix = PROBE_PREFIX,
+            "the provider listed a key outside the prefix it was asked for; leaving it alone"
+        );
+        return false;
+    }
+    probe_is_stale(key, now_nanos)
+}
+
 /// Abort and delete whatever earlier probes left under the probe prefix.
 ///
 /// Best-effort by construction: this is tidying, and a provider that will not
@@ -1249,11 +1274,12 @@ async fn sweep_probe_leftovers(adapter: &S3Adapter) {
     match adapter.list_incomplete_uploads(prefix).await {
         Ok(uploads) => {
             for u in uploads {
-                // Old enough to be nobody's live probe. Two registrations
-                // against one bucket run concurrently on separate connection
-                // threads, and aborting the other one's upload makes a healthy
-                // provider look broken.
-                if !probe_is_stale(u.key.as_str(), now_nanos) {
+                // Beneath the probe prefix, and old enough to be nobody's live
+                // probe. Two registrations against one bucket run concurrently
+                // on separate connection threads, and aborting the other one's
+                // upload makes a healthy provider look broken — aborting a key
+                // that was never a probe at all is worse.
+                if !is_reapable_probe(u.key.as_str(), now_nanos) {
                     continue;
                 }
                 if let Err(e) = adapter.abort_multipart(&u.key, &u.upload_id).await {
@@ -1294,12 +1320,7 @@ async fn sweep_probe_leftovers(adapter: &S3Adapter) {
                     // A provider that lists outside the prefix it was asked for
                     // is the case this guards, and nothing outside that prefix
                     // is this sweep's to delete.
-                    if !key.as_str().starts_with(PROBE_PREFIX) {
-                        tracing::warn!(
-                            prefix,
-                            key = key.as_str(),
-                            "the provider listed a key outside the prefix it was asked                              for; not deleting it"
-                        );
+                    if !is_reapable_probe(key.as_str(), now_nanos) {
                         continue;
                     }
                     // `delete_system_object`, never `delete_object`: §4.1 rule 4
@@ -1309,12 +1330,6 @@ async fn sweep_probe_leftovers(adapter: &S3Adapter) {
                     let Some(control) = ControlKey::new(key.clone()) else {
                         continue;
                     };
-                    // Same age gate as the uploads above: a concurrent probe's
-                    // object deleted just before its own HEAD fails a
-                    // registration that had nothing wrong with it.
-                    if !probe_is_stale(key.as_str(), now_nanos) {
-                        continue;
-                    }
                     if let Err(e) = adapter.delete_system_object(&control).await {
                         tracing::warn!(
                             key = key.as_str(),
