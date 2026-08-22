@@ -511,7 +511,20 @@ impl Executor for ScanExecutor {
         //
         // Immediately before the commit, so what it establishes is still true
         // of the rows about to be written.
-        if present
+        //
+        // RE-PROBED, rather than trusting the observation from before the walk.
+        // `present` was sampled once, at the top, and every check keys off it —
+        // so a root that was ABSENT then and appeared before `walk` opened it
+        // kept `present == false` for the whole attempt. The volume check, both
+        // identity checks and the device comparison were all skipped, and a
+        // successful walk of the newly-appeared tree went on to be committed
+        // and to sweep the enrolled tree's rows as missing, with nothing having
+        // established anything at all.
+        let present_after = std::fs::symlink_metadata(&path).is_ok();
+        if let Some(reason) = appearance_refusal(rid, &root.path, present, present_after) {
+            return Err(reason);
+        }
+        if present_after
             && let Some(enrolled) = root.root_fs_id.as_deref()
             && let Some(seen) = current_root_identity(&path, root.volume_id.as_deref())
             && enrolled != seen
@@ -1075,6 +1088,33 @@ fn device_of(path: &std::path::Path) -> Option<u64> {
 /// Unverifiable is not verified. The direction is the same one PM-3 takes for
 /// an unreadable root: absence of evidence about a destructive precondition is
 /// a refusal, never a pass.
+/// A root that was absent before the walk and is there afterwards.
+///
+/// Refused, because NOTHING about it was checked: every pre-walk gate — the
+/// volume comparison, the directory identity, the device sample — is skipped
+/// when the path does not resolve, on the reasoning that a deleted root has no
+/// identity to report and the walk's own unreadable-root refusal says something
+/// truer. That reasoning holds only while the path stays absent. Once it
+/// appears, the walk can succeed against a tree that no gate ever saw, and
+/// committing it would mix that tree into the retained catalog and sweep the
+/// enrolled tree's rows as missing.
+///
+/// Only that direction. A root present before and gone after was verified while
+/// it was there, and its walk describes what was on disk at the time — which is
+/// as true as any scan's output ever is.
+fn appearance_refusal(
+    root_id: RootId,
+    path: &str,
+    present_before: bool,
+    present_after: bool,
+) -> Option<String> {
+    (!present_before && present_after).then(|| {
+        format!(
+            "root {root_id} ({path}) was not there when this scan started and is now, so              none of the checks that establish which filesystem and directory it is were              able to run. Nothing has been committed — re-run the scan now that the path              resolves"
+        )
+    })
+}
+
 fn volume_refusal(
     root_id: RootId,
     path: &str,
@@ -1140,6 +1180,38 @@ mod tests {
     /// is a different reason: identical identities are the ordinary case; a
     /// root with no recorded identity has nothing to disagree with; and a
     /// platform that cannot answer must not have every scan refused for it.
+    #[test]
+    fn a_root_that_appears_during_the_walk_refuses_to_commit() {
+        let id = RootId::new(7);
+
+        let refusal = appearance_refusal(id, "/data", false, true)
+            .expect("a root nothing checked must not be committed");
+        assert!(
+            refusal.contains("was not there when this scan started"),
+            "the refusal must say why nothing was verified: {refusal}"
+        );
+
+        // The three that must NOT refuse, which is what stops the guard above
+        // being satisfied by a function that always refuses.
+        assert_eq!(
+            appearance_refusal(id, "/data", true, true),
+            None,
+            "a root present throughout is the ordinary case"
+        );
+        assert_eq!(
+            appearance_refusal(id, "/data", false, false),
+            None,
+            "a root absent throughout is the walk's own unreadable-root refusal \
+             to report, not this one's"
+        );
+        assert_eq!(
+            appearance_refusal(id, "/data", true, false),
+            None,
+            "a root verified while it was there, then deleted, produced a walk \
+             that describes what was on disk at the time"
+        );
+    }
+
     #[test]
     fn a_volume_that_disagrees_with_the_enrolled_one_refuses_the_scan() {
         let id = RootId::new(7);

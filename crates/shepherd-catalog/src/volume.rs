@@ -102,6 +102,29 @@ pub fn fs_id(path: &Path, volume_id: &str) -> Result<FsId> {
 /// Only the unqualified form degrades. Where a volume id is known it is what
 /// distinguishes filesystems, and a mount root is perfectly identifiable.
 ///
+/// # The residual case, stated rather than left to be discovered
+///
+/// A DESCENDANT of a no-id filesystem still gets an identity, and an inode
+/// cannot prove the filesystem stayed the same at any depth: replace the mount
+/// at an ancestor with another no-id filesystem whose directory at the same
+/// relative path reuses the inode, and the two compare equal. That is real and
+/// it is deliberate, because of what the callers do with the answer.
+///
+/// **Every consumer uses this as a refusal oracle, never as an authorization.**
+/// The scan's two checks and `enroll_root` all refuse on *mismatch*; a match is
+/// treated exactly as an absent identity is — nothing is granted by it. So the
+/// match direction carries no information and never has to; only the mismatch
+/// direction does. A collision therefore degrades to the no-identity baseline,
+/// which is precisely what returning `None` here would impose on every no-id
+/// filesystem unconditionally — and in the replacement case above the inodes
+/// usually DIFFER, where the mismatch is caught today and would not be then.
+///
+/// The cost of keeping it, since it is a real one: a no-id filesystem that
+/// does not keep inodes stable across a remount (some FUSE and network mounts)
+/// yields a false *refusal* after remounting. That is the safe direction, it is
+/// loud, and `root.add` documents the way back — the same trade `fs_id` already
+/// makes for every file row on such a filesystem.
+///
 /// `None` off unix, and where the directory cannot be stat'd. That is the same
 /// posture `fs_id` takes — Windows needs `FILE_ID_INFO` and that lands with the
 /// rest of the platform in Phase 3 — so a caller gets "unknown", never a wrong
@@ -814,6 +837,32 @@ mod identity_tests {
             id.is_some_and(|s| s.starts_with("ino-only:")),
             "a directory inside a filesystem is distinct within it, which is exactly \
              what this form is for"
+        );
+    }
+
+    /// A descendant of a no-id filesystem still gets one, deliberately.
+    ///
+    /// An inode cannot prove the filesystem stayed the same at any depth, so
+    /// this value can collide across a replacement mounted at an ancestor. It
+    /// is kept because every consumer refuses on MISMATCH and grants nothing on
+    /// a match: a collision degrades to the no-identity baseline, while the
+    /// mismatches — which is what an ancestor replacement usually produces —
+    /// are caught. Returning `None` here would impose that baseline on every
+    /// no-id filesystem unconditionally.
+    ///
+    /// Pinned so the behaviour reads as a decision rather than an oversight.
+    #[test]
+    fn a_directory_below_a_mount_root_still_has_an_unqualified_identity() {
+        let dir = std::env::temp_dir()
+            .join(format!("shepherd-depth-{}", std::process::id()))
+            .join("nested");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = directory_identity(&dir, None);
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+        assert!(
+            id.is_some_and(|s| s.starts_with("ino-only:")),
+            "the depth of a directory is not what makes its inode meaningful; \
+             its being distinct WITHIN the filesystem is"
         );
     }
 
