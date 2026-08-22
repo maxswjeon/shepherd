@@ -127,9 +127,15 @@ pub struct AuditLog {
     ///
     /// `append` reopens by path — it does not hold a descriptor — so without
     /// this it cannot tell the published file from a different one that has
-    /// taken its name. `None` off unix, where the pair is not available; the
-    /// missing-file half of the check works there regardless, because `append`
-    /// no longer creates.
+    /// taken its name.
+    ///
+    /// `None` off unix, and the consequence is worth stating rather than
+    /// leaving to be discovered: **on Windows a rotated or replaced log is not
+    /// detected**, because the equivalent identity sits behind an unstable
+    /// `std` feature and reaching it means a platform dependency — Phase 3's,
+    /// with the rest of Windows durability that `sync_dir` already defers. The
+    /// vanished-file half holds on every platform, since `append` no longer
+    /// creates.
     identity: Option<(u64, u64)>,
 }
 
@@ -568,6 +574,16 @@ mod tests {
     /// And a log REPLACED between opens is the same loss wearing the right
     /// name: the path resolves, the file is writable, and everything written
     /// before it is somewhere else.
+    ///
+    /// Unix only, because the detection is. `file_identity` needs `(dev, ino)`,
+    /// and the Windows equivalent — `GetFileInformationByHandle`'s volume
+    /// serial and file index — is behind an unstable `std` feature, so reaching
+    /// it means a platform dependency. That belongs with the rest of Windows
+    /// durability in Phase 3, alongside `sync_dir`, which already does nothing
+    /// there for the same reason. The VANISHED half is caught on every
+    /// platform: `append` no longer creates, so a missing file simply fails to
+    /// open.
+    #[cfg(unix)]
     #[test]
     fn a_replaced_audit_log_halts() {
         let t = Tmp::new("replaced");
