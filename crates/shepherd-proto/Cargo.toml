@@ -1,0 +1,23 @@
+[package]
+name = "shepherd-proto"
+description = "IPC wire types and the method table: the single source of truth for the JSON-RPC surface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# §4.1 dependency rule 1: this crate depends on nothing internal. Enforced by
+# `cargo xtask check-deps`. That is not incidental tidiness — it is what keeps
+# the *wire* contract able to evolve separately from the *domain* model. If
+# `shepherd-core::FileId` appeared in a request type, a domain refactor would
+# silently become a wire-breaking change. Wire types here are therefore plain
+# scalars, strings and proto-local enums, converted at the daemon boundary.
+[dependencies]
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

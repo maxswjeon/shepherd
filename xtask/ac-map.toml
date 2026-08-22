@@ -1,0 +1,2838 @@
+# AC -> machinery mapping consumed by `cargo xtask gate --audit` (§9 rule 6).
+#
+# PROVENANCE, stated plainly because §9 rule 6 exists to stop this being
+# misrepresented: the rows below were transcribed BY HAND from the plan's
+# Appendix (`Exercises (primary)` column) and §6's per-phase creates-lists.
+# They are not tool output. What IS tool output is the audit that consumes them:
+# `xtask gate --audit` re-derives the owned-too-early invariant from this file
+# on every CI run.
+#
+# The Appendix says its own `Exercises` column is "abbreviated to the primary
+# crate" and that "the full mapping lives in xtask/ac-map.toml". This file is
+# therefore SEEDED from that abbreviated column and enriched to module
+# granularity only where §6 splits a crate across phases — which it does for
+# shepherd-rules (match->1, engine/preview/delete_policy->2, suggest->5),
+# shepherd-placeholder (provider/delete_mode/mock->2, cfapi/fileprovider->3),
+# shepherd-jobs (queue/worker->1, cron/catchup/gate/adaptive->4),
+# shepherd-index (meta->1, ann/hybrid/rrf->5) and shepherd-storage
+# (adapter/s3/multipart/transfer_session/replica->2, azure/graph/drive/nas->6).
+# Without that split the invariant would pass vacuously for exactly the ACs
+# whose mis-assignment two independent critics found.
+#
+# Further module-level enrichment is owned by the phase that creates the module:
+# when a phase lands machinery, it adds the entry here in the same change.
+
+phase_order = ["0a", "0b", "0c", "0d", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+expected_ac_count = 65
+
+# ---------------------------------------------------------------------------
+# CLOSED — `gate --phase 1` PASSED while Phase 1 was NOT done.
+# ---------------------------------------------------------------------------
+#
+# Kept because the shape of the defect is worth more than the fix. Only TWO ACs
+# carried `owning_gate = "1"` (AC-13, AC-56); both were properly backed by
+# evidence that ran, so `gate --phase 1` reported PASS. §9's Phase 1 row demands
+# ten further things — both M1 legs, AC-54's CI check, the identity layer,
+# `atime_mode` on three platforms, the job-queue core, catalog write discipline,
+# and daemon installation on Linux and macOS — and **none of them was encoded
+# here, so the gate could not ask for them.** Nothing lied. The gate answered
+# the question it was given, and the question was a proper subset of §9's.
+#
+# This was the vacuous pass `gate --audit`'s own closing NOTE says it cannot
+# catch: it detects owned-too-early only, and "an AC owned late enough to
+# compile but too early to be non-trivial" was left as a human review property.
+# The limit was reached in practice, at Phase 1.
+#
+# WHAT CHANGED
+#
+# 1. Every clause of §9's Phase 1 row is now encoded — as `[[guard]]` rows
+#    (§9's prose demands carry no AC number, and the numbered AC-1..AC-65 set is
+#    fixed by the Appendix, which `gate --audit` enforces exactly-once) and as
+#    `[[phase]]` requirement rows that quote §9 verbatim.
+# 2. `xtask/src/phase_completeness.rs` reconciles this file against §9's gate
+#    table on every `gate --audit`, and `gate --phase <id>` now FAILS on any
+#    clause of its own §9 row that nothing here claims. A phase can no longer
+#    be under-specified silently: it can only be under-specified loudly.
+# 3. Phase 0 had no gate at all — §9 names `gate --phase 0ab`, which matched no
+#    id here, so `--phase 0a` exited 2. The `[alias]` table below joins §9's
+#    compound gate ids to this file's atomic phases, and 0a/0b/0c/0d now own
+#    guards. Several are RED, which is the correct report.
+#
+# The result is that `gate --phase 1` is now RED and says why. That is the
+# outcome: a gate that reports the phase unfinished is worth more than one that
+# reports it finished on a subset nobody chose deliberately.
+
+# ---------------------------------------------------------------------------
+# [alias] — §9's gate command ids -> the phases in `phase_order` they cover.
+# ---------------------------------------------------------------------------
+#
+# §9's table names `xtask gate --phase 0ab`, `--phase 0cd` and, for Phase 9,
+# `xtask gate --release`. None of the three matched an id here, so three of §9's
+# eleven gate commands could not be run at all — and the two Phase-0 ones failed
+# with "no acceptance criteria are owned by phase `0a`", which is the gate
+# correctly refusing to report a vacuous pass over an empty set. That refusal is
+# how this was found.
+#
+# The join lives here rather than in `phase_order` because `gate --audit`'s
+# owned-no-earlier-than invariant needs a TOTAL ORDER over phases, and `0ab` has
+# no position in one: it is not after `0a` and not before `0b`, it *is* both.
+# Aliasing keeps the ordering exact and makes every command §9 names runnable.
+[alias]
+"0ab" = ["0a", "0b"]
+"0cd" = ["0c", "0d"]
+"release" = ["9"]
+
+# ---------------------------------------------------------------------------
+# [machinery] — key -> the phase whose §6 creates-list produces it.
+# ---------------------------------------------------------------------------
+[machinery]
+# Phase 0a
+"shepherd-core" = "0a"
+"shepherd-obs" = "0a"
+"xtask::check_deps" = "0a"
+"xtask::claim_ledger" = "0a"
+"xtask::gate_audit" = "0a"
+"ci" = "0a"
+# Landed later than 0a but attributed to it: §6's 0a creates-list is the
+# verification-tooling lane ("xtask/ — specifically the deliverables §9 recast
+# those claims as"), and these are that lane. Attributing them to the phase that
+# happened to write them would make every Phase-0 guard citing them
+# owned-too-early, which would be the audit reporting a filing decision as an
+# ordering defect.
+"xtask::gate_phase" = "0a"
+"xtask::phase_completeness" = "0a"
+"xtask::evidence_artifacts" = "0a"
+
+# Phase 0b
+"shepherd-bench" = "0b"
+
+# Phase 0c
+"spikes/windows-syncroot" = "0c"
+"spikes/macos-fileprovider" = "0c"
+
+# Phase 0d
+"fixtures/corpus-10m" = "0d"
+"signing-identities" = "0d"
+
+# Phase 1
+"shepherd-catalog::schema" = "1"
+"shepherd-catalog::migrate" = "1"
+"shepherd-catalog::file_repo" = "1"
+"shepherd-catalog::target_repo" = "1"
+"shepherd-catalog::job_repo" = "1"
+"shepherd-catalog::intent" = "1"
+"shepherd-catalog::identity" = "1"
+# Landed with T3. §4.9 splits identity across key derivation + path policy
+# (identity.rs), stable volume identity (volume.rs) and §4.12's atime fidelity
+# (atime.rs); they are separate machinery because different ACs exercise them.
+"shepherd-catalog::volume" = "1"
+"shepherd-catalog::atime" = "1"
+"shepherd-scan::walk" = "1"
+"shepherd-scan::denylist" = "1"
+"shepherd-scan::ignore" = "1"
+"shepherd-scan::floors" = "1"
+"shepherd-scan::hash" = "1"
+"shepherd-index::meta" = "1"
+"shepherd-proto" = "1"
+"xtask::codegen" = "1"
+"shepherd-daemon" = "1"
+"shepherd-daemon::service" = "1"
+"shepherd-cli" = "1"
+"shepherd-secrets" = "1"
+"shepherd-rules::match" = "1"
+"shepherd-jobs::queue" = "1"
+"shepherd-jobs::worker" = "1"
+
+# Phase 2
+"shepherd-storage::adapter" = "2"
+"shepherd-storage::s3" = "2"
+"shepherd-storage::multipart" = "2"
+"shepherd-storage::transfer_session" = "2"
+"shepherd-storage::replica_bundle" = "2"
+"shepherd-storage::replica_chain" = "2"
+"shepherd-rules::engine" = "2"
+"shepherd-rules::preview" = "2"
+"shepherd-rules::delete_policy" = "2"
+"shepherd-placeholder::provider" = "2"
+"shepherd-placeholder::delete_mode" = "2"
+"shepherd-placeholder::mock" = "2"
+"shepherd-tier::plan" = "2"
+"shepherd-tier::upload" = "2"
+"shepherd-tier::verify" = "2"
+"shepherd-tier::revalidate" = "2"
+"shepherd-tier::destroy" = "2"
+"shepherd-tier::discard" = "2"
+"shepherd-tier::breaker" = "2"
+"shepherd-tier::restore" = "2"
+"shepherd-tier::audit" = "2"
+"shepherd-tier::fidelity" = "2"
+"shepherd-tier::serialize" = "2"
+"tests/docker-compose" = "2"
+
+# Phase 3
+"shepherd-placeholder::cfapi" = "3"
+"shepherd-placeholder::fileprovider" = "3"
+"platform/windows-package" = "3"
+"platform/macos-fileprovider" = "3"
+
+# Phase 4
+"shepherd-watch" = "4"
+"shepherd-watch::cursor" = "4"
+"shepherd-watch::overflow" = "4"
+"shepherd-usnhelper" = "4"
+"shepherd-jobs::cron" = "4"
+"shepherd-jobs::catchup" = "4"
+"shepherd-jobs::gate" = "4"
+"shepherd-jobs::adaptive" = "4"
+"shepherd-net::governor" = "4"
+"shepherd-net::metered" = "4"
+
+# Phase 5
+"shepherd-extract" = "5"
+"shepherd-infer" = "5"
+"shepherd-index::ann" = "5"
+"shepherd-index::hybrid" = "5"
+"shepherd-index::rrf" = "5"
+"shepherd-rules::suggest" = "5"
+
+# Phase 6
+"shepherd-storage::azure" = "6"
+"shepherd-storage::graph" = "6"
+"shepherd-storage::drive" = "6"
+"shepherd-storage::nas" = "6"
+"shepherd-storage::replica_snapshot" = "6"
+"shepherd-net::tailscale" = "6"
+"sidecar/tsnet" = "6"
+
+# Phase 7
+"shepherd-plugin::host" = "7"
+"shepherd-plugin::caps" = "7"
+"shepherd-plugin::http_gate" = "7"
+"shepherd-plugin::storage_plugin" = "7"
+"shepherd-plugin::model_plugin" = "7"
+
+# Phase 8
+"ui" = "8"
+
+# Phase 9
+"tests/e2e" = "9"
+"packaging" = "9"
+
+# ---------------------------------------------------------------------------
+# [[ac]] — one row per acceptance criterion. `owning_gate` is the gate that
+# FAILS if the AC fails (Appendix: "Every AC names exactly one owning gate").
+# ---------------------------------------------------------------------------
+
+[[ac]]
+id = "AC-1"
+owning_gate = "2"
+exercises = ["shepherd-tier::destroy", "shepherd-tier::verify", "shepherd-storage::s3"]
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::the_happy_path_destroys_and_audits"
+proves = "destruction happens only after a verified remote copy, and is audited"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "m2_round_trip_mechanism_a_versioned"
+ignored = true
+requires_env = "SHEPHERD_MINIO_ENDPOINT"
+proves = "AC-1's full remote re-read against real MinIO before any destruction"
+
+[[ac.evidence]]
+package = "shepherd-storage"
+test = "s3::probe_tests::two_probes_of_one_algorithm_do_not_share_an_object_key"
+proves = """
+two concurrent `target.add` probes used the SAME fixed per-algorithm
+object key, so one probe's cleanup DELETE could land between another's
+`complete_multipart` and its HEAD — and a missing checksum reads as
+`the provider does not support this algorithm`, a PERMANENT negative minted by a
+transient race. Round 2 fixed the neighbouring version of this (an auth failure
+recorded as non-support); same principle.
+
+Per-invocation nonce `{pid}-{nanos}-{seq}`, matching the discipline
+`identity.rs` and `atime.rs` now use for their own probes. The `{seq}` counter
+is there because exclusive-create was declined — see below — so the name must
+carry the whole guarantee, and a probability is not a guarantee.
+"""
+
+[[ac.evidence]]
+package = "shepherd-storage"
+test = "concurrent_registration_probes_do_not_race_into_a_false_negative"
+ignored = true
+requires_env = "SHEPHERD_MINIO_ENDPOINT"
+proves = """
+the race exercised against a REAL provider, and checked against an
+UNCONTENDED BASELINE rather than against the other probes — two probes that both
+raced into `adopted: none` would agree with each other perfectly, which is the
+trap. Pre-fix, contended runs recorded MinIO — which does support CRC64NVME — as
+`rejected at head`, degrading to CRC32C.
+
+HONESTLY CHARACTERISED: under the pinned-nonce mutation this dies 4 runs in 5.
+It is a probabilistic detector of a timing window, not a deterministic guard —
+the deterministic guarantee is the unit test above, and this test's job is
+proving the window is real rather than theoretical.
+
+DECLINED: `IfAbsent`/exclusive-create, which needs `conditional_create` — this
+probe's whole job is measuring ARBITRARY S3-compatibles, and a registration
+failing over an unrelated precondition feature reports the wrong fact about the
+provider. The catalog probes' motivation does not transfer either: those write
+into a USER's directory where a collision hits real data, while
+`_shepherd/probe/` is Shepherd's own namespace.
+
+NEW TRADEOFF, RECORDED: cross-probe cleanup was what tidied an object left by a
+probe killed between completion and DELETE. That tidying WAS the cross-probe
+deletion being removed, so an orphan now survives until something sweeps the
+prefix — one ~10 MiB object per crashed probe, a storage cost not a correctness
+one.
+"""
+
+[[ac]]
+id = "AC-2"
+owning_gate = "2"
+exercises = ["shepherd-storage::multipart", "shepherd-storage::transfer_session", "shepherd-jobs::queue"]
+note = "the required 50 GB artifact is produced in the owning gate, not deferred to nightly — and as of the first evidence row below, it is. The removed `evidence_missing` said SIZE ONLY and named a HARDWARE PREREQUISITE (not producible at ~19 GiB free against a ~60 GiB requirement); that was resolved by moving the object and MinIO's erasure parity onto external storage (tests/docker-compose.nas.yml), which is worth recording because the gap was closed by changing where the bytes live rather than by changing what is asserted. Every load-bearing statement is in a `proves` line below rather than here, because `gate --phase` renders those and does not render this."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "a_fifty_gb_upload_killed_mid_flight_resumes_without_resending_verified_parts"
+ignored = true
+requires_env = "SHEPHERD_MINIO_ENDPOINT"
+proves = "§9's artifact, at full size: a real 50 GB object uploaded to MinIO in 746 parts, SIGKILLed once AT LEAST 186 parts are durably acknowledged, then resumed by a THIRD process opening its own database and its own client. The wait status is asserted to be SIGNAL 9 WITH NO EXIT CODE, so the boundary is a real process death rather than a dropped in-process handle — `resume` cannot quietly become `restart after a graceful shutdown`. The quantities are asserted as EQUALITIES, not as `> 0`: bytes_skipped equals a computed value — 186 x 64 MiB = 12,482,248,704 B, parts_sent + acked_before equals the persisted plan.part_count, and plan.part_size is checked against the persisted session so a size that never reached PartPlan::new would surface as 16 MiB and 2 981 parts instead of passing. Its in-run controls make both comparisons load-bearing at scale — an empty listing skips 0 B, and corrupting ONE part's ETag, or separately its length, moves the skip total down by exactly 67 108 864 B, one 64 MiB part, and no further. Prior state cannot reach it by construction: the session dir is PID-scoped and wiped BEFORE creation, so each run mints a fresh upload_id and `list_parts` cannot see an earlier run's parts even though the content-addressed key is identical every time. SCOPE: the kill lands at one point, a quarter of the object. A resume path correct at 25% and wrong at the first or last part would pass exactly as this does — a statement of what a single kill point can support, not a suspicion of a defect."
+
+[[ac.evidence]]
+package = "shepherd-storage"
+test = "multipart::tests::a_changed_etag_or_size_forces_a_resend"
+proves = "WHAT `VERIFIED` MEANS in AC-2's `without re-sending verified parts`, which a reader will otherwise take to mean Shepherd re-checked the bytes. A part is skipped only on three-way agreement — part number, ETag AND length — and this asserts both non-trivial conjuncts in the resend direction: a different token forces Send, and the SAME token with a length one byte short also forces Send. The ETag is the token the provider returned at upload, checkpointed durably and compared against what `list_parts` reports now; it is never recomputed from the local file, so the guarantee is that the provider is still consistent with its own receipt. Note that PartCheckpoint DOES carry a `local_blake3` and the predicate deliberately does not consult it — using it would mean re-reading 64 MiB per part, which is the cost resume exists to avoid. Content is re-read and hashed by AC-1's `m2_round_trip_mechanism_a_versioned`; this row is about the resume decision, not about content verification. Residual, a boundary rather than a defect: the property rests on the provider deriving its part ETag from the stored bytes and on MD5's collision resistance — irrelevant to a resume threat model, where nobody is crafting a colliding part to make Shepherd skip an upload."
+
+[[ac.evidence]]
+package = "shepherd-storage"
+test = "multipart::tests::an_empty_provider_listing_resends_everything"
+proves = "the fail-closed direction: when the provider reports no parts, every part is Send and bytes_skipped is 0 — the unit-scale twin of the 50 GB empty-listing control, and the case that matters because a session can expire while the local checkpoints survive. The other fail-closed half is in the source rather than a test: an ABSENT checkpoint ETag hits `continue` — no skip — with the reason stated as `the durable record does not prove the provider holds our bytes`."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "session_store::tests::a_killed_upload_resumes_from_disk_without_resending_verified_parts"
+proves = "the same mechanism at unit scale, kept deliberately: the acknowledged-part count survives a process boundary and reconcile_parts skips exactly that many, with bytes_skipped > 0. It runs in seconds with no MinIO and no scratch disk, so when the 50 GB legs cannot run this still asserts a property rather than nothing. An AC whose only evidence needs a 46-minute run and 110 GB of scratch is an AC that silently stops being checked."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "session_store::tests::a_session_round_trips_through_a_real_file"
+proves = "the session survives a process boundary at all: a durable store rather than MemStore, which is what was absent before 185598b."
+
+[[ac]]
+id = "AC-3"
+owning_gate = "3"
+exercises = ["shepherd-rules::delete_policy", "shepherd-tier::discard", "shepherd-placeholder::cfapi", "shepherd-placeholder::fileprovider"]
+note = "policy engine + breaker leg at 2 via MockPlaceholderProvider; real-stub trigger at 3"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "delete_policy::tests::an_elapsed_window_belonging_to_another_file_authorizes_nothing"
+proves = """
+a deferral authorizes only its OWN destruction. Pre-fix, an expired
+window was read for its status before anything compared whose window it was, so
+file 2's elapsed window permitted file 1's sole-copy destruction — the same
+two-sides-disagree-about-identity defect as the destroy lock keyed on a
+synthesized <dev>:<ino>. The refusal carries the OFFENDING record's identity,
+because that is what names the wiring mistake.
+"""
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "delete_policy::tests::an_elapsed_window_for_another_target_authorizes_nothing"
+proves = "`target` is independently load-bearing — dropping that one comparison kills this test and nothing else. A test varying only `file` cannot tell you the other two fields are checked"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "delete_policy::tests::an_elapsed_local_unlink_window_does_not_authorize_a_remote_discard"
+proves = "`kind` is independently load-bearing, and is compared by exhaustive match rather than `== Remote`, so a variant added later is a compile error to classify instead of a silent widening"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "delete_policy::tests::a_zero_window_does_not_read_another_files_deferral_either"
+proves = "the sibling path, fixed at the same time rather than left for the next round: `cancelled_at` is a status too, so reading another row's is the same mistake pointed the other way. Fixing only the branch the finding named would have left a hole of exactly the shape being closed"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "delete_policy::tests::the_files_own_elapsed_window_still_authorizes_it"
+proves = "the acceptance direction. Mutating the identity check to always-false takes seven tests with it, including the whole pre-existing deferral-semantics suite — so `never authorize` cannot masquerade as a fix"
+
+[[ac]]
+id = "AC-4"
+owning_gate = "3"
+exercises = ["shepherd-placeholder::cfapi", "shepherd-placeholder::fileprovider", "shepherd-catalog::file_repo"]
+note = "moved from 2 — Phase 2 (Linux delete-mode) has no stubs to rename"
+
+[[ac]]
+id = "AC-5"
+owning_gate = "2"
+exercises = ["shepherd-tier::restore", "shepherd-tier::fidelity"]
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "restore::tests::a_restore_reproduces_bytes_mtime_and_mode_on_a_real_filesystem"
+proves = "restore returns the bytes"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "m2_round_trip_mechanism_b_content_addressed"
+ignored = true
+requires_env = "SHEPHERD_MINIO_ENDPOINT"
+proves = "byte-identical restore over a real round trip, asserted by hash and by path"
+
+[[ac]]
+id = "AC-6"
+owning_gate = "2"
+exercises = ["shepherd-catalog::schema", "shepherd-storage::replica_bundle", "shepherd-tier::destroy"]
+note = "moved from 1 — Phase 1 had no tiering, so it could not exercise remote-only custody state"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "all_local_state_is_dropped_and_rebuilt_from_the_filesystem_plus_the_bundle"
+proves = "P1's restated custody invariant: after tiering, destroying, and deleting the catalog file plus its WAL and shm, a rescan recovers ONLY the surviving file while the destroyed file's address comes from the four-class bundle — and the object key recovered from the bundle actually fetches bytes that hash to the destroyed file."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "the_four_class_split_excludes_derived_and_includes_the_other_two"
+proves = "the guard that stops the rebuild passing for the wrong reason: if Derived ever entered the bundle, recovery would succeed by carrying rows through rather than by rescanning, proving the opposite of the claim."
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "without_its_custody_record_a_destroyed_file_is_unreachable"
+proves = "the negative that gives the positive meaning: absent a custody record the bytes sit in the target with nothing on the machine knowing their address."
+
+[[ac.evidence]]
+package = "shepherd-storage"
+test = "replica::chain::tests::a_deleted_segment_invalidates_custody"
+proves = """
+a chain with intact POINTERS but a deleted SEGMENT was custody-eligible:
+`read_chain` fetches pointer bodies only, so the predicate checked topology and
+never proved the recovery payload exists. Custody is now an ATTESTATION rather
+than a predicate — `SegmentEvidence` starts `Unchecked`, only `verify_segments`
+raises it, and no hot path can mint custody by reading the chain.
+
+WHY NOT ON THE DESTROY PATH: a snapshot segment is a compressed catalog (854 MB
+at 10M files per the capacity ADR), deltas accumulate WITHOUT BOUND because v1
+disables GC, and S3 egress is ~$0.09/GB PER EVALUATION. Re-downloading the
+catalog to decide one file's fate costs more than the tiering saves.
+"""
+
+[[ac.evidence]]
+package = "shepherd-storage"
+test = "replica::chain::tests::a_corrupted_segment_of_the_same_size_invalidates_custody"
+proves = """
+why there is no intermediate `Present` level. A HEAD proves SIZE, and
+size cannot distinguish the right bytes from any others of that length —
+offering it as a custody level is the substitution §4.10.2 refuses for the
+closing HEAD. Kills the existence-only mutation that the deleted-segment row
+above does not.
+
+NOT YET LOAD-BEARING IN PRODUCTION: `verify_segments` has no production caller,
+so `custody_eligible()` answers false for every real chain until the periodic
+replica-verification pass is wired to call it. That costs nothing today —
+`dispatch.rs` already hardcodes `custody_eligible: false` at registration — but
+it is a refusal waiting to be noticed, not a working check.
+"""
+
+[[ac]]
+id = "AC-7"
+owning_gate = "2"
+exercises = ["shepherd-scan::floors", "shepherd-tier::plan"]
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "floors::tests::hardlinked_files_are_refused"
+proves = "the hard safety floors refuse"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "floors::tests::acquisition_is_a_second_gate_not_a_cached_verdict"
+proves = "floors are RE-validated at acquisition, not reused from planning"
+
+[[ac]]
+id = "AC-8"
+owning_gate = "2"
+exercises = ["shepherd-scan::denylist", "shepherd-tier::plan"]
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "denylist::tests::a_substring_is_not_a_component"
+proves = "the built-in deny-list matches components, never substrings"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "each_negative_is_excluded_for_its_own_stated_reason"
+proves = "a deny-listed tree is pruned before any rule sees it"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::a_denied_component_as_the_root_is_refused_rather_than_walked"
+proves = """
+THE DENY LIST WAS APPLIED TO EVERY DIRECTORY EXCEPT THE FIRST. The walk
+seeded its stack with the registered root without ever calling `deny_dir` on it,
+so a root that IS a denied tree walked freely — the pre-fix run emitted
+`objects/abc` from a `.git` root. The guard exists to make certain trees
+uncatalogueable, and the one directory it never checked was the one the user
+names.
+"""
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::a_denied_absolute_prefix_as_the_root_is_refused_without_being_opened"
+proves = "the guard runs BEFORE `read_dir`, which is load-bearing twice over: fail-closed, and it makes `/Library/Caches` testable on Linux where the path does not exist. The pre-fix failure shows why placement matters — a guard after the open reports `Unreadable`, not `Denied`"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::a_symlinked_root_pointing_at_a_denied_tree_is_refused"
+proves = """
+the same finding, still reachable after the first fix: an innocent link
+name pointing at a denied tree walked it, because `root.file_name()` reads the
+LINK's name and `read_dir` follows a symlinked root. Closed by deny-checking the
+canonicalized target as well.
+
+SCOPED TO SYMLINKED ROOTS DELIBERATELY, on measurement rather than taste.
+Canonicalizing unconditionally breaks macOS blind: `env::temp_dir()` there is
+`/var/folders/...`, which canonicalizes to `/private/var/...` — a denied
+absolute prefix — refusing the roots of two existing tests on a platform this
+gate cannot run. And it would not close the symlinked-ANCESTOR case anyway,
+because `deny_dir` matches on the final component only. A sliver of extra
+coverage at that cost.
+
+The root is the SOLE symlink this walker follows — every symlinked directory
+inside a walk is `Skip::SymlinkedDir` — so it is the sole link whose target
+needs checking. This completes the existing no-symlink doctrine rather than
+adding a second one.
+"""
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::a_symlinked_root_that_will_not_resolve_is_reported_not_walked"
+proves = "`canonicalize` failing yields `Skip::Unreadable` rather than falling through — `read_dir` can still succeed after `canonicalize` fails, and falling through would leave a window where the walk proceeds on a deny check that never ran. That window is the shape of half this review's findings, closed before it existed"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::an_innocent_symlinked_root_still_walks"
+proves = """
+the acceptance direction, and it is the only test that dies under
+`refuse every symlinked root` — the plausible over-fix, which would break
+registering `/home/me/data -> /mnt/big/data`. Also asserts `rel_path` stays
+relative to the LINK, pinning that canonicalization is for the deny decision
+only and never redefines the walk root.
+
+STATED RESIDUAL: a root reached through a symlinked ANCESTOR still walks.
+Unconditional canonicalization does not close it either; only a component-wise
+check of every canonical component would, which is a wider policy decision than
+this finding. Strictly smaller than the hole closed, documented at `deny_root`.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_denied_root_is_refused_before_any_probe_writes_into_it"
+proves = """
+THE DENY PROMISE WAS BROKEN BY THE REGISTRATION PATH ITSELF.
+`root_add` called `probe_path_policies` and `detect_with_write_probe` — both of
+which WRITE FILES INTO THE ROOT — before anything consulted the deny list. So
+`root.add <repo>/.git` wrote Shepherd's probe files into a tree the policy says
+is never touched, and only afterwards did a scan decline to walk it. Not a
+missing error message: a write into a directory the user never agreed to have
+written to.
+
+THE ASSERTION IS THE DIRECTORY'S MTIME, PINNED WITH `File::set_times`, AND THAT
+MATTERS. The obvious test — assert the directory is empty — PASSES WITH THE
+TRESPASS FULLY IN PLACE, because both probes clean up after themselves
+(`ProbeFiles` unlinks on `Drop`, `probe_atime_advance` unlinks immediately). An
+mtime bumps on create AND on remove, so it is the version that can fail.
+
+MUTATION 2 IS THE PROOF: move the refusal to AFTER the probes and the message
+test STILL PASSES — same `Refused` code, same `version-control` reason — while
+only the mtime assertion dies. The defect was ordering, and a message test
+cannot see ordering.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_denied_root_refusal_names_the_rule_that_refused_it"
+proves = "two distinct DenyReason routes — exact name to `version-control`, foreign-sync name to `foreign-sync-root` — so the operator can tell which rule refused them. `ErrorCode::Refused` rather than `Invalid` because `error.rs:133` names `a deny-list entry` verbatim in Refused's own definition, and because a built-in list nothing in the request can change ought to be non-retryable"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_substring_is_not_a_component_at_registration"
+proves = "round 1's component rule re-tested at the new boundary: `mygit`, `.gitignore` and `my_node_modules` all still register. Registration and scan both go through `DenyList::builtin()` and `deny_dir`, so the two cannot reach different conclusions about what is denied — by construction, not by a test that they agree"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "an_ordinary_root_still_registers_with_its_probes_run_and_its_policies_recorded"
+proves = """
+the acceptance direction as an exact inversion: mtime CHANGED (the
+probes ran), no `could not probe` warning, and `root.list` reports the same
+case/norm/atime policies `root.add` answered with. `refuse everything` would
+disable enrollment entirely while passing both refusal rows above.
+
+FOLLOW-UP RECORDED: this call site mirrors the walker's uncanonicalized check,
+so a root with an innocent name symlinking to a denied tree still reaches the
+probes here. The walker refuses it, so the promise holds and the error merely
+arrives late; adopting the walker's symlink rule at registration is the open
+item.
+"""
+
+[[ac]]
+id = "AC-9"
+owning_gate = "2"
+exercises = ["shepherd-scan::ignore", "shepherd-tier::plan"]
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "ignore::tests::the_parent_aware_form_refuses_a_file_under_an_excluded_directory"
+proves = "gitignore semantics incl. the parent-exclusion rule"
+
+[[ac.evidence]]
+package = "shepherd-scan"
+test = "walk::tests::an_excluded_directory_is_pruned_so_a_negation_inside_it_does_not_apply"
+proves = "ignores honoured on the scan side by pruning"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_user_supplied_ignore_pattern_reaches_the_scan_and_excludes_only_what_it_names"
+proves = "the User leg the spec's own word names: a pattern sent on root.add is stored in scan_root.ignore_patterns_json, echoed back by root.list, and excludes exactly the files it names on a real scan — paired against a no-pattern control over the same tree, so the exclusion is asserted in both directions. Mutation-verified: reverting the producer to the old DEFAULT '[]' fails this test"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "a_user_ignore_pattern_excludes_a_file_the_rule_would_tier"
+proves = "the `and tier` leg, which had no citation at all: a file the tiering rule DOES select with no pattern in force disappears from the tier plan under one, 2 items to 1. Mutation-verified as load-bearing — neutering IgnoreSet::is_ignored fails this test while each_negative_is_excluded_for_its_own_stated_reason and the_dry_run_selects_exactly_one_candidate_out_of_five both still pass, which is direct evidence the tier leg previously had no coverage"
+
+[[ac.evidence]]
+package = "shepherd-cli"
+test = "tests::ignore_patterns_becomes_a_repeatable_flag_carrying_an_ordered_array"
+proves = "the capability is reachable by a user at the outermost hop: a repeatable, order-preserving --ignore-patterns flag, omitted from the request when unset"
+
+[[ac]]
+id = "AC-10"
+owning_gate = "3"
+exercises = ["shepherd-placeholder::delete_mode", "shepherd-placeholder::cfapi", "shepherd-placeholder::fileprovider"]
+note = "delete-mode leg at 2; same root switched between both modes on real Win/mac at 3"
+
+[[ac]]
+id = "AC-11"
+owning_gate = "3"
+exercises = ["shepherd-placeholder::fileprovider", "platform/macos-fileprovider"]
+
+[[ac]]
+id = "AC-12"
+owning_gate = "3"
+exercises = ["shepherd-placeholder::cfapi", "shepherd-placeholder::fileprovider"]
+
+[[ac]]
+id = "AC-13"
+owning_gate = "1"
+exercises = ["shepherd-rules::match", "shepherd-catalog::file_repo", "shepherd-index::meta"]
+note = "passable now — §6 moves rules/match.rs into Phase 1"
+
+# All seven predicate kinds, each cited to the test that reads THAT field.
+# Four rows rather than one, because a single "the matcher works" test is how a
+# predicate kind goes quietly unimplemented — the row that would fail is the one
+# nobody wrote.
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::extension_matches_case_insensitively_and_ignores_dotfiles"
+proves = "predicate kind 1/7 — extension, case-folded, dotfiles not treated as extensions"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::path_glob_matches_and_does_not_over_match"
+proves = "predicate kind 2/7 — path glob, asserted in BOTH directions: an over-matching glob selects files the user never named, and `is_destructive` is true for Tier and Archive alike"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::size_bounds_are_inclusive_and_combine"
+proves = "predicate kind 3/7 — size, bounds inclusive and combinable"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::mtime_ctime_and_atime_age_predicates_each_read_their_own_field"
+proves = "predicate kinds 4-6/7 — mtime, ctime and atime, each proven to read its OWN field. One test rather than three because the failure it guards is the three collapsing onto one timestamp, which only a comparison can catch"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::tag_and_tags_predicates"
+proves = "predicate kind 7/7 — tag and tags"
+
+# The guards. Without these the seven rows above pass against a matcher that
+# says yes to everything.
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::an_empty_predicate_is_refused_because_it_would_match_everything"
+proves = "the negative that gives the seven meaning: a matcher that matched everything would satisfy every positive row above"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::an_unknown_predicate_key_is_refused_not_ignored"
+proves = "an unrecognised key fails loudly rather than being silently dropped — a dropped predicate widens a destructive rule"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::an_invalid_glob_is_reported_rather_than_matching_nothing"
+proves = "a bad glob is an error, not a silent zero-match — §4.12's rule that a rule which cannot be evaluated must not be treated as evaluated"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_combinator_with_sibling_keys_is_refused_rather_than_silently_dropped"
+proves = """
+A CODEX P1 IN ITS OWN RIGHT, recorded here because the worker that fixed it
+reported it as an incidental discovery while fixing the row above — it was
+both, and the review record is the authority on provenance. The unknown-key
+refusal early-returned as soon as it matched a combinator, so
+`{"all":[...],"older_thn_days":365}` compiled as the bare `all` with the typo'd
+key DISCARDED — a rule that reads as an age filter and runs as none. The typo
+direction is the one that matters: a user who misspells a predicate gets a rule
+that silently matches more files, not an error. Refused in `compile_predicate`,
+which `compile_readonly` shares, so `search` filters refuse the same way —
+a deliberate wire-behaviour widening, recorded here because it is not what the
+finding asked for.
+"""
+
+[[ac.evidence]]
+package = "shepherd-catalog"
+test = "file_repo::tests::a_rescan_that_saw_new_bytes_does_not_keep_the_old_digest"
+proves = """
+a metadata-only rescan of a MODIFIED file kept the digest of the old
+bytes, and `plan_tier` accepts any digest it finds to derive the
+content-addressed remote key — so an upload would send changed bytes under the
+old key and discover the mismatch only after the full transfer. The assertion
+prints the wrong key, computed by production code (`identity::content_key`)
+rather than asserted about. Digest now survives only when size, mtime AND ctime
+all match; ctime catches a write that restored mtime (`cp -p`, `rsync --times`,
+`touch -r`), whose false positive is a wasted rehash rather than a wrong answer.
+
+CORRECT BUT INERT TODAY: nothing writes `file.blake3` at all — `walk` emits
+`None` unconditionally, `set_blake3` has no caller, and there is no
+`WHERE blake3 IS NULL` selector. Whoever wires hashing needs one, or cleared
+digests are never re-taken.
+"""
+
+[[ac.evidence]]
+package = "shepherd-catalog"
+test = "file_repo::tests::a_rescan_that_saw_only_a_new_atime_keeps_the_digest"
+proves = "atime is deliberately OUT of the comparison — it moves on every READ, and a digest invalidated by reading would re-hash the corpus every time anyone opened a file. This is the row that fails if someone 'tightens' the guard to clear on any difference"
+
+[[ac.evidence]]
+package = "shepherd-catalog"
+test = "file_repo::tests::a_rescan_advances_the_generation_it_was_given"
+proves = """
+`last_seen_gen` was DEAD SCHEMA — `schema.rs:135` declared it and a
+workspace grep returned that one line; nothing wrote or read it. It is now
+stamped on both the INSERT and the DO UPDATE, which is the whole point: stamping
+only the INSERT leaves a file seen in every scan at its FIRST generation, and the
+sweep then marks a file it just saw on disk as `missing`. Data-loss-shaped,
+reachable by a one-line omission, invisible to any test that only inserts — so
+this upserts the same path twice under two generations and asserts the value
+MOVED, not that the column is populated
+"""
+
+[[ac.evidence]]
+package = "shepherd-catalog"
+test = "file_repo::tests::a_generation_bump_alone_does_not_clear_the_digest"
+proves = "the interaction that would be catastrophic and silent: every scan bumps the generation for every file it sees, so if `generation` ever joins the digest guard the first rescan clears every hash in the catalog. Independent by construction today; this pins it against the future stricter-guard edit, and is the only test that catches that mutation"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "dispatch::tests::a_page_deeper_than_sqlites_bind_limit_returns_its_rows"
+proves = """
+a valid deep page FAILED with `too many SQL variables` — `hydrate` bound
+one parameter per candidate and an unfiltered `cap = offset + limit` is
+unbounded. The limit is MEASURED for this build, not remembered: binary-searching
+`prepare()` gives 32766 (rusqlite 0.40.2 / bundled libsqlite3-sys 0.38.2), not
+the 999 that predates SQLite 3.32.
+
+THE FIX IS CHUNKING, NOT CAPPING. Clamping at `MAX_CANDIDATES` would return a
+legitimate page empty with a `degraded` note — a refusal in an answer's costume.
+Rows are placed at candidate indices 9,000 / 35,000 / 39,999 precisely so a
+clamp fails this test.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "dispatch::tests::the_filters_still_narrow_every_chunk_of_a_deep_page"
+proves = "the mistake the fix could plausibly have made: chunking rebuilds and re-binds the filter clause per statement, so a version appending predicates only to the first chunk would return later chunks UNFILTERED. The excluded row sits past the chunk boundary, where only a still-applied filter can exclude it"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "dispatch::tests::tags_are_attached_across_a_hit_list_larger_than_the_bind_limit"
+proves = "the ceiling had simply MOVED: `attach_tags` binds one parameter per hit, so chunking `hydrate` alone leaves the same failure one call later. Reverting only this half kills only this test — both halves independently load-bearing"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "state::tests::a_rebuild_from_an_older_snapshot_does_not_replace_a_newer_index"
+proves = """
+with a four-worker pool, two rebuilds race and the unconditional swap
+let the LOSER win: files committed by the newer rebuild stay in SQLite and
+vanish from search until a restart. The generation orders SNAPSHOTS, not
+completions — SQLite's `BEGIN` is DEFERRED, so a read snapshot is pinned by the
+first read inside it, and the ticket is therefore taken under a mutex held
+across `BEGIN` + the count. The build itself stays outside the lock, which is
+why rebuilds are not simply serialized.
+
+The interleaving is DETERMINISTIC — snapshot A, commit, snapshot B, install B
+then A — because a test that merely calls rebuild twice reads and swaps in one
+breath and proves nothing. Asserted on a file still being FINDABLE, the fact a
+user notices, not on a counter.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "state::tests::a_rebuild_from_a_newer_snapshot_does_replace_the_index"
+proves = "the acceptance direction: `refuse every swap` kills this while satisfying the row above, so the fix cannot be `never install`"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_ctime_predicate_reports_ctime_as_the_driving_signal"
+proves = """
+every `ctime_older_than_days` match reported its driving signal as
+`Mtime`. The matcher read the right field and the RECORD lied about which
+timestamp authorised the action — and that record is what the operator approves
+a destructive rule against. The fixture makes the mislabel provably wrong: mtime
+is one day old and so cannot satisfy a 365-day predicate, meaning `Mtime` names
+a timestamp that does not drive the match.
+
+WHY THIS IS WORSE THAN A COSMETIC BUG: round 2 made execution refuse when the
+signal drifts from the preview's, on the argument that a preview saying
+`Observed` and a run proceeding on `Atime` is the substitution the whole
+`AtimeMode` apparatus exists to prevent. That refusal is only as good as the
+labels, and one label was a lie.
+"""
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "engine::tests::a_ctime_rule_previews_as_ctime_and_a_preview_labelled_mtime_refuses"
+proves = """
+the upgrade behaviour, asserted rather than discovered: a preview taken
+before this change and executed after it now drifts `Mtime -> Ctime` and
+refuses. Correct and fail-closed, but visible, so it is pinned — and the same
+test asserts a preview taken by THIS build still executes, so the refusal is not
+`refuse everything`.
+
+Checked and recorded: there is NO `match` on `AccessSignalSource` anywhere in
+the workspace, so no wildcard arm can silently mislabel, and the enum is
+deliberately NOT `#[non_exhaustive]` so an external exhaustive match would be a
+compile error rather than a wrong answer. `shepherd_catalog::AccessSignal` is a
+SEPARATE, parallel enum whose schema CHECK admits `observed|atime|mtime` only —
+an obvious `impl From` would compile and fail at runtime; the hazard is
+documented on the enum.
+"""
+
+[[ac]]
+id = "AC-14"
+owning_gate = "2"
+exercises = ["shepherd-rules::preview", "shepherd-rules::engine", "shepherd-rules::delete_policy"]
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "preview::tests::a_rule_with_no_preview_cannot_be_enabled"
+proves = "a rule cannot be enabled without a dry-run"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "engine::tests::a_file_that_appeared_after_the_preview_is_not_acted_on"
+proves = """
+§AC-14's actual clause — the dry run enumerates EXACTLY the real run's
+set — enforced at execution rather than asserted in a doc. `may_enable` checked
+only the rule-body HASH, so an unchanged rule over a changed corpus executed on
+files the preview never listed. The pre-fix output is the finding itself: a
+destructive `Tier` action planned for a FileId absent from `PreviewRecord`.
+"""
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "engine::tests::a_previewed_file_that_vanished_refuses_rather_than_quietly_shrinking"
+proves = "the removal direction, and the one that rejects the friendlier design: a shrunken set is still not the approved set, so execution refuses rather than intersecting down to what survived. Mutating the fix to refuse only on `added` — the intersect-down design — kills this test and leaves the `added` one green"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "engine::tests::a_match_driven_by_a_different_signal_is_not_the_match_that_was_approved"
+proves = """
+THE SUBSTITUTION THE WHOLE ATIME APPARATUS EXISTS TO PREVENT, arriving
+through the one door nobody guarded: identical file set, different REASON. A
+preview that told the operator `Observed` and a run that proceeds on `Atime` is
+exactly what G-1-ATIME's fallback chain, the Linux write probe and §4.12's
+destructive-rule refusal are all built to stop. No set comparison can satisfy
+this test — same file, still matching, different signal.
+"""
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "engine::tests::a_corpus_that_moved_around_the_match_set_still_executes"
+proves = "the acceptance direction, load-bearing: mutating the drift check to `if true` — refuse every execution — kills this and three siblings while every refusal test stays green. Without it the fix could over-refuse forever and the suite would applaud"
+
+[[ac.evidence]]
+package = "shepherd-rules"
+test = "engine::tests::no_preview_at_all_is_distinguishable_from_a_preview_nothing_drifted_from"
+proves = "the zero-expectation trap, closed in both halves: `Execute` with no preview AND zero candidates refuses `NoPreview`, while a preview that genuinely enumerated nothing proceeds and plans nothing. An absent preview would otherwise compare equal to an empty match set and read as `nothing drifted`"
+
+[[ac]]
+id = "AC-15"
+owning_gate = "2"
+exercises = ["shepherd-tier::verify", "shepherd-tier::revalidate"]
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::a_changed_remote_version_aborts_and_restores"
+proves = "version-bound revalidation after the final local hash"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "revalidate::tests::mechanism_b_head_catches_deletion_and_truncation_only"
+proves = "the closing check's real strength under each mechanism"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "revalidate::tests::a_location_that_does_not_hold_the_object_never_satisfies_custody"
+proves = """
+`satisfies_custody` — the function whose NAME claims to answer the
+question — returned true for `Pending`, `Lost` and `LostButReplicated`, because
+it never read `self.state`. Every other conjunct is a HISTORICAL fact (an
+attestation timestamp, a receipt, a pinned version) and a location keeps all of
+them when it leaves `Verified`, so state is the only field distinguishing `this
+copy exists` from `this copy is known to be gone`. Exhaustive match, no `_` arm:
+a `LocationState` added later cannot default into counting as custody.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "revalidate::tests::destroy_permitted_refuses_a_custodian_that_does_not_hold_the_object"
+proves = """
+DELIBERATELY GREEN ON THE PRE-FIX CODE, and cited for that reason. The
+review finding claimed `destroy_permitted` could select a `Lost` location and
+authorise destroying the sole local copy. It could not — the call site has
+conjoined `state == Verified` since 46b9b9b. This test proves the claim as
+stated was FALSE while the row above proves the predicate was still wrong: the
+hole was plugged at one call site and left fail-open for the next caller. The
+fix moves the check INTO the predicate and REMOVES the call-site conjunct, so
+there is one source of truth rather than two that can drift.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "revalidate::tests::a_verified_location_satisfies_custody"
+proves = "the acceptance direction: flipping the non-Verified arm to `true` kills both rows above and leaves this green, so `never eligible` — which would silently disable tiering while passing every refusal test — cannot masquerade as the fix"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "upload::tests::identity::a_fresh_fingerprint_reports_the_statted_inode_not_the_planned_one"
+proves = """
+THE GUARD COMPARED A VALUE WITH ITSELF. `fingerprint()` statted `size`
+and `mtime` and then copied the caller's planned `fs_id` straight through, so
+`assert_source_unchanged` checked the expected identity against the expected
+identity and could never fail. The pre-fix output is the finding restated as an
+assertion:
+
+    assertion `left != right` failed
+      left:  FsId("vol:1")
+     right:  FsId("vol:1")
+
+Now derived through `shepherd_catalog::volume::fs_id` — the same function round 1
+keyed the destroy lock on, not a second identity.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "upload::tests::identity::a_resume_whose_source_was_swapped_writes_nothing_to_the_target"
+proves = """
+the consequence, produced rather than argued: the inode swapped with
+size and mtime held identical, and the impostor's bytes reached the target under
+the key naming the ORIGINAL's hash. Asserts on the OBJECT'S EXISTENCE, not on
+`is_err()` — pre-fix the call does return an error, just after the object is
+immutable, so every retry rediscovers it and none can replace it
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "upload::tests::identity::an_untouched_resume_still_completes"
+proves = "the acceptance direction, green BEFORE the fix as well, which is the point: a fingerprint returning something fresh each call would satisfy both refusal rows above while refusing every resume and silently breaking AC-2"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "restore::tests::cleanup_removes_only_the_inode_this_attempt_created"
+proves = """
+THE ONLY TEST THAT CATCHES THE PATH-KEYED CLEANUP, and the strongest
+mutation result in this review. A failed restore left partial or known-invalid
+bytes at the destination, so a retry read them as a user-owned conflict and
+restored elsewhere. The fix unlinks only the inode captured FROM THE HANDLE
+immediately after `create_new` — the one moment at which `the inode at this path`
+and `the inode this attempt created` are provably the same thing.
+
+Mutate the cleanup to be path-keyed and EVERY behavioural test still passes;
+only this one fails with `cleanup deleted a file this attempt did not create`. A
+path-keyed cleanup would have shipped looking fully tested.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "restore::tests::a_retry_after_a_failed_restore_lands_at_the_original_path"
+proves = "the finding's stated harm verbatim — pre-fix the retry was diverted to `photo (restored 1).raw` and the user alerted about a conflict that was Shepherd's own failed attempt, not a file of theirs"
+
+[[ac]]
+id = "AC-16"
+owning_gate = "5"
+exercises = ["shepherd-index::meta", "shepherd-infer", "shepherd-jobs::gate"]
+note = "moved from 1 (vacuous there); non-trivial only once inference AND power gating exist"
+
+[[ac]]
+id = "AC-17"
+owning_gate = "5"
+exercises = ["shepherd-rules::suggest"]
+note = "moved from 2 — rules/suggest.rs is a Phase 5 creation"
+
+[[ac]]
+id = "AC-18"
+owning_gate = "5"
+exercises = ["shepherd-rules::suggest"]
+note = "moved from 2 — same reason"
+
+[[ac]]
+id = "AC-19"
+owning_gate = "5"
+exercises = ["shepherd-infer", "shepherd-extract"]
+note = "tightened: >= 2 distinct persisted tags, not >= 1"
+
+[[ac]]
+id = "AC-20"
+owning_gate = "5"
+exercises = ["shepherd-infer", "shepherd-extract"]
+
+[[ac]]
+id = "AC-21"
+owning_gate = "5"
+exercises = ["shepherd-infer", "shepherd-extract"]
+
+[[ac]]
+id = "AC-22"
+owning_gate = "5"
+exercises = ["shepherd-infer", "shepherd-extract"]
+
+[[ac]]
+id = "AC-23"
+owning_gate = "5"
+exercises = ["shepherd-infer", "shepherd-extract"]
+
+[[ac]]
+id = "AC-24"
+owning_gate = "5"
+exercises = ["shepherd-infer", "shepherd-extract"]
+
+[[ac]]
+id = "AC-25"
+owning_gate = "5"
+exercises = ["shepherd-infer", "shepherd-extract"]
+
+[[ac]]
+id = "AC-26"
+owning_gate = "5"
+exercises = ["shepherd-infer", "shepherd-extract"]
+
+[[ac]]
+id = "AC-27"
+owning_gate = "5"
+exercises = ["shepherd-infer", "shepherd-extract"]
+
+[[ac]]
+id = "AC-28"
+owning_gate = "4"
+exercises = ["shepherd-jobs::gate", "shepherd-net::governor", "shepherd-placeholder::cfapi"]
+note = "requires the 3 -> 4 edge (hydration); permits hydration control traffic, forbids content upload"
+
+[[ac]]
+id = "AC-29"
+owning_gate = "4"
+exercises = ["shepherd-jobs::adaptive", "shepherd-net::governor"]
+
+[[ac]]
+id = "AC-30"
+owning_gate = "7"
+exercises = ["shepherd-plugin::http_gate", "shepherd-plugin::caps"]
+
+[[ac]]
+id = "AC-31"
+owning_gate = "7"
+exercises = ["shepherd-plugin::host", "shepherd-plugin::caps"]
+
+[[ac]]
+id = "AC-32"
+owning_gate = "6"
+exercises = ["shepherd-storage::azure", "shepherd-storage::graph", "shepherd-storage::drive", "shepherd-storage::nas"]
+note = "real-account matrix for all seven providers; MinIO alone is not proof"
+
+[[ac]]
+id = "AC-33"
+owning_gate = "6"
+exercises = ["shepherd-storage::nas"]
+
+[[ac]]
+id = "AC-34"
+owning_gate = "6"
+exercises = ["shepherd-storage::azure", "shepherd-storage::graph", "shepherd-storage::drive"]
+
+[[ac]]
+id = "AC-35"
+owning_gate = "8"
+exercises = ["ui", "shepherd-net::tailscale", "sidecar/tsnet"]
+note = "moved from 6 — AC-35 includes a UI warning, and the UI does not exist until Phase 8. Transport leg verified at 6"
+
+[[ac]]
+id = "AC-36"
+owning_gate = "6"
+exercises = ["shepherd-net::tailscale", "sidecar/tsnet"]
+
+[[ac]]
+id = "AC-37"
+owning_gate = "6"
+exercises = ["shepherd-net::governor", "shepherd-net::metered", "shepherd-storage::azure"]
+note = "moved from 4 — caps are only meaningfully exercised once most adapters exist. Governor logic gated at 4"
+
+[[ac]]
+id = "AC-38"
+owning_gate = "7"
+exercises = ["shepherd-plugin::caps", "shepherd-plugin::storage_plugin", "shepherd-plugin::http_gate"]
+note = "positive create/get/list + namespace enforcement + adversarial deletion suite"
+
+[[ac]]
+id = "AC-39"
+owning_gate = "6"
+exercises = ["shepherd-storage::replica_snapshot", "shepherd-storage::nas"]
+note = "clean-machine replica recovery for every provider AND SMB/NFS"
+
+[[ac]]
+id = "AC-40"
+owning_gate = "5"
+exercises = ["shepherd-index::meta", "shepherd-index::hybrid"]
+
+[[ac]]
+id = "AC-41"
+owning_gate = "5"
+exercises = ["shepherd-index::ann", "shepherd-infer"]
+
+[[ac]]
+id = "AC-42"
+owning_gate = "5"
+exercises = ["shepherd-index::hybrid", "shepherd-index::rrf"]
+
+[[ac]]
+id = "AC-43"
+owning_gate = "5"
+exercises = ["shepherd-index::ann", "shepherd-infer"]
+
+[[ac]]
+id = "AC-44"
+owning_gate = "5"
+exercises = ["shepherd-index::ann", "shepherd-infer", "shepherd-jobs::gate"]
+note = "requires the 4 -> 5 edge (power transitions), at 10M scale"
+
+[[ac]]
+id = "AC-45"
+owning_gate = "4"
+exercises = ["shepherd-watch", "shepherd-watch::overflow"]
+note = "N is bound per platform and the gate FAILS above it"
+
+[[ac]]
+id = "AC-46"
+owning_gate = "5"
+exercises = ["shepherd-index::ann"]
+
+[[ac]]
+id = "AC-47"
+owning_gate = "2"
+exercises = ["shepherd-catalog::intent", "shepherd-tier::audit"]
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::the_happy_path_destroys_and_audits"
+proves = "the intent journal and audit record are written for a destruction"
+
+[[ac.evidence]]
+package = "shepherd-catalog"
+test = "intent::tests::a_premature_commit_is_refused_and_the_row_stays_unresolved"
+proves = """
+the guard rejected a transition only once the source was ALREADY
+SETTLED, so `Prepared -> CatalogCommitted` was accepted: an intent could report
+the destruction protocol complete having skipped the syscall and the audit
+entirely. `transition` now checks an explicit `successors()` edge list.
+
+STATED CAREFULLY, because the consequence is latent: nothing in this workspace
+calls `unresolved()` or `needs_recovery()` — there is no startup consumer, so no
+run is rescued or lost by this today. What this asserts is the JOURNAL-LEVEL
+fact — the refusal happens, the row does not move, it is still in the set
+`unresolved()` reports — and not a runtime outcome. See the open review thread
+on `intent.rs:260`.
+"""
+
+[[ac.evidence]]
+package = "shepherd-catalog"
+test = "intent::tests::a_destruction_that_already_happened_can_never_report_itself_aborted"
+proves = """
+the principle the edge list is derived from, decided in review because
+the repo has no §4.4 state table: `aborted` is a claim about the FILE, not about
+the code path — it must mean positive evidence the file was not destroyed. A
+state only reachable after the syscall fired therefore cannot reach it, or a
+SETTLED row claims the file is intact when it is already gone. Also asserts the
+one edge it does have still works, so this cannot be satisfied by stranding the
+state
+"""
+
+[[ac.evidence]]
+package = "shepherd-catalog"
+test = "intent::tests::an_unresolved_outcome_cannot_be_reconstructed_until_it_is_resolved"
+proves = "you cannot reconstruct an audit record of an event you cannot describe — reconstruction presupposes a known outcome, so the route runs through `OutcomeKnown`. Asserts the working route too"
+
+[[ac.evidence]]
+package = "shepherd-catalog"
+test = "intent::tests::re_asserting_a_state_is_refused_and_says_so_by_type"
+proves = """
+self-transitions are refused. The old `current.is_settled() && current != to`
+permitted them by ACCIDENT, and the accident points the wrong way:
+`CatalogCommitted -> CatalogCommitted` is harmless but `SyscallIssued ->
+SyscallIssued` means the irreversible syscall was issued twice — precisely the
+event a journal exists to make visible. Refused by TYPE (`CatalogError::AlreadyInState`)
+rather than by message, so a crash-retry can skip without string matching; pins
+both directions, because a caller skipping on `AlreadyInState` must not skip
+past a real violation
+"""
+
+[[ac.evidence]]
+package = "shepherd-catalog"
+test = "intent::tests::transition_accepts_exactly_the_declared_lifecycle"
+proves = "the 8x8 sweep: every legal pair accepted, every illegal pair refused, and a refused move leaves the row's state untouched. It caught the self-transition change by itself when the oracle was flipped — the acceptance direction, since `refuse everything` takes 8 of 13 tests with it"
+
+[[ac]]
+id = "AC-48"
+owning_gate = "8"
+exercises = ["ui", "shepherd-proto"]
+
+[[ac]]
+id = "AC-49"
+owning_gate = "8"
+exercises = ["ui", "shepherd-proto"]
+
+[[ac]]
+id = "AC-50"
+owning_gate = "8"
+exercises = ["ui", "shepherd-proto"]
+
+[[ac]]
+id = "AC-51"
+owning_gate = "8"
+exercises = ["ui", "shepherd-proto"]
+
+[[ac]]
+id = "AC-52"
+owning_gate = "8"
+exercises = ["ui", "shepherd-proto"]
+
+[[ac]]
+id = "AC-53"
+owning_gate = "8"
+exercises = ["ui", "shepherd-proto"]
+
+[[ac]]
+id = "AC-54"
+owning_gate = "8"
+exercises = ["ui", "shepherd-proto", "xtask::codegen"]
+note = "CLI == registered_methods runs in CI from Phase 1; the inventory test is owned at 8"
+
+[[ac]]
+id = "AC-55"
+owning_gate = "9"
+exercises = ["tests/e2e", "packaging"]
+
+[[ac]]
+id = "AC-56"
+owning_gate = "1"
+exercises = ["shepherd-proto", "shepherd-cli", "xtask::codegen"]
+note = "schema stability at 1; re-asserted at 8"
+
+# "Stable machine-readable output" is only meaningful if drift is DETECTABLE.
+# Determinism alone is not stability — a generator that is deterministic and a
+# checker that never fails would satisfy the word and none of the intent.
+
+[[ac.evidence]]
+package = "xtask"
+test = "codegen::tests::generation_is_deterministic"
+proves = "the same method table produces byte-identical artifacts, so a diff means a real change rather than generator noise"
+
+[[ac.evidence]]
+package = "xtask"
+test = "codegen::tests::check_reports_missing_differing_and_stale_files"
+proves = "the half that makes determinism load-bearing: --check actually FAILS on missing, differing and stale artifacts. Without this the checker could pass unconditionally and `codegen --check` in CI would assert nothing"
+
+[[ac.evidence]]
+package = "xtask"
+test = "codegen::tests::every_method_gets_a_request_and_a_result_schema"
+proves = "coverage is derived from the method table rather than a hand-kept list, so a new method cannot ship without schemas"
+
+[[ac.evidence]]
+package = "shepherd-proto"
+test = "method::tests::schemas_are_deterministic"
+proves = "determinism at the source, upstream of codegen — so a drift reported by --check is attributable to the table rather than to schemars ordering"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "shepctl_events_subscribe_renders_the_events_it_subscribed_to"
+proves = """
+`shepctl events subscribe` RENDERED NOTHING AND REPORTED SUCCESS. It
+used the one-response `client::call` path, which reads the `SubscribeResult` and
+drops the connection, so the daemon's pump saw a closed socket. The mutation
+output is the finding in one frame: the daemon says `"replayed":2` while the
+CLI printed zero events, `ok: true`, exit 0.
+
+BEHAVIOUR CHANGE: the command is now long-running, terminating on daemon EOF
+(exit 0) or Ctrl-C, with no new flags — this CLI's argument tree is derived from
+each method's request schema by construction (AC-54), so a `--count`/`--for`
+would be the first client-only argument. The read deadline is cleared ONLY for
+the streaming phase; it still guards connect, handshake and the subscribe
+response.
+
+Asserts events BY CONTENT — monotonic seq, stream, a payload field — and
+cross-checks `events_rendered` against the lines that reached stdout, so the
+count cannot be right while the output is empty.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "events::tests::a_subscriber_whose_queue_overflows_is_disconnected"
+proves = """
+a subscriber whose 256-frame queue filled was left REGISTERED with a
+silently dropped frame, holding stale state indefinitely. The code's stated
+recovery — the client notices a sequence gap — CANNOT WORK for a filtered
+subscription, because sequence numbers are global and gaps from unrequested
+streams are normal and documented as such.
+
+DISCONNECT, NOT A MARKER, and the reason is the finding one level up: the queue
+is full precisely because the client is not draining the socket, so a marker
+frame would sit unread BEHIND THE VERY FRAMES IT REPORTS. A notification
+deliverable only through the channel whose congestion it reports is not a
+notification. EOF needs no reader to be true. No wire change; PROTO_VERSION
+stays 1.3.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "server::tests::an_overflowing_subscriber_sees_its_connection_close"
+proves = "proven at the CLIENT end over a real `UnixStream::pair()`, exactly as `shepctl` reads it — SUBSCRIBER_QUEUE valid event frames, then `read_line` returns 0. Not `the daemon set a flag`. Queued frames are delivered before the close deliberately: they are frames the client is entitled to and they shorten the resume"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "server::tests::an_ordinary_end_of_stream_leaves_the_connection_open"
+proves = "the acceptance direction against `disconnect everyone` — a clean end-of-stream leaves the socket writable, asserted by writing from the daemon side AFTER the pump returns and reading it on the client side. An overflow and a clean shutdown both reach the pump as a closed channel; only one may tear down the connection"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "events::tests::a_slow_subscriber_does_not_stall_the_publisher_or_its_peers"
+proves = """
+ORACLE DELIBERATELY CHANGED, recorded here so it is never mistaken for
+an assertion weakened to make a build green. This test previously ended on
+`assert_eq!(hub.subscriber_count(), 2)` under the comment `the slow subscriber is
+still registered — it lost frames, it was not disconnected` — it ASSERTED THE
+DEFECT AS THE DESIRED OUTCOME. Renamed to what it was actually guarding: the
+publisher completes without blocking and the healthy subscriber loses nothing.
+"""
+
+[[ac]]
+id = "AC-57"
+owning_gate = "4"
+exercises = ["shepherd-jobs::cron"]
+
+[[ac]]
+id = "AC-58"
+owning_gate = "4"
+exercises = ["shepherd-jobs::catchup"]
+
+[[ac]]
+id = "AC-59"
+owning_gate = "4"
+exercises = ["shepherd-daemon::service", "platform/windows-package"]
+note = "amended to session start (OQ-F); Windows startup task needs the Phase 3 package identity"
+
+[[ac]]
+id = "AC-60"
+owning_gate = "8"
+exercises = ["ui", "shepherd-cli", "shepherd-daemon"]
+note = """
+named in the Phase 8 gate now — iteration 1's appendix claimed it, the gate did \
+not. Evidence recorded at Phase 1 though it will not RUN until Phase 8: the \
+daemon-side legs are already tested and the mapping is cheap to make once, by \
+someone who has just read all twenty-three of shepherd-daemon's e2e tests, and \
+expensive to reconstruct six phases later by someone who has not. Sec8.2 maps \
+the handshake territory here explicitly.\
+"""
+evidence_missing = """
+THE UI HALF CANNOT EXIST YET, AND NOTHING EXERCISES CONCURRENCY. AC-60 is `CLI \
+and UI observe identical state; concurrent mutations serialize` and neither \
+clause is fully proven. (i) There is no UI until Phase 8, so what is proven is \
+that TWO IPC CLIENTS observe identical state — a weaker and different claim, \
+since both speak the same protocol through the same code path while the UI is \
+a separate client. (ii) `two_clients_are_served_concurrently` performs ONE \
+mutation and reads it back; nothing anywhere drives concurrent mutations, so \
+`serialize` rests on `shepherd-catalog`'s single-writer actor (G-1-WRITER) \
+rather than on any test of this AC.
+
+Stated now rather than discovered at Phase 8: without this, the cited tests \
+would all pass and the gate would report AC-60 green over a UI that does not \
+exist — which is the vacuous pass this map exists to refuse, and adding \
+evidence without adding this note is exactly how it would have been \
+introduced.\
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "two_clients_are_served_concurrently"
+proves = "PARTIAL — two independent connections observe the same catalog: client A adds a root, and client B's `root.list` sees exactly one. The daemon-side half of `observe identical state`, over a real socket. It is ONE mutation read back, not concurrent mutation, and both clients are IPC clients rather than a CLI and a UI"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "roots_can_be_added_listed_and_removed"
+proves = "PARTIAL — the mutation surface a second observer would be observing actually works: add, list and remove round-trip through the daemon. Cited because state that cannot change cannot be observed to change identically, and because `root.remove` was until now exercised by a passing test that no AC or guard named"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "the_daemon_handshakes_and_reports_status"
+proves = "PARTIAL — the handshake completes and `status` returns a real answer rather than a stub. §8.2 maps `version handshake accept/reject` to AC-60/61; this is the accept leg, and it was the only test covering `status` that nothing cited"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "shepctl_drives_a_real_daemon_end_to_end"
+proves = "PARTIAL — the CLI half of `CLI and UI`: the real `shepctl` binary drives a real daemon over a real socket, so the client side of the parity claim is a shipped binary rather than an in-process shortcut"
+
+[[ac]]
+id = "AC-61"
+owning_gate = "8"
+exercises = ["ui", "shepherd-cli", "shepherd-daemon"]
+note = "same defect as AC-60; evidence recorded early for the same reason"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "shepherdd_doctor_works_with_no_daemon_running"
+proves = "PARTIAL — with SHEPHERD_SOCKET pointed at a path nothing listens on, `shepherdd doctor` still runs, still reports the lingering check, mentions the daemon, and exits 0. Proves daemon-down is a warning and not a crash; proves nothing about the three things §9 requires the message to name"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_major_version_mismatch_is_rejected_with_both_versions_named"
+proves = "PARTIAL — the adjacent failure mode, and the property AC-61 is really about: a rejection whose message names BOTH versions rather than saying `incompatible`. §8.2 maps handshake accept/reject to AC-60/61. This is skew rather than daemon-down, so it is evidence for the message-quality clause and not for the daemon-down clause"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "a_connection_that_skips_the_handshake_is_refused"
+proves = "PARTIAL — the reject leg of §8.2's handshake row: a client that never said hello is refused rather than served, so the protocol's precondition is enforced rather than assumed"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "shepherdd_doctor_works_with_no_daemon_running"
+proves = "all four things AC-61 requires, as four independent assertions rather than substring checks for the word daemon: the exact socket path tried, the resolved service-unit path with its registration state, a pasteable start command, and the exit code asserted as the specific stable value 0 across repeated invocations and distinct from 1 on a genuine failure. Registration state was the real gap — the message named the other two already"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "shepherdd_doctor_reports_the_daemon_as_registered_when_a_unit_file_exists"
+proves = "the registration line is load-bearing rather than fixed text: writing a real unit file at an independently-computed path flips the message to registered and flips the remediation to the real service-manager start command, so the check reads actual filesystem state"
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "an_unqualified_shepctl_reaches_a_daemon_configured_by_state_dir"
+proves = """
+the daemon was LISTENING and every unqualified `shepctl` reported it
+unreachable (exit 3): `Paths::resolve` puts the socket under a configured
+`XDG_STATE_HOME`/`SHEPHERD_STATE_DIR`, and the client only ever tried
+`$HOME/.local/state/shepherd/daemon.sock`. Fixed by MOVING `paths` to
+`shepherd-obs` rather than adding a cli->daemon edge, which
+`shepherd-cli/Cargo.toml` refuses by design (it would drag a bundled SQLite into
+a CLI needing none — verified still absent: `cargo tree -p shepherd-cli | grep
+-c rusqlite` is 0). Agreement is an INVARIANT over the whole env matrix —
+`socket_candidates(env)[0] == Paths::resolve(env).socket`, with a `checked == 28`
+guard so the sweep cannot pass by skipping — so drift is impossible rather than
+detected. The test asserts the socket file exists before it runs the client.
+"""
+
+[[ac.evidence]]
+package = "shepherd-daemon"
+test = "shepctl_still_reports_unreachable_when_no_daemon_is_listening"
+proves = "the acceptance direction, and AC-61's own clause: pointed at a state dir with no daemon, exit 3 still happens and the hint still names the exact path tried"
+
+[[ac.evidence]]
+package = "shepherd-obs"
+test = "paths::tests::an_explicit_socket_override_is_the_only_candidate"
+proves = """
+A REGRESSION FROM THE PREVIOUS ROUND'S OWN FIX. `socket_candidates` was
+made a LIST so a client could find a daemon configured through XDG_STATE_HOME;
+that is right for environment skew and wrong for an explicit override. With
+`SHEPHERD_SOCKET` set but momentarily unavailable, the client fell through to the
+defaults and could send a DESTRUCTIVE command to a different running daemon and
+catalog. The function's own comment already said an override should be
+definitive — code contradicting its own doc, again.
+
+Asserted as EQUALITY, not `first()`: the defect lived entirely in what came
+after the first entry, so a `first()` assertion would have passed throughout.
+"""
+
+[[ac.evidence]]
+package = "shepherd-obs"
+test = "paths::tests::an_explicit_socket_is_a_candidate_even_when_nothing_else_is_named"
+proves = "a SECOND bug the finding did not name, found by hoisting the check: `env -i SHEPHERD_SOCKET=/tmp/x.sock shepctl` returned `[]` — the user names a socket and is told nothing was tried. Arguably worse than the reported fall-through, which at least attempts something"
+
+[[ac.evidence]]
+package = "shepherd-obs"
+test = "paths::tests::without_an_override_the_other_rungs_are_still_tried"
+proves = "the acceptance direction, and it catches the plausible over-fix: `collapse to one candidate always` satisfies both rows above and re-breaks the environment skew this function exists for. Three tests die on it"
+
+[[ac]]
+id = "AC-62"
+owning_gate = "5"
+exercises = ["shepherd-index::ann", "shepherd-infer"]
+
+[[ac]]
+id = "AC-63"
+owning_gate = "9"
+exercises = ["tests/e2e", "packaging"]
+
+[[ac]]
+id = "AC-64"
+owning_gate = "9"
+exercises = ["tests/e2e", "packaging"]
+note = "checklist is generated with per-AC artifact + timestamp + signer; missing/stale/skipped rejects"
+
+[[ac]]
+id = "AC-65"
+owning_gate = "9"
+exercises = ["packaging", "tests/e2e"]
+
+# ---------------------------------------------------------------------------
+# [[guard]] — release-blocking but not numbered spec ACs. Audited by the same
+# invariant, excluded from the AC-1..AC-65 completeness check.
+# ---------------------------------------------------------------------------
+
+[[guard]]
+id = "PM-1"
+owning_gate = "2"
+exercises = ["shepherd-tier::destroy", "shepherd-tier::revalidate", "shepherd-tier::serialize"]
+note = "handle/staging-bound destruction, adversarial path-swap at the syscall boundary"
+
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::identity_mismatch_aborts_and_restores"
+proves = "handle/staging-bound destruction with an adversarial identity swap"
+
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::a_handle_opened_after_the_floor_check_is_not_seen_by_it"
+proves = "OQ-J's residual exercised rather than assumed away"
+
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "serialize::key_tests::two_files_sharing_one_key_serialize_on_the_key_not_the_file"
+proves = "per-file and per-key serialization"
+
+[[guard]]
+id = "PM-2"
+owning_gate = "2"
+exercises = ["shepherd-tier::discard", "shepherd-tier::breaker", "shepherd-tier::audit", "shepherd-catalog::intent"]
+note = "remote-destroy guard: discard routed through the same intent+audit apparatus"
+
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "destroy::tests::remote_discard_deletes_and_audits_through_the_same_apparatus"
+proves = "the discard branch routes through the same intent+audit apparatus"
+
+[[guard.evidence]]
+package = "shepherd-tier"
+test = "breaker::tests::repeated_sub_threshold_passes_cannot_evade_the_window"
+proves = "the rate-based bulk-discard breaker survives restart"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::an_executed_episode_charges_the_window_exactly_once_per_object"
+proves = """
+THE ROLLING BREAKER WAS NEVER CHARGED. `RateWindow::record` had ZERO
+production callers anywhere in the workspace, so repeated sub-threshold episodes
+kept seeing the same unused budget and the blast-radius control was a check with
+no subject.
+
+HOW IT SURVIVED THE EARLIER GATE, recorded because it is this project's purest
+specimen: the AC evidence test `breaker::tests::repeated_sub_threshold_passes_cannot_evade_the_window`
+HAND-FEEDS ITS OWN SUBJECT —
+
+    w.record(t(1), 4);
+    w.record(t(2), 4);
+
+— proving the window ARITHMETIC while production never called `record` at all.
+An AC proven by a test that supplies the very input whose absence was the bug.
+
+This row asserts the window ends at EXACTLY 3: not 0 (the pre-fix answer) and
+not 6 (a double charge).
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::an_executed_episode_charges_the_window_exactly_once_per_object"
+proves = "the TOCTOU direction the finding named: the charge is reserved and PERSISTED before the deletion it pays for — `ledger.used()` is asserted at the full episode size immediately after `reserve_discard` returns and before any object is touched — so a record-after-delete fix, which would ship the second bug the finding describes, fails here. It then deletes all three and asserts the window still holds exactly three, which is what stops a double charge passing. CITATION REPAIRED: this row named `an_exhausted_charge_refuses_before_anything_is_deleted`, which 4521243 deleted when the charge became a permission for a named candidate set rather than a count; the citation was not updated with it, so the row was asserting nothing"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::two_episodes_evaluating_against_one_snapshot_cannot_both_reserve"
+proves = "what separates two racers: `evaluate_discard` reads a snapshot and is advisory, `try_charge` is test-and-consume in one step and is the authority. This is the only test that isolates atomicity — the accumulate test is also caught by the advisory check, so it cannot"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::a_candidate_from_another_episode_cannot_be_deleted_with_this_episodes_charge"
+proves = """
+a charge was a COUNT, not a permission for a named object: the episode
+confirmed one candidate, the caller named a different one, and the count-only
+`spend()` authorised its irreversible deletion (`got Ok(())`, `deleted() == 1`).
+`DiscardCharge` now carries the confirmed set itself and `spend` RETURNS the key
+it authorised — `execute_discard` takes no `ObjectKey` at all, so a wrong key
+stopped being something we refuse and became something no caller can express.
+Also asserts `remaining() == 1`, because a refusal that consumed the unit would
+leave the confirmed object undeletable.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::varying_any_single_field_of_a_candidate_refuses_it"
+proves = "membership must be WHOLE-candidate equality. Mutating it to compare `file` alone reports `a candidate differing only in `path` was accepted: Ok(())` — a row whose path drifted from the one the operator read, deleted on the strength of a matching file id"
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::the_key_is_derived_from_the_candidate_and_the_targets_prefix"
+proves = """
+the test a suffix check fails: it deletes under a DIFFERENT prefix and
+asserts this target's object — identical hash — survives. An
+`ends_with(<hash hex>)` check would pass every other row here while leaving the
+prefix non-load-bearing, so a foreign-prefix key with the right hash sails
+through. Refused in the design and the reason written at the `DiscardCharge`
+doc.
+
+STATED RESIDUAL: `prefix` is the one component `spend` cannot cross-check,
+because the charge does not know its target's prefix — that is config, not
+`Episode` data. Closing it means persisting the key on the candidate and folding
+it into `candidate_set_hash`; filed as a follow-up rather than done, because the
+finding's stated harm is closed by construction without it.
+"""
+
+[[ac.evidence]]
+package = "shepherd-tier"
+test = "discard::tests::an_unhashed_candidate_is_refused_rather_than_naming_a_key_from_nothing"
+proves = "a consistency check today — `plan_tier` already refuses unhashed files so no remote object can exist for one — pinned precisely because that is the kind of `cannot happen` that becomes reachable when someone changes `plan_tier`. It must fail loudly that day rather than derive a key from `None`"
+
+[[guard]]
+id = "PM-3"
+owning_gate = "4"
+exercises = ["shepherd-watch::overflow", "shepherd-watch::cursor"]
+note = "journal-overflow resync gating; scrub and watcher guards"
+
+# ---------------------------------------------------------------------------
+# Phase 0 guards — the gate §9 names and this file did not have.
+# ---------------------------------------------------------------------------
+#
+# §9's Phase 0 rows demand artifacts and decisions, not numbered ACs, so they
+# are guards: "release-blocking but not numbered spec ACs", audited by the same
+# invariant and excluded from the AC-1..AC-65 completeness check. Inventing
+# AC-66 for them would break that check and misrepresent the Appendix, which
+# fixes the AC set at 65.
+
+[[guard]]
+id = "G-0A-CI"
+owning_gate = "0a"
+exercises = ["ci"]
+note = "§9: `Workspace CI green on all three platforms`"
+evidence_missing = """
+BOTH LEGS HAVE NOW EXECUTED FOR THE FIRST TIME. BOTH ARE RED, AND NEITHER RED \
+IS A PRODUCTION DEFECT. This row previously read `declared, not green`, and \
+recorded that no Windows or macOS leg had ever run. They have now — natively, \
+not in CI, by the user's explicit decision on 2026-08-18 not to push the \
+branch. That decision is why this row stays red: §9 asks for the result of a \
+CI RUN, and no amount of local evidence is that. What follows is what the \
+local runs found, which is worth more than the row's previous silence.
+
+macOS (26.5.2, Mac16,10, arm64, rustc 1.96.0 — Rust was not installed on that \
+machine at all before this). `cargo build --workspace --all-targets` GREEN. \
+`cargo test --workspace` FAILS: 9 tests, ONE root cause — \
+`shepherd-scan/src/floors.rs:317` gates `open_handles()` on \
+`#[cfg(target_os = "linux")]`, so every other platform returns \
+`Held(CouldNotDetermine)`. THAT FAIL-CLOSED BEHAVIOUR IS CORRECT. What is \
+wrong is that the `destroy` tests assume the floor passes, so they are \
+implicitly Linux-only and are not cfg-gated.
+
+Windows (Server 2022, process-isolated container, rustc 1.96.0 — NOT a \
+`windows-latest` VM, and this row must not imply it was). `cargo build \
+--workspace --all-targets` FAILS: `lib.rs:28` correctly gates `pub mod server` \
+on `#[cfg(unix)]` and `main.rs:33` imports it unconditionally; `main.rs:255` \
+uses `std::os::unix::net::UnixStream` unconditionally; \
+`shepherd-bench/src/gen_files.rs:766` calls a bare `symlink`; `shepherd-tier` \
+uses `std::os::unix`, `MetadataExt` and `PermissionsExt` across three test \
+files. With those three crates excluded, `cargo test --workspace \
+--no-fail-fast` gives 502 PASSED / 9 FAILED / 9 ignored. Eight failures are \
+`shepherd-placeholder::delete_mode`, where production fails closed and says so \
+and the TESTS `unwrap()` it. The ninth is `shepherd-scan::walk` asserting \
+`sub/b.txt` where the scanner produced `sub\\b.txt` — and `walk.rs:242` \
+documents `separators left exactly as the OS gave them`, so the test \
+contradicts the documented contract of the function it tests.
+
+USE 502, WITH `--no-fail-fast`, AND SAY SO. Cargo's default fail-fast stops at \
+the first failing binary and reported 170, never reaching four whole crates \
+and missing one of the two failing groups entirely. A truncation that reads \
+like a total is worse than a wrong number.
+
+NO PRODUCTION SAFETY PATH WAS FOUND BROKEN ON EITHER PLATFORM. Every break is \
+a Unix assumption in test code or in a Unix-only binary. Evidence: \
+.omc/artifacts/phase-0a/windows-leg-first-run.md.
+"""
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::ci_declares_all_three_platforms"
+proves = "the CI matrix still names ubuntu-latest, windows-latest and macos-latest — a silent narrowing to Linux-only would otherwise leave the §9 clause reading as satisfied"
+
+[[guard]]
+id = "G-0B-BARS"
+owning_gate = "0b"
+exercises = ["shepherd-bench", "xtask::evidence_artifacts"]
+note = """
+§9: `bench-baseline.json with metadata p95, vector p95 and index RSS at 10M \
+within bars`. The bars were met, so §9's alternative closure path — a written \
+escalation carrying the user's recorded renegotiation decision — was not \
+needed for THIS clause. On what a gate can and cannot assert about a recorded \
+decision, see G-0B-CAPACITY.\
+"""
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::the_recorded_metadata_p95_clears_the_precommitted_bar_in_both_cache_states"
+proves = "the recorded metadata p95 (23.48 ms cold, 22.20 ms warm) clears the bar that bench-contract.toml FIXED BEFORE THE RUN, in both cache states, over the contract's row count — and the bar in the artifact is checked against the bar in the contract, so moving one to fit the other fails here rather than passing quietly"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::the_adr_names_the_only_candidate_that_actually_passed"
+proves = "the written index decision is backed by its own evidence: exactly one candidate clears the bar in both cache states, which is what makes the ADR's claim of `no tie to break` true, and the ADR names that candidate. A re-measure that promoted another candidate would fail here instead of leaving the ADR asserting a superseded conclusion"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::every_ann_cell_that_ran_at_full_scale_fits_the_ac46_band"
+proves = "every ANN cell measured at the contract's full vector count sits inside AC-46's 4-16 GiB band and under the 300 ms bar, and a cell that ran at reduced scale must carry a recorded reason rather than pass as though it had not. Includes a count assertion: a filter matching no cells would satisfy every other line in the test"
+
+[[guard]]
+id = "G-0B-CONTRACT"
+owning_gate = "0b"
+exercises = ["shepherd-bench", "xtask::evidence_artifacts"]
+note = """
+§9: the precommitted numeric workload contract, fixed BEFORE 0b runs.
+
+TWO THINGS A READER OF THE ROWS BELOW MUST KNOW, recorded here now that \
+`gate --phase` renders notes at all — it silently dropped every one of them \
+until 2026-08-19, which is why this was never written down before.
+
+1. `background_ingest` HAD NO PRODUCER FOR THE WHOLE OF PHASES 0b-1. \
+`bench-contract.toml:181` fixes `background_ingest = true` and \
+`background_ingest_rows_per_sec = 2_000`; `shepherd-bench/src/main.rs:148` \
+parses both into `Execution`; and until 2026-08-19 NOTHING READ EITHER — zero \
+consumers in the tree. The writer lived in `meta_bench.rs`, which `ccbc26d` \
+deleted along with the losing bake-off candidates. So the evidence row below \
+that says the 0b run `used ... background ingest the contract fixed` is TRUE \
+OF THE RECORDED RUN AND NOT REPRODUCIBLE: the code that produced those numbers \
+is gone. Two workers found this independently. \
+`xtask/src/evidence_artifacts.rs:167` asserts `background_rows_ingested > 0`, \
+which passes honestly — but it reads `bench-baseline.json`, A RECORDED \
+ARTIFACT, not a live run, so it says nothing whatever about present \
+capability. Do not read it as proof the workload can be reproduced. The Phase 1 \
+`G-1-M1-PERF` harness is the first thing in the tree ever to implement it.
+
+2. THE CONTRACT WAS UNLOADABLE FROM 2026-08-16 UNTIL 2026-08-19. `46b84ab` \
+added `tantivy = "0.26.1"` to `[reference_machine]` together with the matching \
+struct field; `ccbc26d` deleted the struct field and left the contract line. \
+`Contract` is `#[serde(deny_unknown_fields)]`, so EVERY command that loads this \
+file — `gen-trace`, `gen-catalog`, `capacity`, and all three ANN legs — died on \
+a parse error for three days. `ccbc26d`'s commit message carries a `Verified:` \
+block with six green lines, every one of them from `smoke`, which is the ONE \
+command that takes no contract. The verification could not have failed the way \
+the change broke things. Repaired by restoring `tantivy` as `Option<String>` to \
+the struct, NOT by trimming the contract line: this file is a precommitted \
+provenance record, `bench-baseline.json` still carries \
+`meta_bench_tantivy_warm`/`_cold`, and the version those numbers were measured \
+against is precisely what the contract exists to pin. Editing it would have \
+altered a measurement's provenance after the fact — the failure mode this \
+file's own header names.
+"""
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::the_recorded_run_matches_the_precommitted_workload_contract"
+proves = "the run that produced the numbers used the concurrency, run count, per-run query count and background ingest the contract fixed. A p95 measured with one idle client is a different number wearing the same name, and this is what stops it being reported as the same one"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::the_contract_still_scores_every_axis_the_tiebreak_rule_names"
+proves = "the tiebreak rule still scores all five axes, including the three (persistence, crash-consistency, cold-start rebuild) added because latency-and-RSS alone would have selected differently. Losing them would let the decision be re-derived on the two axes it was corrected away from"
+
+[[guard]]
+id = "G-0B-CAPACITY"
+owning_gate = "0b"
+exercises = ["shepherd-bench"]
+note = "§9: the 50 TB capacity model's explicit reject thresholds"
+evidence_missing = """
+THE PRODUCER LANDED; THE CONSUMER IS PHASE 2. This row previously said the \
+remedy was demonstrated but had no caller, and named the blocker as an \
+architecture decision nobody had made. The user made it, `target.add` is \
+served, and the position is now materially better and still not closed.
+
+WHAT CHANGED. `Session::target_add` calls `probe_multipart_checksum` BEFORE \
+inserting the `target` row and persists the adopted algorithm with its \
+per-algorithm evidence to `config_json`. The irreversible decision is therefore \
+made, correctly, at the only moment it can be made — a checksum not requested \
+at upload cannot be retrofitted without re-uploading the object. `Err(_)` \
+refuses and writes no row, so `we could not tell` is never persisted as `it \
+supports nothing`.
+
+WHY THE AXIS STILL FAILS ITS BOUND. Nothing reads `config_json` back into an \
+`S3Config` for an actual upload. The storage layer is ready — \
+`s3.rs:312`, `:354` and `:449` all consume `multipart_checksum` — but the only \
+production construction of an `S3Config` is `to_s3_config` at \
+`dispatch.rs:555`, inside `target_add`, for the probe itself. The upload path \
+is Phase 2. So an object written today still goes without a whole-object \
+checksum, and $441/mo against a $25 bound remains correct for it.
+
+THE SEAM IS LEFT AND TESTED so the future consumer cannot drift: \
+`S3TargetConfig::parse_stored` and `to_s3_config` round-trip through ONE struct \
+with `deny_unknown_fields`, unit-tested in both directions, specifically so \
+Phase 2 does not write a second parser that disagrees with the writer.
+
+WHAT REMAINS IS SMALL AND NAMED, which it was not before: hydrate the stored \
+config on the upload path. No decision is outstanding, no probe is missing, no \
+architecture question is open. And the cost of the delay is currently ZERO — \
+the $441 figure applies to objects uploaded WITHOUT the checksum, and no \
+objects exist yet. That will stop being true the moment the first real upload \
+happens, which is the deadline this row is really tracking.
+
+§9's closure path — `a written escalation carrying the user's recorded \
+renegotiation decision` — remains available and remains unexercised, and is now \
+the LESS attractive option: the axis is on track to pass by measurement rather \
+than by renegotiation.
+"""
+
+[[guard]]
+id = "G-0C-SPIKES"
+owning_gate = "0c"
+exercises = ["spikes/windows-syncroot", "spikes/macos-fileprovider"]
+note = "§9's 0c/0d row: Windows sync-root hydration from a separate process; the macOS spike on BOTH OQ-A mechanisms; CFAPI trash/undelete"
+evidence_missing = """
+`spikes/` NOW EXISTS AND BOTH LEGS HAVE RUN ON REAL HARDWARE. WHAT REMAINS IS \
+NOTARIZATION AND HYDRATION, BOTH G-0D. This row previously read `hardware, and \
+no spike has run` and reported `no evidence at all` — both were true of the \
+repository and false of the work, which is the gap `spikes/` closes.
+
+WINDOWS: GREEN. Register/connect decoupling works from unpackaged executables. \
+Three distinct processes — one registered the sync root with \
+`CF_REGISTER_FLAG_NONE` AND THEN EXITED, a second created a 12,000-byte \
+placeholder, a third read it — with `CF_CALLBACK_TYPE_FETCH_DATA` served across \
+the process boundary, the requester's identity taken from the KERNEL via \
+`CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO`, and the payload confirmed by an \
+independently computed sha256. Registration persists past process exit; REBOOT \
+persistence is UNTESTED and not claimed. `Explorer\\SyncRootManager` is written \
+by the shell-level WinRT API and NOT by `cfapi`, so a check against that key \
+could not have failed for the right reason; `CfGetSyncRootInfoByPath` is the \
+load-bearing one and returns 0x80070186 after unregistration. Source and \
+findings: `spikes/windows-cfapi/`.
+
+macOS: REGISTRATION COSTS NO APPLE IDENTITY, AND THIS IS NOW REPRODUCIBLE. An \
+ad-hoc-signed `MH_EXECUTE` appex registers a File Provider domain — \
+`Signature=adhoc`, `TeamIdentifier=not set`, no certificate, no provisioning \
+profile, no notarization — verified 2026-08-19 on the HOST with SIP ENABLED \
+across four bundle IDs never used there, AND in a fresh VM reporting `0 valid \
+identities found`. The extension PROCESS LAUNCHES, which is further than any \
+earlier probe reached. Two requirements are load-bearing and neither is \
+obvious: the appex must carry `com.apple.security.application-groups` matching \
+its own `NSExtensionFileProviderDocumentGroup` exactly — omit it and `codesign` \
+is happy, `pluginkit` lists it, and only `fileproviderd` says why, once, at \
+ERROR, while the caller sees `-2014` and reads it as never-discovered — and \
+`pluginkit -a` must follow `lsregister -f` WITH NO GAP: six alternating trials \
+on identical bundles gave 0 s -> ACCEPTED x3 and 5 s -> REFUSED x3, perfect \
+separation, mechanism unexplained and labelled a guess. Source, findings and \
+the preserved working bundle: `spikes/macos-fileprovider/` and \
+`.omc/artifacts/phase-0c/`.
+
+AN EARLIER VERSION OF THIS ROW SAID THE macOS RESULT DID NOT REPRODUCE, AND \
+BLAMED THE REBUILT PLISTS OR A HOST-VERSUS-VM DIFFERENCE. Both guesses were \
+wrong, and the correction is recorded rather than quietly replaced: the \
+original probe scripts were recovered from the Mac and `vmfp.sh`'s \
+`write_plist()` generates the appex plist KEY-FOR-KEY identically to the \
+committed one, so the plists are exonerated on evidence. The real causes were \
+the two requirements above. A separate confound in the old record is now dead: \
+the original ad-hoc success had re-signed a bundle pkd already accepted under \
+an Apple Development identity, whereas the cold VM had no identities at all.
+
+THIS EVIDENCE IS PLATFORM-BOUND AND DELIBERATELY NOT GATE-EXECUTABLE. The gate \
+runs `cargo test` on Linux; Cloud Files needs the `cldflt.sys` kernel \
+mini-filter and a File Provider needs `pkd` and `fileproviderd`. A Linux test \
+asserting these files exist and parse was REFUSED on purpose: it would pass \
+honestly while saying nothing about whether either spike works, which is this \
+repository's recurring defect one level up. §9's own text accepts a documented \
+conditional for this row — `a documented sparse failure plus full-MSIX \
+success` — and this is that.
+
+STILL RED FOR: the notarized extension §9 names, and HYDRATION. Domains are \
+created `user-disabled`, and the documented headless bypass \
+(`NSFileProviderDomain.testingModes`) needs a restricted entitlement that AMFI \
+SIGKILLs under ad-hoc. So the boundary is now precise, and it is the answer to \
+the procurement question: REGISTRATION IS FREE; HYDRATION IS WHAT \
+G-0D-PROCUREMENT BUYS.
+"""
+
+[[guard]]
+id = "G-0D-PROCUREMENT"
+owning_gate = "0d"
+exercises = ["fixtures/corpus-10m", "signing-identities"]
+note = "§9's 0c/0d row: signing identities present and test-signed; fixtures/corpus-10m staged; the signing inventory artifact"
+evidence_missing = """
+USER-SUPPLIED AND NOT SUPPLIED. Apple Developer Program membership, the \
+Windows code-signing certificate and MSIX publisher identity, and the three \
+physical machines are recorded in open-questions.md as outstanding \
+prerequisites with multi-day-to-multi-week lead times. `fixtures/corpus-10m` \
+is not staged. These gate Phases 3, 6 and 9 and explicitly NOT Phase 1, so \
+this row being red does not block M1 — which is the whole point of §9 \
+splitting Phase 0's gate per lane.\
+"""
+
+# ---------------------------------------------------------------------------
+# Phase 1 guards — §9's Phase 1 row, clause by clause.
+# ---------------------------------------------------------------------------
+#
+# Guards rather than ACs for the same reason as Phase 0's: §9's Phase 1 row
+# demands eight things that carry no AC number, and the numbered set is fixed at
+# AC-1..AC-65 by the Appendix. Each row below quotes the clause it answers, and
+# `[[phase]]` at the foot of this file ties them to §9's text verbatim so the
+# tie cannot rot silently.
+#
+# Several are PARTIAL: evidence that genuinely runs, plus a stated gap that
+# keeps the row red. That is AC-2's pattern and it is the honest shape for this
+# phase — the mechanisms are largely built and the SCALES and PLATFORMS §9 names
+# are not reachable from this machine.
+
+[[guard]]
+id = "G-1-M1-FUNC"
+owning_gate = "1"
+exercises = ["shepherd-daemon", "shepherd-scan::walk", "shepherd-catalog::file_repo", "shepherd-index::meta", "shepherd-cli"]
+note = "§9 M1 leg 1: `functional pipeline over the 1M on-disk corpus`. Nothing load-bearing here — `note` is not rendered by `gate --phase`; the removal of this guard's former stated gap is recorded in the 1M row's `proves` line instead."
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "the_m1_demo_holds_at_a_million_files"
+ignored = true
+requires_env = "SHEPHERD_M1_CORPUS"
+release = true
+proves = "§9's M1 functional leg at the size §9 names: `root add && scan start && search` over 1,000,000 real files on a real filesystem. files_seen and files_catalogued are BOTH exactly 1,000,000, and unchanged by a rescan — so the scan neither drops nor duplicates at scale, which a nine-file run cannot distinguish. The search needles are asserted against a committed manifest with expected counts including needles that must return ZERO, so a matcher that returned everything fails rather than passes. A smaller run is possible only by setting SHEPHERD_M1_SMALL_RUN_REASON, which forces the reason to be recorded rather than inferred — the same discipline as shepherd-bench's scaled_run_reason. Cited with requires_env because absent the corpus this cannot be produced, and absent evidence fails rather than skips. GAP REMOVED, NOT REWORDED: this guard previously carried `SCALE ONLY, AND THE GAP IS FIVE ORDERS OF MAGNITUDE` with a largest run of NINE files. §9 asked for the 1M corpus and the 1M corpus ran, so no delta remains to state — and a gap kept past its evidence is a gate failing for a reason that no longer exists, which is as wrong as passing for one that never did. COST: this row plus G-1-M1-PERF make `gate --phase 1` a SCHEDULED command — a 1M-file scan and a 10M index build in --release. Budget a window; do not run it into someone else's"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "search_finds_scanned_files_and_misses_absent_ones"
+proves = "PARTIAL — the M1 demo line's shape at nine entries: scan populates the catalog, search returns the files that match and NOT the ones that do not, and the daemon's own doctor reports the same entry count. The miss half is what stops a matcher that returns everything satisfying the hit half"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "shepctl_drives_a_real_daemon_end_to_end"
+proves = "PARTIAL — the demo runs through the real `shepctl` binary over a real socket, not through an in-process shortcut, so the CLI path §9's demo line names is the path exercised"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "a_scan_walks_the_root_and_the_files_land_in_the_catalog"
+proves = "PARTIAL — the walk's output is asserted against the catalog's row count rather than against the walker's own report"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "scanning_twice_converges_rather_than_duplicating"
+proves = "PARTIAL — rescanning converges; the failure this guards (a second scan doubling the catalog) is one that only shows up once a scan is repeated, which a single-run demo would never do"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "shepctl_search_returns_json_a_script_can_read"
+proves = "PARTIAL — the `--json` half of the demo line: the output is machine-readable, which is what makes the demo assertable rather than eyeballed"
+
+[[guard]]
+id = "G-1-M1-PERF"
+owning_gate = "1"
+exercises = ["shepherd-index::meta", "shepherd-bench"]
+note = "§9 M1 leg 2: `< 50 ms p95 over a 10M-row injected catalog`"
+
+[[guard.evidence]]
+package = "shepherd-index"
+test = "meta::tests::the_production_index_meets_the_50ms_bar_at_10m_entries"
+ignored = true
+release = true
+proves = "PARTIAL — 10M entries, 200 queries over ten as-you-type patterns, `assert!(p95 < 50.0)`. It also asserts hits for the queries that should hit and NO hits for the four that should not, which is the guard that stops a p95 measured over an index that matches nothing. Cited with `ignored` and `release` because it refuses to run in debug rather than report a meaningless number — running it explicitly is the opposite of §9 rule 1's skipped test"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::the_metadata_bar_holds_through_the_daemon_on_an_injected_catalog"
+proves = """
+§9's M1 leg 2 AS WRITTEN, and measured FROM Phase 1 rather than re-read from Phase 0b: the
+metadata p95 over a 10M-row catalog INJECTED BY shepherd-bench in the real §4.4 schema and
+queried THROUGH a live daemon — four separate socket connections, under background ingest,
+pinned to the contract's cores — clears the precommitted 50 ms bar in BOTH cache states.
+COLD 41.22 ms, WARM 33.90 ms. This could not have been satisfied by re-reading meta_bench_arena_*
+however good its numbers are: that is an in-process measurement and this clause is about the path
+through the daemon, which is a different quantity and is measured below to cost 15.81 ms of
+concurrency alone.
+Asserts not only the p95 but what it is a measurement OF — zero_hit == 0, contract row count
+and client count, the pinned core list, and NON-ZERO BACKGROUND INGEST IN EVERY RUN (that last
+one because this harness shipped a cursor bug that left runs 1 and 2 of every cell inserting
+nothing while still carrying the label 'under background ingest').
+
+THREE CAVEATS, CARRIED NOT BURIED.
+(1) Run-to-run drift is FLAGGED in both cells — 17.08% cold, 12.92% warm, against the
+contract's 10% — and cold run 1 at 46.56 ms passed by 3.4 ms. This is a pass with flagged
+drift and thin headroom, which is a weaker claim than a clean pass, and the test asserts
+drift_flagged is RECORDED (never that it is false) so a re-measure cannot drop the field and
+silently upgrade it.
+(2) The contention guard that admitted these runs CANNOT DISCRIMINATE at the level that
+matters. Its threshold went 0.90 -> 0.84 during this work: 0.90 sat above this host's measured
+idle floor (88.4% mean, 86.3-90.6% over six samples on an empty box) and was unsatisfiable
+rather than strict, but at 0.84 a neighbouring 10M scan measuring ~85% now passes. No absolute
+idle threshold separates those distributions on this host; the fix is a different guard design
+and is a follow-up. So the guard is NOT the evidence these runs were uncontended. The evidence
+is the recorded per-run samples — cold idle before [.889 .944 .938] / after [.914 .945 .879],
+warm before [.903 .934 .958] / after [.961 .933 .950] — every one at or above the empty-box
+baseline, checkable from the artifact by someone who trusts neither the guard nor its author.
+Ten of those twelve samples would also have cleared the original 0.90, and all twelve clear
+0.87, so the recalibration did not manufacture this result.
+(3) REPRODUCIBILITY: this box could not hold that state on demand. Both cells needed several
+attempts to find a window, on a host whose steady state is ~15 claude processes, tmux, byobu
+status shells and five vscode-server nodes. The number is sound; obtaining it required the box
+to be quieter than its own baseline, and a re-run should budget for that.
+
+CONCURRENCY IS WHERE THE COST IS, AND THE HEADROOM IS THEREFORE FRAGILE. A supplementary
+1-client diagnostic (meta_daemon_bench_warm__diagnostic_1c, marked supplementary_diagnostic and
+emitted under its own key so it can never be read as a contract cell) measured 18.09 ms p95 and
+1.29 ms p50 against the contract cell's 33.90 ms p95 and ~8 ms p50. Same harness, same corpus,
+same committed trace, same binary, same session — ONLY the client count differs, so the 15.81 ms
+between them is attributable to concurrency and to nothing else. That is 47% of the entire warm
+figure, and the 6x median inflation is the sharper tell: a fixed per-call cost cannot move a p50
+like that; serialisation can. CONSEQUENCE FOR AC-40: the 32% headroom measured at four clients
+rests mostly on a term that grows with client count, and must NOT be read as 32% headroom in
+general. Stated as direction, not as a scaling law — two points do not give an exponent and none
+was measured.
+
+NOT A DECOMPOSITION AGAINST THE IN-PROCESS ANCHOR. The same-session in-process anchor measured
+14.91 ms, but it builds its own uniform synthetic corpus and queries 10 hand-written patterns x
+20 rounds, four of which are deliberate misses that scan the whole arena with no early exit —
+where the trace queries here early-exit at cap=50. Subtracting it from either daemon figure
+crosses both corpus and query set, so 18.99 ms as a 'daemon path cost' and any per-call versus
+concurrency percentage split derived from it are INDICATIVE ONLY. The load-bearing comparison is
+18.09 -> 33.90, which is like-for-like. This distinction is recorded because the cross-workload
+subtraction was written into an earlier draft of this row as though it were measured.
+
+MECHANISM STILL NOT ATTRIBUTED — TWO OF THREE CANDIDATES REMAIN LIVE. The diagnostic separates
+per-call cost from concurrency cost and shows concurrency dominates. It does NOT separate the two
+concurrent candidates from each other: writer-actor hydration queueing (dispatch.rs:344 -> cat()
+-> writer().try_with — one thread, one connection, four clients serialising) and backfill from
+SQLite's page-count autocheckpoint (armed because the catalog's PRAGMAS never disable it; tripped
+by the ingest thread's ~100-rows-per-50ms commits). Both scale with client count identically.
+Distinguishing them needs a WAL-size or checkpoint-count probe correlated against per-query
+latency, which was not built. Per-call cost is the one candidate this measurement retires as the
+dominant term.
+"""
+
+[[guard]]
+id = "G-1-IDENTITY-KEY"
+owning_gate = "1"
+exercises = ["shepherd-catalog::identity"]
+note = "§9: `content-addressed keys collision-free under a case/normalization fuzz corpus`"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::nfd_and_nfc_fold_to_one_norm_key"
+proves = "PARTIAL — the two Unicode spellings of one path converge on one norm_key under both Nfc and Nfd policy, so a file does not acquire two catalog identities by how its name was typed"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::preserve_keeps_the_two_spellings_apart"
+proves = "the negative that gives the fold meaning: under Preserve the same two spellings must NOT collapse. Without this, an implementation that folded everything unconditionally would satisfy the row above while destroying the distinction on filesystems that keep it"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::case_folding_follows_the_root_policy"
+proves = "PARTIAL — case folding is driven by the per-root probed policy, asserted in both directions: distinct under Sensitive, equal under Insensitive"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::separators_are_unified"
+proves = "a backslash and a forward slash yield one key, so the same file does not get two identities across platforms"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::path_never_enters_the_key"
+proves = "the content-addressed half: the key is a function of the hash alone, so two identical files at different paths share one object and a rename cannot orphan one"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::key_layout_fans_out_on_the_hash"
+proves = "the emitted key has the documented two-level fan-out, which is what stops one flat prefix holding every object on a target that lists lexicographically"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::probe_detects_this_filesystem_and_cleans_up_after_itself"
+proves = "the policy is PROBED on a real filesystem rather than assumed, and the probe leaves nothing behind — an assumed policy is how a case-insensitive root gets case-sensitive keys"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::probe_on_a_missing_root_assumes_rather_than_failing"
+proves = "and when it cannot probe it says so (`assumed == true`) instead of reporting a detected answer it did not detect"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::proptests::norm_key_is_a_fixed_point_of_itself"
+proves = "§9's `fuzz corpus`, as a real generator dependency (proptest) rather than more hand-chosen examples: 6 properties over uniform strings plus dense draws from the hazard families — dotted/dotless i, Kelvin/Angstrom/Ohm singletons, final sigma, Hangul, multi-mark clusters emitted out of canonical order. 24,576 inputs per run by default, re-verified at 120,000 with 0 failures. THE CORPUS FOUND A REAL DEFECT, which is the point: norm_key normalised only BEFORE case folding, and to_lowercase is not closed over a normalisation form, so two spellings of one folded name took two catalog identities. Fixed by re-normalising after folding; both counterexamples pinned as named example tests so a generator change cannot silently retire the guard"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::a_users_file_whose_name_collides_with_a_probe_survives_enrollment"
+proves = """
+`root.add` DESTROYED USER DATA. `ProbeFiles::new` wrote a FIXED path with
+`fs::write` — which truncates — and `Drop` then unlinked it, so enrolling a root
+that happened to contain `.shepherd-probe-CASE` emptied and deleted that file.
+The pre-fix assertion reads `left: None`: not truncated, GONE. Data loss from an
+operation whose entire job is to measure the volume without damaging it.
+"""
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "identity::tests::a_name_collision_refuses_to_truncate_and_falls_back_to_defaults"
+proves = """
+THE ROW ABOVE IS NOT ENOUGH, and that is why this one exists. Mutating
+`create_new(true)` back to `create(true).truncate(true)` leaves the first test
+GREEN — the unique `{pid}-{nanos}` stem alone satisfies it, because a user's
+fixed-name file no longer collides. So that test pins the NAMING CONVENTION and
+this one pins the EXCLUSIVE CREATE. Reaches the collision the stem makes
+unreachable via a `with_stem` seam. Each of the three mutations (create_new,
+fixed stem, unconditional unlink) is killed by exactly one of the two.
+
+THE PATTERN WAS ALREADY IN THIS CRATE: `atime.rs:291`'s `probe_atime_advance`
+does exactly this and its comment at `atime.rs:327` names the hazard verbatim —
+`A fixed name opened with O_TRUNC would empty a user's file that happened to
+share the name`. `identity.rs` is the one place the rule was not applied.
+"""
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "a_root_whose_identity_probe_could_not_run_is_reported_as_assumed"
+proves = """
+`probe_path_policies`' doc says `the caller records the distinction`
+and the caller DID NOT: `dispatch.rs` read `policies.case`/`.norm`, never
+`.assumed`, and pushed no warning — while the atime and volume-id gaps three
+lines away both push one. A root whose case/normalization policy was GUESSED was
+indistinguishable from one that was measured, under a comment reading `Probed,
+never assumed — §4.9 exists because retrofitting identity after Phase 2 destroys
+files is the scenario it prevents`. A comment describing behaviour the code does
+not have is worse than a gap.
+
+KNOWN GAP, STATED: the distinction is now reported at registration but is NOT
+durable — `scan_root` has no column for it, so it cannot be audited later. A
+schema change was judged out of scope for a review round.
+
+The test refuses to run as root rather than passing vacuously when the condition
+cannot arise.
+"""
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "a_root_that_probed_successfully_carries_no_assumed_warning"
+proves = "`warn when assumed` is otherwise satisfied by warning ALWAYS — which trains users to ignore the line, the same defect wearing the opposite face. Warning unconditionally kills this test and nothing else"
+
+[[guard]]
+id = "G-1-IDENTITY-FSID"
+owning_gate = "1"
+exercises = ["shepherd-catalog::volume"]
+note = "§9: `fs_id stable across a simulated remount`"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::tests::mountinfo_parses_past_the_variable_optional_fields"
+proves = "PARTIAL — /proc/self/mountinfo's variable optional-field section is parsed correctly, including the CIFS line that has none. A parser that miscounted fields here would read the wrong column as the device and give every file the wrong volume"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::tests::the_longest_matching_mount_point_governs"
+proves = "PARTIAL — a path under a nested mount resolves to that mount and not to `/`, which is the resolution fs_id depends on"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::tests::a_mount_point_prefix_must_end_at_a_separator"
+proves = "`/tmpfoo/x` does not resolve to `/tmp` — the substring-is-not-a-component defect, in the mount table this time"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::tests::octal_escapes_are_decoded"
+proves = "a mount point containing a space round-trips, so a real user's external drive does not silently resolve to the wrong volume"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::remount_tests::fs_id_survives_a_remount_that_changes_st_dev"
+ignored = true
+proves = "the property §9 names, by the leg that actually bites. NOTE the row's own suggested test — one device at two mount points — was measured and REJECTED as not load-bearing: it shares a superblock, so st_dev is identical at both paths and the assertion is free even for an st_dev-derived fs_id, the one derivation §4.4 forbids. It is kept as leg 1 for mount-point invariance; leg 2 detaches the loop device and re-attaches the same backing filesystem on a different loop number, so st_dev genuinely changes (1792 to 1793) and fs_id does not. The st_dev change is asserted as a PRECONDITION, so a run that fails to simulate the remount fails saying the simulation failed rather than reporting an unearned green. Mutation-verified: swapping volume_id for md.dev() fails at leg 2 having passed leg 1"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "volume::remount_tests::the_fallback_refuses_a_device_path_source"
+ignored = true
+proves = "the negative that gives leg 2 its meaning, RENAMED AND RE-AIMED in 8ae4b39. It used to assert that volume_id_fallback returned two DIFFERENT identities across the same remount and called that acceptable because the value carried a `src:` label. It is not acceptable: nothing consuming the column branches on the label, so a loop-backed root was enrolled as `src:ext4:/dev/loopN`, came back as `/dev/loopM`, and every reconstructed fs_id quietly stopped matching its catalog row — the label documented the hazard instead of preventing it. The fallback now REFUSES any source named at mount time, and the old assertion survives inside the test as its justification: the two identities it would have minted are still shown to differ, which is why neither is offered. The device-node change is asserted as a PRECONDITION, so a run whose re-attachment reused the same loop number fails saying the simulation failed rather than reporting an unearned green"
+
+[[guard]]
+id = "G-1-ATIME"
+owning_gate = "1"
+exercises = ["shepherd-catalog::atime", "shepherd-rules::match"]
+note = """
+§9: `atime_mode detection correct on all three platforms`. CLOSED, and the
+Linux half was the last to fall because it was the one nobody had questioned.
+
+macOS and Windows detectors landed with direct tests. Writing Linux's exposed a
+correctness gap the option strings hide: the kernel names `noatime` and
+`relatime` in mountinfo and names `strictatime` NOWHERE — strict is the ABSENCE
+of a flag, measured on tmpfs AND ext4. So `classify_mount_options` cannot tell a
+strict mount from an undescribed one, answers `Relatime` for both, and
+`AtimeMode::Reliable` was UNREACHABLE on Linux, leaving §4.12's fallback chain
+with a rung this platform could never reach.
+
+`detect()` still behaves exactly that way and still never answers `Reliable`.
+The ambiguity is resolved where it can be resolved honestly — in
+`detect_with_write_probe()`, on the `target.add` path — by MEASURING, which is
+how macOS resolved its identical `statfs` ambiguity. It corners
+`relatime_need_update()` by driving all three of its update conditions false
+and VERIFYING from the inode that it did, so an advance on the second read can
+only be strictatime.
+
+It can only ever REACH `Reliable`, never default to it: every failure path
+returns the mount-option answer. On this host `/dev/shm` — a real mount whose
+options are silent — reads `Reliable` where the option string reads `Relatime`.
+
+WHAT THIS ROW SHOULD NOT BE READ AS CLAIMING: `detect()` unqualified is still
+option-based on Linux and still cannot see a strict mount. Only the probing
+entry point can, and only at registration.
+
+WHAT THIS GATE CANNOT RUN, stated because three macOS citations were removed
+from this row rather than left to report `filter matched NOTHING` forever:
+`atime::macos_tests::*` is `#[cfg(target_os = "macos")]`, so it does not exist
+in the binary a Linux gate builds. Those tests are real and they pass — on the
+macOS CI leg, which as of 2026-08-19 exists and is green. Citing them here made
+the row red for a bookkeeping reason while the evidence itself was fine, which
+is its own kind of false signal. The Windows classifier tests ARE cited below:
+they are pure mapping tests in the shared module and run on every leg.
+"""
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::explicit_noatime_disables"
+proves = "PARTIAL (Linux) — noatime classifies as Disabled, and wins when it appears alongside relatime"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::relatime_is_explicit_or_the_default"
+proves = "PARTIAL (Linux) — relatime is detected when stated AND assumed when unstated, which is the case that matters because it is the kernel default and the one an implementation is most likely to miss"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::a_substring_is_not_an_option"
+proves = "`some_noatime_lookalike` does not disable atime — the same substring-versus-token defect the deny-list carries, in the mount options"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::the_stricter_classification_wins_when_mount_and_superblock_disagree"
+proves = "when two sources disagree the STRICTER answer wins, so a disagreement cannot resolve in favour of trusting atime"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::destructive_age_rules_are_rejected_on_disabled_and_unknown"
+proves = "§4.12's actual safety property: Unknown is treated like Disabled, so an undetected platform refuses destructive age rules rather than silently trusting a timestamp nothing verified"
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_destructive_atime_rule_is_rejected_on_a_disabled_root"
+proves = "the rejection is enforced where it matters — Matcher::compile refuses, so the rule cannot exist rather than being filtered later"
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::the_age_signal_follows_the_documented_fallback_order"
+proves = "the fallback order is asserted rather than assumed: observed access, then atime only when Reliable, then mtime — so a preview can disclose which signal drove a match"
+
+
+
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::system_managed_enabled_is_unknown_because_the_os_may_flip_it"
+proves = "Windows state 2, system-managed-enabled and the Windows DEFAULT, maps to Unknown deliberately: detect() has exactly one production call site, is persisted and read back, and is never refreshed, so the OS can flip the policy with nobody re-running it. The optimistic mapping would silently authorise destructive age rules fleet-wide"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::unrecognised_encodings_are_unknown_rather_than_masked"
+proves = "the four-state mapping is an explicit allowlist, not a `& 1` mask — a mask would read the in-the-wild 0x80000004 as enabled. This test fails if someone swaps it for a mask"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::tests::the_probe_hosts_real_registry_value_reads_as_disabled"
+proves = "the real Windows host value 0x80000003 — which carries a flag bit `fsutil` does not print, while `fsutil` shows 3 — classifies as Disabled, agreeing with an observed non-advancing atime rather than only with a registry string"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::detect_agrees_with_findmnt_about_the_options_in_force"
+proves = "Linux detect() — the COMPOSITION, not its parts — cross-checked against findmnt, util-linux's independent implementation of the same longest-prefix resolution over the same kernel table. Re-parsing mountinfo with our own function would compare it to itself and pass on a broken one, the same reason the launchd uid test checks against `id -u` rather than getuid()"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::detect_changes_its_answer_when_the_mount_options_change"
+ignored = true
+proves = "the one that catches a constant: the other Linux tests all run against whatever /tmp happens to be, so each passes against a detect() hardcoded to that answer. This mounts a tmpfs noatime, remounts it, and REQUIRES the answer to change. Needs root, hence ignored"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::a_relatime_mount_is_never_measured_as_reliable"
+proves = "the probe can only ever REACH Reliable, never default to it — a relatime mount stays Relatime through the probe, which is the direction that matters because Reliable is the value that both authorises destructive age rules and lets OS atime feed last_observed_access"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::a_mount_that_already_names_its_policy_is_never_written_to"
+proves = "the gate: a mount whose options name a policy is believed for free and receives no write at all. Asserted on the DIRECTORY'S MTIME rather than on the returned mode, because probing a relatime mount also returns Relatime — no assertion on the answer could see whether a write happened"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "atime::linux_tests::the_probe_cannot_truncate_a_users_file"
+proves = "the probe writes with a unique name under O_CREAT|O_EXCL and unlinks immediately, so it cannot clobber a user file — stricter than the neighbouring identity::probe_path_policies, which uses fs::write and a fixed name"
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_trailing_atime_predicate_is_refused_not_only_a_leading_one"
+proves = """
+THE REFUSAL DESCENDS INTO COMBINATORS. The §4.12 check read only the
+top-level predicate, so `{"all":[{"ext":"log"},{"older_than_days":365}]}` on a
+`noatime` root compiled and ran — the destructive age rule the guard exists to
+refuse, wearing an `all` wrapper. `any_age_field_rests_on_atime` now recurses
+through All/Any/Not. Asserted at the TRAILING position specifically: a check
+written against a one-element combinator passes while still missing every real
+rule, because real rules put the cheap filter first.
+"""
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_compound_rule_with_no_atime_dependence_is_still_permitted"
+proves = """
+THE ACCEPTANCE DIRECTION, and the row that stops the fix from being
+`refuse every compound rule`. Mutating the recursion to refuse any compound
+destructive rule kills ONLY this test — the refusal tests above stay green — so
+without it the guard could over-refuse forever and the suite would applaud. A
+`{"all":[{"ext":"log"},{"min_size":...}]}` delete rule touches no time field
+and must still compile on a `noatime` root.
+"""
+
+[[guard.evidence]]
+package = "shepherd-rules"
+test = "r#match::tests::a_compound_atime_rule_is_still_permitted_under_relatime"
+proves = """
+the recursion narrows on the ATIME MODE, not on the shape: the same
+nested age predicate that is refused on Disabled compiles under Relatime. Pairs
+with the row above — one holds the shape axis fixed and varies the mode, the
+other holds the mode and varies the fields — so neither `refuse all compound`
+nor `refuse all age` survives both.
+"""
+
+[[guard]]
+id = "G-1-JOBS"
+owning_gate = "1"
+exercises = ["shepherd-jobs::queue", "shepherd-jobs::worker"]
+note = "§9: `Job-queue core: kill-and-resume of a checkpointed job`"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "worker::tests::kill_and_resume_of_a_checkpointed_job"
+proves = "the §9 clause exactly: a job checkpoints, the actor is dropped with the row left Running, and a second run recovers it, hands the executor back the SAME checkpoint payload, and completes — with attempts == 2, so the resume is visible as a resume rather than as a fresh job. Over a real file-backed database, not a memory store"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "queue::tests::recovery_requeues_a_non_destructive_job_with_its_checkpoint"
+proves = "the checkpoint survives the crash boundary at the queue layer too, so the resume above is a property of the store rather than of the worker that happened to hold it"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "queue::tests::recovery_quarantines_an_interrupted_destroy_instead_of_requeueing_it"
+proves = "the negative that makes resume safe: an interrupted DESTROY is quarantined, never replayed. Abort-forward-never. Without this row, `resume everything` would satisfy the positive one and re-run the only irreversible operation in the product"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "queue::tests::recovery_handles_a_mixed_batch_and_is_idempotent"
+proves = "recovery run twice does not resurrect what it already handled — a crash during recovery is a real state and this is the one that says what happens in it"
+
+[[guard.evidence]]
+package = "shepherd-jobs"
+test = "queue::tests::recovery_clears_any_backoff_the_crash_interrupted"
+proves = "a job that was backing off when the process died is claimable after recovery rather than waiting out a timer that no longer has anything counting it"
+
+[[guard]]
+id = "G-1-WRITER"
+owning_gate = "1"
+exercises = ["shepherd-catalog::schema", "shepherd-catalog::file_repo"]
+note = "§9: `Catalog write discipline: single-writer actor`"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "writer::tests::concurrent_writers_over_one_file_serialize"
+proves = "eight threads and two hundred inserts through one actor over a file-backed WAL database land two hundred rows. The assertion is the COUNT: a lost row is the signature of two threads reaching the connection, which is the defect the single-writer rule exists to prevent, and it is invisible to an assertion that only checks the writes returned Ok"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "writer::tests::shutdown_drains_what_was_already_submitted"
+proves = "the writes are durable rather than merely acknowledged: the database is REOPENED and re-counted, so an actor that dropped its queue on shutdown fails here"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "writer::tests::a_handle_that_outlives_its_actor_reports_gone"
+proves = "a handle whose actor is gone reports it instead of blocking forever — the failure mode that turns a dead writer into a hung daemon"
+
+[[guard]]
+id = "G-1-CHECKPOINT"
+owning_gate = "1"
+exercises = ["shepherd-catalog::schema"]
+note = """
+§9 Phase 1, AS CORRECTED 2026-08-19: `single-writer actor, and a WAL bounded
+across the full scan`. The clause previously read `dedicated PASSIVE-checkpoint
+connection` and named the wrong component as the thing holding the bound. Both
+the plan clause and docs/adr/0b-capacity-model-50tb.md are amended; NO CODE
+CHANGED, because the code was never what was wrong.
+
+WHAT BOUNDS THE WAL IS SQLite's PAGE-COUNT `wal_autocheckpoint`, which fires at
+a commit boundary on the WRITING connection where backfill is possible. The
+dedicated 30 s PASSIVE connection exists, demonstrably checkpoints (second
+evidence row below, mutation-proven), and is a supplementary backstop.
+
+Measured, one corpus, one machine, one pragma different:
+
+    wal_autocheckpoint ON  (production)        WAL peak     7.9 MiB
+    wal_autocheckpoint OFF (30 s thread alone) WAL peak 6,378.8 MiB
+
+808x, and the second figure breaches ADR 0b's own 1 GB reject threshold by
+6.4x. A PASSIVE checkpoint cannot backfill frames a reader still holds; the
+index rebuild reads continuously during a scan, so the WAL tracks CORPUS SIZE
+rather than the interval — it grew across three intervals rather than plateauing
+at one. A SHORTER INTERVAL DOES NOT HELP, and that is the non-obvious part.
+
+THE OPERATIONAL TRAP, which is why this is in a rendered note rather than a
+commit message: `catalog::PRAGMAS` does not set `wal_autocheckpoint`, so the
+bound rests on SQLite's default being left alone. Setting it to 0, or opening a
+catalog connection without `PRAGMAS`, silently removes the bound — and until
+this correction both §9 and ADR 0b told the reader the dedicated thread had them
+covered.
+"""
+
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "the_m1_demo_holds_at_a_million_files"
+ignored = true
+requires_env = "SHEPHERD_M1_CORPUS"
+release = true
+proves = "the WAL BOUND across the FULL 10,000,000-file scan E-4 named, at the scale E-4 named. SAMPLED throughout — 2,066 readings at 1 s — and asserted on the MAXIMUM of the series rather than a final reading, which is the distinction that makes it evidence: a WAL that grew without bound and was checkpointed once at the end satisfies a closing measurement and fails this. Peak 11.30 MiB against the 64 MiB ceiling, first reached at t=633 s and then FLAT AT THAT MAXIMUM for the remaining 69 percent of the scan while ~6.9M further rows landed and the catalog grew to 4,513 MiB — the log held 0.25 percent of what it wrote. wal_max == wal_final is that plateau and NOT a still-growing log: a PASSIVE checkpoint backfills and SQLite reuses the log in place, so the file records a high-water mark and never shrinks. Daemon VmHWM 2,498 MiB, the Vec<FileStat> ceiling scan_exec.rs names 10M as the pressure point for, holding with room. What this does NOT establish is WHICH mechanism bounds it — see the note on this row. The scan_seconds / rescan_seconds / scan_files_per_sec figures in the artifact were taken on a contended box and the test already refuses to let them mean anything"
+
+[[guard.evidence]]
+package = "shepherd-catalog"
+test = "writer::tests::the_checkpoint_lands_on_a_connection_the_writer_thread_does_not_own"
+proves = "the STRUCTURAL half of §9's clause: that the connection issuing the checkpoint is a DISTINCT connection from the writer's. It is not a grep for wal_checkpoint and not a count of checkpoint calls — the call can be present, be issued, and the WAL still grow without bound. It measures an outcome only a separate connection can produce. The writer thread is put to sleep INSIDE a closure and a probe task submitted afterwards is asserted NOT to have completed, so the writer's connection is provably idle for the window; wal_autocheckpoint is disabled on the writer's connection and READ BACK as 0, so SQLite's own checkpointer cannot account for the result; and in WAL mode the main database file grows only when frames are backfilled. Growth in that window is therefore a checkpoint on a connection the writer thread was not touching. A second leg runs the identical window with checkpoint_path None and requires growth == 0, so the measurement has a control rather than a bare number. BOTH LEGS ARE MUTATION-PROVEN. Moving the checkpoint onto the WRITER'S OWN connection through the actor — same PRAGMA wal_checkpoint, same PASSIVE, same timer, indistinguishable to a grep — fails it. Giving the control leg a checkpoint thread also fails it. What this does NOT prove is the MODE: nothing asserts PASSIVE rather than TRUNCATE or RESTART"
+
+[[guard]]
+id = "G-1-INSTALL-LINUX"
+owning_gate = "1"
+exercises = ["shepherd-daemon::service", "shepherd-obs"]
+note = "§9: `Daemon installs on Linux (systemd user unit; lingering checked and warned, never forced — OQ-F)`"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::the_unit_starts_the_daemon_in_run_mode"
+proves = "PARTIAL — the generated unit runs the daemon in `run` mode and is wired to default.target, so it starts at session start (AC-59's OQ-F amendment) rather than at boot"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::the_unit_restarts_on_failure_only"
+proves = "Restart=on-failure and NOT Restart=always — asserted in both directions, because `always` would fight a user who stopped the daemon deliberately"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::the_unit_never_mentions_lingering"
+proves = "the unit does not touch lingering at all, which is the never-forced half of OQ-F expressed where it could most easily be violated"
+
+[[guard.evidence]]
+package = "shepherd-obs"
+test = "lingering::tests::the_remediation_names_the_command_but_nothing_runs_it"
+proves = "the strongest row here: the test greps its OWN SOURCE via include_str! and fails if any line both constructs a Command and mentions enable-linger, then asserts the only subprocess invoked is the read-only `show-user` query. OQ-F says check and warn, never force; this asserts the absence of the forcing code rather than the presence of a warning"
+
+[[guard.evidence]]
+package = "shepherd-obs"
+test = "lingering::tests::a_headless_disabled_node_warns_and_says_it_is_expected"
+proves = "the warning states the consequence plainly — the daemon will NOT start when logged out, this is expected behaviour, and Shepherd will not change the setting — which is the product decision OQ-F records, asserted rather than assumed"
+
+[[guard.evidence]]
+package = "shepherd-obs"
+test = "lingering::tests::unparseable_output_is_unknown_not_assumed_enabled"
+proves = "garbage from loginctl reads as Unknown, never as enabled. Assuming enabled is the failure that would silently drop the warning on exactly the machines that need it"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "nothing_the_daemon_runs_enables_lingering"
+proves = "end to end, over a real daemon: the lingering state before and after running the daemon plus doctor plus status is identical. The never-forced clause proven by observation rather than by code inspection"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "doctor_reports_the_lingering_check_and_never_changes_it"
+proves = "the check is always present in doctor's output and never reports `fail` — a warning, surfaced, as OQ-F requires, rather than a blocker or a silence"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::install_writes_to_the_env_resolved_path_and_nowhere_else"
+proves = "closes the gap the row named — a unit whose text is perfect and whose install path writes to the wrong directory. Two different Envs produce two different real files, content-verified by reading them back, with a cross-check that neither write leaked into the other's tree. Verified load-bearing by hardcoding unit_path_in to a wrong fixed path: 6 of these tests then fail immediately"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::install_is_idempotent_on_reinstall"
+proves = "reinstalling overwrites in place at the same path rather than accumulating a second file"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::uninstall_removes_the_file_install_wrote"
+proves = "the file install() wrote is the exact file uninstall() removes, at the resolved path"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::systemd::tests::unit_path_in_errors_when_neither_is_set"
+proves = "path resolution itself had zero prior coverage; the XDG_CONFIG_HOME-over-HOME priority and the no-env error case are now asserted directly"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "install_and_uninstall_take_effect_in_the_real_session"
+ignored = true
+proves = "the systemctl half of §9's verb `installs`: install() runs against the REAL user unit directory and a real systemctl --user is-enabled reports enabled afterward (not-found before and after), with the real [Install] symlink created and removed. Cited ignored=true because hermetic redirection is structurally impossible here — verified empirically that a running systemd --user manager resolves its unit search path once at its own startup and ignores a later client's XDG_CONFIG_HOME, so enable/daemon-reload can only be proven against a real session, never a fake one. Ran here and passed; machine verified clean before and after"
+
+[[guard]]
+id = "G-1-INSTALL-MACOS"
+owning_gate = "1"
+exercises = ["shepherd-daemon::service"]
+note = """
+§9: `and macOS (LaunchAgent)`. CLOSED, including the half a headless box could
+not answer.
+
+`launchctl bootstrap` acceptance, the agent running with a real pid, and a
+clean `bootout`/`uninstall` were demonstrated on host hardware earlier. What
+remained was §9's actual verb reaching all the way to LOGIN, and it is now
+measured POSITIVE in a throwaway `tart` VM (macOS 26.6.1, cloned from
+`macos-tahoe-base`, destroyed afterwards) rather than by changing the host's
+auto-login posture.
+
+THREE COLD BOOTS, and the middle one only means something because of the other
+two. Boot 1 installed via the real `shepherdd install`, then STERILIZED:
+`bootout`, `launchctl print` answering `Could not find service`, no process,
+`~/.local/state/shepherd` deleted, and the label verified ABSENT from
+`print-disabled` so no disabled override crossed the reboot. Only the plist
+did. Boot 2, with nobody logging in by hand, gave `state = running`,
+`runs = 1`, `properties = runatload`, and a socket and catalog rebuilt +34 s
+after boot having been deleted before shutdown — with the daemon starting at
+17:48:24 against a first contact with the guest at 17:48:31, so it was already
+running before anyone spoke to the VM. Boot 3 was the control: same VM, same
+auto-login, `uninstall` the only variable, sampled at +150 s — far past the
++31 s the positive took, so `absent` cannot mean `sampled too early`. Nothing
+ran, while the BINARY and the `gui/501` login domain (427 active services) both
+remained present, so the absence names the LaunchAgent rather than a missing
+binary or a missing session.
+
+A DEFECT IN THE METHOD, caught before it became a finding: the Mac's prebuilt
+`shepherdd` predated the `libc::getuid()` fix and still carried the literal
+`$(id -u)`. Shipping it would have reproduced `Unrecognized target specifier`,
+the agent would never have loaded, and the report would have read `does not
+start at login` — a false red indistinguishable from a real one. The binary
+under test is pinned to `ae6e43e`, sha256 `c4e6d2c1...`, verified identical at
+every hop.
+
+PLATFORM-BOUND AND NOT GATE-EXECUTABLE, like G-0C-SPIKES. The gate runs
+`cargo test` on Linux; `launchd` and `loginwindow` are macOS components and a
+cold boot is not a cargo target. The Linux half IS gate-executable and is cited
+below. Evidence for the macOS half:
+`.omc/artifacts/g1-install-macos-login/` — REPORT.md plus the raw per-boot
+captures. Auto-login was already enabled in the base image; it is the
+instrumentation that PRODUCES a login, not the claim under test, and the
+sterilized pre-reboot state plus the uninstalled control are what isolate the
+claim.
+"""
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::launchd::tests::the_plist_is_well_formed_and_starts_the_daemon_in_run_mode"
+proves = "PARTIAL — the emitted plist is XML with balanced dict/array tags, carries the executable path and the `run` argument, and names the label. Well-formedness asserted structurally rather than by eye"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::launchd::tests::the_plist_does_not_fight_the_user"
+proves = "RunAtLoad is present and KeepAlive is ABSENT — the macOS form of restart-on-failure-only, asserted in both directions for the same reason"
+
+[[guard.evidence]]
+package = "shepherd-daemon"
+test = "service::launchd::tests::the_domain_target_is_a_real_uid_and_never_a_shell_substitution"
+proves = "the defect the hardware round trip exposed, pinned so it cannot return: the launchctl domain target contains no shell substitution and is a real numeric uid, checked against `id -u` rather than against libc::getuid() — comparing the implementation to itself would pass just as happily on the broken version. Both `bootstrap` and `bootout` took the same broken target, so uninstall was affected identically. Before this, every assertion in this module was about the plist's TEXT, and a well-formed plist that launchd never loads passes all of them"
+
+[[guard]]
+id = "G-1-CLI-REGISTRY"
+owning_gate = "1"
+exercises = ["shepherd-cli", "shepherd-proto", "xtask::codegen", "ci"]
+note = """
+§9: `AC-54's CLI == registered_methods check runs in CI from this phase (the \
+inventory test stays at Phase 8)`. AC-54 itself is owned at Phase 8 and is \
+declared as a [[phase.leg]] on the Phase 1 row; this guard carries only the \
+leg §9 puts here, which is that the check RUNS IN CI from Phase 1.\
+"""
+
+[[guard.evidence]]
+package = "shepherd-cli"
+test = "tests::ac54_cli_equals_registered_methods"
+proves = "the parity itself: every leaf command path the CLI builds and every cli_path in MethodKind::ALL form the same set, asserted as a bijection in both directions with no exemption list — so a CLI verb with no method, or a method with no verb, fails"
+
+[[guard.evidence]]
+package = "xtask"
+test = "evidence_artifacts::tests::ci_runs_the_ac54_cli_equals_registry_check_with_a_count_guard"
+proves = "the part of the clause that is about CI rather than about the test: ci.yml names that test AND asserts `1 passed` on its output. Running the test locally proves the test passes; §9's clause is that CI runs it, and only reading the workflow can say so. The count guard matters because `cargo test --exact` on a renamed test exits 0 having run nothing"
+
+[[guard.evidence]]
+package = "shepherd-proto"
+test = "method::tests::no_cli_path_is_a_prefix_of_another"
+proves = "the registry cannot describe a CLI tree that clap could not represent — the constraint that makes the bijection above achievable rather than aspirational"
+
+[[guard.evidence]]
+package = "shepherd-proto"
+test = "method::tests::names_and_cli_paths_are_unique"
+proves = "no two methods share a name or a CLI path, so the set equality above cannot be satisfied by a collision"
+
+# ---------------------------------------------------------------------------
+# [[phase]] — §9's gate rows, clause by clause.
+# ---------------------------------------------------------------------------
+#
+# Consumed by `xtask/src/phase_completeness.rs`, which runs on every
+# `gate --audit` and reconciles this file against §9's table. The rules it
+# enforces, and what each one is for:
+#
+#   * `quote` must appear VERBATIM in the row, inside a single clause. Editing
+#     §9 therefore breaks the check loudly instead of leaving an encoding that
+#     still reads as current. A quote that spans two clauses is rejected, so one
+#     quote cannot claim two demands.
+#   * `covered_by` ids must exist and be owned by a phase THIS gate runs, so a
+#     clause cannot be carried by something the gate never executes.
+#   * `unencoded` states that nothing carries the clause. It keeps the demand
+#     visible and the gate red. It is the honest answer, not a waiver.
+#   * `rationale` marks a clause that demands no evidence — scope, reasoning,
+#     or an explicit deferral. The most abusable field here, which is why it
+#     requires the quote, prints in `--show-clauses`, is counted separately
+#     rather than folded into "carried", and must say why in writing.
+#
+# `gate --phase <id>` FAILS on any clause of its row that is unencoded or
+# stated-gap. Under-specifying a phase is still possible; doing it quietly is
+# not.
+#
+# ROWS 2..9 ARE DELIBERATELY NOT ENCODED HERE. Their clauses report as
+# UNENCODED, which is accurate — no one has reconciled them — and it keeps this
+# change to the phases it is about. Encoding a future phase's row from the
+# outside is how a requirement gets recorded as someone imagined it rather than
+# as its owner reads it. The AC-level reconciliation below covers every row.
+
+[[phase]]
+gate = "0ab"
+
+[[phase.requirement]]
+quote = "with metadata p95, vector p95 and index RSS at 10M"
+covered_by = ["G-0B-BARS"]
+
+[[phase.requirement]]
+quote = "precommitted numeric workload contract"
+covered_by = ["G-0B-CONTRACT"]
+
+[[phase.requirement]]
+quote = "carries explicit reject thresholds too"
+covered_by = ["G-0B-CAPACITY"]
+
+[[phase.requirement]]
+quote = "Workspace CI green on all three platforms."
+covered_by = ["G-0A-CI"]
+
+[[phase.requirement]]
+quote = "LIST-consistency confirmed against the local emulators only"
+unencoded = """
+NOTHING CARRIES THIS, AND IT CANNOT BE CARRIED FROM PHASE 0. No test asserts \
+LIST pagination or visibility against MinIO, Azurite, Samba or NFS. \
+tests/docker-compose.yml is committed; nothing reads it. The reason it is \
+stated rather than encoded is structural and worth a plan correction: the \
+machinery this clause exercises (shepherd-storage::s3, ::azure, ::nas) is \
+created in Phases 2 and 6, so ANY row owning it at Phase 0 would be rejected \
+by `gate --audit` as owned-too-early — the same unsatisfiable-gate class §9's \
+own row text says it removed real-provider LIST evidence to avoid. The \
+emulator leg has the identical shape one phase down.\
+"""
+
+[[phase.requirement]]
+quote = "Iteration 2 put real-provider LIST evidence on this gate"
+rationale = "records why an earlier iteration's requirement was removed from this gate. It demands nothing of Phase 0; the demand it describes now sits on Phase 6, where the adapters exist."
+
+[[phase.requirement]]
+quote = "Spike sources are **preserved as non-production fixtures**, not deleted"
+unencoded = """
+`spikes/` does not exist in the tree, so there is nothing preserved and \
+nothing deleted. Correctly a 0c concern: the spike sources are 0c's output, \
+and this clause sits in the 0a/0b row. Reported rather than filed against 0c \
+on my own authority — where a clause of §9 belongs is the plan's call, not the \
+gate's.\
+"""
+
+[[phase.leg]]
+ac = "AC-46"
+owned_by = "5"
+quote = "supported AC-46 ceiling range: 4–16 GB"
+
+[[phase]]
+gate = "1"
+
+[[phase.requirement]]
+quote = "functional pipeline over the 1M on-disk corpus"
+covered_by = ["G-1-M1-FUNC"]
+
+[[phase.requirement]]
+quote = "< 50 ms p95 over a 10M-row injected catalog"
+covered_by = ["G-1-M1-PERF"]
+
+[[phase.requirement]]
+quote = "matcher over all seven predicate kinds"
+covered_by = ["AC-13"]
+
+[[phase.requirement]]
+quote = "**AC-56** schema stability."
+covered_by = ["AC-56"]
+
+[[phase.requirement]]
+quote = "check runs in CI from this phase"
+covered_by = ["G-1-CLI-REGISTRY"]
+
+[[phase.requirement]]
+quote = "content-addressed keys collision-free under a case/normalization fuzz corpus"
+covered_by = ["G-1-IDENTITY-KEY"]
+
+[[phase.requirement]]
+quote = "stable across a simulated remount"
+covered_by = ["G-1-IDENTITY-FSID"]
+
+[[phase.requirement]]
+quote = "detection correct on all three platforms"
+covered_by = ["G-1-ATIME"]
+
+[[phase.requirement]]
+quote = "kill-and-resume of a checkpointed job"
+covered_by = ["G-1-JOBS"]
+
+[[phase.requirement]]
+quote = "single-writer actor"
+covered_by = ["G-1-WRITER"]
+
+[[phase.requirement]]
+quote = "WAL bounded across the full scan by SQLite's page-count autocheckpoint"
+covered_by = ["G-1-CHECKPOINT"]
+
+[[phase.requirement]]
+quote = "dedicated PASSIVE-checkpoint connection as a supplementary backstop"
+covered_by = ["G-1-CHECKPOINT"]
+
+[[phase.requirement]]
+quote = "Daemon installs on **Linux"
+covered_by = ["G-1-INSTALL-LINUX"]
+
+[[phase.requirement]]
+quote = "and macOS (LaunchAgent)"
+covered_by = ["G-1-INSTALL-MACOS"]
+
+[[phase.requirement]]
+quote = "Windows startup task defers to Phase 3 with package identity"
+rationale = "an explicit deferral: it states what Phase 1 does NOT have to do. The Windows startup task needs the package identity Phase 3 creates, and AC-59 is owned at Phase 4."
+
+[[phase.leg]]
+ac = "AC-54"
+owned_by = "8"
+quote = "the inventory test stays at Phase 8"
+
+# --- Rows 2..9: AC reconciliation only. -------------------------------------
+#
+# No requirement rows (see the note above), but the leg declarations are
+# required for every row, because the AC check runs over all of §9. Each quotes
+# the sentence in which §9 names an AC it does not own — the "exactly one gate
+# may claim a complete AC; earlier gates name the leg" rule, made checkable.
+
+[[phase]]
+gate = "2"
+
+[[phase.leg]]
+ac = "AC-3"
+owned_by = "3"
+quote = "**AC-3, AC-4 and AC-10 mock legs only**"
+
+[[phase.leg]]
+ac = "AC-4"
+owned_by = "3"
+quote = "AC-4 is deliberately absent from this list"
+
+[[phase.leg]]
+ac = "AC-10"
+owned_by = "3"
+quote = "final ownership of all three is Phase 3"
+
+[[phase]]
+gate = "4"
+
+[[phase.leg]]
+ac = "AC-37"
+owned_by = "6"
+quote = "**AC-37 governor leg only**"
+
+[[phase]]
+gate = "6"
+
+[[phase.leg]]
+ac = "AC-35"
+owned_by = "8"
+quote = "**AC-35 transport leg only**"
+
+# --- One clause of Phase 5, recorded early because its producer was deleted ---
+#
+# Not a reconciliation of Phase 5's row — the other five clauses stay UNENCODED,
+# and encoding a future phase's row from outside is still the wrong shape. This
+# single `unencoded` exists because the fact it records is losable: it is
+# knowable NOW and would otherwise be discovered by whoever encodes Phase 5,
+# months from now, as a missing harness with no explanation.
+#
+# Worth being precise about what the checker did and did not do here. It did NOT
+# detect this — a human did. The general form ("a gate whose stated evidence has
+# no machinery left to produce it") is already caught for anything CITED: delete
+# a module and its cited tests vanish, which `gate --phase` reports as
+# MatchedNothing, loudly and by name. What has no mechanical trace is a
+# capability removed before anything cited it, which is exactly this case:
+# `shepherd-bench` still exists, so a machinery-existence check would pass, and
+# no row in this file names the harness that went.
+
+[[phase]]
+gate = "5"
+
+[[phase.requirement]]
+quote = "Bench re-run on the real `fixtures/corpus-10m`, warm **and cold-cache**"
+unencoded = """
+THE HARNESS THAT WOULD PRODUCE THIS WAS DELETED. `ccbc26d` removed \
+shepherd-bench's `meta_bench.rs` and the three metadata candidates with it — \
+correctly, since two were eliminated spike code — but the winning candidate's \
+bench went with them. So the numbers in `bench-baseline.json` for \
+`meta_bench_arena_*` CANNOT be regenerated from this tree by any command, and \
+§9's Phase 5 demand for a warm-and-cold re-run has nothing left to run.
+
+Only the vector leg is reproducible. When Phase 5 encodes this clause the \
+metadata bench has to come back pointed at `shepherd-index` rather than at a \
+private copy of the arena — which is the better arrangement anyway, since a \
+bench against a private copy measures the copy.
+
+Recorded here rather than left for Phase 5 to rediscover: G-0B-BARS asserts a \
+recording this tree can no longer re-measure, and that is worth knowing while \
+someone still remembers why.\
+"""

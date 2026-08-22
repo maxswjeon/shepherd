@@ -1,0 +1,115 @@
+{
+  "$defs": {
+    "Capability": {
+      "description": "A named, optional feature of one peer.\n\nCapabilities are compared by string equality and are never parsed. A peer\nthat does not recognise one must ignore it.",
+      "type": "string"
+    },
+    "Negotiated": {
+      "description": "What the two peers actually agreed on.",
+      "properties": {
+        "capabilities": {
+          "description": "Capabilities both peers named. Sorted, so the value is comparable.",
+          "items": {
+            "$ref": "#/$defs/Capability"
+          },
+          "type": "array"
+        },
+        "minor": {
+          "description": "`min(client.minor, server.minor)`. Methods with a higher `since_minor`\nare not callable on this connection.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unsupported_client_capabilities": {
+          "description": "Capabilities the client named that this server does not know. Returned\nso a newer client can degrade deliberately instead of discovering the\ngap through a failed call.",
+          "items": {
+            "$ref": "#/$defs/Capability"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "minor",
+        "capabilities",
+        "unsupported_client_capabilities"
+      ],
+      "type": "object"
+    },
+    "PeerInfo": {
+      "description": "Who is on the other end. Diagnostic only; never used for authorization —\n§4.3 is explicit that authorization is filesystem/pipe permissions.",
+      "properties": {
+        "build": {
+          "description": "Human-readable build version, e.g. `\"0.1.0\"`. Not the protocol version.",
+          "type": "string"
+        },
+        "name": {
+          "description": "e.g. `\"shepctl\"`, `\"shepherd-ui\"`, `\"shepherdd\"`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "build"
+      ],
+      "type": "object"
+    },
+    "ProtoVersion": {
+      "description": "A `major.minor` protocol version.\n\nSerialized as an object rather than a `\"1.0\"` string so a future `patch` or\nbuild-metadata field is an additive change instead of a parse change.",
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The server's answer to an accepted [`Hello`].",
+  "properties": {
+    "capabilities": {
+      "description": "Everything the server can do, whether or not the client asked for it.",
+      "items": {
+        "$ref": "#/$defs/Capability"
+      },
+      "type": "array"
+    },
+    "negotiated": {
+      "$ref": "#/$defs/Negotiated"
+    },
+    "proto_version": {
+      "$ref": "#/$defs/ProtoVersion"
+    },
+    "server": {
+      "$ref": "#/$defs/PeerInfo"
+    }
+  },
+  "required": [
+    "proto_version",
+    "server",
+    "capabilities",
+    "negotiated"
+  ],
+  "title": "hello result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

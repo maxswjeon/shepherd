@@ -1,0 +1,236 @@
+[workspace]
+members = ["crates/*", "xtask"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Tracks `rust-toolchain.toml`. Both moved from 1.91 together: `aws-sdk-s3`
+# 1.141.0 and its `aws-smithy-*` transitives declare `rust-version = 1.94.1`,
+# which made the old pin and §4.5's settled SDK choice mutually unsatisfiable.
+rust-version = "1.96"
+# AGPL-3.0-or-later, matching the LICENSE file at the repository root. This
+# line said `Apache-2.0` until 2026-08-19, which contradicted the licence that
+# was actually chosen — and every one of the 22 crates inherits it via
+# `license.workspace = true`, so a stale value here mislabels the whole
+# workspace, not one manifest.
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/maxswjeon/shepherd"
+publish = false
+
+# Workspace-wide lint policy.
+#
+# `clippy::disallowed_methods` is DENY across every crate. It is the lint half of
+# §4.1 dependency rule 4: the destructive `PlaceholderProvider` methods and
+# `StorageAdapter::delete_object` are listed in `clippy.toml`, and the only
+# module permitted to carry `#![allow(clippy::disallowed_methods)]` is
+# `crates/shepherd-tier/src/destroy.rs`. `cargo xtask check-deps` asserts that
+# the escape hatch appears nowhere else, so the allow cannot be quietly copied.
+#
+# This lint only fires under `cargo clippy`, so CI runs
+# `cargo clippy --workspace --all-targets -- -D warnings`.
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+
+[workspace.dependencies]
+# Internal crates. Declared here so member manifests carry a single
+# `shepherd-core.workspace = true` line and the dependency graph that
+# `cargo xtask check-deps` parses has exactly one place to edit.
+shepherd-catalog = { path = "crates/shepherd-catalog" }
+shepherd-core = { path = "crates/shepherd-core" }
+shepherd-extract = { path = "crates/shepherd-extract" }
+shepherd-index = { path = "crates/shepherd-index" }
+shepherd-infer = { path = "crates/shepherd-infer" }
+shepherd-jobs = { path = "crates/shepherd-jobs" }
+shepherd-net = { path = "crates/shepherd-net" }
+shepherd-obs = { path = "crates/shepherd-obs" }
+shepherd-placeholder = { path = "crates/shepherd-placeholder" }
+shepherd-plugin = { path = "crates/shepherd-plugin" }
+shepherd-proto = { path = "crates/shepherd-proto" }
+shepherd-rules = { path = "crates/shepherd-rules" }
+shepherd-scan = { path = "crates/shepherd-scan" }
+shepherd-secrets = { path = "crates/shepherd-secrets" }
+shepherd-storage = { path = "crates/shepherd-storage" }
+shepherd-tier = { path = "crates/shepherd-tier" }
+shepherd-watch = { path = "crates/shepherd-watch" }
+
+# Third-party.
+#
+# `clap` builder API only — `shepctl`'s command tree is constructed at runtime
+# from `shepherd_proto::MethodKind::ALL`, never from `#[derive(Parser)]`. A
+# derived tree would be a second hand-maintained copy of the method table and
+# `CLI == registered_methods` (AC-54) would become a check instead of a
+# property. The `derive` feature is therefore deliberately not enabled.
+clap = { version = "4.6", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+    "wrap_help",
+    # Required, not cosmetic: command and argument names are computed at run
+    # time from the method table and each request's JSON Schema, and without
+    # `string` clap only accepts `&'static str`. The alternative is leaking every
+    # derived name to get a `'static` lifetime.
+    "string",
+] }
+# JSON Schema derivation for the IPC request/result types. `xtask codegen`
+# writes the derived schemas to `schemas/` and `xtask codegen --check` fails on
+# drift, which is what makes AC-56's "stable machine-readable output" a
+# reviewable diff rather than a claim.
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# `bundled` compiles SQLite from source rather than linking the system library.
+# The Windows CI leg has no system sqlite3, and a catalog that builds only where
+# a distro happens to ship the right version is not a three-platform product.
+# `rusqlite` over `sqlx` is an ADR-001 decision: SQLite's WAL model is
+# many-readers/one-writer, and sqlx silently upgrades a SELECT that later writes
+# in the same transaction into an exclusive write transaction, starving the pool.
+rusqlite = { version = "0.40.2", features = ["bundled", "blob", "functions"] }
+# §4.9 path normalisation. NFC/NFD folding for `file.norm_key`, so a macOS
+# watcher event in NFD matches a catalog row stored from a Linux scan in NFC.
+unicode-normalization = "0.1.25"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- Phase 2 transfer layer (§4.5, task T9) ----------------------------------
+#
+# `opendal` is deliberately ABSENT from this table. Its high-level `Writer`
+# hides the upload id and per-part state, so parts cannot be resumed after a
+# disconnection, and spec:89 requires EVERY transfer to be multipart/resumable.
+# `cargo xtask check-deps` rule 5 plus §4.5 confine it to `_shepherd/` control
+# objects inside `shepherd-storage` if a later phase ever needs it; Phase 2 does
+# not, so it is not added.
+#
+# `aws-sdk-s3` 1.141.0 and its ~24 `aws-smithy-*` transitives declare
+# `rust-version = 1.94.1`. That is why `rust-toolchain.toml` moved to 1.96.0:
+# under the old 1.91.1 pin `cargo build` failed at resolution, before compiling
+# anything, with "rustc 1.91.1 is not supported by the following packages".
+# 1.137.0 was the highest release that would have built on 1.91.1, and pinning
+# the transitive closure back that far was not viable — the `aws-smithy-*`
+# crates arrive through caret requirements, so cargo takes the maximum
+# regardless of what the two direct deps are pinned to.
+#
+# `behavior-version-latest` is not optional: without it the SDK panics at client
+# construction rather than failing to compile.
+#
+# `aws-sdk-s3` is taken WITHOUT default features, and the four it does keep are
+# its own `default` list minus one: `rustls`. That name is a legacy alias, not
+# the modern path — `rustls` -> `aws-smithy-runtime/tls-rustls` ->
+# `aws-smithy-http-client/legacy-rustls-ring`, which pulls hyper 0.14, h2 0.3,
+# rustls 0.21, rustls-webpki 0.101 and ring into the SHIPPING closure of
+# `shepherd-daemon` alongside the hyper 1.x / rustls 0.23 stack the SDK
+# actually uses. That dead second stack carries RUSTSEC-2026-0258 (h2 0.3.27 is
+# the last 0.3 release, no backport) and RUSTSEC-2026-0098/0099/0104
+# (rustls-webpki 0.101 is EOL). `default-https-client` is what selects the live
+# connector, so dropping `rustls` removes the dead stack and nothing else.
+# Upgrading does not fix this: 1.142.0 still lists `rustls` in `default`.
+aws-config = { version = "1.8", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.141", default-features = false, features = [
+    "behavior-version-latest",
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
+
+# `async-trait` rather than native `async fn` in traits: one `target` row
+# selects one adapter at runtime, so `StorageAdapter` must be usable as
+# `dyn StorageAdapter`, and AFIT is still not dyn-compatible on 1.96.
+async-trait = "0.1"
+
+blake3 = "1"
+bytes = "1"
+
+# `.gitignore` semantics for `shepherd-scan::ignore` (AC-9) — BurntSushi's
+# matcher, the one ripgrep ships. Used as a LIBRARY via
+# `ignore::gitignore::GitignoreBuilder`, never its walker, which cannot carry
+# the symlink/junction cycle guard §6 requires.
+#
+# A dependency rather than hand-rolled because §8.1 specifies the full
+# semantics — negation, `**`, trailing `/`, anchoring, precedence — and the
+# subtle parts (a negation cannot re-include a file whose parent directory was
+# excluded; `**` differs leading vs trailing vs embedded; last-match-wins across
+# layered per-directory files) are each a way to be QUIETLY wrong. The direction
+# of failure decides the trade: an ignore rule that fails to match makes a file
+# the user explicitly excluded eligible for tiering and, under a `discard`
+# policy, destruction. That is a safety path, so the smaller-but-flimsier
+# implementation is the wrong call. Same reasoning that kept
+# `unicode-normalization` rather than hand-folding NFC.
+ignore = "0.4.33"
+
+# §4.10.1's identity-bound acquisition primitive. `renameat2(RENAME_NOREPLACE)`
+# on Linux and `renameatx_np(RENAME_EXCL)` on macOS are not in std. Following
+# the plan's cited choice rather than `rustix`, which covers the same syscalls:
+# the citation is what was verified, and swapping it silently is the drift this
+# project keeps catching.
+# Path-glob matching for AC-13's rule predicates. Already in the tree
+# transitively — it is `ignore`'s own matcher — so it costs no build time, and
+# using the SAME glob semantics for inclusion as the walker uses for exclusion
+# avoids a class of bug all by itself.
+#
+# The failure direction is the mirror of `ignore`'s: there, a rule that fails to
+# match leaves a user-excluded file eligible for destruction. Here, a glob that
+# OVER-matches selects files the user never named — and `RuleAction::is_destructive`
+# is true for both `Tier` and `Archive`, so an over-broad `*` is a path to
+# destroying files nobody asked about. Subtle over-matching (`*` crossing
+# separators, `**` in the wrong position, trailing-slash cases) is exactly what
+# hand-rolled globs get wrong.
+globset = "0.4"
+
+libc = "0.2"
+
+# The SIMD substring scan that IS the §4.6 metadata index, promoted from a
+# `shepherd-bench` spike dependency to a workspace one now that `shepherd-index`
+# consumes it too.
+#
+# Not an optimisation to be swapped for a hand-rolled scan later. Phase 0b
+# measured candidate (a) at **22.20 ms warm p95** against tantivy's 68.08 and
+# FTS5-trigram's 378.59, and `memmem`'s throughput is the whole reason it won:
+# a naive byte scan runs around 1 GB/s where `memmem` runs at several, so a
+# ~700 MB arena would cross the 50 ms bar single-threaded on arithmetic alone.
+# Replacing it would mean shipping a candidate the bake-off never measured while
+# citing the bake-off's number for it — the same defect as benchmarking FTS5 on a
+# SQLite the product does not ship (see `rusqlite` in `shepherd-bench`).
+#
+# Already in `Cargo.lock` via `shepherd-bench`, so this adds an edge, not a
+# resolution.
+memchr = "2"
+
+# DEV-ONLY, `shepherd-tier`. §8.2 names an mmap hazard test for the destroy
+# path: OQ-J's residual must be EXERCISED, not assumed away, and a held mmap is
+# the case `rename()` cannot invalidate. Never ships.
+memmap2 = "0.9"
+
+# DEV-ONLY, `shepherd-catalog`. §9 asks for the §4.9 identity rules to hold
+# under a `case/normalization fuzz corpus`, and a corpus is not a longer list of
+# examples: the defect it exists to find is a COMPOSITION nobody thought to
+# write down. Every §4.9 rule was previously proven by one hand-chosen pair each
+# — one NFC/NFD spelling of `café`, one `Dir/Report.TXT` — so no input had ever
+# been tried that the author of the assertion had not also chosen. Generated
+# inputs are the only way to break that circle.
+#
+# `proptest` over `quickcheck` for one reason that matters here: shrinking on
+# Unicode. A failure found at a 40-codepoint string with four combining marks is
+# useless as a bug report until it is reduced to the two codepoints that
+# actually disagree, and proptest shrinks `String` and `Vec<char>` structurally
+# where quickcheck largely does not. Its `prop_oneof!` also lets uniform
+# `any::<String>()` sampling be mixed with dense sampling of the families that
+# are known to be hazardous (dotted/dotless i, Kelvin sign, final sigma,
+# Hangul), which uniform sampling alone would essentially never generate.
+#
+# Never ships: `[dev-dependencies]` only.
+proptest = "1.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+# OQ-1's replica layout names its segments `.zst`. Real compression, so the
+# extension describes the bytes rather than decorating them.
+zstd = "0.13"
+
+[profile.release]
+debug = 1

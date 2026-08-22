@@ -1,0 +1,66 @@
+[package]
+name = "shepherd-storage"
+description = "StorageAdapter trait, per-provider adapters and the catalog replica bundle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Exposes `shepherd_storage::testing` (MemAdapter / MemStore / MemSource) to
+# other crates' tests.
+#
+# It exists because §4.1 rule 4 makes a second `StorageAdapter` double
+# ILLEGAL rather than merely wasteful: `delete_object` may be implemented only
+# under `crates/shepherd-storage/src/`, so a test adapter written anywhere else
+# fails `cargo xtask check-deps`. The gate is right — two divergent doubles for
+# one safety-critical trait is exactly the drift it exists to prevent — so the
+# fix is to share this one, not to widen the policy.
+#
+# Off by default, so nothing reaches a shipping binary unless a dev-dependency
+# asks for it.
+testing = []
+
+[dependencies]
+shepherd-core.workspace = true
+
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# For the probe sweep only. Tidying that silently never works is a leak nobody
+# sees, so every refusal it hits is reported with the key it could not reap.
+tracing.workspace = true
+uuid.workspace = true
+zstd.workspace = true
+
+# The S3-family adapter (§4.5). Confined to `s3.rs`; every other module in this
+# crate is provider-agnostic and depends only on the `adapter` traits, which is
+# what lets the transfer state machine and the replica chain be unit-tested with
+# no network and no AWS types in scope.
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# The scripted-transport seam for the `s3.rs` pagination tests.
+#
+# Both pagination loops decide correctness from `is_truncated` plus the
+# continuation markers, and the combination they must refuse — truncated while
+# carrying no marker at all — is one no real provider, MinIO included, can be
+# asked to produce on demand. So the HTTP response is scripted below the SDK.
+# Only the two connector traits are needed, in about forty lines of test code.
+#
+# Not a workspace dependency because it adds nothing to the build: `aws-sdk-s3`
+# already depends on this exact crate with this exact feature, so the edge
+# brings in no new package and changes no resolved version. `Cargo.lock` does
+# move, by exactly one line — this crate's own dependency-list entry.
+aws-smithy-runtime-api = { version = "1.14", features = ["client"] }

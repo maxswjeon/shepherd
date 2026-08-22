@@ -1,0 +1,25 @@
+[package]
+name = "shepherd-index"
+description = "Metadata name index, sharded ANN index, hybrid search and reciprocal-rank fusion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+shepherd-core.workspace = true
+
+# §4.6's metadata bar, decided by measurement in Phase 0b: the in-RAM arena +
+# `memmem` SIMD scan posted 22.20 ms warm p95 at 10M rows against a 50 ms bar,
+# where tantivy 0.26.1 posted 68.08 ms and SQLite FTS5-trigram 378.59 ms.
+# `memmem` IS that candidate — this is not a convenience dependency. A
+# hand-rolled byte scan runs roughly a GB/s against `memmem`'s several, which
+# puts a ~700 MB arena over the bar on arithmetic alone, so hand-rolling would
+# ship a design the bake-off never measured while quoting the bake-off's number.
+#
+# Already present in the lockfile via `shepherd-bench`, which measured it.
+memchr = "2"

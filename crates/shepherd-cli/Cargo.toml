@@ -1,0 +1,32 @@
+[package]
+name = "shepherd-cli"
+description = "Command-line client. Pure IPC client; its clap tree is generated from shepherd-proto."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "shepctl"
+path = "src/main.rs"
+
+[dependencies]
+# `shepherd-core` is here for one reason: it is the only crate that may depend
+# on BOTH the domain enums and the wire enums, so the test asserting that
+# `StubMode` serializes identically on each side can only live here (§4.1 rule 1
+# forbids `shepherd-proto` from depending on `shepherd-core`).
+shepherd-core.workspace = true
+shepherd-proto.workspace = true
+
+# For the offline `doctor` path: the OQ-F lingering probe lives in obs so the
+# daemon, the doctor method and this client share one implementation instead of
+# three. Deliberately NOT a dependency on shepherd-daemon, which would drag
+# rusqlite and a bundled SQLite into a CLI that needs neither.
+shepherd-obs.workspace = true
+
+clap = { workspace = true }
+serde_json = { workspace = true }

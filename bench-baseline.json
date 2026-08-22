@@ -1,0 +1,1677 @@
+{
+  "ann_bench_f16_cold": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "cold",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 9164860516,
+    "on_disk_gib": 8.535441491752863,
+    "pass": true,
+    "peak_vm_hwm_bytes": 9747521536,
+    "precision": "f16",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "stats": {
+      "accepted_p95_ms": 42.483904,
+      "drift_flagged": true,
+      "median_p50_ms": 5.86766,
+      "median_p99_ms": 338.28976900000004,
+      "run_to_run_drift_pct": 13.487077364641449,
+      "runs": [
+        {
+          "max_ms": 1934.356723,
+          "mean_ms": 21.632854648999995,
+          "n": 1000,
+          "p50_ms": 6.506208,
+          "p95_ms": 42.483904,
+          "p99_ms": 332.976378
+        },
+        {
+          "max_ms": 1405.164212,
+          "mean_ms": 20.975318088,
+          "n": 1000,
+          "p50_ms": 5.86766,
+          "p95_ms": 37.540138,
+          "p99_ms": 382.54061700000005
+        },
+        {
+          "max_ms": 1398.193177,
+          "mean_ms": 20.816252755,
+          "n": 1000,
+          "p50_ms": 5.679197,
+          "p95_ms": 43.269975,
+          "p99_ms": 338.28976900000004
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 10000000,
+    "view_open_seconds_per_run": [
+      2.528307436,
+      2.546696204,
+      2.46744431
+    ],
+    "vm_rss_after_open_bytes": 2084614144,
+    "vm_rss_after_queries_bytes": 50204672
+  },
+  "ann_bench_f16_warm": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "warm",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 9164860516,
+    "on_disk_gib": 8.535441491752863,
+    "pass": true,
+    "peak_vm_hwm_bytes": 9770848256,
+    "precision": "f16",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "stats": {
+      "accepted_p95_ms": 10.685073999999998,
+      "drift_flagged": true,
+      "median_p50_ms": 5.344622,
+      "median_p99_ms": 16.213769,
+      "run_to_run_drift_pct": 12.813753091461976,
+      "runs": [
+        {
+          "max_ms": 43.865513,
+          "mean_ms": 5.972450756999997,
+          "n": 1000,
+          "p50_ms": 5.3482829999999995,
+          "p95_ms": 11.0774,
+          "p99_ms": 17.242883
+        },
+        {
+          "max_ms": 37.940692,
+          "mean_ms": 5.501969254000006,
+          "n": 1000,
+          "p50_ms": 4.989187,
+          "p95_ms": 9.708241,
+          "p99_ms": 15.172205
+        },
+        {
+          "max_ms": 48.054419,
+          "mean_ms": 5.904182745,
+          "n": 1000,
+          "p50_ms": 5.344622,
+          "p95_ms": 10.685073999999998,
+          "p99_ms": 16.213769
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 10000000,
+    "view_open_seconds_per_run": [
+      0.992664502,
+      1.053041696,
+      0.931274312
+    ],
+    "vm_rss_after_open_bytes": 2093588480,
+    "vm_rss_after_queries_bytes": 51138560
+  },
+  "ann_bench_f32_cold__scaled": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "cold",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 3368971872,
+    "on_disk_gib": 3.1375995576381683,
+    "pass": true,
+    "peak_vm_hwm_bytes": 3479134208,
+    "precision": "f32",
+    "scaled_run_reason": "f32 confirms exclusion, not selection. R-4 extrapolates f32 at ~17GB against AC-46's 16GB ceiling, so it is over the ceiling before measurement and cannot become the answer at any scale. Disk on this shared box could not hold 15.6GiB of f32 shards plus the 12GiB reserve, and the reserve was deliberately NOT lowered to make it fit. 2M vectors measures bytes-per-vector exactly: on-disk growth is dead linear across shards, verified in the corrected run at i8 (0.50/0.99/1.49/1.98/2.48 GiB over shards 0-4, 532 B/vector at 10M) and f16 (0.85/1.71/2.56/3.41/4.27/5.12 GiB, 114s/shard). Shard-0 recall is measured per 1M shard in EVERY precision, so this run's recall and ef-sweep are directly comparable to i8's and f16's rather than approximations. What this does NOT give is 10M-corpus query latency for f32, which is neither measured nor claimed - f32 is excluded on RAM, so its latency never enters the decision.",
+    "shards": 2,
+    "stats": {
+      "accepted_p95_ms": 23.702949,
+      "drift_flagged": false,
+      "median_p50_ms": 1.537172,
+      "median_p99_ms": 177.13534,
+      "run_to_run_drift_pct": 6.074471999243636,
+      "runs": [
+        {
+          "max_ms": 610.5713310000001,
+          "mean_ms": 7.941804358999997,
+          "n": 1000,
+          "p50_ms": 1.53287,
+          "p95_ms": 23.702949,
+          "p99_ms": 159.320048
+        },
+        {
+          "max_ms": 526.318071,
+          "mean_ms": 8.200469141000001,
+          "n": 1000,
+          "p50_ms": 1.638553,
+          "p95_ms": 24.958615,
+          "p99_ms": 177.13534
+        },
+        {
+          "max_ms": 560.860477,
+          "mean_ms": 8.376690404,
+          "n": 1000,
+          "p50_ms": 1.537172,
+          "p95_ms": 23.518786,
+          "p99_ms": 189.299751
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 2000000,
+    "view_open_seconds_per_run": [
+      0.444500952,
+      0.452455671,
+      0.459627616
+    ],
+    "vm_rss_after_open_bytes": 427053056,
+    "vm_rss_after_queries_bytes": 14061568
+  },
+  "ann_bench_f32_warm__scaled": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "warm",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 3368971872,
+    "on_disk_gib": 3.1375995576381683,
+    "pass": true,
+    "peak_vm_hwm_bytes": 3497308160,
+    "precision": "f32",
+    "scaled_run_reason": "f32 confirms exclusion, not selection. R-4 extrapolates f32 at ~17GB against AC-46's 16GB ceiling, so it is over the ceiling before measurement and cannot become the answer at any scale. Disk on this shared box could not hold 15.6GiB of f32 shards plus the 12GiB reserve, and the reserve was deliberately NOT lowered to make it fit. 2M vectors measures bytes-per-vector exactly: on-disk growth is dead linear across shards, verified in the corrected run at i8 (0.50/0.99/1.49/1.98/2.48 GiB over shards 0-4, 532 B/vector at 10M) and f16 (0.85/1.71/2.56/3.41/4.27/5.12 GiB, 114s/shard). Shard-0 recall is measured per 1M shard in EVERY precision, so this run's recall and ef-sweep are directly comparable to i8's and f16's rather than approximations. What this does NOT give is 10M-corpus query latency for f32, which is neither measured nor claimed - f32 is excluded on RAM, so its latency never enters the decision.",
+    "shards": 2,
+    "stats": {
+      "accepted_p95_ms": 2.7456970000000003,
+      "drift_flagged": false,
+      "median_p50_ms": 1.145025,
+      "median_p99_ms": 5.680246,
+      "run_to_run_drift_pct": 0.06482871198095312,
+      "runs": [
+        {
+          "max_ms": 12.198163999999998,
+          "mean_ms": 1.4371129819999986,
+          "n": 1000,
+          "p50_ms": 1.145025,
+          "p95_ms": 2.7456970000000003,
+          "p99_ms": 5.737057999999999
+        },
+        {
+          "max_ms": 19.762667,
+          "mean_ms": 1.4509625810000002,
+          "n": 1000,
+          "p50_ms": 1.155286,
+          "p95_ms": 2.746727,
+          "p99_ms": 5.239661
+        },
+        {
+          "max_ms": 13.665094,
+          "mean_ms": 1.4318076109999984,
+          "n": 1000,
+          "p50_ms": 1.140365,
+          "p95_ms": 2.744947,
+          "p99_ms": 5.680246
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 2000000,
+    "view_open_seconds_per_run": [
+      0.198589907,
+      0.17876093,
+      0.189320302
+    ],
+    "vm_rss_after_open_bytes": 427393024,
+    "vm_rss_after_queries_bytes": 14278656
+  },
+  "ann_bench_i8_cold": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "cold",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 5324860244,
+    "on_disk_gib": 4.959162551909685,
+    "pass": true,
+    "peak_vm_hwm_bytes": 5929529344,
+    "precision": "i8",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "stats": {
+      "accepted_p95_ms": 14.209567,
+      "drift_flagged": false,
+      "median_p50_ms": 4.765927,
+      "median_p99_ms": 163.014526,
+      "run_to_run_drift_pct": 9.75855914539831,
+      "runs": [
+        {
+          "max_ms": 970.473534,
+          "mean_ms": 12.469132129,
+          "n": 1000,
+          "p50_ms": 4.736715,
+          "p95_ms": 14.209567,
+          "p99_ms": 163.014526
+        },
+        {
+          "max_ms": 1197.901908,
+          "mean_ms": 12.477207300000003,
+          "n": 1000,
+          "p50_ms": 4.765927,
+          "p95_ms": 12.96685,
+          "p99_ms": 125.467244
+        },
+        {
+          "max_ms": 1353.916621,
+          "mean_ms": 13.711202063,
+          "n": 1000,
+          "p50_ms": 5.374705,
+          "p95_ms": 14.353499,
+          "p99_ms": 168.768874
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 10000000,
+    "view_open_seconds_per_run": [
+      2.446813736,
+      2.34805873,
+      2.404090135
+    ],
+    "vm_rss_after_open_bytes": 2092482560,
+    "vm_rss_after_queries_bytes": 50515968
+  },
+  "ann_bench_i8_warm": {
+    "ac46_fits_ceiling_range": true,
+    "ac46_max_gib": 16.0,
+    "ac46_min_gib": 4.0,
+    "bar_ms": 300.0,
+    "cache": "warm",
+    "embedding_cost_excluded_note": "Index latency only. No embedding model exists at Phase 0b, so §4.6's 15-25 ms query-embedding budget is NOT included in these numbers and must be added before comparing against the 300 ms end-to-end bar.",
+    "expansion_search_read_back_per_shard": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "expansion_search_requested": 200,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_neighbours_returned": 200.0,
+    "on_disk_bytes": 5324860244,
+    "on_disk_gib": 4.959162551909685,
+    "pass": true,
+    "peak_vm_hwm_bytes": 5929713664,
+    "precision": "i8",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "stats": {
+      "accepted_p95_ms": 10.249112,
+      "drift_flagged": true,
+      "median_p50_ms": 4.827717,
+      "median_p99_ms": 13.781361,
+      "run_to_run_drift_pct": 15.061812184314128,
+      "runs": [
+        {
+          "max_ms": 23.798821,
+          "mean_ms": 5.77211781,
+          "n": 1000,
+          "p50_ms": 5.297073999999999,
+          "p95_ms": 11.099005,
+          "p99_ms": 18.158743
+        },
+        {
+          "max_ms": 26.867424,
+          "mean_ms": 5.297698675999994,
+          "n": 1000,
+          "p50_ms": 4.827717,
+          "p95_ms": 10.249112,
+          "p99_ms": 13.753211
+        },
+        {
+          "max_ms": 28.675999,
+          "mean_ms": 5.273318716999996,
+          "n": 1000,
+          "p50_ms": 4.8070070000000005,
+          "p95_ms": 9.555303,
+          "p99_ms": 13.781361
+        }
+      ]
+    },
+    "top_k": 200,
+    "vectors": 10000000,
+    "view_open_seconds_per_run": [
+      0.969986888,
+      0.949789045,
+      0.964725611
+    ],
+    "vm_rss_after_open_bytes": 2092392448,
+    "vm_rss_after_queries_bytes": 59338752
+  },
+  "ann_build_f16": {
+    "build_seconds": 1123.718555822,
+    "bytes_per_vector": 916.4860516,
+    "connectivity": 16,
+    "dimensions": 384,
+    "on_disk_bytes": 9164860516,
+    "on_disk_gib": 8.535441491752863,
+    "peak_vm_hwm_bytes": 1038663680,
+    "precision": "f16",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "vectors": 10000000,
+    "vectors_per_shard": 1000000
+  },
+  "ann_build_f32__scaled": {
+    "build_seconds": 293.376633627,
+    "bytes_per_vector": 1684.485936,
+    "connectivity": 16,
+    "dimensions": 384,
+    "on_disk_bytes": 3368971872,
+    "on_disk_gib": 3.1375995576381683,
+    "peak_vm_hwm_bytes": 1795227648,
+    "precision": "f32",
+    "scaled_run_reason": "f32 confirms exclusion, not selection. R-4 extrapolates f32 at ~17GB against AC-46's 16GB ceiling, so it is over the ceiling before measurement and cannot become the answer at any scale. Disk on this shared box could not hold 15.6GiB of f32 shards plus the 12GiB reserve, and the reserve was deliberately NOT lowered to make it fit. 2M vectors measures bytes-per-vector exactly: on-disk growth is dead linear across shards, verified in the corrected run at i8 (0.50/0.99/1.49/1.98/2.48 GiB over shards 0-4, 532 B/vector at 10M) and f16 (0.85/1.71/2.56/3.41/4.27/5.12 GiB, 114s/shard). Shard-0 recall is measured per 1M shard in EVERY precision, so this run's recall and ef-sweep are directly comparable to i8's and f16's rather than approximations. What this does NOT give is 10M-corpus query latency for f32, which is neither measured nor claimed - f32 is excluded on RAM, so its latency never enters the decision.",
+    "shards": 2,
+    "vectors": 2000000,
+    "vectors_per_shard": 1000000
+  },
+  "ann_build_i8": {
+    "build_seconds": 821.543875344,
+    "bytes_per_vector": 532.4859564,
+    "connectivity": 16,
+    "dimensions": 384,
+    "on_disk_bytes": 5324859564,
+    "on_disk_gib": 4.959161918610334,
+    "peak_vm_hwm_bytes": 654909440,
+    "precision": "i8",
+    "scaled_run_reason": null,
+    "shards": 10,
+    "vectors": 10000000,
+    "vectors_per_shard": 1000000
+  },
+  "ann_recall_f16": {
+    "above_floor": true,
+    "bench_expansion_search": 200,
+    "expansion_search_sweep": [
+      {
+        "distance_ratio": 1.4063178478609342,
+        "expansion_search": 64,
+        "recall_at_10": 0.908,
+        "returned_mean_top10_cosine_distance": 0.2095298385620117
+      },
+      {
+        "distance_ratio": 1.0444157339842937,
+        "expansion_search": 200,
+        "recall_at_10": 0.988,
+        "returned_mean_top10_cosine_distance": 0.15560938835144042
+      },
+      {
+        "distance_ratio": 1.0000000390051835,
+        "expansion_search": 512,
+        "recall_at_10": 0.998,
+        "returned_mean_top10_cosine_distance": 0.14899181365966796
+      }
+    ],
+    "floor_provenance": "SELF-IMPOSED sanity floor, NOT a plan-committed threshold. §4.6's tiebreak rule governs latency and RSS and does not mention recall. A breach is escalated as a finding; it is not a contract violation and does not fail a candidate.",
+    "k": 10,
+    "oracle": "exact cosine brute force over f32 vectors regenerated from the seed — NOT read back from the quantised index, which would compare the index against itself",
+    "oracle_mean_top10_cosine_distance": 0.1489918078482151,
+    "precision": "f16",
+    "probes": 100,
+    "recall_at_10": 0.988,
+    "sanity_floor": 0.9,
+    "scaled_run_reason": null,
+    "shard": 0,
+    "shard_vectors": 1000000,
+    "vectors_per_shard_contract": 1000000
+  },
+  "ann_recall_f32__scaled": {
+    "above_floor": true,
+    "bench_expansion_search": 200,
+    "expansion_search_sweep": [
+      {
+        "distance_ratio": 1.3191856277274816,
+        "expansion_search": 64,
+        "recall_at_10": 0.93,
+        "returned_mean_top10_cosine_distance": 0.1965478515625
+      },
+      {
+        "distance_ratio": 1.0000000390051835,
+        "expansion_search": 200,
+        "recall_at_10": 1.0,
+        "returned_mean_top10_cosine_distance": 0.14899181365966796
+      },
+      {
+        "distance_ratio": 1.0000000390051835,
+        "expansion_search": 512,
+        "recall_at_10": 1.0,
+        "returned_mean_top10_cosine_distance": 0.14899181365966796
+      }
+    ],
+    "floor_provenance": "SELF-IMPOSED sanity floor, NOT a plan-committed threshold. §4.6's tiebreak rule governs latency and RSS and does not mention recall. A breach is escalated as a finding; it is not a contract violation and does not fail a candidate.",
+    "k": 10,
+    "oracle": "exact cosine brute force over f32 vectors regenerated from the seed — NOT read back from the quantised index, which would compare the index against itself",
+    "oracle_mean_top10_cosine_distance": 0.1489918078482151,
+    "precision": "f32",
+    "probes": 100,
+    "recall_at_10": 1.0,
+    "sanity_floor": 0.9,
+    "scaled_run_reason": "f32 confirms exclusion, not selection. R-4 extrapolates f32 at ~17GB against AC-46's 16GB ceiling, so it is over the ceiling before measurement and cannot become the answer at any scale. Disk on this shared box could not hold 15.6GiB of f32 shards plus the 12GiB reserve, and the reserve was deliberately NOT lowered to make it fit. 2M vectors measures bytes-per-vector exactly: on-disk growth is dead linear across shards, verified in the corrected run at i8 (0.50/0.99/1.49/1.98/2.48 GiB over shards 0-4, 532 B/vector at 10M) and f16 (0.85/1.71/2.56/3.41/4.27/5.12 GiB, 114s/shard). Shard-0 recall is measured per 1M shard in EVERY precision, so this run's recall and ef-sweep are directly comparable to i8's and f16's rather than approximations. What this does NOT give is 10M-corpus query latency for f32, which is neither measured nor claimed - f32 is excluded on RAM, so its latency never enters the decision.",
+    "shard": 0,
+    "shard_vectors": 1000000,
+    "vectors_per_shard_contract": 1000000
+  },
+  "ann_recall_i8": {
+    "above_floor": false,
+    "bench_expansion_search": 200,
+    "expansion_search_sweep": [
+      {
+        "distance_ratio": 1.4058505857603991,
+        "expansion_search": 64,
+        "recall_at_10": 0.716,
+        "returned_mean_top10_cosine_distance": 0.20946022033691403
+      },
+      {
+        "distance_ratio": 1.0444962566860023,
+        "expansion_search": 200,
+        "recall_at_10": 0.778,
+        "returned_mean_top10_cosine_distance": 0.15562138557434085
+      },
+      {
+        "distance_ratio": 1.0036439152872734,
+        "expansion_search": 512,
+        "recall_at_10": 0.785,
+        "returned_mean_top10_cosine_distance": 0.1495347213745117
+      }
+    ],
+    "floor_provenance": "SELF-IMPOSED sanity floor, NOT a plan-committed threshold. §4.6's tiebreak rule governs latency and RSS and does not mention recall. A breach is escalated as a finding; it is not a contract violation and does not fail a candidate.",
+    "k": 10,
+    "oracle": "exact cosine brute force over f32 vectors regenerated from the seed — NOT read back from the quantised index, which would compare the index against itself",
+    "oracle_mean_top10_cosine_distance": 0.1489918078482151,
+    "precision": "i8",
+    "probes": 100,
+    "recall_at_10": 0.778,
+    "sanity_floor": 0.9,
+    "scaled_run_reason": "i8 recall re-measured on shard 0 only, at 1M vectors. recall-ann reads shard 0 alone and shard 0 is seed-derived, so this is the identical shard the 10M run measured, not an approximation. Latency is NOT re-measured here and the 10M figures stand.",
+    "shard": 0,
+    "shard_vectors": 1000000,
+    "vectors_per_shard_contract": 1000000
+  },
+  "capacity_primitives": {
+    "bytes_per_row_base": 85.4011904,
+    "bytes_per_row_marginal": 85.6064,
+    "catalog_bytes": 854011904,
+    "catalog_rows": 10000000,
+    "checkpoint_seconds": 0.002559004,
+    "note": "Bench-schema catalog only (id, parent, name, ext, size, mtime). The production schema in §4.4 carries remote_object, object_location, job and tag tables; the 50 TB model states the multiplier it applies and marks it extrapolated.",
+    "page_size": 4096,
+    "probe_rows": 200000,
+    "probe_write_seconds": 0.823105141,
+    "scaled_run_reason": null,
+    "wal_after_truncate_checkpoint_bytes": 0,
+    "wal_bytes_per_row": 86.23176,
+    "wal_peak_bytes": 17246352
+  },
+  "fixture_catalog": {
+    "dir_space": 200000,
+    "generate_seconds": 16.673074152,
+    "on_disk_bytes": 854093824,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "seed": 20260816
+  },
+  "meta_bench_arena_cold": {
+    "background_rows_ingested": 1400,
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 3.720515,
+        "p95_ms": 22.154818,
+        "p99_ms": 32.176756,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 38.29985007496252,
+        "p50_ms": 12.016441,
+        "p95_ms": 26.950933,
+        "p99_ms": 36.257207,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 49.99850074962519,
+        "p50_ms": 3.189766,
+        "p95_ms": 19.209266,
+        "p99_ms": 28.186024,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "cold",
+    "candidate": "arena",
+    "index_bytes": 800000004,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.958333333333336,
+    "open_or_rebuild_seconds_per_run": [
+      4.05169678,
+      4.03824813,
+      4.008363892
+    ],
+    "pass": true,
+    "peak_vm_hwm_bytes": 812077056,
+    "query_clients": 4,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 23.477371,
+      "drift_flagged": false,
+      "median_p50_ms": 3.857697,
+      "median_p99_ms": 30.247663,
+      "run_to_run_drift_pct": 2.686885171257023,
+      "runs": [
+        {
+          "max_ms": 37.323536999999995,
+          "mean_ms": 7.539767044999998,
+          "n": 1000,
+          "p50_ms": 4.105372,
+          "p95_ms": 23.383172,
+          "p99_ms": 30.247663
+        },
+        {
+          "max_ms": 48.260798,
+          "mean_ms": 6.895724466000001,
+          "n": 1000,
+          "p50_ms": 3.528832,
+          "p95_ms": 24.013982,
+          "p99_ms": 34.216991
+        },
+        {
+          "max_ms": 41.774112,
+          "mean_ms": 7.370834045,
+          "n": 1000,
+          "p50_ms": 3.857697,
+          "p95_ms": 23.477371,
+          "p99_ms": 29.301943
+        }
+      ]
+    },
+    "vm_rss_after_queries_bytes": 12603392,
+    "zero_hit_queries": 0
+  },
+  "meta_bench_arena_warm": {
+    "background_rows_ingested": 1400,
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 3.651135,
+        "p95_ms": 22.03225,
+        "p99_ms": 31.727115,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 38.29985007496252,
+        "p50_ms": 11.996674,
+        "p95_ms": 27.126201,
+        "p99_ms": 34.089894,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 49.99850074962519,
+        "p50_ms": 3.220007,
+        "p95_ms": 20.105219,
+        "p99_ms": 28.163199,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "warm",
+    "candidate": "arena",
+    "index_bytes": 800000004,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.958333333333336,
+    "open_or_rebuild_seconds_per_run": [
+      3.486519597,
+      3.534909243,
+      3.525606839
+    ],
+    "pass": true,
+    "peak_vm_hwm_bytes": 812404736,
+    "query_clients": 4,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 22.195175000000003,
+      "drift_flagged": true,
+      "median_p50_ms": 4.047392,
+      "median_p99_ms": 32.021249000000005,
+      "run_to_run_drift_pct": 13.255227769098465,
+      "runs": [
+        {
+          "max_ms": 44.630005,
+          "mean_ms": 7.552343642000004,
+          "n": 1000,
+          "p50_ms": 4.058152,
+          "p95_ms": 22.124444,
+          "p99_ms": 31.727115
+        },
+        {
+          "max_ms": 54.196413,
+          "mean_ms": 6.875211146999997,
+          "n": 1000,
+          "p50_ms": 3.547673,
+          "p95_ms": 22.195175000000003,
+          "p99_ms": 32.021249000000005
+        },
+        {
+          "max_ms": 41.459635,
+          "mean_ms": 7.799262589000003,
+          "n": 1000,
+          "p50_ms": 4.047392,
+          "p95_ms": 25.066465,
+          "p99_ms": 32.036727
+        }
+      ]
+    },
+    "vm_rss_after_queries_bytes": 21843968,
+    "zero_hit_queries": 0
+  },
+  "meta_bench_fts5_cold": {
+    "background_rows_ingested": 133000,
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.72272272272272,
+        "p50_ms": 2.41342,
+        "p95_ms": 54.047361,
+        "p99_ms": 219.335494,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 38.32383808095952,
+        "p50_ms": 120.004282,
+        "p95_ms": 1410.696171,
+        "p99_ms": 2581.153238,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 49.99850074962519,
+        "p50_ms": 1.440523,
+        "p95_ms": 6.837683,
+        "p99_ms": 56.669384,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "cold",
+    "candidate": "fts5",
+    "index_bytes": 4341215232,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.978,
+    "open_or_rebuild_seconds_per_run": [
+      3.8e-7,
+      3.1e-7,
+      3.3e-7
+    ],
+    "pass": false,
+    "peak_vm_hwm_bytes": 521076736,
+    "query_clients": 4,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 587.525616,
+      "drift_flagged": true,
+      "median_p50_ms": 2.249927,
+      "median_p99_ms": 1520.165431,
+      "run_to_run_drift_pct": 16.56316428592963,
+      "runs": [
+        {
+          "max_ms": 3169.742963,
+          "mean_ms": 87.51872613500001,
+          "n": 1000,
+          "p50_ms": 2.37814,
+          "p95_ms": 587.525616,
+          "p99_ms": 1410.696171
+        },
+        {
+          "max_ms": 5280.546745,
+          "mean_ms": 89.88903099699999,
+          "n": 1000,
+          "p50_ms": 2.249927,
+          "p95_ms": 518.997948,
+          "p99_ms": 1821.002645
+        },
+        {
+          "max_ms": 2382.847368,
+          "mean_ms": 86.071096074,
+          "n": 1000,
+          "p50_ms": 2.2018459999999997,
+          "p95_ms": 616.310781,
+          "p99_ms": 1520.165431
+        }
+      ]
+    },
+    "vm_rss_after_queries_bytes": 201408512,
+    "zero_hit_queries": 0
+  },
+  "meta_bench_fts5_warm": {
+    "background_rows_ingested": 92600,
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.72272272272272,
+        "p50_ms": 2.321149,
+        "p95_ms": 37.908815999999995,
+        "p99_ms": 183.749497,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 38.32083958020989,
+        "p50_ms": 87.53495799999999,
+        "p95_ms": 870.3310779999999,
+        "p99_ms": 1617.079082,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 49.99850074962519,
+        "p50_ms": 1.5848870000000002,
+        "p95_ms": 7.313735,
+        "p99_ms": 45.192063999999995,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "warm",
+    "candidate": "fts5",
+    "index_bytes": 4341215232,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.977333333333334,
+    "open_or_rebuild_seconds_per_run": [
+      1.1e-7,
+      2.1e-7,
+      7e-8
+    ],
+    "pass": false,
+    "peak_vm_hwm_bytes": 498278400,
+    "query_clients": 4,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 378.590937,
+      "drift_flagged": true,
+      "median_p50_ms": 2.36839,
+      "median_p99_ms": 783.872126,
+      "run_to_run_drift_pct": 51.323445442118434,
+      "runs": [
+        {
+          "max_ms": 3440.729074,
+          "mean_ms": 83.00913457400003,
+          "n": 1000,
+          "p50_ms": 2.36839,
+          "p95_ms": 553.081289,
+          "p99_ms": 1516.849184
+        },
+        {
+          "max_ms": 4590.709817000001,
+          "mean_ms": 51.358814391,
+          "n": 1000,
+          "p50_ms": 1.992563,
+          "p95_ms": 358.775376,
+          "p99_ms": 783.872126
+        },
+        {
+          "max_ms": 969.802867,
+          "mean_ms": 48.893666245000006,
+          "n": 1000,
+          "p50_ms": 2.584753,
+          "p95_ms": 378.590937,
+          "p99_ms": 649.9637299999999
+        }
+      ]
+    },
+    "vm_rss_after_queries_bytes": 172716032,
+    "zero_hit_queries": 0
+  },
+  "meta_bench_tantivy_cold": {
+    "background_rows_ingested": 36900,
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 9.618977,
+        "p95_ms": 44.654622,
+        "p99_ms": 90.133021,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 38.29985007496252,
+        "p50_ms": 13.182926,
+        "p95_ms": 83.203932,
+        "p99_ms": 149.830389,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 49.99850074962519,
+        "p50_ms": 20.480074,
+        "p95_ms": 131.55225000000002,
+        "p99_ms": 222.15929,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "cold",
+    "candidate": "tantivy",
+    "index_bytes": 2150314481,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.958333333333336,
+    "open_or_rebuild_seconds_per_run": [
+      0.040051344,
+      0.033496479,
+      0.032264856
+    ],
+    "pass": false,
+    "peak_vm_hwm_bytes": 1335435264,
+    "query_clients": 4,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 87.987914,
+      "drift_flagged": true,
+      "median_p50_ms": 16.595626,
+      "median_p99_ms": 187.397774,
+      "run_to_run_drift_pct": 27.05397584490981,
+      "runs": [
+        {
+          "max_ms": 344.542555,
+          "mean_ms": 22.845988579,
+          "n": 1000,
+          "p50_ms": 15.59338,
+          "p95_ms": 68.49651499999999,
+          "p99_ms": 187.381221
+        },
+        {
+          "max_ms": 304.688687,
+          "mean_ms": 25.650087326999984,
+          "n": 1000,
+          "p50_ms": 16.924022,
+          "p95_ms": 92.300744,
+          "p99_ms": 220.05027
+        },
+        {
+          "max_ms": 293.65490900000003,
+          "mean_ms": 24.391710279000012,
+          "n": 1000,
+          "p50_ms": 16.595626,
+          "p95_ms": 87.987914,
+          "p99_ms": 187.397774
+        }
+      ]
+    },
+    "vm_rss_after_queries_bytes": 34131968,
+    "zero_hit_queries": 0
+  },
+  "meta_bench_tantivy_warm": {
+    "background_rows_ingested": 33800,
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 8.342306,
+        "p95_ms": 42.438168,
+        "p99_ms": 90.690116,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 38.29985007496252,
+        "p50_ms": 10.140026,
+        "p95_ms": 68.083957,
+        "p99_ms": 122.404541,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 49.99850074962519,
+        "p50_ms": 20.144459,
+        "p95_ms": 126.857706,
+        "p99_ms": 220.906893,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "warm",
+    "candidate": "tantivy",
+    "index_bytes": 2150283683,
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.958333333333336,
+    "open_or_rebuild_seconds_per_run": [
+      0.035749016,
+      0.001418955,
+      0.001417424
+    ],
+    "pass": false,
+    "peak_vm_hwm_bytes": 1343504384,
+    "query_clients": 4,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 68.083957,
+      "drift_flagged": true,
+      "median_p50_ms": 15.611672,
+      "median_p99_ms": 184.534595,
+      "run_to_run_drift_pct": 12.950642689583969,
+      "runs": [
+        {
+          "max_ms": 321.388811,
+          "mean_ms": 22.852785525000005,
+          "n": 1000,
+          "p50_ms": 15.884837,
+          "p95_ms": 72.238862,
+          "p99_ms": 184.534595
+        },
+        {
+          "max_ms": 244.86883,
+          "mean_ms": 22.59419424900003,
+          "n": 1000,
+          "p50_ms": 15.611672,
+          "p95_ms": 68.083957,
+          "p99_ms": 189.756137
+        },
+        {
+          "max_ms": 262.398607,
+          "mean_ms": 21.163499757999993,
+          "n": 1000,
+          "p50_ms": 14.570263,
+          "p95_ms": 63.421552000000005,
+          "p99_ms": 183.194333
+        }
+      ]
+    },
+    "vm_rss_after_queries_bytes": 25018368,
+    "zero_hit_queries": 0
+  },
+  "meta_build_arena": {
+    "build_seconds": 3.74068011,
+    "bytes": 800000004,
+    "candidate": "arena",
+    "peak_vm_hwm_bytes": 809762816,
+    "persistence_note": "NO persisted form; this build IS the cold-start rebuild, paid at every logon",
+    "rows": 10000000,
+    "scaled_run_reason": null
+  },
+  "meta_build_fts5": {
+    "build_seconds": 372.333837313,
+    "bytes": 4341215232,
+    "candidate": "fts5",
+    "peak_vm_hwm_bytes": 620371968,
+    "persistence_note": "transactional with the catalog; nothing to rebuild at start",
+    "rows": 10000000,
+    "scaled_run_reason": null
+  },
+  "meta_build_tantivy": {
+    "build_seconds": 113.860015016,
+    "bytes": 2116526084,
+    "candidate": "tantivy",
+    "peak_vm_hwm_bytes": 1887293440,
+    "persistence_note": "independent on-disk index with its own commit semantics",
+    "rows": 10000000,
+    "scaled_run_reason": null
+  },
+  "meta_daemon_bench_cold": {
+    "background_ingest_errors": 0,
+    "background_ingest_rows_per_sec_target": 2000,
+    "background_rows_ingested": 7911,
+    "background_rows_ingested_per_run": [
+      2212,
+      3399,
+      2300
+    ],
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 9.034174,
+        "p95_ms": 39.550776000000006,
+        "p99_ms": 111.703322,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 37.497751124437784,
+        "p50_ms": 22.887714,
+        "p95_ms": 82.824578,
+        "p99_ms": 146.723229,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 50.0,
+        "p50_ms": 6.2778920000000005,
+        "p95_ms": 22.981233,
+        "p99_ms": 109.606254,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "cold",
+    "client_connections": 4,
+    "contract_core_count": 8,
+    "contract_pin_to_cores": "0-7",
+    "contract_query_clients": 4,
+    "core_count": 8,
+    "cores_substitution_reason": null,
+    "daemon_cpus_allowed_list": "0-7",
+    "daemon_start_to_ready_seconds_per_run": [
+      4.666239584,
+      4.716252083,
+      4.565953966
+    ],
+    "harness_cpus_allowed_list": "0-7",
+    "loadavg_at_start": "6.56 5.04 5.21",
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.78066666666667,
+    "measured_host_idle_baseline": 0.884,
+    "measured_through": "live shepherdd over a Unix socket, client-side send->response",
+    "min_idle_fraction_required": 0.84,
+    "pass": true,
+    "pinned_core_idle_fraction_after_each_run": [
+      0.913793103448276,
+      0.9446182728410512,
+      0.8785982478097623
+    ],
+    "pinned_core_idle_fraction_before_each_run": [
+      0.8891324772940808,
+      0.9439398684622612,
+      0.9379310344827586
+    ],
+    "pinned_core_idle_sample_window_ms": 4000,
+    "post_run_settle_ms": 2000,
+    "query_clients": 4,
+    "result_limit": 50,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 41.219823000000005,
+      "drift_flagged": true,
+      "median_p50_ms": 8.159013999999999,
+      "median_p99_ms": 108.151302,
+      "run_to_run_drift_pct": 17.081148068005998,
+      "runs": [
+        {
+          "max_ms": 150.371326,
+          "mean_ms": 14.987566459000016,
+          "n": 1000,
+          "p50_ms": 8.571239,
+          "p95_ms": 41.219823000000005,
+          "p99_ms": 91.340598
+        },
+        {
+          "max_ms": 155.988327,
+          "mean_ms": 16.527325778,
+          "n": 1000,
+          "p50_ms": 8.159013999999999,
+          "p95_ms": 46.563517,
+          "p99_ms": 137.94500000000002
+        },
+        {
+          "max_ms": 448.427539,
+          "mean_ms": 15.402176963000002,
+          "n": 1000,
+          "p50_ms": 8.025312999999999,
+          "p95_ms": 39.522698000000005,
+          "p99_ms": 108.151302
+        }
+      ]
+    },
+    "supplementary_diagnostic": false,
+    "zero_hit_queries": 0
+  },
+  "meta_daemon_bench_warm": {
+    "background_ingest_errors": 0,
+    "background_ingest_rows_per_sec_target": 2000,
+    "background_rows_ingested": 11008,
+    "background_rows_ingested_per_run": [
+      1014,
+      5497,
+      4497
+    ],
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 8.906087999999999,
+        "p95_ms": 35.241438,
+        "p99_ms": 44.451071,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 37.497751124437784,
+        "p50_ms": 20.429278,
+        "p95_ms": 41.12141,
+        "p99_ms": 49.614731,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 50.0,
+        "p50_ms": 5.885761,
+        "p95_ms": 18.081389,
+        "p99_ms": 29.996925,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "warm",
+    "client_connections": 4,
+    "contract_core_count": 8,
+    "contract_pin_to_cores": "0-7",
+    "contract_query_clients": 4,
+    "core_count": 8,
+    "cores_substitution_reason": null,
+    "daemon_cpus_allowed_list": "0-7",
+    "daemon_start_to_ready_seconds_per_run": [
+      3.259018143,
+      3.308722963,
+      3.309256253
+    ],
+    "harness_cpus_allowed_list": "0-7",
+    "loadavg_at_start": "4.25 4.79 5.03",
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.78066666666667,
+    "measured_host_idle_baseline": 0.884,
+    "measured_through": "live shepherdd over a Unix socket, client-side send->response",
+    "min_idle_fraction_required": 0.84,
+    "pass": true,
+    "pinned_core_idle_fraction_after_each_run": [
+      0.9609497032177444,
+      0.9327284105131415,
+      0.9499217527386542
+    ],
+    "pinned_core_idle_fraction_before_each_run": [
+      0.9032863849765258,
+      0.9335214800878018,
+      0.9577993122850891
+    ],
+    "pinned_core_idle_sample_window_ms": 4000,
+    "post_run_settle_ms": 2000,
+    "query_clients": 4,
+    "result_limit": 50,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 33.903592,
+      "drift_flagged": true,
+      "median_p50_ms": 8.191529,
+      "median_p99_ms": 42.275424,
+      "run_to_run_drift_pct": 12.919462928883755,
+      "runs": [
+        {
+          "max_ms": 67.344685,
+          "mean_ms": 12.844213858999991,
+          "n": 1000,
+          "p50_ms": 8.191529,
+          "p95_ms": 37.606485,
+          "p99_ms": 47.272662
+        },
+        {
+          "max_ms": 51.888029,
+          "mean_ms": 11.351753640999998,
+          "n": 1000,
+          "p50_ms": 7.5558320000000005,
+          "p95_ms": 33.226323,
+          "p99_ms": 40.670223
+        },
+        {
+          "max_ms": 51.869261,
+          "mean_ms": 12.009706992999996,
+          "n": 1000,
+          "p50_ms": 8.283831000000001,
+          "p95_ms": 33.903592,
+          "p99_ms": 42.275424
+        }
+      ]
+    },
+    "supplementary_diagnostic": false,
+    "zero_hit_queries": 0
+  },
+  "meta_daemon_bench_warm__diagnostic_1c": {
+    "background_ingest_errors": 0,
+    "background_ingest_rows_per_sec_target": 2000,
+    "background_rows_ingested": 22900,
+    "background_rows_ingested_per_run": [
+      6411,
+      8094,
+      8395
+    ],
+    "bar_ms": 50.0,
+    "by_class": {
+      "infix": {
+        "mean_hits": 48.67967967967968,
+        "p50_ms": 1.63475,
+        "p95_ms": 16.882861,
+        "p99_ms": 20.620288000000002,
+        "queries": 999,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "path_fragment": {
+        "mean_hits": 37.497751124437784,
+        "p50_ms": 12.947892000000001,
+        "p95_ms": 21.792392,
+        "p99_ms": 28.154131999999997,
+        "queries": 667,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      },
+      "prefix": {
+        "mean_hits": 50.0,
+        "p50_ms": 1.069814,
+        "p95_ms": 2.197727,
+        "p99_ms": 13.61552,
+        "queries": 1334,
+        "zero_hit": 0,
+        "zero_hit_pct": 0.0
+      }
+    },
+    "cache": "warm",
+    "client_connections": 1,
+    "contract_core_count": 8,
+    "contract_pin_to_cores": "0-7",
+    "contract_query_clients": 4,
+    "core_count": 8,
+    "cores_substitution_reason": null,
+    "daemon_cpus_allowed_list": "0-7",
+    "daemon_start_to_ready_seconds_per_run": [
+      3.462580589,
+      3.309174865,
+      3.258848806
+    ],
+    "harness_cpus_allowed_list": "0-7",
+    "loadavg_at_start": "4.66 4.56 4.79",
+    "machine": {
+      "cores_pinned_to": "0-7",
+      "cpu_logical_cores": 8,
+      "cpu_model": "AMD EPYC 7302P 16-Core Processor",
+      "kernel": "Linux 6.8.0-136-generic",
+      "ram_total_gib": 68.62666702270508,
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "sqlite": "3.53.2",
+      "storage_device": "sda  QEMU HARDDISK",
+      "storage_note": "QEMU/KVM virtual block device, non-rotational, `none` I/O scheduler. NOT a bare-metal NVMe: the contract's declared storage class is not met and this is recorded as a substitution, not as an equivalent.",
+      "storage_rotational": false,
+      "usearch": "2.26.0",
+      "usearch_simd_available": "serial, haswell",
+      "usearch_simd_compiled": "serial, haswell, skylake, icelake, genoa, sapphire, sapphireamx, graniteamx, turin, sierra, alder",
+      "virtualization": "kvm"
+    },
+    "mean_hits_per_query": 46.78066666666667,
+    "measured_host_idle_baseline": 0.884,
+    "measured_through": "live shepherdd over a Unix socket, client-side send->response",
+    "min_idle_fraction_required": 0.84,
+    "pass": true,
+    "pinned_core_idle_fraction_after_each_run": [
+      0.9525296689569019,
+      0.949874686716792,
+      0.9005006257822278
+    ],
+    "pinned_core_idle_fraction_before_each_run": [
+      0.945244055068836,
+      0.9292866082603254,
+      0.9416354556803995
+    ],
+    "pinned_core_idle_sample_window_ms": 4000,
+    "post_run_settle_ms": 2000,
+    "query_clients": 1,
+    "result_limit": 50,
+    "rows": 10000000,
+    "scaled_run_reason": null,
+    "stats": {
+      "accepted_p95_ms": 18.092405999999997,
+      "drift_flagged": false,
+      "median_p50_ms": 1.294436,
+      "median_p99_ms": 21.59109,
+      "run_to_run_drift_pct": 5.103091319087141,
+      "runs": [
+        {
+          "max_ms": 34.105006,
+          "mean_ms": 4.560653911999997,
+          "n": 1000,
+          "p50_ms": 1.294436,
+          "p95_ms": 18.068546,
+          "p99_ms": 21.422468
+        },
+        {
+          "max_ms": 28.748639,
+          "mean_ms": 4.508150222999998,
+          "n": 1000,
+          "p50_ms": 1.273616,
+          "p95_ms": 18.092405999999997,
+          "p99_ms": 21.59109
+        },
+        {
+          "max_ms": 32.264803,
+          "mean_ms": 4.707340933999999,
+          "n": 1000,
+          "p50_ms": 1.330046,
+          "p95_ms": 18.991818000000002,
+          "p99_ms": 25.58663
+        }
+      ]
+    },
+    "supplementary_diagnostic": true,
+    "zero_hit_queries": 0
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "$defs": {
+    "ScanState": {
+      "description": "Progress of one root's scan.",
+      "properties": {
+        "bytes_seen": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_seen": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "finished_at": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "last_error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "root_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "running": {
+          "type": "boolean"
+        },
+        "started_at": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "root_id",
+        "running",
+        "files_seen",
+        "bytes_seen"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`scan.status`.",
+  "properties": {
+    "scans": {
+      "items": {
+        "$ref": "#/$defs/ScanState"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "scans"
+  ],
+  "title": "scan.status result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

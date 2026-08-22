@@ -1,0 +1,21 @@
+[package]
+name = "shepherd-placeholder"
+description = "PlaceholderProvider trait and its cfapi / fileprovider / delete-mode impls."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+shepherd-core.workspace = true
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# §4.10.1's identity-bound acquisition primitive: `renameat2(RENAME_NOREPLACE)`
+# on Linux, `renameatx_np(RENAME_EXCL)` on macOS. Neither is in std.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

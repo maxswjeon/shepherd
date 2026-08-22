@@ -1,0 +1,67 @@
+{
+  "$defs": {
+    "RuleSummary": {
+      "description": "One rule.",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "last_preview_at": {
+          "default": null,
+          "description": "Nanoseconds since the epoch, or `None` if the rule has never been\npreviewed. AC-14 rejects enabling a rule in that state, so `None` here\nwith `enabled: true` is a contradiction the daemon must never produce.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "last_preview_hash": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "rule_id": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rule_id",
+        "name",
+        "enabled",
+        "action"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`rule.list`.",
+  "properties": {
+    "rules": {
+      "items": {
+        "$ref": "#/$defs/RuleSummary"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "rules"
+  ],
+  "title": "rule.list result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

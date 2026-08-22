@@ -1,0 +1,76 @@
+{
+  "$defs": {
+    "CliError": {
+      "description": "The script-facing error.\n\n`code` is [`crate::ErrorCode::stable_slug`], never the numeric JSON-RPC code.",
+      "properties": {
+        "code": {
+          "description": "A stable `lower_snake` slug. Match on this.",
+          "type": "string"
+        },
+        "hint": {
+          "description": "What the user can do about it.\n\nAC-61 requires the daemon-down error to name the socket path, the service\nregistration state and the platform start command rather than a bare\n\"connection refused\". This is where that text goes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What every `shepctl <command> --json` invocation prints, exactly once, on\nstdout.\n\nSuccess and failure use the same shape so a script parses one thing:\n`.ok` is the branch, and `.error` is populated iff `ok` is `false`.",
+  "properties": {
+    "data": {
+      "description": "The method's result payload. `null` on failure.\n\nNot `skip_serializing_if`: a script may read `.data` unconditionally, and\nan absent key and a `null` key are different things to `jq`."
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CliError"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Populated iff `ok` is `false`."
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "schema_version": {
+      "description": "[`CLI_SCHEMA_VERSION`]. Present on every envelope including failures, so\na script can branch on it before it branches on anything else.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "warnings": {
+      "description": "Non-fatal notices. Always present, possibly empty — again so `jq` can\niterate it without a guard.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "ok",
+    "warnings"
+  ],
+  "title": "shepctl --json envelope (schema_version 1)",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

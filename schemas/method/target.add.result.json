@@ -1,0 +1,73 @@
+{
+  "$defs": {
+    "TargetSummary": {
+      "description": "One configured storage target.",
+      "properties": {
+        "adapter": {
+          "type": "string"
+        },
+        "custody_eligible": {
+          "description": "§4.4's CHECK-constrained invariant: `is_third_party` implies\n`!custody_eligible`. There is no API that can set both true. It is on the\nwire so a UI can *show* why a third-party target cannot hold the only\ncopy of anything.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "is_third_party": {
+          "description": "True for any WASM-plugin-backed target.",
+          "type": "boolean"
+        },
+        "last_health_at": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "reachable": {
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "target_id": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target_id",
+        "name",
+        "adapter",
+        "enabled",
+        "is_third_party",
+        "custody_eligible"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`target.add`.",
+  "properties": {
+    "target": {
+      "$ref": "#/$defs/TargetSummary"
+    }
+  },
+  "required": [
+    "target"
+  ],
+  "title": "target.add result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

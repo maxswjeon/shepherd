@@ -1,0 +1,145 @@
+{
+  "$defs": {
+    "AtimeMode": {
+      "description": "How much to trust this root's atime (§4.12).\n\nSurfaced on the wire because it changes what a *user* should believe about a\nrule that matches on last access: under `relatime` an atime can be a day\nstale, and under `disabled` it is not an access signal at all.",
+      "enum": [
+        "reliable",
+        "relatime",
+        "disabled",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "PathCasePolicy": {
+      "description": "How a root's paths compare (§4.9, probed at enrollment, never assumed).",
+      "enum": [
+        "sensitive",
+        "insensitive"
+      ],
+      "type": "string"
+    },
+    "PathNormPolicy": {
+      "description": "How a root's paths are Unicode-normalized (§4.9).",
+      "enum": [
+        "nfc",
+        "nfd",
+        "preserve"
+      ],
+      "type": "string"
+    },
+    "RootAvailability": {
+      "description": "Whether a root is currently reachable (§4.9 PM-3).",
+      "enum": [
+        "available",
+        "unavailable",
+        "unmounted"
+      ],
+      "type": "string"
+    },
+    "RootSummary": {
+      "description": "One registered scan root.",
+      "properties": {
+        "atime_mode": {
+          "$ref": "#/$defs/AtimeMode"
+        },
+        "availability": {
+          "$ref": "#/$defs/RootAvailability"
+        },
+        "bytes_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "file_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hosted_optin": {
+          "type": "boolean"
+        },
+        "ignore_patterns": {
+          "default": [],
+          "description": "The `.gitignore`-syntax exclusions **as stored**, not as sent.\n\nEchoed because the additive rule makes the write side silent in the one\ndirection that matters: a 1.1 daemon ignores a 1.2 client's\n`root.add.ignore_patterns` rather than rejecting it, and the user's\nexclusions simply do not exist. Reading the stored list back is what\nturns that into something a client can detect.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_case_policy": {
+          "$ref": "#/$defs/PathCasePolicy"
+        },
+        "path_norm_policy": {
+          "$ref": "#/$defs/PathNormPolicy"
+        },
+        "resync_required": {
+          "description": "When true, every tier, destroy and discard operation for this root is\ngated off until a resync completes (§4.9 PM-3). Surfaced because a user\nwhose rules have silently stopped acting deserves to see why.",
+          "type": "boolean"
+        },
+        "root_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "stub_mode": {
+          "$ref": "#/$defs/StubMode"
+        }
+      },
+      "required": [
+        "root_id",
+        "path",
+        "enabled",
+        "stub_mode",
+        "hosted_optin",
+        "availability",
+        "resync_required",
+        "path_case_policy",
+        "path_norm_policy",
+        "atime_mode",
+        "file_count",
+        "bytes_total"
+      ],
+      "type": "object"
+    },
+    "StubMode": {
+      "description": "Proto-local mirror of the per-root stub mode.\n\nA mirror rather than a re-export, because `shepherd_core::StubMode` is a\ndomain type this crate may not depend on. The serde representations must\nagree, and `shepherd-cli` is where the two are compared — it is the only\ncrate that legitimately depends on both.",
+      "enum": [
+        "dehydrate",
+        "delete"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`root.add`.",
+  "properties": {
+    "root": {
+      "$ref": "#/$defs/RootSummary"
+    },
+    "warnings": {
+      "default": [],
+      "description": "Non-fatal notices raised while enrolling — an unreliable atime, a\ncase-insensitive volume, a root nested under an existing one.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "root"
+  ],
+  "title": "root.add result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

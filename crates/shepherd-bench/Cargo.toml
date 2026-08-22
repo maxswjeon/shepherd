@@ -1,0 +1,63 @@
+[package]
+name = "shepherd-bench"
+description = "Fixture generator and benchmark harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "shepherd-bench"
+path = "src/main.rs"
+
+[dependencies]
+shepherd-core.workspace = true
+
+# The injected catalog must be the schema the daemon actually reads, so it is
+# created by the product's own migrator rather than by a second spelling of the
+# DDL here, and `norm_key` is computed by the product's own function. See
+# `daemon_meta::inject_catalog`.
+shepherd-catalog.workspace = true
+
+# The wire contract for the through-daemon leg. Hand-rolled JSON frames would be
+# a private copy of the protocol, free to drift from the one the daemon speaks —
+# and a handshake that drifts fails as "connection refused", which reads as a
+# harness bug rather than as the protocol change it would be.
+shepherd-proto.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# --- Post-bake-off dependency set ----------------------------------------
+#
+# The Phase 0b bake-off is decided (`docs/adr/0b-index-decision.md`): the in-RAM
+# SIMD arena won, and `tantivy` left with the candidate it served. What remains
+# is the surviving harness plus the vector leg, not spike code.
+
+# The winner's substring scan primitive. Kept here because the smoke test
+# exercises it, and inherited from the workspace because `shepherd-index` is the
+# real consumer — one pin, one place to bump.
+memchr.workspace = true
+
+# NOT a leftover of the FTS5 candidate. `rusqlite` serves the surviving harness:
+# `gen-catalog` writes the fixture every leg reads, `capacity` measures the
+# DB-growth and WAL/checkpoint primitives behind the 50 TB model, and the machine
+# probe records the bundled SQLite version into every result object. Inherits the
+# workspace pin — `libsqlite3-sys` carries `links = "sqlite3"`, so cargo permits
+# exactly one version in the graph and a local pin here breaks every
+# workspace-scoped command for every worker.
+rusqlite = { workspace = true }
+
+# The §4.6 vector index. Still under measurement, not a bake-off candidate — the
+# precision comparison (f32/f16/i8) is between configurations of this crate.
+usearch = "2.26"
+
+# Fixture generation and the brute-force recall oracle are embarrassingly
+# parallel; the query clients are threads, not tasks (no async runtime in the
+# harness on purpose).
+rayon = "1"

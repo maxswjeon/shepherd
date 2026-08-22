@@ -1,0 +1,50 @@
+{
+  "$defs": {
+    "StubMode": {
+      "description": "Proto-local mirror of the per-root stub mode.\n\nA mirror rather than a re-export, because `shepherd_core::StubMode` is a\ndomain type this crate may not depend on. The serde representations must\nagree, and `shepherd-cli` is where the two are compared — it is the only\ncrate that legitimately depends on both.",
+      "enum": [
+        "dehydrate",
+        "delete"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`root.add` — register a scan root.",
+  "properties": {
+    "hosted_optin": {
+      "default": false,
+      "description": "Whether files under this root may be sent to a hosted inference provider.\nDefaults to `false`: consent is opt-in per root.",
+      "type": "boolean"
+    },
+    "ignore_patterns": {
+      "default": [],
+      "description": "`.gitignore`-syntax patterns excluding paths under this root from scan\n**and** tier (AC-9). Later patterns win, as in `.gitignore`.\n\nAdded at proto 1.2, and it is the field AC-9's `**User**` was always\nabout: `scan_root.ignore_patterns_json` has existed since schema 0001\nand `shepherd-scan::IgnoreSet` has honoured whatever it was handed, but\nuntil this field there was no way for a client to hand it anything, so\nevery scan ran against `'[]'`.\n\nEmpty is the pre-1.2 behaviour exactly, which is why this is a `Vec`\ndefaulting to empty rather than an `Option`: \"the client did not say\"\nand \"the client said nothing is ignored\" must produce the same scan.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "path": {
+      "description": "Absolute path. Sent as the platform writes it; the daemon probes the\nroot's case and normalization policy (§4.9) rather than guessing here.",
+      "type": "string"
+    },
+    "stub_mode": {
+      "$ref": "#/$defs/StubMode",
+      "description": "What happens to a file's bytes locally once it is durably remote."
+    }
+  },
+  "required": [
+    "path",
+    "stub_mode"
+  ],
+  "title": "root.add request",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

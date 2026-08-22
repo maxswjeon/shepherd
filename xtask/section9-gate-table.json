@@ -1,0 +1,77 @@
+{
+  "row_count": 11,
+  "rows": [
+    {
+      "command": "xtask gate --phase 0ab",
+      "evidence": "`bench-baseline.json` with metadata p95, vector p95 and index RSS at 10M **within bars** — **or a written escalation carrying the user's recorded renegotiation decision** (§4.6 contemplates no candidate passing; R-4 argues some ceilings are structurally unreachable). Includes a **precommitted numeric workload contract, fixed *before* 0b runs and recorded in `bench-contract.toml`**: reference machine (CPU model, core count, RAM, NVMe class), fixture **seed** (so corpora are reproducible), query trace composition — **40% prefix, 30% infix substring, 20% path-fragment, 10% semantic**, drawn from a committed trace file — **concurrency = 4 concurrent query clients** against a daemon under a background ingest load, cache state per run (warm and cold measured separately), the **statistical rule** (n = 1000 queries per run, 3 runs, report p50/p95/p99, accept on median-of-runs p95, flag >10% drift vs baseline), the **reference machine** (8-core x86-64, 32 GB RAM, NVMe SSD — recorded exactly in `bench-contract.toml`, and any substitution re-baselines rather than compares), and the **supported AC-46 ceiling range: 4–16 GB**, with **< 4 GB rejected as unachievable at 10M × 384-dim** (R-4) rather than silently accepted. The **50 TB capacity model** carries explicit reject thresholds too — DB growth, checkpoint size, scrub request/egress cost, restart time, and transfer duration each have a fail bound rather than being \"measured-or-extrapolated\" — plus persistence, crash-consistency and cold-start-rebuild axes in the tiebreak rule. Workspace CI green on all three platforms. **LIST-consistency confirmed against the local emulators only** (MinIO, Azurite, Samba, NFS) — the real-provider leg moves to **Phase 6**, where accounts and adapters exist. *Iteration 2 put real-provider LIST evidence on this gate, which Phase 0 structurally cannot produce and which would have re-coupled procurement to catalog work — the same unsatisfiable-gate class that rejected iteration 1.* Spike sources are **preserved as non-production fixtures**, not deleted",
+      "gate_id": "0ab",
+      "label": "0a/0b (blocks Phase 1)"
+    },
+    {
+      "command": "xtask gate --phase 0cd",
+      "evidence": "Windows sync-root hydration proven **from a separate process** by *either* branch the user's OQ-C decision permits: **sparse-package success**, **or** documented sparse-package failure **plus** full-MSIX success. *(Iteration 3 could close only on sparse success, which deadlocked the approved full-MSIX fallback.)* the macOS spike reporting on **both** OQ-A mechanisms — `claimKnownFolders` **and** symlink, each proven independently, since both are live in production simultaneously and neither is a migration target for the other — and resolving OQ-D's Rust-only-vs-Swift-shim question (both OQ-A mechanisms ship regardless — the spike proves each, it does not choose between them); the **CFAPI trash/undelete choreography nailed** (currently `[U]`). Signing identities present and test-signed; `fixtures/corpus-10m` staged; **signing inventory artifact** enumerating every binary needing a signature. ⚠ **A written blocking constraint is a valid Phase-0 *result*, but it is NOT plan closure** — it hands the decision to Phase 3's gate, which requires a *proven mechanism or a formally revised settled requirement*",
+      "gate_id": "0cd",
+      "label": "0c/0d (blocks Phase 3 and Phase 9 only — NOT Phase 1)"
+    },
+    {
+      "command": "xtask gate --phase 1",
+      "evidence": "**M1 both legs**: functional pipeline over the 1M on-disk corpus; < 50 ms p95 over a 10M-row injected catalog. **AC-13** (matcher over all seven predicate kinds — now passable, §6 moves `rules/match.rs` here). **AC-56** schema stability. **AC-54's `CLI == registered_methods` check runs in CI from this phase** (the inventory test stays at Phase 8). Identity layer proven: content-addressed keys collision-free under a case/normalization fuzz corpus; `fs_id` stable across a simulated remount. `atime_mode` detection correct on all three platforms. Job-queue core: kill-and-resume of a checkpointed job. Catalog write discipline: single-writer actor, WAL bounded across the full scan by SQLite's page-count autocheckpoint, dedicated PASSIVE-checkpoint connection as a supplementary backstop (corrected 2026-08-19, measured — see docs/adr/0b-capacity-model-50tb.md). Daemon installs on **Linux (systemd user unit; lingering *checked and warned*, never forced — OQ-F) and macOS (LaunchAgent)**; Windows startup task defers to Phase 3 with package identity",
+      "gate_id": "1",
+      "label": "1"
+    },
+    {
+      "command": "xtask gate --phase 2",
+      "evidence": "✅ **Schema/API prerequisites SETTLED by user decision, 2026-08-16** — this phase is no longer blocked: **OQ-H** deferral window = **14 days**, per-policy override (the `deferral` table and discard API may freeze); **OQ-I** version-less substrates use **content self-attestation** (mechanism B), so the destroy predicate is implementable; **OQ-J** the narrowed writable-fd residual is **accepted**, with an added **open-handle precondition** at step 0 — Unix roots are *not* copy-only, and the residual remains documented (D-8, D-11, D-15, R-21), not closed. **M2 demo** on Linux. **AC-1, AC-2 (a fresh 50 GB resume artifact in *this* gate, not merely nightly), AC-5, AC-7, AC-8, AC-9, AC-14, AC-15, AC-47** green. *(AC-4 is deliberately absent from this list — its mock leg passes here, the AC itself is owned by Phase 3.)* **AC-6 owned here** (moved from Phase 1, where tiering did not exist): drop *all* local state **after** tiering-and-destroying, then rebuild from filesystem **plus the four-class recovery bundle** (§4.10.3a) — proving P1's restated custody invariant. **AC-3, AC-4 and AC-10 mock legs only** via `MockPlaceholderProvider`'s stub-lifecycle events — **this gate does not claim any of the three complete**; final ownership of all three is Phase 3. *(Exactly one gate may claim a complete AC; earlier gates name the leg.)* **Every §4.10 invariant demonstrated**: handle/staging-bound destruction with adversarial path-swap *at the syscall boundary*; version-bound remote revalidation after the final local hash; fail-closed on unprovable identity; abort-forward-never recovery incl. move-back; safety floors re-validated at acquisition; discard intent+audit; rate-based breaker with candidate-set-hash confirmation; exclusive-create restore; per-file serialization; restore-fidelity contract (bytes+mtime+mode). `doctor` clean",
+      "gate_id": "2",
+      "label": "2"
+    },
+    {
+      "command": "xtask gate --phase 3",
+      "evidence": "**AC-11, AC-12 on real hardware**, window-closed. **AC-10 final ownership** — the *same root* switched between both post-move modes on real Win/macOS. **AC-3 final ownership** — a real stub deleted in Explorer/Finder drives detection → reconcile → each delete-policy branch. **AC-4 final ownership** — a real placeholder renamed and moved in Explorer/Finder updates the catalog pointer, asserted with **zero remote calls** via the recording adapter. **PM-1's revalidation/abort suite re-run against `cfapi` and `fileprovider` destroy primitives** and against **all three macOS behaviours** (claimed / symlink / delete-mode). Windows MSIX-or-sparse startup task installs and auto-starts. ⚠ **Closure requires a mechanism proven to satisfy AC-11/12/65, or a formally revised settled requirement — a documented blocking constraint does not close this phase**",
+      "gate_id": "3",
+      "label": "3"
+    },
+    {
+      "command": "xtask gate --phase 4",
+      "evidence": "**AC-28** (needs the 3→4 edge): metadata completion *and* hydration proceed on battery, inference and uploads **queued-not-failed** with exact resume, **zero content bytes uploaded** — while *permitting* hydration control traffic, which the literal \"zero outbound\" reading forbids. **AC-29, AC-45 (N bound per platform, and the gate FAILS above it), AC-57, AC-58, AC-59**, plus the **AC-37 governor leg only** (cap arithmetic and metered detection; final ownership at Phase 6 once the adapters exist) (incl. the lingering *warning* path). Journal-overflow injection produces a loud `resync-required` **and refuses tier/destroy/discard for that root**. Root-unavailable injection processes **zero** absences. Self-event suppression verified. Tier-1 watcher passes with the helper **uninstalled**. Scrub cadence, separate presence/integrity alerts, `max_full_verification_age` enforced",
+      "gate_id": "4",
+      "label": "4"
+    },
+    {
+      "command": "xtask gate --phase 5",
+      "evidence": "**AC-19 (≥ 2 distinct persisted tags per file, not ≥ 1), AC-20…AC-27, AC-17, AC-18, AC-40, AC-41, AC-42, AC-43, AC-46, AC-62** green. **AC-44** (needs the 4→5 edge): resume across reboot **and power transitions at 10M scale**. **AC-16 final ownership** — the \"regardless of inference settings or power state\" clause is only non-trivial once both confounders exist. Bench re-run on the real `fixtures/corpus-10m`, warm **and cold-cache**, plus the mixed-load row (ingest+preview+search: p95, WAL size, checkpoint age, `SQLITE_BUSY`). Dual-model migration keeps search live. **50 TB capacity model** measured-or-extrapolated: DB growth, checkpoints, scrub cost, restart time, transfer duration",
+      "gate_id": "5",
+      "label": "5"
+    },
+    {
+      "command": "xtask gate --phase 6",
+      "evidence": "**AC-32, AC-33, AC-34, AC-36, AC-39** green, plus **AC-37 final ownership** (bandwidth and metered caps are only meaningfully exercised once most adapters exist; the governor logic leg passed at Phase 4). **AC-35 transport leg only** — the sidecar reaches the NAS from a foreign tailnet; its UI-warning leg is owned at Phase 8. **Real-account matrix for all seven providers** — MinIO is not proof any real provider works — plus clean-machine replica recovery for every provider *and* SMB/NFS. ****LIST pagination-exhaustion and visibility bounds confirmed per real provider** (moved here from Phase 0ab) — Drive `files.list` and Graph `children` are index-backed with propagation lag and are the weak cases; any provider that fails stays `custody_eligible=false`. **R-12's conformance matrix against Synology, QNAP, TrueNAS, Windows Server**, with SMB signing enforcement asserted by Shepherd's own test; failure or an unresolved `smb2` issue #5 triggers the documented fallback. tsnet forwarder: authenticated loopback, `0700` state dir, supervision state machine",
+      "gate_id": "6",
+      "label": "6"
+    },
+    {
+      "command": "xtask gate --phase 7",
+      "evidence": "**AC-30** (socket-layer zero-egress), **AC-31**, **AC-38** green — AC-38 now requiring **positive** `create`/`get`/`list`, same-namespace enforcement, cross-namespace denial, **and the adversarial deletion suite** (DELETE, deletion-via-POST, namespace escape, credential exfiltration, deletion attempted inside every allowed ABI operation). Host mediation proven: no plugin holds a raw HTTP handle or a delete-capable credential. **the third-party custody invariant holds under attack** — API, import, hand-edited row + restart, and migration all fail to grant custody (gating on \"defaults false\" would let an executor ship an override)",
+      "gate_id": "7",
+      "label": "7"
+    },
+    {
+      "command": "xtask gate --phase 8",
+      "evidence": "**AC-48…AC-53** green. **AC-54 inventory test** — generated TS client is the sole IPC path, raw `invoke` banned by lint, zero UI-only capabilities. **AC-60, AC-61** owned here (iteration 1's appendix assigned them to Phase 8 while the gate named only AC-48…54). **AC-35 final ownership** — the tsnet transport leg passed at Phase 6, but AC-35 also requires *\"the UI warns about userspace-networking performance\"*, which cannot exist before this phase",
+      "gate_id": "8",
+      "label": "8"
+    },
+    {
+      "command": "xtask gate --release",
+      "evidence": "**AC-55, AC-63, AC-64, AC-65**. AC-63 full E2E on all three physical machines with the documented Linux substitution. AC-65 verified on a **clean machine from the shipped installer**, never a dev build. **AC-64's checklist is generated, not asserted**: one row per AC with owning test, artifact path, result, timestamp, and signer — **missing, stale, or skipped rows reject the release**. Installer upgrade/downgrade/uninstall/rollback gates, explicitly including behaviour when dehydrated files remain",
+      "gate_id": "release",
+      "label": "9"
+    }
+  ],
+  "x-shepherd": {
+    "generator": "cargo xtask gate --regen-table",
+    "source": ".omc/plans/shepherd-consensus-plan.md, §9's gate table",
+    "warning": "GENERATED FILE — edit §9 in the plan and re-run `cargo xtask gate --regen-table`. `gate --audit` FAILS when this disagrees with the plan.",
+    "why_tracked": "the plan is gitignored (/.omc/), so without this artifact the §9 reconciliation cannot run in CI at all"
+  }
+}

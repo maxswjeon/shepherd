@@ -1,0 +1,125 @@
+{
+  "$defs": {
+    "FileState": {
+      "description": "A file's local materialization state, as the catalog records it.",
+      "enum": [
+        "local",
+        "stub",
+        "remote",
+        "missing"
+      ],
+      "type": "string"
+    },
+    "SearchHit": {
+      "description": "One search hit.",
+      "properties": {
+        "blake3": {
+          "default": null,
+          "description": "Lowercase hex BLAKE3, or `None` while the file is still unhashed —\nhashing is its own job class and never gates cataloguing (§6 Phase 1).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "mtime": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "rel_path": {
+          "type": "string"
+        },
+        "root_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "score": {
+          "default": null,
+          "description": "Relevance, higher is better. Absent for a pure metadata query, where\nordering is by the requested sort and a score would be invented.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/FileState"
+        },
+        "tags": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "file_id",
+        "root_id",
+        "rel_path",
+        "size",
+        "mtime",
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`rule.preview` — the dry run AC-14 makes mandatory before enabling a rule.",
+  "properties": {
+    "bytes_matched": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "matched": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "preview_hash": {
+      "description": "Lowercase hex BLAKE3 over the matched set. Recorded as\n`rule.last_preview_hash`, and the value a later enable is checked\nagainst.",
+      "type": "string"
+    },
+    "previewed_at": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "rule_id": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "sample": {
+      "description": "A bounded sample of the matches, for the user to eyeball.",
+      "items": {
+        "$ref": "#/$defs/SearchHit"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "rule_id",
+    "matched",
+    "bytes_matched",
+    "sample",
+    "preview_hash",
+    "previewed_at"
+  ],
+  "title": "rule.preview result",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

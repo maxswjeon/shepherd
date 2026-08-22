@@ -1,0 +1,313 @@
+{
+  "$defs": {
+    "EventPayload": {
+      "anyOf": [
+        {
+          "properties": {
+            "attempts": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "class": {
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "job_id": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "kind": {
+              "const": "job_transition",
+              "type": "string"
+            },
+            "last_error": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "job_id",
+            "class",
+            "from",
+            "to"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "bytes_seen": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "current_path": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "done": {
+              "type": "boolean"
+            },
+            "files_seen": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "scan_progress",
+              "type": "string"
+            },
+            "root_id": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "root_id",
+            "files_seen",
+            "bytes_seen",
+            "done"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "build": {
+              "default": 0,
+              "description": "Which rebuild this frame belongs to — the snapshot generation.\n\nRebuilds run concurrently: a scan finishing triggers one, and\nseveral workers finishing near each other trigger several. Without\nan identifier their counts and their terminal `done` frames\ninterleave, so one rebuild's `done` looks like the end of another's\nprogress and a dashboard still cannot tell an active index from an\nidle one. The generation is the value that already orders snapshots\nagainst each other, so it is the one that identifies them.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "done": {
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "index_progress",
+              "type": "string"
+            },
+            "rows_indexed": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows_total": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "rows_indexed",
+            "done"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "bytes_done": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "bytes_total": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "files_done": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "files_total": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "tier_progress",
+              "type": "string"
+            },
+            "phase": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "plan_id": {
+              "type": "string"
+            },
+            "target_id": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "plan_id",
+            "target_id",
+            "files_done",
+            "files_total",
+            "bytes_done",
+            "bytes_total"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "detail": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "power_state",
+              "type": "string"
+            },
+            "metered_network": {
+              "default": false,
+              "type": "boolean"
+            },
+            "on_battery": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "on_battery"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "detail": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "target_health",
+              "type": "string"
+            },
+            "reachable": {
+              "type": "boolean"
+            },
+            "target_id": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "target_id",
+            "reachable"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A payload kind this build does not know.\n\nSerde's untagged-fallback position: it must be **last**, and it captures\nthe tag so a client can log what it skipped. Without it, a Phase 1 UI\nwould hard-fail on the first Phase 5 event."
+        }
+      ],
+      "description": "The event payloads.\n\nInternally tagged on `kind`, so an unknown payload is distinguishable from a\nmalformed one and a client can log \"kind=x, ignored\" instead of failing.\nAdding a variant is a minor bump; a client built earlier must tolerate one it\ndoes not know, which is why [`EventPayload::Unknown`] exists."
+    },
+    "EventStream": {
+      "description": "The named event streams.\n\nA closed enum on purpose: a client subscribes by name, and an unknown stream\nname should be a clear error at subscribe time rather than a silent\nnever-delivers. Adding a stream is a minor bump.",
+      "oneOf": [
+        {
+          "const": "job",
+          "description": "Job queue transitions (§6 Phase 1's queue core).",
+          "type": "string"
+        },
+        {
+          "const": "scan",
+          "description": "Scan and walk progress.",
+          "type": "string"
+        },
+        {
+          "const": "index",
+          "description": "Index build progress.",
+          "type": "string"
+        },
+        {
+          "const": "tier",
+          "description": "Tiering, verification and restore progress.",
+          "type": "string"
+        },
+        {
+          "const": "power",
+          "description": "Power and network state changes (Phase 4 populates it; the stream is\ndeclared now so the Dashboard's contract does not change then).",
+          "type": "string"
+        },
+        {
+          "const": "target",
+          "description": "Target reachability and scrub results.",
+          "type": "string"
+        }
+      ]
+    },
+    "Seq": {
+      "description": "A monotonic per-daemon-run event sequence number.\n\nNumbering is **global across streams**, not per stream. One counter means a\nclient holds one cursor no matter how many streams it subscribes to, and the\nrelative order of a `ScanProgress` and the `JobTransition` it caused is\npreserved. The cost is that a client subscribed to one stream sees gaps in\nthe numbers it receives; that is expected and is why the contract is \"no\ngaps in what the daemon *emitted*\", not \"no gaps in what you received\".\n\nSequence numbers restart at 1 on daemon restart. A resume cursor is\ntherefore only meaningful within one run, which is why\n[`SubscribeResult::epoch`] exists.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One event, as delivered.\n\nSent as a JSON-RPC notification (`method: \"event\"`, no `id`), which is what\nlets events share the connection with request/response traffic.",
+  "properties": {
+    "emitted_at": {
+      "description": "Nanoseconds since the Unix epoch, from the daemon's clock.",
+      "format": "int64",
+      "type": "integer"
+    },
+    "payload": {
+      "$ref": "#/$defs/EventPayload"
+    },
+    "seq": {
+      "$ref": "#/$defs/Seq"
+    },
+    "stream": {
+      "$ref": "#/$defs/EventStream"
+    }
+  },
+  "required": [
+    "seq",
+    "stream",
+    "emitted_at",
+    "payload"
+  ],
+  "title": "event notification payload",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

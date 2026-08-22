@@ -1,0 +1,52 @@
+{
+  "$defs": {
+    "JsonRpcV2": {
+      "description": "The `\"2.0\"` literal, as a type.\n\nA `String` field would let a peer send `\"1.0\"` and have it parse. This\nrejects anything else at deserialization, which is where\n[`crate::ErrorCode::InvalidRequest`] belongs.",
+      "type": "null"
+    },
+    "RequestId": {
+      "anyOf": [
+        {
+          "format": "int64",
+          "type": "integer"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "description": "A JSON-RPC request id. The spec permits a string or a number; both are\naccepted so a client may use whichever its language makes natural."
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One request frame. Newline-delimited on the socket (§4.3).",
+  "properties": {
+    "id": {
+      "$ref": "#/$defs/RequestId"
+    },
+    "jsonrpc": {
+      "$ref": "#/$defs/JsonRpcV2"
+    },
+    "method": {
+      "description": "The registered method name, e.g. `\"root.add\"`.",
+      "type": "string"
+    },
+    "params": {
+      "description": "The method's request payload, always a JSON object."
+    }
+  },
+  "required": [
+    "jsonrpc",
+    "id",
+    "method",
+    "params"
+  ],
+  "title": "JSON-RPC request frame",
+  "type": "object",
+  "x-shepherd": {
+    "generator": "cargo xtask codegen",
+    "generator_version": 1,
+    "proto_version": "1.3",
+    "registry_fingerprint": "ec2b4050376aac73",
+    "warning": "GENERATED FILE — edit crates/shepherd-proto and re-run `cargo xtask codegen`."
+  }
+}

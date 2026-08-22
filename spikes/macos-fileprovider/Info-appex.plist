@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>kr.swjeon.shepherd.spike.provider</string>
+  <key>CFBundleName</key><string>Provider</string>
+  <key>CFBundleExecutable</key><string>Provider</string>
+  <key>CFBundlePackageType</key><string>XPC!</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+
+  <!-- Launch Services uses both of these to decide whether an extension
+       applies on this machine. A known-working provider (Photos) carries
+       them; an early version of this spike did not, and was not discovered.
+       They were NOT the root cause — the MH_BUNDLE build was — but they are
+       present on every shipping provider and absent from the naive bundle. -->
+  <key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
+
+  <key>NSExtension</key>
+  <dict>
+    <key>NSExtensionPointIdentifier</key><string>com.apple.fileprovider-nonui</string>
+    <key>NSExtensionPrincipalClass</key><string>Provider</string>
+
+    <!-- Required by the extension point, and Provider.entitlements MUST grant
+         com.apple.security.application-groups for exactly this string.
+         fileproviderd checks the two against each other and, if the
+         entitlement is missing, logs "doesn't have a group container for
+         document group ... Ignoring the extension" and answers the caller
+         -2014, which reads as "never discovered". NOTE separately that the
+         container it names is NOT writable under ad-hoc signing:
+         containermanagerd rejects the group because ad-hoc has no team
+         identifier. The extension still registers a domain. Admission and
+         access are two different checks. See FINDINGS.md. -->
+    <key>NSExtensionFileProviderDocumentGroup</key><string>group.kr.swjeon.shepherd.spike</string>
+
+    <key>NSExtensionFileProviderEnabledByDefault</key><true/>
+  </dict>
+</dict>
+</plist>

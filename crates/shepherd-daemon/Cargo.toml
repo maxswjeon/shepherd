@@ -1,0 +1,64 @@
+[package]
+name = "shepherd-daemon"
+description = "The always-on daemon: IPC server and service lifecycle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "shepherd_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shepherdd"
+path = "src/main.rs"
+
+[dependencies]
+shepherd-catalog.workspace = true
+shepherd-core.workspace = true
+# The §4.6 metadata index. The daemon owns the catalog read that fills it and
+# the `Arc` swap that refreshes it, because `shepherd-index` is deliberately
+# catalog-agnostic — see its `meta` module docs.
+shepherd-index.workspace = true
+shepherd-jobs.workspace = true
+shepherd-obs.workspace = true
+shepherd-proto.workspace = true
+shepherd-scan.workspace = true
+shepherd-secrets.workspace = true
+# `target.add` registers a storage target, and §4.5's registration-time
+# whole-object-checksum probe lives here. This is the daemon's only async edge:
+# see `targets::probe_multipart_checksum_blocking` for why the runtime it needs
+# is built per call rather than owned by the process.
+shepherd-storage.workspace = true
+
+rusqlite.workspace = true
+# Only `target.add` awaits anything. `enable_all` needs the io and time drivers,
+# which the `aws-sdk-s3` edge under `shepherd-storage` already unifies in.
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# `launchd::uid()` needs the real uid. It read `std::env::var("UID")` and fell
+# back to the literal string `$(id -u)`; `Command::new` runs no shell, so
+# nothing ever expanded it. Target-scoped because `service::launchd` compiles
+# on every platform even though only macOS dispatches to it.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+# The E2E drives the daemon with a typed client rather than only through the
+# CLI, so it needs the wire types it would otherwise have to hand-roll.
+shepherd-proto.workspace = true
+serde_json = { workspace = true }
+# `target.add`'s stored effective config is not on the wire — `TargetSummary`
+# carries no checksum field and `target.list` is still refused — so the e2e
+# reads the committed row out of the daemon's own catalog. WAL gives it a
+# consistent cross-process read without disturbing the writer.
+rusqlite = { workspace = true }

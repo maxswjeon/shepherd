@@ -1,0 +1,23 @@
+[package]
+name = "shepherd-jobs"
+description = "Durable job queue, workers, cron scheduling, catch-up and adaptive concurrency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+shepherd-catalog.workspace = true
+shepherd-core.workspace = true
+
+# `rusqlite` appears here for exactly one reason: the dedicated PASSIVE
+# WAL-checkpoint connection in `worker.rs`, which is a second connection to the
+# same file and therefore cannot go through `Catalog` (whose whole contract is
+# that it is the single writer). No query in this crate uses it.
+rusqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
