@@ -223,24 +223,53 @@ fn remove_unit_file(env: &Env) -> Result<Option<PathBuf>> {
     }
 }
 
+/// One step of [`UNINSTALL_PLAN`].
+enum UninstallStep {
+    Systemctl(&'static [&'static str]),
+    RemoveUnitFile,
+}
+
+/// What `uninstall` does, in order — separated from doing it because the ORDER
+/// is the correctness property and neither systemctl call is runnable in a
+/// test.
+///
+/// `daemon-reload` reloads the manager's configuration *from what is on disk*.
+/// Running it while the unit file is still there re-reads `shepherd.service`
+/// and leaves the definition loaded in the user manager after the file is
+/// deleted, until some later reload or garbage collection. So the removal sits
+/// between the two calls: `disable --now` still needs the unit to exist to act
+/// on it, and the reload has to run after it is gone to be the reload that
+/// forgets it.
+const UNINSTALL_PLAN: &[UninstallStep] = &[
+    UninstallStep::Systemctl(&["--user", "disable", "--now", UNIT_NAME]),
+    UninstallStep::RemoveUnitFile,
+    UninstallStep::Systemctl(&["--user", "daemon-reload"]),
+];
+
 pub fn uninstall() -> Result<Outcome> {
     let mut commands = Vec::new();
     let mut notes = Vec::new();
+    let mut paths = Vec::new();
 
-    for args in [
-        vec!["--user", "disable", "--now", UNIT_NAME],
-        vec!["--user", "daemon-reload"],
-    ] {
-        let rendered = format!("systemctl {}", args.join(" "));
-        match std::process::Command::new("systemctl").args(&args).output() {
-            Ok(out) if out.status.success() => commands.push(rendered),
-            Ok(_) | Err(_) => notes.push(format!("`{rendered}` did not succeed; continuing.")),
+    for step in UNINSTALL_PLAN {
+        match step {
+            UninstallStep::Systemctl(args) => {
+                let rendered = format!("systemctl {}", args.join(" "));
+                match std::process::Command::new("systemctl").args(*args).output() {
+                    Ok(out) if out.status.success() => commands.push(rendered),
+                    Ok(_) | Err(_) => {
+                        notes.push(format!("`{rendered}` did not succeed; continuing."));
+                    }
+                }
+            }
+            // Propagates: a removal that failed leaves the unit installed, and
+            // reporting success there would tell the user the service is gone
+            // while it still starts at their next logon.
+            UninstallStep::RemoveUnitFile => {
+                paths.extend(remove_unit_file(&Env::from_process())?);
+            }
         }
     }
-
-    let paths = remove_unit_file(&Env::from_process())?
-        .into_iter()
-        .collect::<Vec<_>>();
     notes.push(
         "The catalog and secrets were NOT removed. Uninstalling a service must not destroy \
          the only address of files that no longer exist locally."
@@ -308,6 +337,33 @@ mod tests {
         assert!(
             !t.to_lowercase().contains("linger"),
             "a unit file cannot enable lingering, and must not appear to try: {t}"
+        );
+    }
+
+    /// `daemon-reload` has to run AFTER the file is gone.
+    ///
+    /// It reloads the manager's configuration from disk, so a reload issued
+    /// while `shepherd.service` is still there re-reads it and leaves the
+    /// definition loaded in the user manager after the deletion — the unit
+    /// survives its own uninstall until some later reload. `disable --now`
+    /// still has to come first, while there is a unit to disable.
+    #[test]
+    fn uninstall_removes_the_unit_between_disabling_it_and_reloading() {
+        let order: Vec<String> = UNINSTALL_PLAN
+            .iter()
+            .map(|s| match s {
+                UninstallStep::Systemctl(args) => args.join(" "),
+                UninstallStep::RemoveUnitFile => "<remove unit file>".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                format!("--user disable --now {UNIT_NAME}"),
+                "<remove unit file>".to_string(),
+                "--user daemon-reload".to_string(),
+            ],
+            "the removal must sit between the two systemctl calls"
         );
     }
 

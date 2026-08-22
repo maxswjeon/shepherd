@@ -149,6 +149,12 @@ impl DenyList {
                 (".bundle", Bundle),
                 (".photoslibrary", Bundle),
                 (".xcodeproj", Bundle),
+                // A DIRECTORY, despite being a disk image — which is why it is
+                // here and not only in `file_exts`, where the walk would never
+                // consult it: a bundle is reached as a directory and descended
+                // before any extension rule runs. `VmImage`, not `Bundle`,
+                // because that is what it is.
+                (".sparsebundle", VmImage),
             ],
             abs_prefixes: vec![
                 // Unix system trees.
@@ -594,6 +600,34 @@ mod tests {
         );
         // A directory the user literally named ".app" is theirs, not a bundle.
         assert_eq!(d.deny_dir(".app", &p("/home/u/.app")), None);
+    }
+
+    /// A sparse bundle is a DIRECTORY, so the extension list never sees it.
+    ///
+    /// `file_exts` is consulted only for non-directory entries. Listing
+    /// `sparsebundle` there and nowhere else meant the walker descended into
+    /// `Backup.sparsebundle` and catalogued its band files one by one — the
+    /// disk image `VmImage` exists to exclude, admitted as a few thousand
+    /// opaque fragments instead.
+    #[test]
+    fn a_sparse_bundle_is_denied_as_a_directory_not_only_as_an_extension() {
+        let d = DenyList::builtin();
+        assert_eq!(
+            d.deny_dir("Backup.sparsebundle", &p("/Users/u/Backup.sparsebundle")),
+            Some(DenyReason::VmImage),
+            "the walk reaches a sparse bundle as a directory, and this is the only \
+             hook that runs before it descends"
+        );
+        // Still denied by extension, for the spelling that is a plain file.
+        assert_eq!(
+            d.deny_file("disk.sparsebundle", &p("/Users/u/disk.sparsebundle")),
+            Some(DenyReason::VmImage)
+        );
+        // And the bare suffix is a user's own directory, as with every other.
+        assert_eq!(
+            d.deny_dir(".sparsebundle", &p("/home/u/.sparsebundle")),
+            None
+        );
     }
 
     #[test]
