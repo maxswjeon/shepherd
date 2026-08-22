@@ -6276,3 +6276,54 @@ fn the_unprobed_feasibility_warning_lasts_exactly_as_long_as_tiering_is_unreacha
          established. warnings were: {warnings:?}"
     );
 }
+
+/// The state directory is not a scan root — reached by any name.
+///
+/// The refusal is registration-time on purpose: everything below it in
+/// `root_add` WRITES, and `probe_path_policies` dropping a probe file into the
+/// directory holding the live catalog, its write-ahead log and the secret store
+/// is the trespass. A symlink is the interesting half, because the enrolled
+/// path and the directory it names are different strings.
+#[test]
+fn a_root_inside_the_state_directory_is_refused_by_any_name() {
+    let d = Daemon::start_with_socket_outside_the_state_dir("statedir-root");
+    let mut c = d.connect();
+
+    let inner = d.dir.join("state").join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+
+    // Named literally.
+    let err = c.call_err(
+        "root.add",
+        serde_json::json!({ "path": inner.to_string_lossy(), "stub_mode": "delete" }),
+    );
+    assert!(
+        err.message.contains("state directory"),
+        "a path inside the state directory must be refused: {}",
+        err.message
+    );
+
+    // Named through a symlink that resolves into it. The literal path shares no
+    // prefix with the state directory at all.
+    let link = d.dir.join("innocent");
+    std::os::unix::fs::symlink(&inner, &link).unwrap();
+    let err = c.call_err(
+        "root.add",
+        serde_json::json!({ "path": link.to_string_lossy(), "stub_mode": "delete" }),
+    );
+    assert!(
+        err.message.contains("state directory"),
+        "a symlink resolving into the state directory must be refused too — \
+         enrolling it writes probe files beside the live catalog: {}",
+        err.message
+    );
+
+    // And nothing was enrolled by either attempt.
+    assert_eq!(
+        c.call("root.list", serde_json::json!({}))["roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
