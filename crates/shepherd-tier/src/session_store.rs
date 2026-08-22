@@ -576,6 +576,14 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
                 ),
             });
         }
+        // The three validated numbers ARE the plan, so the per-part ranges come
+        // from `PartPlan` itself rather than from a second copy of its
+        // arithmetic living here.
+        let plan = PartPlan {
+            total_size: src_size,
+            part_size,
+            part_count,
+        };
         let rows = stmt
             .query_map([r.0], |row| {
                 Ok((
@@ -608,12 +616,48 @@ fn load_blocking(cat: &Catalog, job_id: JobId) -> StorageResult<Option<TransferS
                          no part of this plan"
                     ),
                 })?;
+            // Against the PLAN, both halves. The offset was already derived
+            // rather than stored — `part_size` is immutable for a session's
+            // life, which is what makes the column redundant — but `bytes` was
+            // taken as given, so an imported, hand-edited or damaged row could
+            // name a length no part of this plan has.
+            //
+            // That is not caught later. Reconciliation SKIPS a part whose
+            // provider listing agrees with the persisted length, and a session
+            // reloaded in `completing` never reconciles at all. Completion then
+            // publishes a truncated object under a content-addressed key, and
+            // because the key names bytes the object does not contain, every
+            // retry fails verification forever — the object cannot be repaired,
+            // only abandoned. So the refusal belongs at LOAD, where the
+            // session can still be rejected as a whole.
+            //
+            // `range_of` rather than the formula again: this file derived the
+            // offset by hand, and a second copy of a plan's arithmetic is the
+            // way the two stop agreeing.
+            let range = plan
+                .range_of(part_no)
+                .ok_or_else(|| StorageError::Provider {
+                    provider: "catalog",
+                    op: "transfer_session".into(),
+                    detail: format!("part {part_no} has no range in a {part_count}-part plan"),
+                })?;
+            if bytes != range.len {
+                return Err(StorageError::Provider {
+                    provider: "catalog",
+                    op: "transfer_session".into(),
+                    detail: format!(
+                        "part {part_no} is recorded as {bytes} bytes, but this plan's part \
+                         {part_no} is {} bytes ({src_size} bytes in {part_count} parts of \
+                         {part_size}); resuming it publishes an object whose content-addressed \
+                         key names bytes it does not contain",
+                        range.len
+                    ),
+                });
+            }
             parts.push(PartCheckpoint {
                 part_no,
-                // Derived, not stored: `part_size` is immutable for a session's
-                // life, which is what makes this safe and the column redundant.
-                offset: u64::from(part_no.saturating_sub(1)) * part_size,
-                len: bytes,
+                offset: range.offset,
+                len: range.len,
                 local_blake3: hash_from(local).unwrap_or(Blake3Hash::from_bytes([0u8; 32])),
                 etag: etag.map(OpaqueToken::new),
                 // PERSISTED now, and the old comment here was wrong about the

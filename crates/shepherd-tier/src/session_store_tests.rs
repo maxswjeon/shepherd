@@ -216,10 +216,16 @@ async fn checkpointing_a_part_writes_only_that_part_and_keeps_the_rest() {
         // does — each `save_part` call after the part before it is already
         // durable.
         for part_no in 1..=4u32 {
+            // From the PLAN, not from the requested part size. `plan` clamps a
+            // request below the adapter's minimum, so `4` here became 8 — and
+            // hand-written 4-byte checkpoints described parts this plan does
+            // not have. `load` refuses that now, which is the point of the
+            // refusal; a fixture is not exempt from it.
+            let range = s.plan.range_of(part_no).expect("part is in the plan");
             s.parts.push(PartCheckpoint {
                 part_no,
-                offset: u64::from(part_no - 1) * 4,
-                len: 4,
+                offset: range.offset,
+                len: range.len,
                 local_blake3: Blake3Hash::from_bytes([part_no as u8; 32]),
                 etag: Some(OpaqueToken::new(format!("etag-{part_no}"))),
                 checksum: None,
@@ -258,7 +264,9 @@ async fn checkpointing_a_part_writes_only_that_part_and_keeps_the_rest() {
         assert_eq!(p.part_no, n);
         assert_eq!(p.etag, Some(OpaqueToken::new(format!("etag-{n}"))));
         assert_eq!(p.local_blake3, Blake3Hash::from_bytes([n as u8; 32]));
-        assert_eq!(p.len, 4);
+        // The plan's length for this part, which is what `load` now derives
+        // and enforces — not the size this fixture asked for and did not get.
+        assert_eq!(p.len, back.plan.range_of(n).expect("in the plan").len);
     }
 
     // And re-checkpointing a part already on disk updates it rather than
@@ -1047,5 +1055,86 @@ async fn a_completing_session_reloads_the_part_checksums_it_must_echo() {
         vec![Some("crc32c-part-1".to_owned()), None],
         "a completing session that cannot echo its part checksums is refused \
          with `InvalidPart` by every provider that required them"
+    );
+}
+
+/// A persisted part length that no part of the plan has must refuse the load.
+///
+/// `bytes` was taken as given — only checked for being non-negative — so an
+/// imported, hand-edited, legacy or damaged row could name any length. Nothing
+/// downstream catches it: reconciliation SKIPS a part whose provider listing
+/// agrees with the persisted length, and a session reloaded in `completing`
+/// never reconciles at all. Completion then publishes a truncated object under
+/// a content-addressed key, and because the key names bytes the object does not
+/// contain, verification fails on every retry forever — the object cannot be
+/// repaired, only abandoned. Load is the last point where the session can still
+/// be rejected whole.
+#[tokio::test]
+async fn a_part_length_that_is_not_in_the_plan_refuses_the_load() {
+    let dir = TempDir::new("part-length");
+    let db = dir.join("catalog.db");
+    let src = dir.join("a.bin");
+    std::fs::write(&src, BODY).expect("write source");
+    let item = item_for(&src);
+
+    let job = JobId::new(91);
+    seed(&db, job, item.target, item.file);
+    {
+        let store = CatalogSessionStore::open(&db).expect("open");
+        let adapter = MemAdapter::content_addressed();
+        let mut s = TransferSession::plan(
+            job,
+            item.target,
+            item.remote_key.clone(),
+            SourceIdentity {
+                file_id: item.file,
+                rel_path: item.path.clone(),
+                size: item.size,
+                mtime: Timestamp::from_nanos(7),
+                fs_id: FsId::new("vol-1:ino-9"),
+                blake3: item.blake3,
+            },
+            &adapter,
+            16,
+        )
+        .expect("plan");
+        s.state = TransferState::Completing;
+        s.upload_id = Some(OpaqueToken::new("upload-xyz"));
+        s.parts.push(PartCheckpoint {
+            part_no: 1,
+            offset: 0,
+            len: 16,
+            local_blake3: Blake3Hash::from_bytes([9u8; 32]),
+            etag: Some(OpaqueToken::new("etag-1")),
+            checksum: None,
+        });
+        store.save(&s).await.expect("save");
+    }
+
+    // The accepting direction first: the row as saved must load, or the
+    // refusal below proves only that this fixture cannot load at all.
+    {
+        let store = CatalogSessionStore::open(&db).expect("reopen");
+        assert!(
+            store.load(job).await.expect("load").is_some(),
+            "the unmodified session must load"
+        );
+    }
+
+    // Now the damage: part 1 of a 16-byte plan claims 4 bytes.
+    rusqlite::Connection::open(&db)
+        .expect("open catalog")
+        .execute("UPDATE transfer_part SET bytes = 4 WHERE part_no = 1", [])
+        .expect("forge the part length");
+
+    let store = CatalogSessionStore::open(&db).expect("reopen");
+    let err = store
+        .load(job)
+        .await
+        .expect_err("a part length outside the plan must refuse the session");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("recorded as 4 bytes") && msg.contains("16"),
+        "the refusal must name both the recorded length and the plan's: {msg}"
     );
 }

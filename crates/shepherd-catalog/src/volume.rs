@@ -88,6 +88,20 @@ pub fn fs_id(path: &Path, volume_id: &str) -> Result<FsId> {
 /// equal to a volume-qualified one: a root enrolled before a UUID appeared must
 /// not look like the same root afterwards.
 ///
+/// # What the unqualified form cannot answer
+///
+/// An inode is unique **within one filesystem**, so `ino-only:` answers "is
+/// this still the same directory *on the same filesystem*" and nothing more.
+/// At a MOUNT POINT that is not enough: the inode is then the filesystem's own
+/// root inode, drawn from a tiny reused set — `2` on ext4, `1` on many others
+/// — so an unrelated no-id filesystem (tmpfs, overlay, some FUSE) mounted at
+/// the enrolled path can produce the identical value and be accepted as the
+/// enrolled root. Claiming a match there would be worse than claiming nothing,
+/// so a mount root gets `None`: **unverifiable, not verified**.
+///
+/// Only the unqualified form degrades. Where a volume id is known it is what
+/// distinguishes filesystems, and a mount root is perfectly identifiable.
+///
 /// `None` off unix, and where the directory cannot be stat'd. That is the same
 /// posture `fs_id` takes — Windows needs `FILE_ID_INFO` and that lands with the
 /// rest of the platform in Phase 3 — so a caller gets "unknown", never a wrong
@@ -96,17 +110,43 @@ pub fn directory_identity(path: &Path, volume_id: Option<&str>) -> Option<String
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let ino = std::fs::metadata(path).ok()?.ino();
-        Some(match volume_id {
-            Some(vol) => fs_id_from_ino(vol, ino).as_str().to_owned(),
-            None => format!("ino-only:{ino}"),
-        })
+        let md = std::fs::metadata(path).ok()?;
+        match volume_id {
+            Some(vol) => Some(fs_id_from_ino(vol, md.ino()).as_str().to_owned()),
+            None if is_mount_root(path, &md) => None,
+            None => Some(format!("ino-only:{}", md.ino())),
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = (path, volume_id);
         None
     }
+}
+
+/// Is `path` the root of a mounted filesystem?
+///
+/// `mountpoint(1)`'s rule, both halves. The familiar one is that `..` crosses
+/// back into the parent filesystem, so the devices differ. The second is what
+/// makes it correct at `/`, where `..` IS `/` — same device, same inode — and
+/// a device comparison alone reports the one filesystem root that matters most
+/// as an ordinary directory.
+///
+/// `st_dev` is read here and never stored. §4.4's prohibition is on building an
+/// **identity** out of it, because it does not survive a remount; comparing two
+/// devices observed a microsecond apart asks a question that does not outlive
+/// the call, which is the same thing the scan's `dev_before`/`dev_after` guard
+/// does.
+#[cfg(unix)]
+fn is_mount_root(path: &Path, md: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // Unreadable parent: treat it as a mount root, because the question could
+    // not be answered and this function's `false` is the answer that mints an
+    // identity.
+    let Ok(parent) = std::fs::metadata(path.join("..")) else {
+        return true;
+    };
+    md.dev() != parent.dev() || md.ino() == parent.ino()
 }
 
 /// The same packing, from an inode already in hand.
@@ -737,6 +777,56 @@ mod remount_tests {
     #[allow(dead_code)]
     fn _typecheck(p: &Path) -> Option<&std::ffi::OsStr> {
         p.file_name()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod identity_tests {
+    use super::*;
+
+    /// A filesystem root's inode identifies no filesystem.
+    ///
+    /// Root inodes are a tiny, reused set — `2` on ext4, `1` on many others —
+    /// so `ino-only:` at a mount point says the same thing about every
+    /// unrelated filesystem that could be mounted there. Claiming a match on
+    /// it would let a swapped no-id mount (tmpfs, overlay, some FUSE) be
+    /// accepted as the enrolled root, after which the scan updates the
+    /// same-path rows and sweeps the rest as missing.
+    #[test]
+    fn a_mount_root_has_no_unqualified_identity() {
+        assert_eq!(
+            directory_identity(Path::new("/"), None),
+            None,
+            "the root of a filesystem must read as unverifiable, not as a match"
+        );
+    }
+
+    /// And an ordinary directory still gets one — the retarget case the
+    /// unqualified form exists for. Without this the fix above passes by
+    /// returning `None` everywhere.
+    #[test]
+    fn an_ordinary_directory_still_has_an_unqualified_identity() {
+        let dir = std::env::temp_dir().join(format!("shepherd-ident-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = directory_identity(&dir, None);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            id.is_some_and(|s| s.starts_with("ino-only:")),
+            "a directory inside a filesystem is distinct within it, which is exactly \
+             what this form is for"
+        );
+    }
+
+    /// The volume-qualified form is unaffected: the volume id is what
+    /// distinguishes filesystems, so a mount root is perfectly identifiable
+    /// once one is known.
+    #[test]
+    fn a_mount_root_keeps_its_volume_qualified_identity() {
+        // Asserted on the SHAPE: the root inode differs per filesystem, and
+        // the point is that the volume id carries the answer the inode cannot.
+        let id = directory_identity(Path::new("/"), Some("uuid:abc"))
+            .expect("a volume-qualified identity does not depend on the inode being unique");
+        assert!(id.starts_with("uuid:abc:"), "{id}");
     }
 }
 

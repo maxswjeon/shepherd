@@ -179,7 +179,7 @@ impl Executor for ScanExecutor {
             .writer()
             .try_with(move |cat| load_scan_input(cat, rid))
             .map_err(|e| e.to_string())?;
-        let Some((root, patterns)) = loaded else {
+        let Some((root, patterns, incarnation)) = loaded else {
             // Not retryable in any useful sense — the root is no longer
             // registered, whether it was forgotten outright or deregistered
             // with its catalog kept. Returning Err lets the queue's backoff run
@@ -189,6 +189,10 @@ impl Executor for ScanExecutor {
                 "scan root {root_id} is no longer registered for scanning"
             ));
         };
+
+        // `Arc`, because both writer closures below are `move` and each needs
+        // to compare against the same captured token.
+        let incarnation = Arc::new(incarnation);
 
         // PM-3: an unavailable root processes zero absences. Walking one would
         // read an empty or partial tree and, worse, a later sweep could read
@@ -560,9 +564,11 @@ impl Executor for ScanExecutor {
             // rebuild happens to run. `with_catalog_mutation` holds the ticket
             // across the closure, which is what makes the generation order the
             // two; taking it afterwards orders nothing.
+            let inc_for_batch = Arc::clone(&incarnation);
             let (wrote, at) = self.daemon.with_catalog_mutation(|| {
-                self.writer()
-                    .try_with(move |cat| upsert_batch(cat, &root_for_batch, &batch, generation))
+                self.writer().try_with(move |cat| {
+                    upsert_batch(cat, &root_for_batch, &batch, generation, &inc_for_batch)
+                })
             });
             match wrote {
                 Ok(()) => {
@@ -641,8 +647,15 @@ impl Executor for ScanExecutor {
         // rows still in it. A scan whose only effect was deletions had
         // `mutated_at: None` and never invalidated at all.
         let root_for_sweep = Arc::clone(&root);
+        let inc_for_sweep = Arc::clone(&incarnation);
         let (swept, swept_at) = self.daemon.with_catalog_mutation(|| {
             self.writer().try_with(move |cat| {
+                // Gated too, and this is the half that MARKS ROWS MISSING.
+                // `unobserved` is the skipped-path set from this walk; against
+                // a root re-registered with different ignore patterns it
+                // spares the wrong subtrees and sweeps rows the current
+                // configuration never had a chance to observe.
+                same_incarnation(cat, root_for_sweep.id, &inc_for_sweep)?;
                 FileRepo::new(cat).sweep_absent(&root_for_sweep, generation, &unobserved, now())
             })
         });
@@ -748,10 +761,92 @@ impl ScanExecutor {
 /// with it (see `dispatch::remove_root`). A queued job outliving either one must
 /// not walk the tree the user just deregistered, and this is the single point
 /// both reach.
+/// The root configuration a walk was produced under.
+///
+/// `enabled` alone was the check, and it is not enough. A default
+/// `root.remove` followed by a `root.add` sets `enabled` back to true, so a
+/// scan that was walking the whole time finds the flag it expects and commits
+/// batches produced under the PREVIOUS configuration — files the new
+/// `ignore_patterns_json` excludes, catalogued from a walk that never saw the
+/// new patterns, and a skipped-path set from the old ones driving the absence
+/// sweep.
+///
+/// So the whole rewritten set is the token, not one flag. These are exactly
+/// the columns `enroll_root` rewrites on a revival; the two policies it
+/// deliberately keeps are not here, because they cannot change.
+///
+/// Compared as a tuple rather than hashed: a hash is a second encoding of the
+/// same fact, and this file has been bitten by second encodings.
+#[derive(Debug, PartialEq, Eq)]
+struct Incarnation {
+    enabled: bool,
+    ignore_patterns_json: Option<String>,
+    stub_mode: String,
+    hosted_optin: bool,
+    volume_id: Option<String>,
+    root_fs_id: Option<String>,
+    atime_mode: String,
+}
+
+impl Incarnation {
+    /// `None` when the row is gone entirely.
+    fn read(cat: &Catalog, id: RootId) -> Result<Option<Self>, CatalogError> {
+        cat.conn()
+            .query_row(
+                "SELECT enabled, ignore_patterns_json, stub_mode, hosted_optin,
+                        volume_id, root_fs_id, atime_mode
+                 FROM scan_root WHERE id = ?1",
+                rusqlite::params![id.get()],
+                |r| {
+                    Ok(Self {
+                        enabled: r.get::<_, i64>(0)? != 0,
+                        ignore_patterns_json: r.get(1)?,
+                        stub_mode: r.get(2)?,
+                        hosted_optin: r.get::<_, i64>(3)? != 0,
+                        volume_id: r.get(4)?,
+                        root_fs_id: r.get(5)?,
+                        atime_mode: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(CatalogError::from)
+    }
+}
+
+/// Refuse a write whose walk belongs to a different incarnation of this root.
+///
+/// Read inside the transaction that writes, for the reason the `enabled` check
+/// it replaces gives: the writer actor is single-threaded, so a check inside
+/// its transaction and the writes that follow cannot be separated by another
+/// writer, while a check in the executor is a read the re-enrollment can land
+/// behind.
+fn same_incarnation(cat: &Catalog, root: RootId, loaded: &Incarnation) -> Result<(), CatalogError> {
+    match Incarnation::read(cat, root)? {
+        Some(now) if &now == loaded => Ok(()),
+        Some(now) if !now.enabled => Err(CatalogError::Invalid(format!(
+            "root {} was deregistered while this scan was walking it, so these rows are not \
+             ours to write",
+            root.get()
+        ))),
+        Some(_) => Err(CatalogError::Invalid(format!(
+            "root {} was re-registered with a different configuration while this scan was \
+             walking it: this walk was produced under the previous one, and committing it \
+             would catalogue files the current ignore patterns exclude and reconcile \
+             absences against the old skipped-path set",
+            root.get()
+        ))),
+        None => Err(CatalogError::Invalid(format!(
+            "root {} no longer exists, so these rows are not ours to write",
+            root.get()
+        ))),
+    }
+}
+
 fn load_scan_input(
     cat: &mut Catalog,
     id: RootId,
-) -> Result<Option<(ScanRoot, Vec<String>)>, CatalogError> {
+) -> Result<Option<(ScanRoot, Vec<String>, Incarnation)>, CatalogError> {
     let Some(root) = FileRepo::new(cat).get_root(id)? else {
         return Ok(None);
     };
@@ -785,7 +880,12 @@ fn load_scan_input(
             ))
         })?,
     };
-    Ok(Some((root, patterns)))
+    // Captured HERE, in the same actor closure that read the patterns, so the
+    // token and the configuration the walk is about to use are the same read.
+    let Some(incarnation) = Incarnation::read(cat, id)? else {
+        return Ok(None);
+    };
+    Ok(Some((root, patterns, incarnation)))
 }
 
 /// One transaction per batch, so a crash mid-scan leaves whole batches.
@@ -820,10 +920,11 @@ fn upsert_batch(
     root: &ScanRoot,
     batch: &[shepherd_core::FileStat],
     generation: i64,
+    incarnation: &Incarnation,
 ) -> Result<(), CatalogError> {
     cat.conn().execute_batch("BEGIN")?;
 
-    // STILL REGISTERED, re-read inside the transaction that writes.
+    // THE SAME ROOT INCARNATION, re-read inside the transaction that writes.
     //
     // `load_scan_input` checked this once, before the walk. A default
     // `root.remove` keeps the row and its catalog and clears `enabled` — it
@@ -837,22 +938,9 @@ fn upsert_batch(
     // actor is single-threaded, so a check inside its transaction and the
     // upserts that follow cannot be separated by another writer. A check in
     // the executor would be a read the removal could land behind.
-    let enabled: bool = cat
-        .conn()
-        .query_row(
-            "SELECT enabled FROM scan_root WHERE id = ?1",
-            [root.id.get()],
-            |r| r.get::<_, i64>(0).map(|v| v != 0),
-        )
-        .unwrap_or(false);
-    if !enabled {
+    if let Err(e) = same_incarnation(cat, root.id, incarnation) {
         let _ = cat.conn().execute_batch("ROLLBACK");
-        return Err(CatalogError::Invalid(format!(
-            "root {} was deregistered while this scan was walking it, so these {} rows are \
-             not ours to write",
-            root.id.get(),
-            batch.len()
-        )));
+        return Err(e);
     }
 
     let stamp = now();
@@ -1094,8 +1182,62 @@ mod tests {
     #[test]
     fn a_roots_stored_ignore_patterns_reach_the_scan() {
         let (mut cat, id) = seeded_root(&["*.tmp".to_string(), "cache/".to_string()]);
-        let (_root, patterns) = load_scan_input(&mut cat, id).unwrap().unwrap();
+        let (_root, patterns, _inc) = load_scan_input(&mut cat, id).unwrap().unwrap();
         assert_eq!(patterns, vec!["*.tmp".to_string(), "cache/".to_string()]);
+    }
+
+    /// A walk may only be committed against the configuration it was produced
+    /// under.
+    ///
+    /// `enabled` alone was the gate, and a soft `root.remove` followed by a
+    /// `root.add` sets it straight back to true — so a scan that was walking
+    /// the whole time found the flag it expected and committed batches built
+    /// from the PREVIOUS ignore patterns, with the old skipped-path set then
+    /// driving the absence sweep.
+    #[test]
+    fn a_walk_may_not_be_committed_against_a_re_registered_root() {
+        let (mut cat, id) = seeded_root(&["*.tmp".to_string()]);
+        let (_root, _patterns, loaded) = load_scan_input(&mut cat, id).unwrap().unwrap();
+
+        // The accepting direction first, so the refusal below cannot pass on a
+        // check that simply always refuses.
+        assert!(
+            same_incarnation(&cat, id, &loaded).is_ok(),
+            "an untouched root must still be committable"
+        );
+
+        // Re-registered with different exclusions, `enabled` still 1 — exactly
+        // what `enroll_root` leaves behind on a revival.
+        cat.conn_mut()
+            .execute(
+                r#"UPDATE scan_root SET ignore_patterns_json = '["*.log"]' WHERE id = ?1"#,
+                rusqlite::params![id.get()],
+            )
+            .unwrap();
+
+        let err = same_incarnation(&cat, id, &loaded)
+            .expect_err("a walk produced under the old patterns is not ours to write");
+        assert!(
+            err.to_string().contains("different configuration"),
+            "the refusal must name what actually changed, not report a deregistration: {err}"
+        );
+    }
+
+    /// And the deregistration case keeps its own wording, because the two are
+    /// different things for the user: one root is gone, the other came back
+    /// altered.
+    #[test]
+    fn a_deregistered_root_still_refuses_by_name() {
+        let (mut cat, id) = seeded_root(&[]);
+        let (_root, _patterns, loaded) = load_scan_input(&mut cat, id).unwrap().unwrap();
+        cat.conn_mut()
+            .execute(
+                "UPDATE scan_root SET enabled = 0 WHERE id = ?1",
+                rusqlite::params![id.get()],
+            )
+            .unwrap();
+        let err = same_incarnation(&cat, id, &loaded).expect_err("a disabled root refuses");
+        assert!(err.to_string().contains("deregistered"), "{err}");
     }
 
     /// A catalog failure reading the ignore list must fail the scan, not read

@@ -63,6 +63,22 @@ const S3_MAX_PARTS: u32 = 10_000;
 /// would not fix it.
 const MAX_INCOMPLETE_UPLOADS: usize = 10_000;
 
+/// An HTTP `Range` header for `range`, or `None` when there is nothing to ask
+/// for.
+///
+/// One function because there are two callers — the current-object read and
+/// the versioned one — and the *inclusive* end (`offset + len - 1`) underflows
+/// at `len == 0`: a panic in debug, and in release a wrap to `u64::MAX` that
+/// asks the provider for the rest of the object. A zero-length range is legal
+/// here; `PartPlan` emits one for a zero-byte object.
+///
+/// `None` rather than an empty string, so a caller cannot send the header and
+/// silently get the whole object: the empty read is the caller's to return.
+fn range_header(range: ByteRange) -> Option<String> {
+    let last = range.offset.checked_add(range.len.checked_sub(1)?)?;
+    Some(format!("bytes={}-{last}", range.offset))
+}
+
 /// Static credentials, for MinIO and for targets whose secrets Shepherd holds
 /// in `shepherd-secrets` rather than in the ambient environment.
 #[derive(Clone)]
@@ -803,19 +819,15 @@ impl StorageAdapter for S3Adapter {
     }
 
     async fn get_range(&self, key: &ObjectKey, range: ByteRange) -> StorageResult<Bytes> {
-        if range.len == 0 {
+        let Some(header) = range_header(range) else {
             return Ok(Bytes::new());
-        }
+        };
         let out = self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(key.as_str())
-            .range(format!(
-                "bytes={}-{}",
-                range.offset,
-                range.offset + range.len - 1
-            ))
+            .range(header)
             .send()
             .await
             .map_err(|e| Self::map_err("get_object", key.as_str(), e))?;
@@ -839,17 +851,16 @@ impl StorageAdapter for S3Adapter {
         // `version_id`, which is what makes this a read of a VERSION rather
         // than of whatever is current. See the trait docs for why verification
         // cannot use the mutable key.
+        let Some(header) = range_header(range) else {
+            return Ok(Bytes::new());
+        };
         let out = self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(key.as_str())
             .version_id(version.as_opaque())
-            .range(format!(
-                "bytes={}-{}",
-                range.offset,
-                range.offset + range.len - 1
-            ))
+            .range(header)
             .send()
             .await
             .map_err(|e| Self::map_err("get_range_versioned", key.as_str(), e))?;
@@ -1620,6 +1631,48 @@ pub async fn probe_multipart_checksum(cfg: &S3Config) -> StorageResult<ChecksumP
     let bucket = cfg.bucket.clone();
     let prober = S3RoundTrip { cfg: cfg.clone() };
     adopt_first_round_trip(&prober, &FULL_OBJECT_PREFERENCE, &endpoint, &bucket).await
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    /// A zero-length range asks for nothing, and must not compute an end.
+    ///
+    /// `offset + len - 1` underflows at `len == 0`: a panic in debug builds,
+    /// and in release a wrap to `u64::MAX`, which asks the provider for the
+    /// whole object instead of none of it. `PartPlan` emits a zero-length
+    /// range for a zero-byte object, so this is a legal input, not a
+    /// defensive check.
+    #[test]
+    fn a_zero_length_range_has_no_header() {
+        assert_eq!(range_header(ByteRange { offset: 0, len: 0 }), None);
+        assert_eq!(
+            range_header(ByteRange {
+                offset: 4096,
+                len: 0
+            }),
+            None
+        );
+    }
+
+    /// And the end stays INCLUSIVE for everything else — an off-by-one here
+    /// silently drops or duplicates a byte at every part boundary.
+    #[test]
+    fn a_range_header_names_the_inclusive_last_byte() {
+        assert_eq!(
+            range_header(ByteRange { offset: 0, len: 1 }).as_deref(),
+            Some("bytes=0-0")
+        );
+        assert_eq!(
+            range_header(ByteRange {
+                offset: 100,
+                len: 50
+            })
+            .as_deref(),
+            Some("bytes=100-149")
+        );
+    }
 }
 
 #[cfg(test)]

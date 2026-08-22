@@ -114,26 +114,47 @@ pub fn install(exe: &Path) -> Result<Outcome> {
 pub fn uninstall() -> Result<Outcome> {
     let path = plist_path()?;
     let mut commands = Vec::new();
+    let mut notes = Vec::new();
     let args = vec!["bootout".to_string(), format!("gui/{}/{LABEL}", uid())];
     let rendered = format!("launchctl {}", args.join(" "));
-    if let Ok(out) = std::process::Command::new("launchctl").args(&args).output()
-        && out.status.success()
-    {
-        commands.push(rendered);
+    // A failed `bootout` is REPORTED, on both arms — the install path five
+    // functions up already does this for `bootstrap`, and only the uninstall
+    // arm dropped it. Deleting the plist stops the agent starting at the next
+    // logon; it does nothing to an agent that is loaded and running right now.
+    // Silently succeeding there told the user the service was gone while it
+    // went on running and mutating the catalog until they logged out.
+    //
+    // Not fatal: the plist still has to go, or the next logon starts the
+    // daemon again and the uninstall achieved nothing at all. So the removal
+    // proceeds and the note carries the part that did not.
+    match std::process::Command::new("launchctl").args(&args).output() {
+        Ok(out) if out.status.success() => commands.push(rendered),
+        Ok(out) => notes.push(format!(
+            "`{rendered}` failed ({}): {}. The plist is removed, so the agent will not \
+             start again — but if it is running now it keeps running until you log out. \
+             Run that command yourself to stop it immediately.",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => notes.push(format!(
+            "could not run `{rendered}` ({e}). The plist is removed, so the agent will not \
+             start again — but if it is running now it keeps running until you log out."
+        )),
     }
     let mut paths = Vec::new();
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| io_err(&path, e))?;
         paths.push(path);
     }
+    notes.push(
+        "The catalog and secrets were NOT removed. Uninstalling a service must not \
+         destroy the only address of files that no longer exist locally."
+            .into(),
+    );
     Ok(Outcome {
         paths,
         commands,
-        notes: vec![
-            "The catalog and secrets were NOT removed. Uninstalling a service must not \
-             destroy the only address of files that no longer exist locally."
-                .into(),
-        ],
+        notes,
     })
 }
 
